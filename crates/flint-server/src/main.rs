@@ -4222,6 +4222,11 @@ pub(crate) struct TxnState {
     /// Empty is the overwhelmingly common case, so this allocates nothing
     /// for connections that never WATCH.
     watches: Vec<(Vec<u8>, u64)>,
+    /// `FLINTWHOLE` (ADR-0053): this connection's namespace lives wholly on
+    /// this seat's pair, so its transactions and scripts may span slots. A
+    /// connection property, not a transaction's: `end` leaves it, and
+    /// `FLINTNS` clears it.
+    whole: bool,
 }
 
 impl TxnState {
@@ -4359,14 +4364,16 @@ fn transaction_control(
                 conn_ns,
                 watch,
                 txn,
+                conn_txn.whole,
             ));
         }
         _ => {}
     }
     // Not a transaction verb. If one is open, this command is queued
     // instead of run.
+    let whole = conn_txn.whole;
     let txn = conn_txn.open.as_mut()?;
-    if let Some(e) = commands::queue_time_error(args) {
+    if let Some(e) = commands::queue_time_error(args, whole) {
         // Poison and report. The client sees the error now, while it still
         // knows which command it sent; EXEC will refuse the whole batch.
         txn.poisoned = true;
@@ -4381,7 +4388,10 @@ fn transaction_control(
         .first()
         .map(|n| n.to_ascii_uppercase())
         .unwrap_or_default();
-    let keys: Vec<&[u8]> = if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS") {
+    // A placed tenant's transaction may span slots (ADR-0053, `FLINTWHOLE`).
+    let keys: Vec<&[u8]> = if whole {
+        Vec::new()
+    } else if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS") {
         args[1..].iter().map(|k| k.as_slice()).collect()
     } else {
         commands::command_key(args).into_iter().collect()
@@ -4753,6 +4763,7 @@ fn exec_transaction(
     conn_ns: &[u8],
     watch: &flint_storage::watch::WatchTable,
     txn: Txn,
+    whole: bool,
 ) -> Value {
     if txn.queued.is_empty() {
         return Value::Array(Some(Vec::new()));
@@ -4798,8 +4809,10 @@ fn exec_transaction(
                     limits,
                     conn_ns,
                 )
-                // `_all` above: a script here may touch any key in its slot.
+                // `_all` above: a script here may touch any key in its slot,
+                // or in any slot for a placed tenant (ADR-0053).
                 .holding_every_writer(true)
+                .whole(whole)
                 .dispatch(cmd),
             );
         }
@@ -5192,6 +5205,25 @@ fn execute(
             Some(_) => return Value::Error("ERR FLINTNS <namespace> [a]".into()),
         }
         *conn_ns = ns.clone();
+        conn_txn.whole = false;
+        return Value::Simple("OK".into());
+    }
+    // FLINTWHOLE (ADR-0053): this connection's namespace is a placed
+    // tenant's, and lives wholly on this seat's pair, so a transaction or a
+    // script of it may name keys in any slot: it runs under the lock over
+    // every writer and commits as one batch, atomic on this seat as one in
+    // a single slot is. Sent by the proxy right after FLINTNS, only for a
+    // placed tenant; the proxy routes such a tenant's keyed and keyless
+    // commands to its pair and nowhere else. A connection without it keeps
+    // every unit to one slot.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTWHOLE"))
+    {
+        if args.len() != 1 {
+            return Value::Error("ERR FLINTWHOLE takes no arguments".into());
+        }
+        conn_txn.whole = true;
         return Value::Simple("OK".into());
     }
     // MULTI / EXEC / DISCARD (ADR-0012). Answered here rather than in the
@@ -5724,7 +5756,8 @@ fn execute(
                     limits,
                     conn_ns,
                 )
-                .holding_every_writer(every_writer);
+                .holding_every_writer(every_writer)
+                .whole(conn_txn.whole);
                 let reply = d.dispatch(args);
                 if !d.wants_every_writer() || every_writer {
                     drop(d);
@@ -8257,6 +8290,62 @@ mod serve_tests {
         assert!(
             taken >= 1,
             "the script touched an undeclared key without the lock over every writer"
+        );
+    }
+
+    /// ADR-0053 over the wire: a connection marked `FLINTWHOLE` (a placed
+    /// tenant's) queues a transaction across slots and commits it whole; a
+    /// connection without it is refused at the first key in another slot,
+    /// as before. rq's enqueue has this shape: the job's hash and the
+    /// queue's list, in two slots.
+    #[test]
+    fn a_whole_connections_transaction_may_span_slots() {
+        let addr = spawn_server();
+        let send = |cmds: &[&[&str]]| {
+            let mut s = connect(addr);
+            let mut p = Vec::new();
+            for c in cmds {
+                let parts = c.iter().map(|x| Value::Bulk(Some(x.as_bytes().to_vec())));
+                encode(&Value::Array(Some(parts.collect())), &mut p);
+            }
+            s.write_all(&p).expect("send");
+            read_frames(&mut s, cmds.len())
+        };
+        assert_ne!(
+            flint_slot::slot_for_key(b"rq:job:1"),
+            flint_slot::slot_for_key(b"rq:queue:q")
+        );
+        let txn: &[&[&str]] = &[
+            &["MULTI"],
+            &["HSET", "rq:job:1", "status", "queued"],
+            &["RPUSH", "rq:queue:q", "1"],
+            &["EXEC"],
+            &["LRANGE", "rq:queue:q", "0", "-1"],
+        ];
+        let plain = send(txn);
+        assert!(
+            matches!(&plain[2], Value::Error(e) if e.starts_with("CROSSSLOT")),
+            "without FLINTWHOLE: {:?}",
+            plain[2]
+        );
+        assert!(matches!(&plain[3], Value::Error(e) if e.starts_with("EXECABORT")));
+        let mut whole = vec![&["FLINTWHOLE"][..]];
+        whole.extend_from_slice(txn);
+        let f = send(&whole);
+        assert_eq!(f[0], Value::Simple("OK".into()));
+        assert_eq!(
+            f[3],
+            Value::Simple("QUEUED".into()),
+            "the second slot queues"
+        );
+        assert_eq!(
+            f[4],
+            Value::Array(Some(vec![Value::Integer(1), Value::Integer(1)])),
+            "EXEC applies both"
+        );
+        assert_eq!(
+            f[5],
+            Value::Array(Some(vec![Value::Bulk(Some(b"1".to_vec()))]))
         );
     }
 

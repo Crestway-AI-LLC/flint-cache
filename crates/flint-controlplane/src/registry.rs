@@ -38,6 +38,12 @@ pub enum Mutation {
         token: String,
         ns: String,
         subset: Vec<String>,
+        /// ADR-0053: the pair a placed tenant lives on. A field with a
+        /// default, not a new variant: a release that predates it reads the
+        /// record and drops the field, where an unknown variant would make
+        /// it unable to read the store at all (BUG-0191).
+        #[serde(default)]
+        pair: Option<usize>,
     },
     /// Remove a tenant: the record (auth revoked on the next push) and its
     /// namespace's slot-map exception rows. Data wipe is the caller's
@@ -364,6 +370,7 @@ impl RegistryState {
                 token,
                 ns,
                 subset,
+                pair,
             } => {
                 self.tenants.insert(
                     name.clone(),
@@ -380,6 +387,7 @@ impl RegistryState {
                         ops_per_sec: 0,
                         max_bytes: 0,
                         over_quota: false,
+                        pair,
                     },
                 );
             }
@@ -873,6 +881,21 @@ mod adr_0030_refill_tests {
         r
     }
 
+    /// ADR-0053: `pair` is a defaulted field, not a new variant, so a record
+    /// written before placement still parses (as unplaced), and one written
+    /// with it places the tenant.
+    #[test]
+    fn add_tenant_reads_with_and_without_a_pair() {
+        let old = r#"{"AddTenant":{"name":"t","token":"d","ns":"n","subset":[]}}"#;
+        let new = r#"{"AddTenant":{"name":"t","token":"d","ns":"n","subset":[],"pair":1}}"#;
+        for (json, want) in [(old, None), (new, Some(1))] {
+            let m: Mutation = serde_json::from_str(json).expect("parses");
+            let mut r = RegistryState::default();
+            r.apply(m);
+            assert_eq!(r.tenants.get("t").expect("added").pair, want, "{json}");
+        }
+    }
+
     fn with_tenant(r: &mut RegistryState, name: &str, k: usize) {
         let subset = shuffle_shard(name, &r.proxies, k);
         r.apply(Mutation::AddTenant {
@@ -880,6 +903,7 @@ mod adr_0030_refill_tests {
             token: format!("tok-{name}"),
             ns: name.to_string(),
             subset,
+            pair: None,
         });
     }
 

@@ -368,6 +368,9 @@ impl State {
                                 over_quota,
                                 federated,
                                 async_writes,
+                                // The line format predates placement, and a
+                                // placed tenant is only ever written as JSON.
+                                pair: None,
                             },
                         );
                     }
@@ -578,6 +581,7 @@ mod tests {
                     local_cache: false,
                     federated: false,
                     async_writes: false,
+                    pair: None,
                     ops_per_sec: 0,
                     max_bytes: 0,
                     over_quota: false,
@@ -691,6 +695,7 @@ mod tests {
             local_cache: true,
             federated: true,
             async_writes: true,
+            pair: Some(1),
             ops_per_sec: 4242,
             max_bytes: 1 << 31,
             over_quota: true,
@@ -800,6 +805,7 @@ mod tests {
                 local_cache: true,
                 federated: true,
                 async_writes: true,
+                pair: None,
                 ops_per_sec: 4242,
                 max_bytes: 1 << 31,
                 over_quota: true,
@@ -1072,6 +1078,7 @@ mod tests {
                 local_cache: false,
                 federated: false,
                 async_writes: false,
+                pair: None,
                 ops_per_sec: 0,
                 max_bytes: 0,
                 over_quota: false,
@@ -1117,6 +1124,7 @@ mod tests {
                     local_cache: false,
                     federated: false,
                     async_writes: false,
+                    pair: None,
                     ops_per_sec: 0,
                     max_bytes: 0,
                     over_quota: false,

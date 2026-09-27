@@ -124,6 +124,12 @@ single-slot, all or nothing. See "Lua scripts" below (ADR-0051).
 > no node could queue it; the transaction stays open, every later command
 > answers `QUEUED`, and EXEC applies nothing (BUG-0190).
 >
+> **A tenant placed on one pair** (ADR-0053) is the exception: all its keys
+> live on that pair, so its transactions may span slots, with the same
+> guarantees. A multi-key command inside one still keeps its one-slot rule.
+> rq and Sidekiq name keys that cannot share a hash tag, and need this. The
+> operator places a tenant when creating it (`self-hosting.md`).
+>
 > Queue-time errors — an unknown command, a wrong argument count, a
 > cross-slot key — poison the transaction, and EXEC then returns
 > `EXECABORT` having applied nothing. Runtime errors (WRONGTYPE, a bad
@@ -472,7 +478,10 @@ by the conformance corpus. What Flint adds is the frame around a script:
   refused, and whatever it did is undone, even when the script catches the
   refusal with `pcall`. A script that declares no keys may touch none. This
   is Redis Cluster's rule, enforced rather than advised: it is what lets a
-  script run on the one pair that owns its slot, atomically (ADR-0052).
+  script run on the one pair that owns its slot, atomically (ADR-0052). A
+  tenant placed on one pair (ADR-0053) may declare and touch keys in any
+  slot, since every one of them is on that pair; a script that declares no
+  keys still may touch none.
   A script that touches only its `KEYS` locks only them. One that reaches
   another key in the slot is stopped there, with nothing kept, and run again
   from the start holding the lock over every writer on its seat, because

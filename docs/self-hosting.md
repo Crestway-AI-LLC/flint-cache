@@ -206,6 +206,7 @@ cp 127.0.0.1:7500           # one line = single-node CP; three = Raft HA
 pair HOST:P,HOST:P[,HOST:P] # a replica set (master first); repeatable
 proxy HOST:P                # a routing proxy; repeatable
 controller on               # automatic failover supervision
+placed-tenants on           # allow `tenant add-on-pair` (ADR-0053; see section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
 admin-token <tok>           # gate the PROXY*/operator surface
@@ -1183,6 +1184,10 @@ A tenant is a namespace + a token + a proxy subset + quotas. All via
 # create: name, token, namespace, k = how many proxies serve it (subset)
 flintctl -f cluster.flint tenant add acme <token> acme 2
 
+# or place it whole on one pair (index or member), so its transactions and
+# scripts may span slots: rq, Sidekiq (ADR-0053; needs `placed-tenants on`)
+flintctl -f cluster.flint tenant add-on-pair jobs <token> jobs 1 2
+
 # quotas: fleet ops/s and storage bytes (0 = unlimited)
 flintctl -f cluster.flint tenant-quota acme 50000 53687091200
 
@@ -1207,6 +1212,14 @@ Notes:
   overrides it (dedicated proxies for a large tenant).
 - The proxy-side `PROXYLATENCY`/`PROXYHOTKEYS` commands answer per-tenant
   (scoped by the caller's token), so a tenant sees only its own numbers.
+- A **placed** tenant (`add-on-pair`) lives whole on one pair, so it is as
+  big and as fast as that pair and no bigger. Nothing moves it: the
+  balancer leaves its slots where they are, though it counts them as that
+  pair's fill, and `migrate-slots` refuses its namespace. It needs its own
+  namespace. The inventory must say `placed-tenants on`, which is off by
+  default in this release, because a release before it would route a
+  placed tenant as a spread one: once you place a tenant, do not roll this
+  fleet back below this release (ADR-0053).
 
 ## 5. Rotating credentials & keys
 

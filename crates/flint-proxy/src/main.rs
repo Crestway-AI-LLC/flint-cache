@@ -231,6 +231,16 @@ struct TenantGrant {
     async_writes: bool,
     /// Per-proxy ops/s share (token bucket); 0 = unlimited.
     rate: u64,
+    /// The pair a placed tenant lives on, whole (ADR-0053): `P<n>` in the
+    /// flags. Every slot of its namespace routes there.
+    pair: Option<usize>,
+}
+
+/// `P<n>` from a tenant's snapshot flags (ADR-0053), if it is there.
+fn placed_pair(flags: &str) -> Option<usize> {
+    let rest = &flags[flags.find('P')? + 1..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    rest[..digits].parse().ok()
 }
 
 /// A single-use channel grant (ADR-0010 D2). The proxy mints one when it
@@ -503,6 +513,9 @@ struct Topology {
     /// rebuilt on every snapshot so a mid-connection verdict flip applies
     /// without re-auth. Buckets carry the running token count.
     quota: RwLock<HashMap<Vec<u8>, (u64, bool)>>,
+    /// Placed tenants by NAMESPACE (ADR-0053): the pair each lives on,
+    /// whole. Rebuilt on every snapshot, as `quota` is; `route` consults it.
+    placed: RwLock<HashMap<Vec<u8>, usize>>,
     buckets: std::sync::Mutex<BucketMap>,
     /// Quota shed counters (PROXYSTATS -> exporter/billing).
     stat_quota_throttled_total: std::sync::atomic::AtomicU64,
@@ -739,6 +752,18 @@ impl Topology {
                 None => {}
             }
         }
+        // ADR-0053: a placed tenant lives on one pair, whole. After the
+        // per-slot bridge and exceptions, which are what a move of it would
+        // write; before the default ranges, which would spread it. A pair
+        // index this proxy does not know is a refusal, never the default:
+        // the default would read and write the tenant's keys where they are
+        // not.
+        // The index is into the control plane's pair list, the home
+        // cluster's, whichever cluster the slot's level-0 entry names.
+        if let Some(pair) = self.placed_pair(ns) {
+            let routing = self.clusters[0].routing.read().ok()?;
+            return routing.masters.get(pair).cloned().flatten();
+        }
         let routing = view.routing.read().ok()?;
         // The default owner — ONE definition shared with the CP's
         // exception-redundancy check (flint-slot::default_pair), so routing
@@ -782,6 +807,23 @@ impl Topology {
     /// round-robin (D7). None -> no replica known: the caller falls back to
     /// the master. Follows ownership via the master so a migrated slot reads
     /// from the new owner's replicas, not the old pair's.
+    /// The pair a placed tenant lives on (ADR-0053); `None` when it is
+    /// spread by slot.
+    fn placed_pair(&self, ns: &[u8]) -> Option<usize> {
+        self.placed.read().ok()?.get(ns).copied()
+    }
+
+    /// Where a command naming no key goes: a placed tenant's own pair, where
+    /// its transaction must bind (ADR-0053), else pair 0's master.
+    fn keyless_route(&self, ns: &[u8]) -> Option<String> {
+        let routing = self.clusters[0].routing.read().ok()?;
+        routing
+            .masters
+            .get(self.placed_pair(ns).unwrap_or(0))
+            .cloned()
+            .flatten()
+    }
+
     fn route_replica(&self, ns: &[u8], slot: u16) -> Option<String> {
         let master = self.route(ns, slot)?;
         let routing = self.cluster_for(slot).routing.read().ok()?;
@@ -1130,6 +1172,7 @@ impl Topology {
                         federated: flags.contains('f'),
                         async_writes: flags.contains('a'),
                         rate,
+                        pair: placed_pair(flags),
                     },
                 ))
             })
@@ -1143,6 +1186,12 @@ impl Topology {
             *quota = new_tenants
                 .values()
                 .map(|g| (g.ns.clone(), (g.rate, g.over_quota)))
+                .collect();
+        }
+        if let Ok(mut placed) = self.placed.write() {
+            *placed = new_tenants
+                .values()
+                .filter_map(|g| g.pair.map(|p| (g.ns.clone(), p)))
                 .collect();
         }
         if let Ok(mut tenants) = self.tenants.write() {
@@ -1331,6 +1380,13 @@ struct Backends {
     async_writes: bool,
     /// Read budget for the O(keys) admin class only (see call_slow).
     fanout_timeout: Duration,
+    /// A placed tenant's connections (ADR-0053): each tells its seat, with
+    /// `FLINTWHOLE`, that this namespace lives wholly on that seat's pair,
+    /// so its transactions and scripts may span slots there. Every
+    /// connection of a placed tenant carries it: routing sends such a
+    /// tenant's keyed and keyless commands only to its own pair, so a
+    /// transaction or script of it never reaches another.
+    whole: bool,
 }
 
 impl Backends {
@@ -1346,7 +1402,14 @@ impl Backends {
             tls,
             async_writes,
             fanout_timeout,
+            whole: false,
         }
+    }
+
+    /// Mark these connections as a placed tenant's (ADR-0053).
+    fn placed(mut self, whole: bool) -> Self {
+        self.whole = whole;
+        self
     }
 
     /// A connection is only reusable for the SAME (address, namespace,
@@ -1357,6 +1420,7 @@ impl Backends {
             addr: addr.to_string(),
             ns: self.ns.clone(),
             async_writes: self.async_writes,
+            whole: self.whole,
             lane,
         }
     }
@@ -1673,11 +1737,7 @@ async fn forward(
         let target = match slot {
             Some(s) if use_replica => topo.route_replica(ns, s).or_else(|| topo.route(ns, s)),
             Some(s) => topo.route(ns, s),
-            None => topo.clusters[0]
-                .routing
-                .read()
-                .ok()
-                .and_then(|r| r.masters.first().cloned().flatten()),
+            None => topo.keyless_route(ns),
         };
         let Some(addr) = target else {
             if Instant::now() > deadline {
@@ -3097,11 +3157,7 @@ async fn transaction_step(
                 }
                 (Some(pinned), _) => pinned,
                 (None, Some(target)) => target,
-                (None, None) => topo.clusters[0]
-                    .routing
-                    .read()
-                    .ok()
-                    .and_then(|r| r.masters.first().cloned().flatten())?,
+                (None, None) => topo.keyless_route(ns)?,
             };
             txn.addr = Some(addr.clone());
             // Open the transaction on the backend now that one is known.
@@ -3509,6 +3565,7 @@ async fn prefetch_run(
                 async_writes,
                 topo.fanout_timeout,
             )
+            .placed(topo.placed_pair(ns).is_some())
         });
         saw_write |= is_write;
         let lane = if saw_write {
@@ -3586,6 +3643,7 @@ async fn data_command(
                 async_writes,
                 topo.fanout_timeout,
             )
+            .placed(topo.placed_pair(ns).is_some())
         });
         let reply = forward_collect(topo, b, ns, args, raw, ticket, addr).await;
         cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
@@ -3624,6 +3682,7 @@ async fn data_command(
                     async_writes,
                     topo.fanout_timeout,
                 )
+                .placed(topo.placed_pair(ns).is_some())
             });
             return script_command(topo, b, ns, args, raw).await;
         }
@@ -3697,6 +3756,7 @@ async fn data_command(
                 async_writes,
                 topo.fanout_timeout,
             )
+            .placed(topo.placed_pair(ns).is_some())
         });
         if let Some(reply) = transaction_step(topo, b, txn, ns, args, raw).await {
             return reply;
@@ -3726,6 +3786,7 @@ async fn data_command(
             async_writes,
             topo.fanout_timeout,
         )
+        .placed(topo.placed_pair(ns).is_some())
     });
     let reply = handle(topo, b, ns, args, raw, read_replica, idle).await;
     cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
@@ -3823,7 +3884,13 @@ fn cache_writeback(
             // not only the keys it declared (ADR-0052 D2): every entry of
             // that slot goes. A script that declares none may write none.
             b"EVAL" | b"EVALSHA" => {
-                if let Some(first) = flint_commands::eval_keys(args).unwrap_or_default().first() {
+                if topo.placed_pair(ns).is_some() {
+                    // A placed tenant's script may write any key it has, in
+                    // any slot (ADR-0053).
+                    topo.cache.invalidate_ns(ns);
+                } else if let Some(first) =
+                    flint_commands::eval_keys(args).unwrap_or_default().first()
+                {
                     topo.cache.invalidate_slot(ns, slot_for_key(first));
                 }
             }
@@ -5103,6 +5170,7 @@ fn main() -> std::io::Result<()> {
                 .map(|g| (g.ns.clone(), (g.rate, g.over_quota)))
                 .collect(),
         ),
+        placed: RwLock::new(HashMap::new()),
         buckets: std::sync::Mutex::new(HashMap::new()),
         stat_quota_throttled_total: std::sync::atomic::AtomicU64::new(0),
         stat_quota_write_shed_total: std::sync::atomic::AtomicU64::new(0),
@@ -5787,6 +5855,7 @@ mod route_tests {
             latency: latency::LatencyHistograms::default(),
             errors: errors::ErrorCounts::default(),
             quota: RwLock::new(HashMap::new()),
+            placed: RwLock::new(HashMap::new()),
             buckets: std::sync::Mutex::new(HashMap::new()),
             stat_quota_throttled_total: std::sync::atomic::AtomicU64::new(0),
             stat_quota_write_shed_total: std::sync::atomic::AtomicU64::new(0),
@@ -6577,6 +6646,45 @@ mod route_tests {
             moved.get(&(b"acme".to_vec(), 200)).map(String::as_str),
             Some("c:1"),
             "disagreeing (newer) bridge must survive the push"
+        );
+    }
+
+    /// ADR-0053: `P<n>` in a tenant's flags places it. Every slot of its
+    /// namespace routes to pair n, keyless commands too, and a pair this
+    /// proxy does not know is a refusal rather than the default range, which
+    /// would put the tenant's keys where they are not. Another tenant is
+    /// spread as before.
+    #[test]
+    fn a_placed_tenant_routes_every_slot_and_keyless_commands_to_its_pair() {
+        assert_eq!(placed_pair("rP12"), Some(12));
+        assert_eq!(placed_pair("P1"), Some(1));
+        assert_eq!(placed_pair("rq"), None);
+        assert_eq!(placed_pair(""), None);
+        let t = two_pair_topo();
+        if let Ok(mut r) = t.clusters[0].routing.write() {
+            r.ranges = vec![None, None];
+        }
+        t.apply_snapshot("a:1;b:1", "tj=jobs#P1,ts=spread,tx=lost#P9@5", "", "");
+        let (lo, hi) = (0u16, 16383u16);
+        assert_eq!(t.route(b"jobs", lo).as_deref(), Some("b:1"));
+        assert_eq!(t.route(b"jobs", hi).as_deref(), Some("b:1"));
+        assert_eq!(t.keyless_route(b"jobs").as_deref(), Some("b:1"));
+        assert_eq!(t.route(b"spread", lo).as_deref(), Some("a:1"));
+        assert_eq!(t.route(b"spread", hi).as_deref(), Some("b:1"));
+        assert_eq!(t.keyless_route(b"spread").as_deref(), Some("a:1"));
+        assert_eq!(t.route(b"lost", lo), None, "an unknown pair is a refusal");
+        assert_eq!(t.keyless_route(b"lost"), None);
+        let grant = t
+            .tenants
+            .read()
+            .expect("lock")
+            .get("tx")
+            .cloned()
+            .expect("tx");
+        assert_eq!(
+            (grant.pair, grant.rate),
+            (Some(9), 5),
+            "the rate still reads after P<n>"
         );
     }
 }

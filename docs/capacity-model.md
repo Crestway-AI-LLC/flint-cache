@@ -147,6 +147,12 @@ minimum set of moves to bring the group within the deadband, and — with
 fresh observations each time (convergence by small steps; the deadband stops
 the loop at balance).
 
+**A tenant placed on one pair (ADR-0053) is never moved.** Its keys count
+toward its pair's load, since they fill the pair like any others, and the
+balancer moves spread tenants' slots off that pair instead. A pair whose
+excess is all one placed tenant's stays heavy, and the balancer goes on to
+its other moves; the remedy is capacity on that pair, not a move.
+
 **BOTH ARE OFF UNTIL YOUR INVENTORY ASKS, and until 2026-09-14 there was no
 way to ask** (BUG-0142): `flintctl` passed neither flag, so the loop above
 described a fleet nobody was running — the controller never planned, and the

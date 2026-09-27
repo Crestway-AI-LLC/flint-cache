@@ -68,6 +68,7 @@ cp 127.0.0.1:7724
 pair 127.0.0.1:7321,127.0.0.1:7322
 pair 127.0.0.1:7323,127.0.0.1:7324
 proxy 127.0.0.1:$PORT
+placed-tenants on
 EOF
 
 echo "== bootstrap 2 pairs + tenant"
@@ -79,10 +80,22 @@ echo "== bootstrap 2 pairs + tenant"
   # failed and nobody looked" (BUG-0064).
   echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 ./target/release/flintctl -f "$INV" tenant add acme tok-acme acme 1 >/dev/null 2>&1
-for _ in $(seq 1 30); do
-  [ "$(valkey-cli -p $PORT -a tok-acme --no-auth-warning PING 2>/dev/null)" = "PONG" ] && break
-  sleep 0.3
+# ADR-0053: `jobs` lives whole on pair 1, so its transactions and scripts may
+# span slots. rq and Sidekiq's server run against it below.
+./target/release/flintctl -f "$INV" tenant add-on-pair jobs tok-jobs jobs 1 1 >"$STATE-placed.log" 2>&1 || {
+  echo "FAIL: tenant add-on-pair"; cat "$STATE-placed.log"; exit 1; }
+for tok in tok-acme tok-jobs; do
+  for _ in $(seq 1 30); do
+    [ "$(valkey-cli -p $PORT -a $tok --no-auth-warning PING 2>/dev/null)" = "PONG" ] && break
+    sleep 0.3
+  done
 done
+# Nothing may move one slot of a placed tenant: the operator's verb refuses.
+if ./target/release/flintctl -f "$INV" migrate-slots jobs 0-0 0 1 >"$STATE-placed.log" 2>&1; then
+  echo "FAIL: migrate-slots moved a slot of a placed tenant"; exit 1
+fi
+grep -q "placed on one pair" "$STATE-placed.log" || {
+  echo "FAIL: migrate-slots refused a placed tenant, but not as placed:"; cat "$STATE-placed.log"; exit 1; }
 
 PORT=$PORT "$PY" - <<'PY'
 import asyncio, os, sys
@@ -519,6 +532,130 @@ RC=$?
 # sentence saying it connected (BUG-0176: the first version of that line named
 # go-redis on a box that had no Go).
 RAN="redis-py"; SKIPPED=""
+
+# ---------------------------------------------------------------------------
+# A tenant placed on one pair (ADR-0053). `a` (15495) is on pair 1 by the
+# slot table, `b` (3300) and `c` (7365) on pair 0: for `jobs` every one of
+# them is on pair 1, so what spans pairs for `acme` spans only slots here.
+# ---------------------------------------------------------------------------
+PORT=$PORT "$PY" - <<'PY'
+import os, sys
+import redis
+
+PORT = int(os.environ["PORT"])
+fails = []
+def check(name, fn):
+    try:
+        fn(); ok, note = True, ""
+    except Exception as e:
+        ok, note = False, f"{type(e).__name__}: {e}"
+    print(f"  {'ok ' if ok else 'FAIL'} {name}{'  ' + note if note else ''}")
+    if not ok:
+        fails.append(name)
+
+j = redis.Redis(host="127.0.0.1", port=PORT, password="tok-jobs", decode_responses=True)
+acme = redis.Redis(host="127.0.0.1", port=PORT, password="tok-acme", decode_responses=True)
+print("== a tenant placed on one pair (ADR-0053)")
+def txn_across_slots():
+    j.delete("a", "b", "c")
+    p = j.pipeline(transaction=True)
+    p.set("a", "1"); p.set("b", "2"); p.incr("c"); p.get("a")
+    assert p.execute() == [True, True, 1, "1"], "the transaction's replies"
+    assert j.mget("a", "b", "c") == ["1", "2", "1"], "every write applied"
+check("a transaction across three slots commits whole", txn_across_slots)
+def watch_across_slots():
+    j.set("a", "w0")
+    p = j.pipeline(transaction=True)
+    p.watch("a", "b")
+    p.multi(); p.set("c", "watched")
+    j.set("b", "moved")  # another connection's write to a watched key
+    try:
+        p.execute()
+    except redis.WatchError:
+        pass
+    else:
+        raise AssertionError("EXEC ran although a watched key changed")
+    assert j.get("c") == "1", "the aborted transaction applied"
+check("WATCH across slots aborts on a write to any watched key", watch_across_slots)
+def script_across_slots():
+    got = j.eval("redis.call('SET', KEYS[1], ARGV[1]); redis.call('SET', KEYS[2], ARGV[1]);"
+                 " return redis.call('MGET', KEYS[1], KEYS[1])", 2, "a", "b", "s")
+    assert got == ["s", "s"], f"script -> {got!r}"
+    assert j.get("b") == "s", "the script's second write applied"
+check("a script whose KEYS span slots runs", script_across_slots)
+def multi_key_command_still_one_slot():
+    try:
+        j.rename("a", "c")
+    except redis.ResponseError as e:
+        assert "same slot" in str(e), f"refused, but how: {e}"
+    else:
+        raise AssertionError("RENAME across slots was served")
+check("a multi-key command keeps its one-slot rule", multi_key_command_still_one_slot)
+def tenants_stay_apart():
+    acme.set("a", "acme's")
+    assert j.get("a") == "s" and acme.get("a") == "acme's", "one tenant read the other's key"
+check("the placed tenant and a spread one keep their own keys", tenants_stay_apart)
+def spread_still_refused():
+    p = acme.pipeline(transaction=True)
+    p.set("a", "1"); p.set("b", "2")
+    try:
+        p.execute()
+    except redis.ResponseError:
+        pass
+    else:
+        raise AssertionError("a spread tenant's transaction across pairs was served")
+check("a spread tenant's transaction across pairs is still refused", spread_still_refused)
+
+if fails:
+    print(f"\nFAIL: {len(fails)} placed-tenant problem(s): {', '.join(fails)}")
+    sys.exit(1)
+print("\nall placed-tenant checks passed")
+PY
+[ $? -eq 0 ] || { echo "FAIL: placed tenant"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# rq (ADR-0053). Every write rq makes is a transaction, over up to nine
+# slots, and its key names cannot carry a hash tag: it runs on a placed
+# tenant only. Enqueue is served. Its worker is not yet: it dequeues with
+# `LMOVE` from the queue to a second list in another slot, a multi-key
+# command, which keeps its one-slot rule, and it records a result in a
+# stream (ADR-0052 stage 4). Measured 2026-09-27; see ADR-0053 as built.
+# ---------------------------------------------------------------------------
+RQ_VENV=${FLINT_COMPAT_RQ_VENV:-$FLINT_DRILL_ROOT/flint-compat-rq}
+rq_ready() { "$RQ_VENV/bin/python" -c 'import rq' >/dev/null 2>&1; }
+if ! rq_ready; then
+  RQ_BASE=""
+  for cand in python3.14 python3.13 python3.12 python3.11 python3; do
+    command -v "$cand" >/dev/null && { RQ_BASE=$(command -v "$cand"); break; }
+  done
+  [ -n "$RQ_BASE" ] && "$RQ_BASE" -m venv "$RQ_VENV" >/dev/null 2>&1 \
+    && "$RQ_VENV/bin/pip" install -q "rq==2.8.0" >/dev/null 2>&1
+fi
+if ! rq_ready; then
+  echo "== rq: SKIP (could not install rq 2.8.0; offline?)"
+  SKIPPED="$SKIPPED rq"
+else
+  PORT=$PORT "$RQ_VENV/bin/python" - <<'PYRQ'
+import os, sys
+import redis, rq
+from rq import Queue
+PORT = int(os.environ["PORT"])
+print(f"== client: rq {rq.__version__}, on the placed tenant")
+r = redis.Redis(host="127.0.0.1", port=PORT, password="tok-jobs", socket_timeout=10)
+q = Queue("compat", connection=r)
+q.empty()
+jobs = [q.enqueue("operator.add", i, 1) for i in range(5)]
+queued = [j.get_status() for j in jobs]
+ok = q.count == 5 and queued == ["queued"] * 5 and q.job_ids == [j.id for j in jobs]
+print(f"  {'ok ' if ok else 'FAIL'} enqueue: 5 jobs, each queued, in order"
+      f"{'' if ok else f'  count {q.count}, {queued}'}")
+q.empty()
+print(f"  {'ok ' if q.count == 0 else 'FAIL'} the queue empties (its script reaches every job's key)")
+sys.exit(0 if ok and q.count == 0 else 1)
+PYRQ
+  [ $? -eq 0 ] || { echo "FAIL: rq on a placed tenant"; exit 1; }
+  RAN="$RAN, rq (enqueue)"
+fi
 
 # ---------------------------------------------------------------------------
 # Python rate limiting and python-redis-lock (ADR-0051). Their scripts write
@@ -1344,7 +1481,7 @@ fi
 RUBY=${FLINT_COMPAT_RUBY:-$(command -v ruby || true)}
 if [ -z "$RUBY" ]; then
   echo "== rails cache store: SKIP (no ruby on PATH)"
-  SKIPPED="$SKIPPED rails-cache-store redlock-rb sidekiq"
+  SKIPPED="$SKIPPED rails-cache-store redlock-rb sidekiq sidekiq-server"
 else
   RB_HOME=${FLINT_COMPAT_GEM_HOME:-$FLINT_DRILL_ROOT/flint-compat-ruby}
   # GEM_HOME only. Setting GEM_PATH too hides the system gems, and gem install
@@ -1473,7 +1610,7 @@ RUBYSRC
   fi
   if ! sk_ready; then
     echo "== sidekiq: SKIP (could not install sidekiq 8.1.7; offline?)"
-    SKIPPED="$SKIPPED sidekiq"
+    SKIPPED="$SKIPPED sidekiq sidekiq-server"
   else
     cat > "$RB_HOME/sidekiq_check.rb" <<'RUBYSRC'
 gem "sidekiq", "8.1.7"
@@ -1493,7 +1630,8 @@ Sidekiq.configure_server { |c| c.redis = { url: url } }
 class CompatJob; include Sidekiq::Job; def perform(x); end; end
 begin
   # A plain DEL, which the proxy splits by pair. Queue#clear is a MULTI
-  # over queue:<name> and the "queues" set, two slots (ADR-0052 as built).
+  # over queue:<name> and the "queues" set, two slots, and is checked on
+  # the placed tenant below (ADR-0053).
   Sidekiq.redis { |c| c.call("DEL", "queue:critical", "queue:default") }
   cap = Sidekiq.default_configuration.default_capsule
   cap.queues = %w[critical default]
@@ -1524,6 +1662,66 @@ RUBYSRC
     GEM_HOME="$RB_HOME" FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$RUBY" "$RB_HOME/sidekiq_check.rb"
     [ $? -eq 0 ] || { echo "FAIL: sidekiq compatibility"; exit 1; }
     RAN="$RAN, sidekiq"
+
+    # A real Sidekiq server on the placed tenant (ADR-0053). Its heartbeat
+    # is a transaction over the process set and the process's own keys, and
+    # `Queue#clear` one over the queue and the `queues` set.
+    cat > "$RB_HOME/sk_job.rb" <<'RUBYSRC'
+gem "sidekiq", "8.1.7"
+require "sidekiq"
+url = "redis://:tok-jobs@127.0.0.1:#{ENV.fetch('FLINT_PORT')}"
+Sidekiq.configure_client { |c| c.redis = { url: url } }
+Sidekiq.configure_server { |c| c.redis = { url: url } }
+class DoneJob
+  include Sidekiq::Job
+  def perform(tag)
+    Sidekiq.redis { |c| c.call("SET", "sk:done:#{tag}", "1") }
+  end
+end
+RUBYSRC
+    cat > "$RB_HOME/sk_server.rb" <<'RUBYSRC'
+require_relative "sk_job"
+require "sidekiq/api"
+puts "== sidekiq server, on the placed tenant"
+fails = []
+check = lambda do |name, ok, note = ""|
+  puts "  #{ok ? 'ok  ' : 'FAIL'} #{name}#{ok ? '' : "  #{note}"}"
+  fails << name unless ok
+end
+begin
+  DoneJob.set(queue: "default").perform_async("clear")
+  Sidekiq::Queue.new("default").clear
+  check.("Queue#clear empties the queue", Sidekiq::Queue.new("default").size == 0)
+  tag = Process.pid.to_s
+  DoneJob.perform_async(tag)
+  log = "#{__dir__}/sk_server.log"
+  bin = Gem.bin_path("sidekiq", "sidekiq", "8.1.7")
+  pid = spawn(ENV.to_h, RbConfig.ruby, bin, "-r", "#{__dir__}/sk_job.rb", "-c", "2", "-q", "default",
+              out: log, err: [:child, :out])
+  done = false; procs = 0
+  120.times do
+    sleep 0.25
+    done ||= Sidekiq.redis { |c| c.call("EXISTS", "sk:done:#{tag}") } == 1
+    procs = Sidekiq::ProcessSet.new.size
+    break if done && procs > 0
+  end
+  Process.kill("TERM", pid)
+  Process.wait(pid)
+  errors = File.readlines(log).grep(/ERROR|WARN/).first(3).map { |l| l.strip[0, 200] }
+  check.("the server runs a job", done, errors.inspect)
+  check.("its heartbeat registers the process", procs > 0, "#{procs} process(es); #{errors.inspect}")
+rescue => e
+  check.("sidekiq server", false, "#{e.class}: #{e.message[0, 200]}")
+end
+if fails.any?
+  puts "\nFAIL: #{fails.size} client-visible problem(s): #{fails.join(', ')}"
+  exit 1
+end
+puts "\nall sidekiq server checks passed"
+RUBYSRC
+    GEM_HOME="$RB_HOME" FLINT_PORT=$PORT "$RUBY" "$RB_HOME/sk_server.rb"
+    [ $? -eq 0 ] || { echo "FAIL: a sidekiq server on a placed tenant"; exit 1; }
+    RAN="$RAN, sidekiq server"
   fi
 fi
 

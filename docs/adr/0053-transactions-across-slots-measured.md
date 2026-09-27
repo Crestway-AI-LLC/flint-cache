@@ -1,6 +1,9 @@
 # ADR-0053: Transactions across slots, measured
 
-Status: **PROPOSED 2026-09-27, for Jeff's decision.** Nothing is built.
+Status: **ACCEPTED 2026-09-27** (Jeff: "go with your recommendation on
+ADR-0053"): option D. Built for transactions and scripts; see "As built" at
+the end, which also measures a need the Context missed (rq's worker) and
+proposes an amendment for it.
 
 ## Context
 
@@ -112,3 +115,115 @@ Celery work unconfigured.
 - Moving a one-pair tenant to another pair, under load, with its
   transactions still atomic.
 - The ADR-0052 probe re-run, as after every stage.
+
+## As built (2026-09-27)
+
+Option D, for transactions and scripts. Not in rc.77: ships with the next
+release.
+
+**A tenant is placed when it is created**, with
+`flintctl tenant add-on-pair <name> <token> <ns> <pair> [k]` (at the control
+plane, `CPADDTENANTONPAIR`). `<pair>` is the pair's index in the inventory,
+or one of its members. The namespace must be the tenant's own: the control
+plane refuses to place a tenant in a namespace a spread tenant uses, a spread
+tenant in a placed one, and two placed tenants in one namespace. A placed
+tenant stays where it was created (see "Not built").
+
+**Two releases to switch it on.** A release from before this one routes a
+placed tenant by the slot table, across every pair, where its keys are not:
+rolled back to, it would serve that tenant empty. So this release reads
+placement everywhere, and creates a placed tenant only when the control plane
+runs with `--placed-tenants` (inventory: `placed-tenants on`), which is off
+by default. The next release turns it on, and a rollback from there lands on
+this release, which reads it. An operator who turns it on now accepts that
+this fleet does not roll back below this release while it holds a placed
+tenant.
+
+- **Control plane.** The tenant record has an optional `pair`. A record
+  without it is spread, and a release before this one ignores the field, so
+  the change adds no `Mutation` variant. `CPPLACED` lists each placed
+  namespace and its pair. The snapshot proxies read carries `P<n>` in the
+  tenant's flags.
+  - **Found on the way: BUG-0191.** A Raft control-plane node whose state
+    file would not parse started with an empty store, so it forgot its vote
+    and could vote twice. An unknown `Mutation` variant from a newer release
+    was one way to reach it. It now refuses to start, and says why.
+- **Proxy.** Every key of a placed tenant routes to its pair, and so does
+  every keyless command. A slot in migration, and an exception row, would
+  still win, as for any tenant; a placed tenant has neither, since nothing
+  moves it. A pair index with no pair behind it is refused rather than
+  routed by the slot table. On each seat connection it opens for a placed
+  tenant, the proxy sends `FLINTWHOLE` after `FLINTNS`.
+- **Seat.** `FLINTWHOLE` marks the connection's namespace as whole on this
+  seat, and `FLINTNS` clears the mark. On such a connection a transaction
+  and a script may span slots. A transaction still runs under the lock over
+  every writer and commits as one batch (ADR-0012 D2, D3). A script that
+  reaches an undeclared key runs again under that lock, as in its own slot
+  (ADR-0052 D2). Every other connection keeps the one-slot rule, and so does
+  a client that dials a seat directly. A tenant cannot send `FLINTWHOLE`:
+  the proxy refuses every `FLINT*` command from a client.
+  - **Where D differs from the proposal.** The seat is not given a list of
+    the namespaces that live wholly on it; the proxy marks the connection.
+    The seat trusts its internal peer for this as it already does for
+    `FLINTNS`, and nothing new is pushed to seats.
+- **Multi-key commands keep their one-slot rule** on a placed tenant too:
+  `RENAME`, `LMOVE`, `SMOVE`, `MSET`, `SUNIONSTORE` and the rest. Each
+  stores its keys under one slot.
+- **Controller.** A placed tenant's keys count toward its pair's load, since
+  they fill it as any keys do, and a pair full of one must not be sent more.
+  None of its slots is ever chosen to move. The controller asks the control
+  plane `CPPLACED` every cycle. When a planned move's source has nothing
+  movable, it tries the plan's next move, so a pair that one placed tenant
+  keeps heavy holds up no other move. If it cannot ask, it moves nothing
+  that cycle. A controller without `--commit-cp` has no control plane to ask
+  and treats every tenant as spread; `flintctl` always passes it.
+- **Operator.** `flintctl migrate-slots` refuses a placed namespace.
+
+**Measured** on a gate box, in `client_compat_drill` and
+`placed_tenant_rebalance_drill`, both in the gate:
+
+- **Transactions and scripts.** A placed tenant's transaction over three
+  slots, which a spread tenant's two pairs would refuse, commits whole. WATCH
+  across slots aborts on another connection's write to any watched key. A
+  script whose `KEYS` span slots runs. `RENAME` across slots is still
+  refused. A spread tenant's transaction across pairs is still refused, and
+  the two tenants' keys stay apart.
+- **rq 2.8.0.** Enqueue works on a placed tenant: five jobs, each queued, in
+  order. So does `Queue.empty`, whose script reaches every job's key.
+- **Sidekiq 8.1.7, its server run for real** on a placed tenant.
+  `Queue#clear` empties the queue. The server runs a job, and its heartbeat
+  registers the process (`Sidekiq::ProcessSet`). Its log shows two gaps,
+  neither of them this record's, logged as BUG-0192. The metrics flush on
+  each heartbeat sends `BITFIELD`, which Flint does not serve, so it fails
+  every beat, and the job and the heartbeat are unaffected. INFO reports no
+  `maxmemory_policy`, so the server warns that Redis will evict its data,
+  which Flint does only for a namespace that opts in.
+- **The balancer.** A placed tenant (8,000 keys) and a spread one (4,000
+  keys in four slots) both started on pair 0, with rebalancing armed. The
+  controller moved every key of the spread tenant to pair 1, in one move,
+  and none of the placed tenant's. Both read back whole through the proxy,
+  and the placed tenant's transaction across slots still committed.
+- **Not measured:** the queue probe re-run, with Celery (pub/sub, stage 3)
+  and BullMQ on its default prefix (`cmsgpack`, stage 4). Each stops at its
+  stage first.
+
+**rq's worker needs two things more, measured.** It dequeues with
+`LMOVE rq:queue:<name> rq:queue:<name>:intermediate`, and those two keys are
+in different slots (6541 and 3513 for the queue `compat`), so the seat
+refuses the `LMOVE` as `CROSSSLOT`. It then reads a job's result from a
+stream (`XREVRANGE`), which is stage 4. The Context above said nothing
+measured needed a multi-key command across slots. rq's worker does, and so
+this record's claim that D serves rq is not yet true.
+
+**Proposed amendment, for Jeff's decision:** on a placed tenant, let
+`LMOVE`, `RPOPLPUSH`, `BLMOVE` and `BRPOPLPUSH` span slots. Each is one pop
+and one push, and each already excludes every writer while it runs
+(BUG-0188), so the change is to take the destination's own slot; days, not
+a re-plumbing. The other multi-key commands keep one slot until something
+measured needs them. Recommended, and worth building alongside stage 4,
+since rq's worker needs both before it can finish a job.
+
+**Not built.** Moving a placed tenant to another pair, whole. It stays on the
+pair it was created on, and that pair's size and throughput are its limit.
+The verification item "moving a one-pair tenant to another pair, under load"
+waits with it.

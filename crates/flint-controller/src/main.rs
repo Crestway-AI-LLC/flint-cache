@@ -777,7 +777,10 @@ impl Pair {
                 // The policy maps the master's per-slot stats to the single
                 // load number the planner balances on. `size` (open default)
                 // sums key counts; other policies weigh the same stats
-                // differently without changing the planner.
+                // differently without changing the planner. A placed
+                // tenant's keys count (ADR-0053): they fill the pair as any
+                // others do, and a pair full of one must not be sent more.
+                // `execute_move` is what leaves them where they are.
                 let fill = policy.pair_load(&slot_stats(addr));
                 return Some((
                     planner::PairLoad {
@@ -1597,6 +1600,7 @@ fn main() {
         // deadband stopping the loop at balance.
         if cfg.rebalance_deadband > 0.0 && last_rebalance.elapsed() > Duration::from_secs(5) {
             last_rebalance = Instant::now();
+            let placed = placed_namespaces(&cfg);
             let observed: Vec<(planner::PairLoad, String)> = pairs
                 .iter()
                 .filter_map(|p| p.observe_fill(&*cfg.balance_policy))
@@ -1624,7 +1628,23 @@ fn main() {
                             );
                         }
                     }
-                    Some(m) => execute_move(&cfg, m, &masters, &fills),
+                    Some(m) => match &placed {
+                        // The first move that has something to move: a pair
+                        // whose excess is a placed tenant's has none, and
+                        // must not hold up the moves behind it.
+                        Some(placed) => {
+                            for m in &plan {
+                                if execute_move(&cfg, m, &masters, &fills, placed) {
+                                    break;
+                                }
+                            }
+                        }
+                        None => eprintln!(
+                            "[{}] rebalance: move {}->{} deferred — the control plane could \
+                             not say which tenants are placed on one pair (ADR-0053)",
+                            cfg.id, m.from, m.to
+                        ),
+                    },
                 }
             }
         }
@@ -1681,6 +1701,45 @@ fn has_inflight_migration(addr: &str) -> bool {
     }
 }
 
+/// The namespaces of tenants placed on one pair (ADR-0053), which are never
+/// moved slot by slot: a placed tenant lives whole on its pair, and one slot
+/// of it elsewhere would split the transactions it relies on across pairs.
+/// Asked of the control plane each cycle. With no control plane configured
+/// there are none; one that predates placement answers `unknown command`
+/// and has none either. `None` when it cannot be asked: the caller then
+/// makes no move, since the slot moved might be a placed tenant's.
+fn placed_namespaces(cfg: &Config) -> Option<std::collections::HashSet<String>> {
+    let Some(cp) = &cfg.commit_cp else {
+        return Some(std::collections::HashSet::new());
+    };
+    match call(cp, &[b"CPPLACED"]) {
+        Ok(Value::Array(Some(rows))) => Some(
+            rows.into_iter()
+                .filter_map(|r| match r {
+                    Value::Bulk(Some(b)) => String::from_utf8_lossy(&b)
+                        .split(' ')
+                        .next()
+                        .map(String::from),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Ok(Value::Error(e)) if e.contains("unknown") => Some(std::collections::HashSet::new()),
+        _ => None,
+    }
+}
+
+/// `stats` without the units of placed tenants (ADR-0053).
+fn movable(
+    stats: Vec<((String, u16), u64)>,
+    placed: &std::collections::HashSet<String>,
+) -> Vec<((String, u16), u64)> {
+    stats
+        .into_iter()
+        .filter(|((ns, _), _)| !placed.contains(ns))
+        .collect()
+}
+
 /// Per-(namespace, slot) key counts from a master (FLINTSLOTSTATS:
 /// "slot count ns" bulks) — the migration unit is (ns, slot).
 fn slot_stats(addr: &str) -> Vec<((String, u16), u64)> {
@@ -1709,26 +1768,31 @@ fn slot_stats(addr: &str) -> Vec<((String, u16), u64)> {
 /// the fenced records make duplicates collapse, but not-starting is cheaper
 /// than being fenced). Serial one-move-per-cycle IS the pacing: the next
 /// cycle re-observes fills and re-plans, and the deadband ends the loop.
+///
+/// `false` when the donor has nothing movable (its excess is a placed
+/// tenant's, ADR-0053), so the caller tries the plan's next move; `true`
+/// ends the cycle, as every other outcome did before placement.
 fn execute_move(
     cfg: &Config,
     m: &planner::Move,
     masters: &std::collections::HashMap<String, String>,
     fills: &[(String, u64)],
-) {
+    placed: &std::collections::HashSet<String>,
+) -> bool {
     let (Some(src), Some(dst)) = (masters.get(&m.from), masters.get(&m.to)) else {
-        return;
+        return true;
     };
     if has_inflight_migration(src) || has_inflight_migration(dst) {
         eprintln!(
             "[{}] rebalance: move {}->{} deferred — a migration is already in flight",
             cfg.id, m.from, m.to
         );
-        return;
+        return true;
     }
-    let stats = slot_stats(src);
+    let stats = movable(slot_stats(src), placed);
     let units = planner::select_units(&stats, m.approx, cfg.max_slots_per_cycle);
     if units.is_empty() {
-        return;
+        return false;
     }
     eprintln!(
         "[{}] rebalance EXECUTE: ~{} load {}({src}) -> {}({dst}), units {units:?} — fills={fills:?}",
@@ -1785,10 +1849,11 @@ fn execute_move(
                     "[{}] rebalance: {ns}/{slot} move failed ({other:?}) — yielding to recovery",
                     cfg.id
                 );
-                return;
+                return true;
             }
         }
     }
+    true
 }
 
 /// One in-flight migration record observed on a node.
@@ -2000,6 +2065,28 @@ fn fence(id: &str, zombie: &str, epoch: u32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// ADR-0053: a placed tenant's units are never offered to a move.
+    #[test]
+    fn placed_tenants_are_left_out_of_the_moves() {
+        let stats = vec![
+            (("jobs".to_string(), 5), 40),
+            (("shared".to_string(), 5), 3),
+            (("jobs".to_string(), 900), 7),
+            (("shared".to_string(), 12), 2),
+        ];
+        let placed: std::collections::HashSet<String> = ["jobs".to_string()].into();
+        let kept = super::movable(stats.clone(), &placed);
+        assert_eq!(
+            kept,
+            vec![
+                (("shared".to_string(), 5), 3),
+                (("shared".to_string(), 12), 2)
+            ]
+        );
+        let none = std::collections::HashSet::new();
+        assert_eq!(super::movable(stats.clone(), &none), stats);
+    }
 
     /// BUG-0124: the dial budget has to keep WORST-CASE DETECTION inside the
     /// exit budget, because detection latency is the front half of RTO.

@@ -23,6 +23,10 @@
 //!   `CPADDPAIR <a,b[,c]>`                   register a replica set
 //!   `CPADDTENANT <name> <token> <ns> [k]`   add tenant; subset = shuffle
 //!                                           shard of k (default 2) proxies
+//!   `CPADDTENANTONPAIR <name> <token> <ns> <pair> [k]`
+//!                                           add a tenant placed on one pair
+//!                                           (ADR-0053); needs --placed-tenants
+//!   `CPPLACED`                              placed tenants, `ns pair` each
 //!   `CPSETSUBSET <name> <p1,p2|*|->`        override subset: an explicit
 //!                                           list, `*` = every registered
 //!                                           proxy, `-` = NONE (drain). The
@@ -65,6 +69,65 @@ use std::time::Duration;
 
 use flint_resp::{Decoded, Value, decode, encode};
 use state::{State, canonical_members, clean, shuffle_shard};
+
+/// Whether this control plane may create a tenant placed on one pair
+/// (ADR-0053): `--placed-tenants`. Off by default in the release that first
+/// reads placement, so a rollback to one that predates it can never meet a
+/// placed tenant. A release that predates it would route such a tenant's
+/// keys across every pair, away from where they are.
+pub(crate) static PLACED_TENANTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The `<pair>` of `CPADDTENANTONPAIR`, checked. `None` for `CPADDTENANT`.
+pub(crate) fn placement_arg(placed: bool, raw: Option<String>) -> Result<Option<usize>, String> {
+    if !placed {
+        return Ok(None);
+    }
+    if !PLACED_TENANTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(
+            "placed tenants are off: start the control plane with --placed-tenants \
+                    (ADR-0053)"
+                .into(),
+        );
+    }
+    match raw.and_then(|v| v.parse::<usize>().ok()) {
+        Some(p) => Ok(Some(p)),
+        None => {
+            Err("CPADDTENANTONPAIR <name> <token> <ns> <pair> [k]: <pair> is a pair index".into())
+        }
+    }
+}
+
+/// A placed tenant's namespace is its alone (ADR-0053): its keys all live
+/// on its pair, and a second tenant spread across pairs in the same
+/// namespace would put some of them elsewhere. And its pair must exist.
+pub(crate) fn placement_allowed<'a>(
+    pair: Option<usize>,
+    ns: &str,
+    pairs: usize,
+    tenants: impl Iterator<Item = &'a crate::tenant::Tenant>,
+) -> Result<(), String> {
+    if let Some(p) = pair
+        && p >= pairs
+    {
+        return Err(format!("no pair {p}: the fleet has {pairs}"));
+    }
+    for t in tenants.filter(|t| t.ns == ns) {
+        if pair.is_some() {
+            return Err(format!(
+                "namespace {ns} is already tenant {}'s: a placed tenant's namespace is its alone",
+                t.name
+            ));
+        }
+        if t.pair.is_some() {
+            return Err(format!(
+                "namespace {ns} belongs to placed tenant {}, whose keys all live on one pair",
+                t.name
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
@@ -271,14 +334,26 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             shared.changed.notify_all();
             ok()
         }
-        b"CPADDTENANT" => {
+        b"CPADDTENANT" | b"CPADDTENANTONPAIR" => {
+            let placed = cmd.as_slice() == b"CPADDTENANTONPAIR";
+            let usage = if placed {
+                "CPADDTENANTONPAIR <name> <token> <ns> <pair> [k]"
+            } else {
+                "CPADDTENANT <name> <token> <ns> [k]"
+            };
             let (Some(name), Some(token), Some(ns)) = (text(1), text(2), text(3)) else {
-                return err("CPADDTENANT <name> <token> <ns> [k]");
+                return err(usage);
             };
             if !clean(&name) || !clean(&token) || !clean(&ns) {
                 return err("invalid name/token/ns (space-free, <=128 chars)");
             }
-            let k: usize = text(4).and_then(|v| v.parse().ok()).unwrap_or(2);
+            let pair = match placement_arg(placed, text(4)) {
+                Ok(p) => p,
+                Err(e) => return err(&e),
+            };
+            let k: usize = text(if placed { 5 } else { 4 })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
             // ADR-0006 D1: only the DIGEST is stored/pushed; the plaintext
             // dies with this request.
             let token = flint_tls::sha256_hex(token.as_bytes());
@@ -291,6 +366,9 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             if st.tenants.values().any(|t| t.token == token) {
                 return err("token already in use");
             }
+            if let Err(e) = placement_allowed(pair, &ns, st.pairs.len(), st.tenants.values()) {
+                return err(&e);
+            }
             let subset = shuffle_shard(&name, &st.proxies, k);
             let reply = format!("OK tenant {name} ns {ns} subset [{}]", subset.join(","));
             // The eleven field defaults were written out here AND in
@@ -302,6 +380,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 token,
                 ns,
                 subset,
+                pair,
             });
             match st.commit() {
                 Ok(_) => {}
@@ -444,6 +523,15 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             ok()
         }
         // The queryable ownership truth: "ns lo hi pair" per RUN.
+        // ADR-0053: the placed tenants, one `ns pair` line each. Read by the
+        // controller and by `flintctl migrate-slots`, which must not move a
+        // placed tenant's slots one at a time.
+        b"CPPLACED" => {
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            Value::Array(Some(crate::tenant::placed_lines(st.tenants.values())))
+        }
         b"CPSLOTS" => {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
@@ -1613,6 +1701,11 @@ fn main() -> std::io::Result<()> {
     }
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7500);
     let path = arg("--state").unwrap_or_else(|| "./flint-cp-state".into());
+    // ADR-0053: set before either dispatcher can serve a verb.
+    PLACED_TENANTS.store(
+        std::env::args().any(|a| a == "--placed-tenants"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // HA mode: --raft with --node-id / --raft-port / --peers / --client-addrs
     // runs a Raft-replicated node (openraft); otherwise the durable
@@ -2461,6 +2554,67 @@ mod step3_dispatch_tests {
             sh.leases.lock().expect("lease lock").entries,
             want,
             "the mirror carries the generation the record holds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn tenant(name: &str, ns: &str, pair: Option<usize>) -> crate::tenant::Tenant {
+        crate::tenant::Tenant {
+            name: name.into(),
+            ns: ns.into(),
+            pair,
+            ..Default::default()
+        }
+    }
+
+    /// ADR-0053: creating a placed tenant needs `--placed-tenants`, its pair
+    /// must exist, and its namespace is its alone.
+    #[test]
+    fn a_placed_tenant_needs_the_flag_a_real_pair_and_its_own_namespace() {
+        PLACED_TENANTS.store(false, Ordering::Relaxed);
+        assert!(
+            placement_arg(true, Some("1".into())).is_err_and(|e| e.contains("--placed-tenants"))
+        );
+        assert_eq!(
+            placement_arg(false, Some("1".into())),
+            Ok(None),
+            "CPADDTENANT places nothing"
+        );
+        PLACED_TENANTS.store(true, Ordering::Relaxed);
+        assert_eq!(placement_arg(true, Some("1".into())), Ok(Some(1)));
+        assert!(placement_arg(true, Some("x".into())).is_err());
+        assert!(placement_arg(true, None).is_err());
+        PLACED_TENANTS.store(false, Ordering::Relaxed);
+
+        let spread = tenant("a", "shared", None);
+        let placed = tenant("b", "jobs", Some(0));
+        let all = [spread, placed];
+        assert!(
+            placement_allowed(Some(2), "new", 2, all.iter())
+                .is_err_and(|e| e.contains("no pair 2"))
+        );
+        assert!(
+            placement_allowed(Some(1), "shared", 2, all.iter()).is_err(),
+            "into a spread namespace"
+        );
+        assert!(
+            placement_allowed(None, "jobs", 2, all.iter()).is_err(),
+            "spread into a placed one"
+        );
+        assert!(
+            placement_allowed(Some(1), "jobs", 2, all.iter()).is_err(),
+            "two placed tenants"
+        );
+        assert_eq!(placement_allowed(Some(1), "new", 2, all.iter()), Ok(()));
+        assert_eq!(
+            placement_allowed(None, "shared", 2, all.iter()),
+            Ok(()),
+            "as before"
         );
     }
 }

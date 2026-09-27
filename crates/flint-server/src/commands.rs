@@ -100,10 +100,12 @@ pub const DEFAULT_NS: &[u8] = b"0";
 /// although `command-support.md` promises a cross-slot key poisons the
 /// transaction. `DEL`, `UNLINK` and `EXISTS` check no slot of their own; the
 /// queue step walks their keys itself (BUG-0179).
-pub fn queue_time_error(args: &[Vec<u8>]) -> Option<Value> {
+pub fn queue_time_error(args: &[Vec<u8>], whole: bool) -> Option<Value> {
     // A script is checked, never run: probing it would run tenant code at
     // queue time. Its arity and its keys' slots are what a queued command's
-    // verdict rests on, as for any other (ADR-0051).
+    // verdict rests on, as for any other (ADR-0051). A placed tenant's
+    // script may span slots (`whole`, ADR-0053); every other command keeps
+    // its own slot rule, which its storage needs.
     if let Some(name) = args.first()
         && (name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA"))
     {
@@ -113,6 +115,9 @@ pub fn queue_time_error(args: &[Vec<u8>]) -> Option<Value> {
             ));
         }
         let keys = flint_commands::eval_keys(args)?;
+        if whole {
+            return None;
+        }
         return Dispatcher::crossslot(keys.first()?, &keys[1..]);
     }
     let probe = flint_storage::MemKv::new();
@@ -217,6 +222,10 @@ pub struct Dispatcher<'a> {
     /// Set when a script was abandoned because it reached such a key while
     /// the caller held only its declared keys' locks.
     wants_every_writer: std::cell::Cell<bool>,
+    /// The connection's namespace lives wholly on this seat's pair
+    /// (`FLINTWHOLE`, ADR-0053): a script may name and touch keys in any
+    /// slot, not only its KEYS' one.
+    whole: bool,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -247,7 +256,15 @@ impl<'a> Dispatcher<'a> {
             ns: ns.to_vec(),
             every_writer: false,
             wants_every_writer: std::cell::Cell::new(false),
+            whole: false,
         }
+    }
+
+    /// Tell the dispatcher that its connection is a placed tenant's
+    /// (`FLINTWHOLE`, ADR-0053).
+    pub fn whole(mut self, yes: bool) -> Self {
+        self.whole = yes;
+        self
     }
 
     /// Tell the dispatcher that its caller holds the lock over every writer
@@ -1388,7 +1405,8 @@ impl<'a> Dispatcher<'a> {
         } else {
             args[1].clone()
         };
-        if let Some(first) = keys.first()
+        if !self.whole
+            && let Some(first) = keys.first()
             && let Some(refusal) = Self::crossslot(first, &keys[1..])
         {
             return refusal;
@@ -1400,7 +1418,8 @@ impl<'a> Dispatcher<'a> {
             let overlay = flint_storage::batch::BatchingKv::new(&buffer);
             let (reply, strayed) = {
                 let guard =
-                    crate::script::KeyGuard::new(&overlay, &self.ns, &declared, self.every_writer);
+                    crate::script::KeyGuard::new(&overlay, &self.ns, &declared, self.every_writer)
+                        .whole(self.whole);
                 let reply = Dispatcher::with_limits(&guard, self.clock, self.limits, &self.ns)
                     .dispatch(cmd);
                 (reply, guard.strayed())
@@ -3468,6 +3487,7 @@ mod tests {
                     .iter()
                     .map(|p| p.as_bytes().to_vec())
                     .collect::<Vec<_>>(),
+                false,
             )
         };
         for c in [
@@ -4973,6 +4993,90 @@ mod tests {
             ev(&s, &["EVAL", "return redis.call('get', KEYS[1] .. string.rep('k', ARGV[1]))", "1", "{t}n", &max.to_string()]),
             Value::Error(e) if e.contains("max-key-bytes")
         ));
+    }
+
+    /// ADR-0053: a placed tenant's script (`whole`) may declare and touch
+    /// keys in any slot. Declared keys in two slots are refused without it;
+    /// with it, an undeclared key in another slot abandons the script to run
+    /// again holding every writer, as one in the same slot does, and under
+    /// that lock it runs. A script declaring no keys still touches none.
+    #[test]
+    fn a_placed_tenants_script_may_span_slots() {
+        assert_ne!(slot_for_key(b"{a}k"), slot_for_key(b"{b}k"));
+        let s = MemKv::new();
+        let parts = |v: &[&str]| v.iter().map(|p| p.as_bytes().to_vec()).collect::<Vec<_>>();
+        let two = "redis.call('set', KEYS[1], 'x') redis.call('set', KEYS[2], 'y') return 1";
+        let spread = Dispatcher::new(&s, system_clock).holding_every_writer(true);
+        assert!(matches!(
+            spread.dispatch(&parts(&["EVAL", two, "2", "{a}k", "{b}k"])),
+            Value::Error(e) if e.starts_with("CROSSSLOT")
+        ));
+        let placed = Dispatcher::new(&s, system_clock)
+            .holding_every_writer(true)
+            .whole(true);
+        assert_eq!(
+            placed.dispatch(&parts(&["EVAL", two, "2", "{a}k", "{b}k"])),
+            Value::Integer(1)
+        );
+        assert_eq!(ev(&s, &["GET", "{a}k"]), Value::Bulk(Some(b"x".to_vec())));
+        assert_eq!(ev(&s, &["GET", "{b}k"]), Value::Bulk(Some(b"y".to_vec())));
+        let reach = "redis.call('set', '{b}u', 'z') return 2";
+        let striped = Dispatcher::new(&s, system_clock).whole(true);
+        assert!(matches!(
+            striped.dispatch(&parts(&["EVAL", reach, "1", "{a}k"])),
+            Value::Error(_)
+        ));
+        assert!(
+            striped.wants_every_writer(),
+            "another slot without every writer re-runs"
+        );
+        assert_eq!(ev(&s, &["EXISTS", "{b}u"]), Value::Integer(0));
+        let all = Dispatcher::new(&s, system_clock)
+            .holding_every_writer(true)
+            .whole(true);
+        assert_eq!(
+            all.dispatch(&parts(&["EVAL", reach, "1", "{a}k"])),
+            Value::Integer(2)
+        );
+        let keyless = Dispatcher::new(&s, system_clock)
+            .holding_every_writer(true)
+            .whole(true);
+        assert!(matches!(
+            keyless.dispatch(&parts(&["EVAL", "return redis.call('get', '{a}k')", "0"])),
+            Value::Error(e) if e.contains("access key '{a}k'")
+        ));
+    }
+
+    /// ADR-0053 at queue time: a placed tenant's script may name keys in
+    /// several slots, and every other command keeps its own slot rule, which
+    /// its storage needs (`RENAME` keeps both keys under the source's slot).
+    #[test]
+    fn a_placed_tenant_relaxes_only_the_scripts_queue_time_slot_rule() {
+        let q = |parts: &[&str], whole: bool| {
+            queue_time_error(
+                &parts
+                    .iter()
+                    .map(|p| p.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+                whole,
+            )
+        };
+        let script = ["EVAL", "return 1", "2", "{a}k", "{b}k"];
+        assert!(
+            q(&script, false)
+                .is_some_and(|e| matches!(e, Value::Error(t) if t.starts_with("CROSSSLOT")))
+        );
+        assert!(q(&script, true).is_none());
+        for c in [
+            &["MSET", "{a}k", "1", "{b}k", "2"][..],
+            &["RENAME", "{a}k", "{b}k"],
+        ] {
+            assert!(
+                q(c, true)
+                    .is_some_and(|e| matches!(e, Value::Error(t) if t.starts_with("CROSSSLOT"))),
+                "{c:?}"
+            );
+        }
     }
 
     /// asynq 0.26's dequeue script, as measured in ADR-0052: it pops a task

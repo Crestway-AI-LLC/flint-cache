@@ -58,13 +58,21 @@ pub struct Tenant {
     /// snapshot as the 'a' flag; operator-set (hot-key write mitigation).
     #[serde(default)]
     pub async_writes: bool,
+    /// The pair this tenant lives on, whole (ADR-0053): every slot of its
+    /// namespace routes there, so its transactions and scripts may span
+    /// slots on that pair's seat. `None` spreads it by slot, as every
+    /// tenant was before. Set only when the tenant is created, and only by
+    /// a control plane started with `--placed-tenants`; a placed tenant
+    /// does not move. Rides the snapshot as `P<pair>` in the flags.
+    #[serde(default)]
+    pub pair: Option<usize>,
 }
 
 impl Tenant {
     /// The snapshot flag suffix the proxy parses: `"#<flags>[@<rate>]"` —
     /// flags 'r' (replica reads), 'c' (near-cache), 'q' (over storage
     /// quota), 'f' (federated, ADR-0007), 'a' (async write queue, ADR-0005
-    /// D4); `rate` = this tenant's PER-PROXY
+    /// D4), `P<n>` (placed on pair n, ADR-0053); `rate` = this tenant's PER-PROXY
     /// ops/s share (present only
     /// when a rate quota is set). THE single producer of this encoding —
     /// see the proxy's `apply_snapshot` for the single consumer.
@@ -85,6 +93,12 @@ impl Tenant {
         if self.async_writes {
             flags.push('a');
         }
+        // Digits and 'P' are safe for a proxy that predates placement: it
+        // asks only whether the flags contain r, c, q, f or a. Before '@',
+        // never after it, where such a proxy would read it as the rate.
+        if let Some(p) = self.pair {
+            flags.push_str(&format!("P{p}"));
+        }
         let rate = self.per_proxy_rate();
         match (flags.is_empty(), rate) {
             (true, 0) => String::new(),
@@ -104,6 +118,14 @@ impl Tenant {
         let n = self.subset.len().max(1) as u64;
         self.ops_per_sec.div_ceil(n)
     }
+}
+
+/// `CPPLACED`'s reply: one `ns pair` line per placed tenant (ADR-0053).
+pub fn placed_lines<'a>(tenants: impl Iterator<Item = &'a Tenant>) -> Vec<flint_resp::Value> {
+    tenants
+        .filter_map(|t| t.pair.map(|p| format!("{} {p}", t.ns)))
+        .map(|line| flint_resp::Value::Bulk(Some(line.into_bytes())))
+        .collect()
 }
 
 /// Render the snapshot a given proxy should see: the shared pair topology
@@ -444,6 +466,39 @@ mod tests {
         rot.prev_token = Some("old-tok".into());
         let (_, ts) = snapshot_for(&pairs, &ranges, [rot].iter(), "p1");
         assert_eq!(ts, "tok-rot=rot#r,old-tok=rot#r");
+    }
+
+    /// ADR-0053: a placed tenant's pair rides in the flags as `P<n>`, before
+    /// any rate. A proxy that predates placement asks only whether the flags
+    /// contain r, c, q, f or a, so `P` and digits pass it by; after the `@`
+    /// it would have read them as the rate. And `CPPLACED` lists it.
+    #[test]
+    fn a_placed_tenants_pair_rides_in_the_flags_before_the_rate() {
+        let mk = |name: &str, pair: Option<usize>| Tenant {
+            name: name.into(),
+            token: format!("tok-{name}"),
+            ns: format!("{name}-ns"),
+            subset: vec!["p1".into()],
+            pair,
+            ..Tenant::default()
+        };
+        let pairs = vec![vec!["a".to_string()], vec!["b".to_string()]];
+        let ranges = vec![None, None];
+        let (_, ts) = snapshot_for(&pairs, &ranges, [mk("jobs", Some(1))].iter(), "p1");
+        assert_eq!(ts, "tok-jobs=jobs-ns#P1");
+        let mut busy = mk("busy", Some(12));
+        busy.replica_reads = true;
+        busy.ops_per_sec = 50;
+        let (_, ts) = snapshot_for(&pairs, &ranges, [busy].iter(), "p1");
+        assert_eq!(ts, "tok-busy=busy-ns#rP12@50");
+        for ch in ['r', 'c', 'q', 'f', 'a'] {
+            assert!(!"P12".contains(ch), "P<n> must not read as flag {ch}");
+        }
+        let lines = placed_lines([mk("jobs", Some(1)), mk("spread", None)].iter());
+        assert_eq!(
+            lines,
+            vec![flint_resp::Value::Bulk(Some(b"jobs-ns 1".to_vec()))]
+        );
     }
 
     #[test]

@@ -436,6 +436,7 @@ mod tests {
                 lane: Lane::Write,
                 addr: addr.clone(),
                 ns: b"0".to_vec(),
+                whole: false,
                 async_writes: false,
             };
 
@@ -513,6 +514,8 @@ pub(crate) struct Key {
     pub addr: String,
     pub ns: Vec<u8>,
     pub async_writes: bool,
+    /// A placed tenant's connection (ADR-0053): pinned with `FLINTWHOLE`.
+    pub whole: bool,
     pub lane: Lane,
 }
 
@@ -589,6 +592,18 @@ async fn dial(
                 "namespace handshake rejected: {other:?}"
             )));
         }
+    }
+    // ADR-0053: a placed tenant's connection tells its seat the namespace
+    // lives wholly on that seat's pair. A seat that predates placement
+    // answers `unknown command`, and the connection stays as it was: its
+    // transactions and scripts keep to one slot, and nothing is misrouted.
+    if key.whole {
+        let mut whole = Vec::new();
+        flint_resp::encode(
+            &Value::Array(Some(vec![Value::Bulk(Some(b"FLINTWHOLE".to_vec()))])),
+            &mut whole,
+        );
+        exchange(&mut s, &whole).await?;
     }
     Ok(s)
 }

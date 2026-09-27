@@ -624,14 +624,25 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
-        b"CPADDTENANT" => {
+        b"CPADDTENANT" | b"CPADDTENANTONPAIR" => {
+            let placed = cmd.as_slice() == b"CPADDTENANTONPAIR";
             let (Some(name), Some(token), Some(ns)) = (text(1), text(2), text(3)) else {
-                return Value::Error("ERR CPADDTENANT <name> <token> <ns> [k]".into());
+                return Value::Error(if placed {
+                    "ERR CPADDTENANTONPAIR <name> <token> <ns> <pair> [k]".into()
+                } else {
+                    "ERR CPADDTENANT <name> <token> <ns> [k]".into()
+                });
             };
             if !clean(&name) || !clean(&token) || !clean(&ns) {
                 return Value::Error("ERR invalid name/token/ns".into());
             }
-            let k: usize = text(4).and_then(|v| v.parse().ok()).unwrap_or(2);
+            let pair = match crate::placement_arg(placed, text(4)) {
+                Ok(p) => p,
+                Err(e) => return Value::Error(format!("ERR {e}")),
+            };
+            let k: usize = text(if placed { 5 } else { 4 })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
             // ADR-0006 D1: hash BEFORE proposing — the Raft log, snapshots,
             // and every follower store only the digest.
             let token = flint_tls::sha256_hex(token.as_bytes());
@@ -647,6 +658,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             if reg.tenants.values().any(|t| t.token == token) {
                 return Value::Error("ERR token already in use".into());
             }
+            if let Err(e) =
+                crate::placement_allowed(pair, &ns, reg.pairs.len(), reg.tenants.values())
+            {
+                return Value::Error(format!("ERR {e}"));
+            }
             let subset = crate::registry::shuffle_shard(&name, &reg.proxies, k);
             let reply = format!("OK tenant {name} ns {ns} subset [{}]", subset.join(","));
             match ha
@@ -655,6 +671,7 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                     token,
                     ns,
                     subset,
+                    pair,
                 })
                 .await
             {
@@ -921,6 +938,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
             }
+        }
+        b"CPPLACED" => {
+            let reg = ha.store.registry().await;
+            Value::Array(Some(crate::tenant::placed_lines(reg.tenants.values())))
         }
         b"CPSLOTS" => {
             let reg = ha.store.registry().await;

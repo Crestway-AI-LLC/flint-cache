@@ -7,6 +7,7 @@
 //!                                          -> proxies -> controller -> agent
 //!   flintctl -f cluster.flint status       roles/lag/liveness table
 //!   flintctl -f cluster.flint tenant add `<name>` `<token>` `<ns>` `[k]`
+//!   flintctl -f cluster.flint tenant add-on-pair `<name>` `<token>` `<ns>` `<pair>` `[k]`
 //!   `flintctl -f cluster.flint expand <a,b[,c]>`    new pair + reroll ctl
 //!   flintctl -f cluster.flint swap-node `<bad>` `<new>` fresh replica + CPSETPAIR
 //!   `flintctl -f cluster.flint failover <node>`     graceful master handoff
@@ -118,6 +119,11 @@ struct Inventory {
     /// ever needs raising, not lowering.
     billing_retain_days: Option<u64>,
     controller: bool,
+    /// `placed-tenants on`: start the control plane with `--placed-tenants`,
+    /// which lets `tenant add-on-pair` place a tenant on one pair (ADR-0053).
+    /// Off by default in the release that introduced it, because a release
+    /// before it routes a placed tenant as a spread one.
+    placed_tenants: bool,
     /// Failure domain per HOST (`zone <host> <name>`): an availability zone
     /// on a cloud, a rack or a power domain on your own hardware.
     ///
@@ -388,6 +394,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "billing" => inv.billing = Some(val.to_string()),
             "billing-retain-days" => inv.billing_retain_days = val.parse().ok(),
             "controller" => inv.controller = val == "on",
+            "placed-tenants" => inv.placed_tenants = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
             "admin-token" => inv.admin_token = Some(val.to_string()),
@@ -4372,6 +4379,9 @@ fn cp_seat_args(inv: &Inventory, i: usize) -> Vec<String> {
         ]);
     }
     args.extend(internal_args(inv));
+    if inv.placed_tenants {
+        args.push("--placed-tenants".into());
+    }
     if let Some(tok) = &inv.admin_token {
         // ADR-0006 D4: the admin token lives in the CP and is pushed to
         // proxies as a digest; rotate it later with `flintctl rotate-admin`.
@@ -6392,6 +6402,47 @@ fn tenant_add(inv: &Inventory, rest: &[String]) {
     }
 }
 
+/// `tenant add-on-pair <name> <token> <ns> <pair> [k]`: a tenant whose every
+/// slot lives on one pair, so its transactions and scripts may span slots
+/// (ADR-0053). `<pair>` is a pair's index in the inventory or one of its
+/// members; the CP numbers pairs in the order bootstrap and `expand` added
+/// them, which is the inventory's.
+fn tenant_add_on_pair(inv: &Inventory, rest: &[String]) {
+    const USAGE: &str = "usage: tenant add-on-pair <name> <token> <ns> <pair> [k]";
+    if !(4..=5).contains(&rest.len()) {
+        die(USAGE);
+    }
+    let pair = pair_index(inv, &rest[3]).to_string();
+    let tls = tls_client(inv);
+    let mut args = vec!["CPADDTENANTONPAIR", &rest[0], &rest[1], &rest[2], &pair];
+    if let Some(k) = rest.get(4) {
+        args.push(k);
+    }
+    match call_cp(inv, &tls, &args) {
+        Ok(Value::Simple(s)) => println!("{s}"),
+        other => fail("tenant add-on-pair failed", &other),
+    }
+}
+
+/// The namespaces placed on one pair (CPPLACED). A control plane from before
+/// placement answers `unknown`, and has none.
+fn placed_namespaces(inv: &Inventory, tls: &Option<Arc<flint_tls::ClientConfig>>) -> Vec<String> {
+    match call_cp(inv, tls, &["CPPLACED"]) {
+        Ok(Value::Array(Some(rows))) => rows
+            .into_iter()
+            .filter_map(|r| match r {
+                Value::Bulk(Some(b)) => String::from_utf8_lossy(&b)
+                    .split(' ')
+                    .next()
+                    .map(String::from),
+                _ => None,
+            })
+            .collect(),
+        Ok(Value::Error(e)) if e.contains("unknown") => Vec::new(),
+        other => fail("CPPLACED failed", &other),
+    }
+}
+
 /// Remove a tenant end to end: look up its namespace, revoke the record at
 /// the CP (CPDELTENANT — auth dies on the next snapshot push, and the ns's
 /// slot-exception rows retire with it), then WIPE the namespace's data on
@@ -7534,15 +7585,20 @@ fn pair_master(
     tls: &Option<Arc<flint_tls::ClientConfig>>,
     pair_ref: &str,
 ) -> String {
-    let idx = match pair_ref.parse::<usize>() {
+    let idx = pair_index(inv, pair_ref);
+    master_of(&inv.pairs[idx], tls, &format!("pair {idx}")).unwrap_or_else(|why| die(&why))
+}
+
+/// A pair named by its inventory index or by any of its members.
+fn pair_index(inv: &Inventory, pair_ref: &str) -> usize {
+    match pair_ref.parse::<usize>() {
         Ok(i) if i < inv.pairs.len() => i,
         _ => inv
             .pairs
             .iter()
             .position(|p| p.iter().any(|a| a == pair_ref))
             .unwrap_or_else(|| panic!("{pair_ref} is not a pair index or a known member")),
-    };
-    master_of(&inv.pairs[idx], tls, &format!("pair {idx}")).unwrap_or_else(|why| die(&why))
+    }
 }
 
 /// `flintctl migrate-slots <ns> <lo-hi> <src> <dest>`: move a contiguous
@@ -7561,6 +7617,13 @@ fn migrate_slots(inv: &Inventory, ns: &str, range: &str, src: &str, dest: &str) 
         .unwrap_or_else(|| panic!("range must be lo-hi, e.g. 8000-8191 (got {range:?})"));
     assert!(lo <= hi, "range lo must be <= hi ({lo}-{hi})");
     assert!(hi < 16384, "slots are 0..16383 (got hi={hi})");
+    if placed_namespaces(inv, &tls).iter().any(|p| p == ns) {
+        die(&format!(
+            "refusing: namespace {ns} belongs to a tenant placed on one pair (ADR-0053). \
+             Its transactions span its slots, and a slot of it on another pair would \
+             split them; a placed tenant does not move in this release"
+        ));
+    }
     let src_master = pair_master(inv, &tls, src);
     let dest_master = pair_master(inv, &tls, dest);
     assert!(
@@ -9216,7 +9279,7 @@ Lifecycle    bootstrap  start  stop  status [--json]  verify [--probe <t>:<tok>]
 Topology     expand  add-replica  swap-node  decommission-node  migrate-slots
 Failure      failover <node>  kill-node <node>  stall-node <node> <ms>
              restart-node <node>
-Tenants      tenant add|remove  tenant-quota  tenant-reads  tenant-cache
+Tenants      tenant add|add-on-pair|remove  tenant-quota  tenant-reads  tenant-cache
              tenant-async  tenant-federate
 Edge         retire-proxy  proxy-cache
 Secrets      rotate-certs  rotate-admin
@@ -9413,11 +9476,15 @@ fn main() {
         "verify" => verify(&inv, &rest),
         "tenant" => match rest.first().map(|s| s.as_str()) {
             Some("add") => tenant_add(&inv, &rest[1..]),
+            Some("add-on-pair") => tenant_add_on_pair(&inv, &rest[1..]),
             Some("remove") => {
                 let name = rest.get(1).expect("usage: tenant remove <name>");
                 tenant_remove(&inv, name);
             }
-            _ => panic!("usage: tenant add <name> <token> <ns> [k] | tenant remove <name>"),
+            _ => panic!(
+                "usage: tenant add <name> <token> <ns> [k] | \
+                 tenant add-on-pair <name> <token> <ns> <pair> [k] | tenant remove <name>"
+            ),
         },
         "expand" => {
             let spec = rest.first().expect("usage: expand <a,b[,c]>");
@@ -10009,6 +10076,25 @@ mod cp_seat_liveness_tests {
             .len(),
             1
         );
+    }
+
+    /// ADR-0053: `placed-tenants on` is what lets the control plane place a
+    /// tenant, on every seat; without it the seats refuse `add-on-pair`.
+    #[test]
+    fn placed_tenants_on_reaches_every_control_plane_seat() {
+        let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+                    cp 10.0.0.1:7500\ncp 10.0.0.2:7500\ncp 10.0.0.1:7501\n\
+                    pair 10.0.0.1:7001,10.0.0.2:7002\n";
+        let off = inv_from(base, "placed-off");
+        let on = inv_from(&format!("{base}placed-tenants on\n"), "placed-on");
+        for i in 0..3 {
+            assert!(
+                !cp_seat_args(&off, i)
+                    .iter()
+                    .any(|a| a == "--placed-tenants")
+            );
+            assert!(cp_seat_args(&on, i).iter().any(|a| a == "--placed-tenants"));
+        }
     }
 
     /// The probe reads the `--state` token that `cp_seat_args` writes. They

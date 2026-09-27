@@ -925,6 +925,9 @@ pub struct KeyGuard<'a> {
     /// then it may touch no key at all.
     slot: Option<u16>,
     every_writer: bool,
+    /// A placed tenant's namespace (ADR-0053): every key of it is on this
+    /// seat's pair, so every slot counts as the declared keys' slot.
+    whole: bool,
     strayed: Mutex<Option<Stray>>,
 }
 
@@ -984,8 +987,23 @@ impl<'a> KeyGuard<'a> {
             declared,
             slot: declared.iter().next().map(|k| slot_for_key(k)),
             every_writer,
+            whole: false,
             strayed: Mutex::new(None),
         }
+    }
+
+    /// A placed tenant's script (ADR-0053): any key of the namespace, in any
+    /// slot, is treated as a key in the declared keys' slot. Without the
+    /// lock over every writer, reaching one still abandons the script to run
+    /// again under it. A script that declares no keys still may touch none.
+    pub fn whole(mut self, yes: bool) -> Self {
+        self.whole = yes;
+        self
+    }
+
+    /// Whether `key` counts as in the declared keys' slot.
+    fn in_slot(&self, key: &[u8]) -> bool {
+        self.slot.is_some() && (self.whole || Some(slot_for_key(key)) == self.slot)
     }
 
     /// The first thing a command reached that the script did not declare.
@@ -1000,18 +1018,13 @@ impl<'a> KeyGuard<'a> {
         match row_owner(row) {
             Some((ns, key)) if ns == self.ns && self.declared.contains(key) => true,
             Some((ns, key))
-                if ns == self.ns
-                    && !key.is_empty()
-                    && self.every_writer
-                    && Some(slot_for_key(key)) == self.slot =>
+                if ns == self.ns && !key.is_empty() && self.every_writer && self.in_slot(key) =>
             {
                 true
             }
             other => {
                 let stray = match other {
-                    Some((ns, k))
-                        if ns == self.ns && !k.is_empty() && Some(slot_for_key(k)) == self.slot =>
-                    {
+                    Some((ns, k)) if ns == self.ns && !k.is_empty() && self.in_slot(k) => {
                         Stray::NeedsEveryWriter(k.to_vec())
                     }
                     Some((_, k)) if !k.is_empty() => Stray::Key(k.to_vec()),
