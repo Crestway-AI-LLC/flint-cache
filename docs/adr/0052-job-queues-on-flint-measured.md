@@ -1,8 +1,11 @@
 # ADR-0052: Job queues on Flint, measured
 
 Status: **ACCEPTED 2026-09-27** (Jeff: "go with your recommendation on
-ADR-0052"): Flint serves job queues, in the four stages below. Stage 1 (D1
-and D2) is built; see "As built" at the end. The three plain commands the
+ADR-0052"): Flint serves job queues, in the four stages below. Stages 1 (D1
+and D2) and 2 (D4) are built; see "As built" at the end. **Stage 3, pub/sub
+(D5), is STOPPED 2026-09-30** (Jeff: "stop pub/sub as out of scope"): the
+roadmap lists pub/sub as out of v0 scope, and no user has asked for it.
+Stage 4 is accepted and not started. The three plain commands the
 measurement found missing (`LMOVE`, `RPOPLPUSH`, `HINCRBYFLOAT`) were
 ordinary gaps and are fixed as BUG-0187.
 
@@ -374,3 +377,31 @@ libraries cannot be told to add one, and ADR-0012 serves a transaction in one
 slot. That is a decision of its own, and comes to Jeff as its own record,
 measured, before stages 3 and 4. Pub/sub (stage 3) would not by itself make
 Celery work.
+
+### Stage 3: D5, pub/sub, stopped (2026-09-30)
+
+Not built. Jeff stopped it as out of scope: the roadmap lists pub/sub as out
+of v0 scope, and the measured need is libraries rather than users. It serves
+no stored data, so Flint's durability adds nothing to it, and it bills
+nothing under per-GB pricing. Its one argument was removing a migration
+blocker for a Python team whose single Redis also carries Celery, and no
+such team has asked.
+
+**What it means today:** Celery is not supported (its workers subscribe for
+their control channel and its Redis result backend for results). rq's
+workers run, without their command channel (shutdown, kill, stop-job), and
+asynq runs without cancelling a running task. Those teams keep Celery's
+broker on Redis or RabbitMQ.
+
+**Measured before stopping**, against Valkey 9.1, for whoever reopens it:
+
+| library | what it sends |
+|---|---|
+| Celery 5.6.3 | `PSUBSCRIBE /0.celery.pidbox` (a pattern with no wildcard) and `PUBLISH` to it for control; `SUBSCRIBE celery-task-meta-<id>` per awaited result; the result written as `MULTI`, `SETEX celery-task-meta-<id>`, `PUBLISH celery-task-meta-<id>`, `EXEC`: the key and the channel are one string, so one slot. With kombu's `global_keyprefix '{celery}'` every name carries the tag. All RESP2 |
+| rq 2.8.0 | `SUBSCRIBE rq:pubsub:<worker>` per worker, `PUBLISH` to it for a command. RESP2 |
+| asynq 0.26 | `SUBSCRIBE asynq:cancel` per server, `PUBLISH` to it to cancel. RESP3 |
+
+The design this record chose held up against them: a channel hashed like a
+key keeps Celery's result transaction on one pair. The build had reached a
+seat-side broker and a RESP3 push frame; it is not in the repository.
+

@@ -590,7 +590,9 @@ two-second write.
   still refused across slots. Either write those keys one at a time, or give
   the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
   that whole cache in one slot, on one pair.
-  Also **pub/sub** and **streams** (both planned, ADR-0052),
+  Also **pub/sub** (out of v0 scope, ADR-0052: so Celery is not supported,
+  and rq's worker commands and asynq's task cancellation are unavailable),
+  **streams** (planned, ADR-0052),
   **RANDOMKEY**, and **`EVAL_RO`,
   `EVALSHA_RO`, `FUNCTION` and `FCALL`** (Redis 7's read-only scripts and
   functions; `EVAL` and `EVALSHA` are supported, see "Lua scripts").
