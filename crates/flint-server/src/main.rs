@@ -2369,6 +2369,9 @@ fn main() -> std::io::Result<()> {
                             if attempt < 120
                                 && (e.to_string().contains("THROTTLED")
                                     || e.to_string().contains("LOADING")
+                                    // BUG-0194: the master could not checkpoint.
+                                    // Retried as before, but now with the reason.
+                                    || e.to_string().contains("could not checkpoint")
                                     || matches!(
                                         e.kind(),
                                         std::io::ErrorKind::ConnectionRefused
@@ -2498,6 +2501,19 @@ fn main() -> std::io::Result<()> {
             }
             let kv = RocksKv::open_with_retention(std::path::Path::new(&dir), wal_ttl, wal_mb)
                 .map_err(|e| std::io::Error::other(format!("rocksdb open: {e}")))?;
+            // A full sync interrupted by a crash leaves its checkpoint, whose
+            // hard links pin SSTs compaction has since replaced. None can be
+            // in use before this node serves, so the whole directory goes.
+            let stale = std::path::Path::new(&dir).join(FULLSYNC_CKPT_DIR);
+            if stale.exists() {
+                match std::fs::remove_dir_all(&stale) {
+                    Ok(()) => eprintln!(
+                        "removed {}: a full sync checkpoint left by an earlier run",
+                        stale.display()
+                    ),
+                    Err(e) => eprintln!("could not remove {}: {e}", stale.display()),
+                }
+            }
             // The flag is parsed before the engine exists, so the engine
             // starts with an empty set and would honour no declaration at all
             // until the first FLINTCONFIG. Seed it here.
@@ -7031,6 +7047,12 @@ fn flintsnapshot(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
 #[cfg(feature = "rocks")]
 const FULLSYNC_CHUNK: usize = 4 * 1024 * 1024;
 
+/// Where a full sync's checkpoint is made: a directory INSIDE the data
+/// directory, so it is on the database's own filesystem (BUG-0194). Swept at
+/// boot, when no full sync can be using it.
+#[cfg(feature = "rocks")]
+const FULLSYNC_CKPT_DIR: &str = "flint-fullsync";
+
 /// Master side of a checkpoint full sync: stream every file of a fresh
 /// checkpoint in `FULLSYNC_CHUNK`-sized frames, then FULLSYNC-END. No
 /// whole file is ever held in memory — SSTs are usually ~64MB, but
@@ -7068,14 +7090,41 @@ fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> s
     // exists — which left both replicas unable to seed (found wiring D7's
     // 3-member pair). A process-global counter guarantees uniqueness.
     static FULLSYNC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let ckpt = std::env::temp_dir().join(format!(
-        "flint-fullsync-{}-{}-{}",
+    // ON THE DATABASE'S OWN FILESYSTEM, not in temp_dir() (BUG-0194). There a
+    // checkpoint is hard links: instant, and no extra space. Anywhere else
+    // RocksDB falls back to COPYING every file, and on the AMI (AL2023)
+    // temp_dir is a tmpfs capped at half the RAM -- 8 GiB on an i4i.large.
+    // So a pair holding more than that could not be re-seeded at all: each
+    // attempt copied into memory until the tmpfs filled, and the `?` that
+    // stood here dropped the connection without a word. The replica read
+    // that EOF as "not ready" and asked again, 37 times on the 9/30 soak.
+    let base = kv.path().join(FULLSYNC_CKPT_DIR);
+    let ckpt = base.join(format!(
+        "{}-{}-{}",
         std::process::id(),
         flint_storage::strings::system_clock(),
         FULLSYNC_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    kv.checkpoint_to(&ckpt)
-        .map_err(|e| std::io::Error::other(format!("checkpoint: {e}")))?;
+    if let Err(e) = std::fs::create_dir_all(&base)
+        .and_then(|()| kv.checkpoint_to(&ckpt).map_err(std::io::Error::other))
+    {
+        // SAY SO, on both ends. A failure the replica cannot see is retried
+        // as if the master were merely busy, and one this node does not log
+        // leaves nothing to read afterwards.
+        let _ = std::fs::remove_dir_all(&ckpt);
+        eprintln!(
+            "full sync FAILED: could not checkpoint into {}: {e}",
+            ckpt.display()
+        );
+        out.clear();
+        encode(
+            &Value::Error(format!(
+                "ERR full sync could not checkpoint on the master: {e}"
+            )),
+            &mut out,
+        );
+        return stream.write_all(&out);
+    }
     // Paced: this node is serving a checkpoint while also taking live writes,
     // and after a failover it is the freshly promoted master carrying the
     // pair alone. Unthrottled, that starved the write path for 11.9s on soak
@@ -7475,55 +7524,78 @@ mod replica {
                             // The master accepted us: "FLINTSYNC-OK <cursor>
                             // e<gen>.<counter>". On a rewind attach the
                             // cursor is TRANSLATED into the master's own
-                            // sequence space — adopt it durably before any
-                            // batch arrives, or every apply trips the
-                            // contiguity check against the old-space number.
-                            // Guarded to only move FORWARD: keepalive OKs
-                            // repeat the serve-time cursor, which goes stale
-                            // as applies progress.
-                            if let Some(returned) = s
-                                .split_whitespace()
-                                .nth(1)
-                                .and_then(|t| t.parse::<u64>().ok())
-                                && returned > kv.last_applied()
-                            {
-                                let _ = kv.set_last_applied(returned);
-                                eprintln!(
-                                    "adopted the master's translated cursor {returned}: tailing \
-                                     its sequence space now"
-                                );
-                            }
-                            // And ADOPT its epoch if ours is older: from here
-                            // on our cursor advances on the MASTER's
-                            // timeline, and re-presenting the pre-rewind
-                            // epoch would get a legitimately grown cursor
-                            // refused at the old fence on the next reconnect
-                            // (#187).
-                            if let Some(adopted) = s
-                                .split_whitespace()
-                                .nth(2)
-                                .and_then(|t| t.strip_prefix('e'))
-                                .and_then(|t| t.split_once('.'))
-                                .and_then(|(g, c)| {
-                                    Some(flint_storage::manifest::Epoch {
-                                        generation: g.parse().ok()?,
-                                        counter: c.parse().ok()?,
-                                    })
-                                })
-                            {
-                                use flint_storage::manifest::{self, Role, RoleClaim};
-                                let kv_dyn = kv.as_ref() as &dyn flint_storage::Kv;
-                                let mine = manifest::read_role(kv_dyn).map(|c| c.epoch);
-                                if mine.is_some_and(|m| m < adopted) {
-                                    manifest::force_role(
-                                        kv_dyn,
-                                        RoleClaim {
+                            // sequence space, and the master streams from
+                            // exactly that number -- adopt it durably, with
+                            // the epoch that names its space, before any
+                            // batch arrives.
+                            //
+                            // THE HANDSHAKE ONLY. The idle keepalive repeats
+                            // "FLINTSYNC-OK <cursor>" with the position the
+                            // master has served through, which every batch
+                            // before it has already brought us to. It moves
+                            // nothing: equal is a no-op, and ahead could only
+                            // mean batches we never applied.
+                            //
+                            // IN EITHER DIRECTION (BUG-0194). This used to
+                            // adopt only a cursor ABOVE ours, and a master
+                            // whose own space runs behind the stream it once
+                            // applied -- a copy that rewound to an old
+                            // snapshot, which the soak makes routine --
+                            // translates DOWN. The copy then kept its
+                            // old-space number while adopting the epoch, the
+                            // master's batches up to that number were dropped
+                            // as already applied, and the reconnect presented
+                            // an old-space cursor under the master's epoch.
+                            // Measured by tools/rewind_lower_space_drill.sh:
+                            // 900 keys short, nothing logged.
+                            if !accepted {
+                                use flint_storage::manifest::{self, Epoch, Role, RoleClaim};
+                                let mut words = s.split_whitespace().skip(1);
+                                let returned = words.next().and_then(|t| t.parse::<u64>().ok());
+                                let offered = words
+                                    .next()
+                                    .and_then(|t| t.strip_prefix('e'))
+                                    .and_then(|t| t.split_once('.'))
+                                    .and_then(|(g, c)| {
+                                        Some(Epoch {
+                                            generation: g.parse().ok()?,
+                                            counter: c.parse().ok()?,
+                                        })
+                                    });
+                                let asked = kv.last_applied();
+                                let mine =
+                                    manifest::read_role(kv.as_ref() as &dyn flint_storage::Kv)
+                                        .map(|c| c.epoch);
+                                let to_cursor = returned.filter(|&r| r != asked);
+                                // Only a NEWER epoch: from here on our cursor
+                                // advances on the MASTER's timeline, and
+                                // re-presenting the pre-rewind epoch would get
+                                // a legitimately grown cursor refused at the
+                                // old fence on the next reconnect (#187).
+                                let to_epoch = offered.filter(|&e| mine.is_some_and(|m| m < e));
+                                if to_cursor.is_some() || to_epoch.is_some() {
+                                    kv.adopt_timeline(
+                                        to_cursor.unwrap_or(asked),
+                                        to_epoch.map(|epoch| RoleClaim {
                                             role: Role::Replica,
-                                            epoch: adopted,
-                                        },
-                                    );
+                                            epoch,
+                                        }),
+                                    )
+                                    .map_err(|e| {
+                                        std::io::Error::other(format!(
+                                            "adopting the master's timeline: {e:?}"
+                                        ))
+                                    })?;
+                                }
+                                if let Some(c) = to_cursor {
                                     eprintln!(
-                                        "adopted the master's role epoch {adopted}: this copy is \
+                                        "adopted the master's translated cursor {c}: tailing \
+                                         its sequence space now (asked from {asked})"
+                                    );
+                                }
+                                if let Some(e) = to_epoch {
+                                    eprintln!(
+                                        "adopted the master's role epoch {e}: this copy is \
                                          on its timeline now"
                                     );
                                 }

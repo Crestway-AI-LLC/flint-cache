@@ -657,6 +657,48 @@ impl RocksKv {
             .map_err(|e| ReplError::Storage(e.to_string()))
     }
 
+    /// Put this copy on the timeline of the master that just accepted it:
+    /// the cursor that master will stream from, and its role epoch, in ONE
+    /// write (BUG-0194).
+    ///
+    /// EXACT, NOT SNAPPED. [`Self::set_last_applied`] snaps against THIS
+    /// node's WAL, which is the right space for every cursor it is handed --
+    /// a checkpoint's own latest, a rewound snapshot's own position -- and
+    /// the wrong one here. A translated cursor numbers the MASTER's WAL; this
+    /// node's batch at the same number is unrelated, and snapping to its end
+    /// would step over master sequences this copy never applied.
+    ///
+    /// EITHER DIRECTION. The master streams from exactly the number it
+    /// returned, so that number is the cursor whether it is above or below
+    /// the one asked with. Adoption used to move only forward, which holds
+    /// while the master's own space runs ahead of the stream it applied (one
+    /// cursor row per batch) and fails once the master is itself a copy that
+    /// rewound to an old snapshot and adopted a far higher cursor: its own
+    /// space then starts low and stays behind. The copy kept its old-space
+    /// number, every master batch ending at or below it was dropped as
+    /// already applied, and the rejoin lost that whole span without a word.
+    ///
+    /// ONE WRITE, because the pair is one claim. The epoch names the space
+    /// the cursor is in: a master reads a cursor presented under its own
+    /// epoch as its own sequence, and translates one presented under an
+    /// older epoch. Written apart, a crash between the two leaves a pair
+    /// that is read in the wrong space on the next attach.
+    pub fn adopt_timeline(
+        &self,
+        cursor: u64,
+        role: Option<crate::manifest::RoleClaim>,
+    ) -> Result<(), ReplError> {
+        let mut wb = WriteBatch::default();
+        wb.put(REPL_STATE_KEY, cursor.to_be_bytes());
+        if let Some(claim) = role {
+            wb.put(crate::manifest::ROLE_KEY, crate::manifest::role_row(claim));
+        }
+        let _w = Counted::enter(&ENGINE_WRITERS);
+        self.db()
+            .write(wb)
+            .map_err(|e| ReplError::Storage(e.to_string()))
+    }
+
     /// The end of the retained batch containing `seq`, or None when no
     /// retained batch covers it (already a boundary, or past the WAL's reach).
     /// Best-effort: a None leaves the caller's value untouched, because a
@@ -1499,6 +1541,46 @@ mod tests {
             replica.apply_batch(b).expect("apply");
         }
         assert_eq!(scan_all(&replica), before, "replay is a no-op for state");
+    }
+
+    /// BUG-0194. A translated cursor is a position in the MASTER's WAL, so
+    /// adopting one must neither consult this node's WAL nor refuse to go
+    /// down, and it lands together with the epoch that names its space.
+    #[test]
+    fn adopt_timeline_is_exact_in_either_direction_and_carries_the_epoch() {
+        use crate::manifest::{self, Epoch, Role, RoleClaim};
+        let d = TempDir::new("adopt");
+        let kv = RocksKv::open(&d.0).expect("open");
+        // One multi-op batch in THIS node's WAL, spanning 1..=8.
+        let mut wb = WriteBatch::default();
+        for i in 0..8u8 {
+            wb.put([b'k', i], b"v");
+        }
+        kv.db().write(wb).expect("write");
+        // The contrast: set_last_applied snaps an interior number to the end
+        // of this node's batch -- right for its own space, wrong for a
+        // master's, where it would skip three sequences never applied.
+        kv.set_last_applied(5).expect("set");
+        assert_eq!(kv.last_applied(), 8, "set_last_applied snaps in own space");
+
+        let claim = RoleClaim {
+            role: Role::Replica,
+            epoch: Epoch {
+                generation: 0,
+                counter: 3,
+            },
+        };
+        kv.adopt_timeline(5, Some(claim)).expect("adopt");
+        assert_eq!(kv.last_applied(), 5, "adopted exactly, and DOWN from 8");
+        assert_eq!(
+            manifest::read_role(&kv),
+            Some(claim),
+            "epoch in the same write"
+        );
+
+        kv.adopt_timeline(4_000_000, None).expect("adopt");
+        assert_eq!(kv.last_applied(), 4_000_000, "and up, epoch untouched");
+        assert_eq!(manifest::read_role(&kv), Some(claim));
     }
 
     #[test]

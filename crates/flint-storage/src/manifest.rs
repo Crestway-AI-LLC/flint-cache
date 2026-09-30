@@ -233,11 +233,18 @@ pub fn set_role(kv: &dyn Kv, new: RoleClaim) -> Result<(), ManifestError> {
     if new.epoch <= current {
         return Err(ManifestError::Fenced { current });
     }
-    let mut raw = Vec::with_capacity(9);
-    raw.push(new.role as u8);
-    raw.extend_from_slice(&new.epoch.encode());
-    kv.put(ROLE_KEY, &raw);
+    kv.put(ROLE_KEY, &role_row(new));
     Ok(())
+}
+
+/// The bytes of the role row [`read_role`] decodes: the role, then the epoch.
+/// Public for the one writer outside this module that must put the row in a
+/// batch with another one (`RocksKv::adopt_timeline`, BUG-0194).
+pub fn role_row(claim: RoleClaim) -> [u8; 9] {
+    let mut raw = [0u8; 9];
+    raw[0] = claim.role as u8;
+    raw[1..].copy_from_slice(&claim.epoch.encode());
+    raw
 }
 
 /// UNFENCED role write — bootstrap only. A checkpoint full sync copies the
@@ -245,10 +252,7 @@ pub fn set_role(kv: &dyn Kv, new: RoleClaim) -> Result<(), ManifestError> {
 /// its own identity before serving. Never use this for role transitions —
 /// promotions go through the fenced `set_role`.
 pub fn force_role(kv: &dyn Kv, claim: RoleClaim) {
-    let mut raw = Vec::with_capacity(9);
-    raw.push(claim.role as u8);
-    raw.extend_from_slice(&claim.epoch.encode());
-    kv.put(ROLE_KEY, &raw);
+    kv.put(ROLE_KEY, &role_row(claim));
 }
 
 fn claim_key(ns: &[u8]) -> Vec<u8> {
