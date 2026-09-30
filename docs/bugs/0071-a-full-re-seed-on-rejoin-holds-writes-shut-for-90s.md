@@ -1,4 +1,4 @@
-# BUG-0071: a full re-seed on rejoin holds writes shut for ~90 s at min-replicas=1 (FIXED 2026-08-29 for the observed 94.2 s cause; what stays OPEN is a design question, below)
+# BUG-0071: a full re-seed on rejoin holds writes shut for ~90 s at min-replicas=1 (FIXED 2026-08-29 for the observed 94.2 s cause; the design question DECIDED 2026-09-30: no code change, documented)
 
 **Found** 2026-08-28, in the soak run to verify BUG-0070's probe fix. Severity:
 high — it is a 9x overrun of the published 10 s RTO budget, and unlike BUG-0070
@@ -663,4 +663,35 @@ has to drive from a disk that stays mounted.
 
 Evidence: `/Volumes/FlintDev/soak-20260930/` (the log, boot decisions,
 rejoin timeline, bring-up run).
+
+## The design question, decided 2026-09-30
+
+*What remains open* above asked whether a re-seeding replica should hold the
+write path shut at all. Jeff, 2026-09-30: *"go with your recommendations on
+0071 and 0146"*. The recommendation was **no code change**, and this closes the
+question.
+
+- **The refusal is the setting doing its job.** A write is refused only at
+  `min-replicas-to-write >= 1` with no live replica. That is the promise the
+  tenant chose: never acknowledge a write held on one copy. The alternative
+  from the Flint KV session, accept while the replica re-seeds but do not
+  count those writes, keeps writes flowing by breaking that promise silently.
+  It was declined.
+- **The shape that blocks is already refused at deploy.** On a two-member pair
+  a failover leaves `members - 2 = 0` live replicas, so `min-replicas 1` refuses
+  writes on every failover. `verify` refuses that shape unless given
+  `--allow-blocking-min-replicas` (BUG-0074). A three-member pair keeps one
+  replica through a failover and rides through.
+- **What was missing was the documentation**, now written: `docs/failover.md`
+  gives the arithmetic, the three-member advice and the declined alternative.
+  Writing it found a guide that taught the refused shape. `docs/self-hosting.md`'s
+  own two-pair example set `min-replicas 1` on two-member pairs, and its prose
+  said to set it "on a replicated pair". Both are corrected. The gate's
+  documented-inventory check (`assert_doc_inventories_are_runnable`) gains the
+  `members - 2` rule, so an example cannot teach that shape again. It failed on
+  the old text before the fix.
+
+The re-seeds on the second 2026-09-30 soak (the internal-disk run) were not
+this bug's kind. They came from BUG-0194's wrong-space cursor, and that fix
+also makes a full re-seed able to complete on a pair larger than half the RAM.
 

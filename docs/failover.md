@@ -78,6 +78,26 @@ failover RTO for durability on every single failover — the same reason
 Redis ships `min-replicas-to-write 0`. Set it to 1 only when a write
 outage is genuinely preferable to losing acked writes.
 
+**How long that outage lasts depends on the pair's size.** After a failover
+the live replicas are `members - 2`: one member died and another is now the
+master.
+
+- **Two members:** zero live replicas, so `min-replicas 1` refuses writes on
+  every failover until the dead seat rejoins. That is usually a rewind to its
+  own snapshot and a short tail. It is the whole dataset over the wire when
+  the rejoin needs a full re-seed, which once measured 94.2 s (BUG-0071).
+  `flintctl verify` refuses this shape unless given
+  `--allow-blocking-min-replicas`, so choosing it is recorded, not accidental.
+- **Three members:** one replica survives, so `min-replicas 1` rides through a
+  failover and every acked write is still on two copies. **This is the shape to
+  use when a write must never be acknowledged on one copy.**
+
+Considered and declined (2026-09-30): accepting writes while the replica
+re-seeds, without counting them toward the gate. Writes would keep flowing,
+but each one would be on a single copy while the setting promises two, and no
+client would be told. The gate is that promise; bending it silently is worse
+than the outage it avoids.
+
 The gate that IS on by default for pair members is the widowed grace,
 below, which buys the same bound without that trade.
 

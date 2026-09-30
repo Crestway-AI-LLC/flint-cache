@@ -3248,6 +3248,23 @@ for f in FILES:
         if wild and not ({"proxy-host", "proxy-advertise"} & set(keys)):
             bad.append("%s\t%s (wildcard proxy, no proxy-host)"
                        % (f, wild[0].strip()))
+        # RULE 3, BUG-0071 / BUG-0074: after a failover the live replicas are
+        # `members - 2`, and `verify` refuses a `min-replicas` above that unless
+        # told --allow-blocking-min-replicas. self-hosting.md's example paired
+        # `min-replicas 1` with two-member pairs -- a shape the tool rejects, and
+        # on a fleet a write outage at every failover. Checked on every block.
+        mr = [l.partition(" ")[2].strip() for l in live
+              if l.split(" ")[0] == "min-replicas"]
+        if mr and mr[-1].isdigit() and int(mr[-1]) > 0:
+            n = int(mr[-1])
+            for l in live:
+                if l.split(" ")[0] != "pair":
+                    continue
+                m = len([a for a in l.partition(" ")[2].split(",") if a.strip()])
+                if n > m - 2:
+                    bad.append("%s\tmin-replicas %d with a %d-member pair "
+                               "(verify refuses above members - 2)" % (f, n, m))
+                    break
         if not remote:
             continue
         multi += 1
@@ -3286,7 +3303,9 @@ DOCINV
     echo "        \"places a seat on <host>, which is not this machine\"; one"
     echo "        with a wildcard proxy and no \`proxy-host\` dies at bootstrap"
     echo "        with \"proxy 0.0.0.0:P never answered PROXYSTATS\" — which is"
-    echo "        a certificate rejection, not a dead proxy (BUG-0107)."
+    echo "        a certificate rejection, not a dead proxy (BUG-0107); and one"
+    echo "        with \`min-replicas\` above \`members - 2\` is refused by"
+    echo "        \`verify\`, since no failover could satisfy it (BUG-0074)."
     echo "        See the Placement section of docs/self-hosting.md."
     FAILED="$FAILED doc-inventories-refuse"
     return

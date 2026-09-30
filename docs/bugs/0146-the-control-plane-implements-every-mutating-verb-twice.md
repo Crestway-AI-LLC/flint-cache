@@ -1,6 +1,16 @@
 # BUG-0146 — the control plane implements every mutating verb twice
 
-**Status:** OPEN — found 2026-09-14 by a fix that landed in one of the two and
+**Status:** **CLOSED 2026-09-30.** Jeff: *"go with your recommendations on 0071
+and 0146"*; the recommendation was to close it. Its stated work is complete
+and held by the gate: all of ADR-0032's steps are done (one state machine for
+both control planes), `assert_cp_verbs_agree_across_paths` checks the verb
+tables, `ha.rs` carries the BUG-0160 refusal guard, and
+`err_is_not_given_a_message_that_carries_its_own_code` holds BUG-0173's reply
+codes. The caution under *Where that leaves this file* still stands, because
+four passes each found a new class. A fifth class, if one is found, gets its
+own number and cites this file instead of reopening it.
+
+Was: OPEN — found 2026-09-14 by a fix that landed in one of the two and
 was reported green by six unit tests. **The design this file asked for exists:
 [ADR-0032](../adr/0032-one-implementation-of-every-control-plane-mutation.md),
 ACCEPTED 2026-09-15 (Jeff) — candidate A, single-node runs the same state

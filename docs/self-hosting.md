@@ -344,7 +344,12 @@ proxy 10.0.1.20:7379         # 2 proxies -> a proxy loss is invisible
 proxy 10.0.1.21:7379
 controller on
 capacity 1717986918400       # ~1.6 TB per-node fill budget
-min-replicas 1               # close the widowed-master write hole
+# min-replicas 1             # NOT with the two-member pairs above: after a
+                             # failover they have 0 live replicas, so every
+                             # failover would refuse writes until the rejoin,
+                             # and `verify` refuses it. Use it with three-member
+                             # pairs; the widowed grace (on by default for pair
+                             # members) bounds the same hole here.
 node-env FLINT_LEVEL_BASE_MB=64   # engine tuning, no CLI flag; repeatable
 node-env FLINT_BG_JOBS=4          # a PAIR -- measured, but NOT a default:
                                   # costs +36% disk, price it first (below)
@@ -532,8 +537,13 @@ node-ready-s 15       ctl   ctl-only PING budget for a freshly spawned replica.
                                   report a healthy syncing node as dead.
 ```
 
-On a replicated pair, set `min-replicas 1` — it closes the widowed-master
-write hole ([failover.md](failover.md)).
+`min-replicas 1` closes the widowed-master write hole, and **its cost depends
+on the pair's size**. On a **three-member** pair one replica survives a
+failover, so writes carry on. On a **two-member** pair none does, so every
+failover refuses writes until the dead seat rejoins, and `verify` refuses
+that shape unless you pass `--allow-blocking-min-replicas`. There, rely on the
+widowed grace, which is on by default for pair members and bounds the same
+hole without the outage ([failover.md](failover.md)).
 
 ## 2b. Running it as a service, and surviving a reboot
 
