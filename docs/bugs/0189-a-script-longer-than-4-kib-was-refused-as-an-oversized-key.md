@@ -1,7 +1,7 @@
 # BUG-0189: a Lua script longer than 4 KiB was refused as an oversized key (FIXED 2026-09-27)
 
-**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77; live since
-v0.1.0-rc.78 (rolled 2026-09-30).
+**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77: it ships with the next
+release.
 **Severity:** medium: every script past the size failed, loudly, and through
 the proxy caching it by SHA1 did not help.
 

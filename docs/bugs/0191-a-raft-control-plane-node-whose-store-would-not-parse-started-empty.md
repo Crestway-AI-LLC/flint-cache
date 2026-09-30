@@ -1,7 +1,7 @@
 # BUG-0191: a Raft control-plane node whose store would not parse started empty (FIXED 2026-09-27)
 
-**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77; live since
-v0.1.0-rc.78 (rolled 2026-09-30).
+**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77: it ships with the next
+release.
 **Severity:** high: a node silently forgot every tenant, pair and vote.
 
 ## What was measured

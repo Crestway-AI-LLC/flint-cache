@@ -2,7 +2,7 @@
 
 **Status:** **FIXED 2026-09-24**, found the same day (ops OPS-0314's follow-up,
 surveying which commands real clients send on their own). Not in
-v0.1.0-rc.77; live since v0.1.0-rc.78 (rolled 2026-09-30).
+v0.1.0-rc.77: it ships with the next release.
 **Severity:** high for onboarding. `docs/tenant-guide.md` shows ioredis, the most
 widely used Node client, as one of three samples. Written as the guide writes
 it, that sample never served a command against a Flint cluster.

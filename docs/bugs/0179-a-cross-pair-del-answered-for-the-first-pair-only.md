@@ -2,7 +2,7 @@
 
 **Status:** **FIXED 2026-09-24**, found the same day while surveying framework
 cache stores (BUG-0178). It settles the question BUG-0053 left open. Not in
-v0.1.0-rc.77; live since v0.1.0-rc.78 (rolled 2026-09-30).
+v0.1.0-rc.77: it ships with the next release.
 **Severity:** high on any fleet with more than one pair. A delete that
 silently leaves keys behind is a stale cache with no error anywhere, and
 multi-key `DEL` is how framework cache stores invalidate (`delete_many`,

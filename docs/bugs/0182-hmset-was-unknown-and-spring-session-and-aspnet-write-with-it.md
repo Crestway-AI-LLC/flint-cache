@@ -1,7 +1,7 @@
 # BUG-0182: HMSET was an unknown command, and Spring Session and ASP.NET Core write every entry with it (FIXED 2026-09-25)
 
-**Status:** **FIXED 2026-09-25**. Not in v0.1.0-rc.77; live since
-v0.1.0-rc.78 (rolled 2026-09-30).
+**Status:** **FIXED 2026-09-25**. Not in v0.1.0-rc.77: it ships with the next
+release.
 **Severity:** high for the two stacks named below: neither can store anything.
 
 ## What was measured

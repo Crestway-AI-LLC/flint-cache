@@ -1,7 +1,7 @@
 # BUG-0192: a Sidekiq server fails its metrics flush on every heartbeat, and warns of eviction (FIXED 2026-09-27)
 
-**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77; live since
-v0.1.0-rc.78 (rolled 2026-09-30).
+**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77: it ships with the next
+release.
 **Severity:** low: jobs run and the heartbeat registers the process. What
 fails is Sidekiq's execution metrics, and an operator reading the server's
 log sees an exception every beat and a warning that is not true.

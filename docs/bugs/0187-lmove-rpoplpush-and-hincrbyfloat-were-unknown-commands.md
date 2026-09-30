@@ -1,7 +1,7 @@
 # BUG-0187: LMOVE, RPOPLPUSH and HINCRBYFLOAT were unknown commands, and every job queue measured moves jobs with one of them (FIXED 2026-09-26)
 
-**Status:** **FIXED 2026-09-26**. Not in v0.1.0-rc.77; live since
-v0.1.0-rc.78 (rolled 2026-09-30).
+**Status:** **FIXED 2026-09-26**. Not in v0.1.0-rc.77: it ships with the next
+release.
 **Severity:** medium: whole client libraries failed at their core operation,
 loudly, with `ERR unknown command`.
 

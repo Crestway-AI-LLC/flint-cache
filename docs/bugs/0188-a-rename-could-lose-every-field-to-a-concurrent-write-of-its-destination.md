@@ -1,7 +1,7 @@
 # BUG-0188: a RENAME could lose every field it moved to a concurrent write of its destination (FIXED 2026-09-26)
 
-**Status:** **FIXED 2026-09-26**. Not in v0.1.0-rc.77; live since
-v0.1.0-rc.78 (rolled 2026-09-30).
+**Status:** **FIXED 2026-09-26**. Not in v0.1.0-rc.77: it ships with the next
+release.
 **Severity:** high: silent data loss on an acknowledged write.
 
 ## What was measured
