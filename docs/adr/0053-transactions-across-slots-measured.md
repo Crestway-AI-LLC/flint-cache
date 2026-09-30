@@ -2,8 +2,9 @@
 
 Status: **ACCEPTED 2026-09-27** (Jeff: "go with your recommendation on
 ADR-0053"): option D. Built for transactions and scripts; see "As built" at
-the end, which also measures a need the Context missed (rq's worker) and
-proposes an amendment for it.
+the end, which also measures a need the Context missed (rq's worker). The
+amendment it proposed for that need was **accepted 2026-09-30** (Jeff: "go
+with your recommendations"), to be built with ADR-0052's stage 4.
 
 ## Context
 
@@ -215,13 +216,14 @@ stream (`XREVRANGE`), which is stage 4. The Context above said nothing
 measured needed a multi-key command across slots. rq's worker does, and so
 this record's claim that D serves rq is not yet true.
 
-**Proposed amendment, for Jeff's decision:** on a placed tenant, let
+**Amendment, ACCEPTED 2026-09-30** (Jeff: "go with your recommendations"),
+not yet built: on a placed tenant, let
 `LMOVE`, `RPOPLPUSH`, `BLMOVE` and `BRPOPLPUSH` span slots. Each is one pop
 and one push, and each already excludes every writer while it runs
 (BUG-0188), so the change is to take the destination's own slot; days, not
 a re-plumbing. The other multi-key commands keep one slot until something
-measured needs them. Recommended, and worth building alongside stage 4,
-since rq's worker needs both before it can finish a job.
+measured needs them. It is built alongside ADR-0052's stage 4, since rq's
+worker needs both before it can finish a job.
 
 **Not built.** Moving a placed tenant to another pair, whole. It stays on the
 pair it was created on, and that pair's size and throughput are its limit.
