@@ -587,6 +587,22 @@ It is also worth stating plainly that the rejoin on that cycle **tailed
 incrementally**, so whatever held the edge shut, it was not the 94.2 s
 re-seed this bug measured.
 
+**The next one will say which (2026-09-30, public `cefeb70`).** The verdict
+could not separate its causes because it printed only the count of acks since
+the kill. It now also prints what the writer did: its last ack relative to the
+kill, and since the kill how many writes it sent and how each was answered
+(acked, `THROTTLED`, another error with the last one's text, failed dials, the
+longest dial and hold). The three readings are then distinct:
+
+- **a writer that had stopped** sent nothing after the kill, and its last ack
+  is well before it;
+- **the quorum gate doing its job** sent and got `THROTTLED`, which at
+  `min-replicas-to-write=1` on a two-member pair lasts until the killed seat
+  rejoins, so a slow restart is the thing to look at;
+- **an edge it could not reach** shows failed dials or connection errors.
+
+Nothing has been reproduced yet; that needs the same soak again.
+
 ### What the run did settle about the instrument
 
 The Open section above says the collection *"cannot see the cycles that
