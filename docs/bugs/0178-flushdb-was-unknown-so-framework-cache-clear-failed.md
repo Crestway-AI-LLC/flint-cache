@@ -1,8 +1,8 @@
 # BUG-0178: FLUSHDB was an unknown command, so framework cache stores could not clear (FIXED 2026-09-24)
 
 **Status:** **FIXED 2026-09-24**, found the same day in a survey of framework
-cache stores against a Flint cluster. Not in v0.1.0-rc.77: it ships with the
-next release.
+cache stores against a Flint cluster. Not in v0.1.0-rc.77; live since
+v0.1.0-rc.78 (rolled 2026-09-30).
 **Severity:** medium, and the worse half is silent. Django's `cache.clear()`
 raised. Rails' `RedisCacheStore#clear` reported nothing and cleared nothing,
 so an application that clears its cache on deploy kept serving stale entries

@@ -1,7 +1,7 @@
 # BUG-0193: a write inside MULTI/EXEC never invalidated the proxy's near-cache (FIXED 2026-09-27)
 
-**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77: it ships with the next
-release.
+**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77; live since
+v0.1.0-rc.78 (rolled 2026-09-30).
 **Severity:** medium: a tenant that opted in to the near-cache read its own
 transaction's writes stale, through the proxy it wrote by, for up to the
 cache TTL (300 ms by default). The tenant guide promised the opposite.

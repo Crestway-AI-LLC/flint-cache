@@ -1,7 +1,7 @@
 # BUG-0185: EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT refused Redis 7's NX, XX, GT and LT (FIXED 2026-09-26)
 
-**Status:** **FIXED 2026-09-26**. Not in v0.1.0-rc.77: it ships with the next
-release.
+**Status:** **FIXED 2026-09-26**. Not in v0.1.0-rc.77; live since
+v0.1.0-rc.78 (rolled 2026-09-30).
 **Severity:** medium: a documented command refused a standard form of itself
 with the wrong error, and the framework measured sending it takes that path
 on any server that reports Redis 7.

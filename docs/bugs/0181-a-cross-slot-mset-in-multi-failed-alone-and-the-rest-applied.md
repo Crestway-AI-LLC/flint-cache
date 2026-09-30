@@ -1,7 +1,7 @@
 # BUG-0181: a cross-slot MSET inside MULTI failed alone at EXEC, and the rest of the transaction applied (FIXED 2026-09-25)
 
 **Status:** **FIXED 2026-09-25**, found while building ADR-0048. Not in
-v0.1.0-rc.77: it ships with the next release.
+v0.1.0-rc.77; live since v0.1.0-rc.78 (rolled 2026-09-30).
 **Severity:** medium. Nothing is written to the wrong node: the command that
 spans slots still refuses itself. But a transaction the client was told would
 refuse a cross-slot key applied everything queued around that key.
