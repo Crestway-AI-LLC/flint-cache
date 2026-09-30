@@ -200,6 +200,18 @@ pub struct Shared {
     /// Acks observed strictly after the kill instant — proof that service
     /// continued, and how the client path knows the window has closed.
     pub acks_after_kill: AtomicU64,
+    /// Writes SENT after the kill, however answered. The soak of 2026-09-21
+    /// ended on "0 acks since the kill" and could not say whether the writer
+    /// had stopped, or the fleet was refusing it, or it never reached the
+    /// edge (public BUG-0071, cycle 9). With no ack, none sent is the first;
+    /// the counters below tell the other two apart. See `around_the_kill`.
+    pub sends_after_kill: AtomicU64,
+    /// `-THROTTLED` answers after the kill: the lag or quorum gate refusing,
+    /// which at `min-replicas-to-write=1` lasts until a replica rejoins.
+    pub throttled_after_kill: AtomicU64,
+    /// Every other failed answer after the kill, and the text of the last.
+    pub errors_after_kill: AtomicU64,
+    pub last_error: Mutex<String>,
     pub key_count: u64,
     /// Client-path mode: dial the PROXY EDGE with a tenant credential rather
     /// than the pair's master directly.
@@ -284,11 +296,62 @@ impl Shared {
             max_connect_at_ms: AtomicU64::new(0),
             connect_failures: AtomicU64::new(0),
             acks_after_kill: AtomicU64::new(0),
+            sends_after_kill: AtomicU64::new(0),
+            throttled_after_kill: AtomicU64::new(0),
+            errors_after_kill: AtomicU64::new(0),
+            last_error: Mutex::new(String::new()),
             key_count,
             edge: None,
             tag: String::new(),
             run_nonce: String::new(),
         }
+    }
+
+    /// What the writer did around the kill at `kill_ms`, for a verdict that
+    /// no write landed after it. Acking up to the kill and then refused by the
+    /// quorum gate, unable to dial, or already idle before it are three
+    /// different failures, and only the first is the gate doing its job.
+    pub fn around_the_kill(&self, kill_ms: u64) -> String {
+        let last = self.last_ack_ms.load(Ordering::SeqCst);
+        let last_ack = if last == 0 {
+            "no ack yet in this run".to_string()
+        } else if last <= kill_ms {
+            format!("last ack {} ms BEFORE the kill", kill_ms - last)
+        } else {
+            format!("last ack {} ms after the kill", last - kill_ms)
+        };
+        let last_error = self
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        format!(
+            "writer: {last_ack}; since the kill {} sent, {} acked, {} THROTTLED, {} other \
+             errors{}, {} failed dials (longest dial {} ms), longest hold {} ms",
+            self.sends_after_kill.load(Ordering::SeqCst),
+            self.acks_after_kill.load(Ordering::SeqCst),
+            self.throttled_after_kill.load(Ordering::SeqCst),
+            self.errors_after_kill.load(Ordering::SeqCst),
+            if last_error.is_empty() {
+                String::new()
+            } else {
+                format!(" (last: {last_error})")
+            },
+            self.connect_failures.load(Ordering::SeqCst),
+            self.max_connect_ms.load(Ordering::SeqCst),
+            self.max_hold_ms.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Zero the post-kill counters, as the kill is armed.
+    pub fn reset_around_the_kill(&self) {
+        self.sends_after_kill.store(0, Ordering::SeqCst);
+        self.throttled_after_kill.store(0, Ordering::SeqCst);
+        self.errors_after_kill.store(0, Ordering::SeqCst);
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub fn with_edge(mut self, edge: Option<Edge>, tag: String) -> Self {
@@ -475,6 +538,10 @@ pub fn run(shared: &Shared, seed: u64) {
         // instant — so the ack time alone cannot say which master served it.
         // See KeyLedger::acked_at.
         let sent_us = now_us();
+        let armed = shared.kill_ms.load(Ordering::SeqCst) != 0;
+        if armed {
+            shared.sends_after_kill.fetch_add(1, Ordering::SeqCst);
+        }
         let reply = c.call(&[b"SET", key.as_bytes(), value.as_bytes()]);
         // Recorded before the match, so a reconnect in the error arm is not
         // counted as time the server held the request. Every answer closes a
@@ -537,9 +604,18 @@ pub fn run(shared: &Shared, seed: u64) {
                 // does not count it and no false loss is reported. The client
                 // contract is retry-with-backoff.
                 shared.throttled.fetch_add(1, Ordering::SeqCst);
+                if armed {
+                    shared.throttled_after_kill.fetch_add(1, Ordering::SeqCst);
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            _ => {
+            other => {
+                if armed {
+                    shared.errors_after_kill.fetch_add(1, Ordering::SeqCst);
+                    let mut text = format!("{other:?}");
+                    text.truncate(200);
+                    *shared.last_error.lock().unwrap_or_else(|e| e.into_inner()) = text;
+                }
                 // Dead or demoted master: rediscover, exactly as a client
                 // would. This is the blackout the RTO measurement is timing.
                 if shared.kill_ms.load(Ordering::SeqCst) != 0 {
@@ -599,6 +675,40 @@ mod clock_resolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-0071's cycle 9 ended "0 since the kill" and could not name why.
+    /// Each of the three causes now reads differently.
+    #[test]
+    fn a_verdict_of_no_acks_says_which_of_three_things_happened() {
+        let s = Shared::new(Vec::new(), None, 1);
+        let kill = 100_000;
+        s.last_ack_ms.store(kill - 5, Ordering::SeqCst);
+        s.sends_after_kill.store(900, Ordering::SeqCst);
+        s.throttled_after_kill.store(900, Ordering::SeqCst);
+        let gated = s.around_the_kill(kill);
+        assert!(gated.contains("last ack 5 ms BEFORE the kill"), "{gated}");
+        assert!(
+            gated.contains("900 sent, 0 acked, 900 THROTTLED, 0 other errors"),
+            "{gated}"
+        );
+
+        s.reset_around_the_kill();
+        s.last_ack_ms.store(kill - 30_000, Ordering::SeqCst);
+        let idle = s.around_the_kill(kill);
+        assert!(
+            idle.contains("30000 ms BEFORE") && idle.contains("0 sent"),
+            "{idle}"
+        );
+
+        s.errors_after_kill.store(4, Ordering::SeqCst);
+        *s.last_error.lock().expect("lock") = "Err(Connection refused)".into();
+        s.connect_failures.store(4, Ordering::SeqCst);
+        let unreachable = s.around_the_kill(kill);
+        assert!(
+            unreachable.contains("4 other errors (last: Err(Connection refused)), 4 failed dials"),
+            "{unreachable}"
+        );
+    }
     use crate::cluster::pair_tag;
 
     fn shared(tag: &str, nonce: &str) -> Shared {

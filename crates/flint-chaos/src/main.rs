@@ -577,6 +577,7 @@ fn main() {
             shared.max_connect_at_ms.store(0, Ordering::SeqCst);
             shared.connect_failures.store(0, Ordering::SeqCst);
             shared.acks_after_kill.store(0, Ordering::SeqCst);
+            shared.reset_around_the_kill();
             let kill_ms = now_ms();
             shared.kill_ms.store(kill_ms, Ordering::SeqCst);
             // Two clocks on purpose. `kill_ms` is armed BEFORE the kill and
@@ -622,9 +623,10 @@ fn main() {
                         Instant::now() < deadline,
                         "iter {iteration}: edge served fewer than 50 writes in \
                          {rto_budget_ms}ms x2 after the kill ({} since) — the \
-                         proxy never recovered, OR this run never reached it: {}",
+                         proxy never recovered, OR this run never reached it: {}. {}",
                         shared.acks_after_kill.load(Ordering::SeqCst),
                         edge_hint(&edge_addr, &edge_ca),
+                        shared.around_the_kill(kill_ms),
                     );
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -636,7 +638,8 @@ fn main() {
                     }
                     assert!(
                         Instant::now() < deadline,
-                        "iter {iteration}: writer saw no ack within {rto_budget_ms}ms x2 of the kill"
+                        "iter {iteration}: writer saw no ack within {rto_budget_ms}ms x2 of the kill. {}",
+                        shared.around_the_kill(kill_ms),
                     );
                     std::thread::sleep(Duration::from_millis(10));
                 }
