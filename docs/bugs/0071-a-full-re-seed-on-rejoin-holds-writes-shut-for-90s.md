@@ -628,3 +628,39 @@ that only ever appears inside its own negation cannot be counted by matching
 it.** The number that stands came from taking the text after the final colon,
 with a control: *show every line that is not "tailing incrementally"*, which
 returns nothing.
+
+## The soak run, 2026-09-30 — rc.78, 7 more rejoins, and the driver died, not the fleet
+
+Jeff approved re-running the 9/21 soak to reproduce cycle 9 with the new
+verdict: `scale-cluster/run.sh --pairs 1 --soak-mins 240 --ctl-from-source`,
+5 x `i4i.large`, the published v0.1.0-rc.78 bundle for the seats and
+`flint-chaos` built from public `2da4251`. Bring-up's baseline chaos passed:
+12 cross-host kills, 8 of them masters, through the proxy edge.
+
+**The soak ran 7 of its ~20 cycles and then the laptop driving it lost its
+disk.** At 12:50 PDT the external SSD holding the harness script, its
+worktree and its log dropped out and remounted (the power log shows a
+lid-open and a disk-management client dying at that second), and the
+harness, reading its own script from that disk, ended with exit 1 and no
+teardown line. The five hosts kept running, healthy, and were torn down by
+hand and confirmed gone. This is the dropout signature the Flint sessions
+have seen twice before, not a finding about the fleet.
+
+### The measurement
+
+| | this run | pooled |
+|---|---|---|
+| master kills in the soak | 7 | |
+| client stall per kill | 368 to 610 ms (budget 10 s) | |
+| acked writes lost | 0 | |
+| rejoins | 7, every one rewound to a snapshot that cleared the fence and tailed | 49 |
+| full re-seed, superseded copy | 0 | 0 |
+
+**Cycle 9's stall did not recur, and this run cannot say it will not:** 9/21
+failed at its ninth cycle and this one stopped after its seventh. The
+verdict that would name it (`cefeb70`) is in place for the next run, which
+has to drive from a disk that stays mounted.
+
+Evidence: `/Volumes/FlintDev/soak-20260930/` (the log, boot decisions,
+rejoin timeline, bring-up run).
+
