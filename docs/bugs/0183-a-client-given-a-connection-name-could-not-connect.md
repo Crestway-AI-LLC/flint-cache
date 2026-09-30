@@ -1,7 +1,7 @@
 # BUG-0183: a client given a connection name could not connect, because CLIENT was unknown (FIXED 2026-09-25)
 
-**Status:** **FIXED 2026-09-25**. Not in v0.1.0-rc.77: it ships with the next
-release.
+**Status:** **FIXED 2026-09-25**. Not in v0.1.0-rc.77; live since
+v0.1.0-rc.78 (rolled 2026-09-30).
 **Severity:** high for anyone who names their connections, which is a
 one-line option in every mainstream client and a common operations habit.
 

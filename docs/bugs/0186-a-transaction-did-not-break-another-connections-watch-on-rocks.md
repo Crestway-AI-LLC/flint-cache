@@ -1,7 +1,7 @@
 # BUG-0186: on rocks, another connection's transaction did not break a WATCH, so the watcher's EXEC committed over it (FIXED 2026-09-26)
 
-**Status:** **FIXED 2026-09-26**. Not in v0.1.0-rc.77: it ships with the next
-release.
+**Status:** **FIXED 2026-09-26**. Not in v0.1.0-rc.77; live since
+v0.1.0-rc.78 (rolled 2026-09-30).
 **Severity:** high: a silent lost update in the one mechanism whose whole job
 is to prevent one, on the engine that ships.
 

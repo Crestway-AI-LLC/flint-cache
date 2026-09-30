@@ -1,6 +1,6 @@
 # BUG-0177: the re-seed record says why a copy was marked, and not which way its rejoin went (FIXED)
 
-**Status:** FIXED 2026-09-24 in `flint-server`. It ships with the next release.
+**Status:** FIXED 2026-09-24 in `flint-server`. It is live since v0.1.0-rc.78 (rolled 2026-09-30).
 The ops side is the operations agent reading the new field (ops OPS-0319).
 Found by the operations agent's `recent_reseed` insight firing the morning
 after a routine roll, for a seat that had not re-seeded.

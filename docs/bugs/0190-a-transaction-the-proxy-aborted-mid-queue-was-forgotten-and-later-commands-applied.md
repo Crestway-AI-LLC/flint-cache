@@ -1,7 +1,7 @@
 # BUG-0190: a transaction the proxy aborted mid-queue was forgotten, and the commands after it applied (FIXED 2026-09-27)
 
-**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77: it ships with the next
-release.
+**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77; live since
+v0.1.0-rc.78 (rolled 2026-09-30).
 **Severity:** high: a partial transaction, applied silently, on the path every
 client library uses.
 

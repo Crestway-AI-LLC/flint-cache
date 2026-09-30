@@ -1,7 +1,7 @@
 # BUG-0184: an error reply could carry a raw newline, and redis-py then hung until its socket timeout (FIXED 2026-09-25)
 
-**Status:** **FIXED 2026-09-25**. Not in v0.1.0-rc.77: it ships with the next
-release.
+**Status:** **FIXED 2026-09-25**. Not in v0.1.0-rc.77; live since
+v0.1.0-rc.78 (rolled 2026-09-30).
 **Severity:** high where it bites: a client hangs instead of failing, holding
 its connection until a timeout, and many clients set none.
 
