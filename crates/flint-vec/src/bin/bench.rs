@@ -17,6 +17,11 @@
 //!        bench --memory [--sizes ...] [--dim ...] [--vec-dir D]
 //!                (heap bytes each kind of set holds per vector, counted by
 //!                 this binary's allocator, beside what the D4 meter charges)
+//!        bench --data DIR --arm plain|sq8|sq8-disk [--n N] [--queries Q]
+//!              [--k 10] [--metric cosine] [--vec-dir D] [--gt-only]
+//!                (ADR-0049 verifications 1 and 2 on a real corpus: one set a
+//!                 process, its RSS growth, and recall against brute force
+//!                 across EF and RERANK; DIR holds base.fbin and query.fbin)
 //! Not wired into any gate — it allocates a corpus and takes seconds; run it by
 //! hand when the index engine or its parameters change.
 
@@ -288,6 +293,10 @@ fn recall(oracle: &[Vec<Vec<u8>>], approx: &[Vec<Vec<u8>>], k: usize) -> f64 {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    if a.iter().any(|x| x == "--data") {
+        real_data(&a);
+        return;
+    }
     let sizes: Vec<usize> = arg(&a, "--sizes")
         .unwrap_or_else(|| "1000,10000,100000".into())
         .split(',')
@@ -413,3 +422,220 @@ fn main() {
         }
     }
 }
+
+/// A float32 vector file mapped read-only: `u32` count, `u32` dim, then
+/// count x dim little-endian floats (the big-ann-benchmarks `.fbin` layout).
+/// Mapped rather than read so the arms run as separate processes share one
+/// copy in the page cache, and so it shows as file-backed memory, not in the
+/// anonymous RSS the measurement is about.
+struct Fbin {
+    map: *const u8,
+    len: usize,
+    n: usize,
+    dim: usize,
+}
+
+// SAFETY: the mapping is read-only and lives as long as the process, so any
+// thread may read it.
+unsafe impl Sync for Fbin {}
+
+impl Fbin {
+    fn open(path: &std::path::Path) -> Fbin {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let len = f.metadata().expect("metadata").len() as usize;
+        // SAFETY: a read-only private mapping of a file this process opened,
+        // kept for the life of the process and never written through.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+        assert!(map != libc::MAP_FAILED, "mmap {}", path.display());
+        let map = map as *const u8;
+        // SAFETY: the mapping is at least the 8-byte header (checked below).
+        let head = unsafe { std::slice::from_raw_parts(map, 8.min(len)) };
+        assert_eq!(head.len(), 8, "{} is shorter than its header", path.display());
+        let n = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        let dim = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        assert_eq!(len, 8 + n * dim * 4, "{}: size disagrees with its header", path.display());
+        Fbin { map, len, n, dim }
+    }
+
+    fn row(&self, i: usize) -> &[f32] {
+        assert!(i < self.n && 8 + (i + 1) * self.dim * 4 <= self.len);
+        // SAFETY: within the mapping (asserted at open); offset 8 + 4k is
+        // 4-byte aligned on a page-aligned mapping; the host is little-endian,
+        // as every target this repo builds for is.
+        unsafe {
+            std::slice::from_raw_parts(self.map.add(8 + i * self.dim * 4) as *const f32, self.dim)
+        }
+    }
+}
+
+/// Anonymous resident memory of this process (Linux `RssAnon`), in bytes.
+fn rss_anon() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = s.lines().find(|l| l.starts_with("RssAnon:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// Score where HIGHER is nearer, as flint-vec answers `VEC.SEARCH`.
+fn exact_score(metric: &str, q: &[f32], qn: f32, v: &[f32], vn: f32) -> f32 {
+    let dot: f32 = q.iter().zip(v).map(|(a, b)| a * b).sum();
+    match metric {
+        "l2" => -q.iter().zip(v).map(|(a, b)| (a - b) * (a - b)).sum::<f32>(),
+        "ip" => dot,
+        _ => {
+            if qn == 0.0 || vn == 0.0 {
+                0.0
+            } else {
+                dot / (qn * vn)
+            }
+        }
+    }
+}
+
+/// The exact top-`k` ids of each query over the first `n` base rows, by
+/// brute force on every core, cached in `dir` because it is the same for
+/// every arm.
+fn ground_truth(dir: &std::path::Path, base: &Fbin, n: usize, queries: &Fbin, nq: usize, k: usize, metric: &str) -> Vec<Vec<u32>> {
+    let cache = dir.join(format!("gt-n{n}-q{nq}-k{k}-{metric}.ibin"));
+    if let Ok(bytes) = std::fs::read(&cache)
+        && bytes.len() == nq * k * 4
+    {
+        let ids: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        return ids.chunks(k).map(|c| c.to_vec()).collect();
+    }
+    let t0 = Instant::now();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norms: Vec<f32> = (0..n).map(|i| norm(base.row(i))).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
+    let qids: Vec<usize> = (0..nq).collect();
+    let mut gt = vec![Vec::new(); nq];
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = qids
+            .chunks(nq.div_ceil(threads))
+            .map(|chunk| {
+                let norms = &norms;
+                sc.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&qi| {
+                            let q = queries.row(qi);
+                            let qn = norm(q);
+                            let mut top: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+                            for (i, &vn) in norms.iter().enumerate() {
+                                let s = exact_score(metric, q, qn, base.row(i), vn);
+                                if top.len() < k || s > top[top.len() - 1].0 {
+                                    let at = top.partition_point(|&(t, _)| t >= s);
+                                    top.insert(at, (s, i as u32));
+                                    top.truncate(k);
+                                }
+                            }
+                            (qi, top.into_iter().map(|(_, i)| i).collect::<Vec<u32>>())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            for (qi, ids) in h.join().expect("ground-truth thread") {
+                gt[qi] = ids;
+            }
+        }
+    });
+    let bytes: Vec<u8> = gt.iter().flatten().flat_map(|i| i.to_le_bytes()).collect();
+    let _ = std::fs::write(&cache, bytes);
+    eprintln!("ground truth: {nq} queries over {n} in {:.0} s, {threads} threads", t0.elapsed().as_secs_f64());
+    gt
+}
+
+/// `--data`: ADR-0049 verifications 1 and 2 on a real corpus. One set a run
+/// (`--arm`), so this process's RSS growth is that set's alone.
+fn real_data(a: &[String]) {
+    let dir = std::path::PathBuf::from(arg(a, "--data").expect("--data DIR"));
+    let arm = arg(a, "--arm").unwrap_or_else(|| "plain".into());
+    let k: usize = arg(a, "--k").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let metric = arg(a, "--metric").unwrap_or_else(|| "cosine".into());
+    let base = Fbin::open(&dir.join("base.fbin"));
+    let queries = Fbin::open(&dir.join("query.fbin"));
+    assert_eq!(base.dim, queries.dim, "base and queries disagree on dim");
+    let n: usize = arg(a, "--n").and_then(|s| s.parse().ok()).unwrap_or(base.n).min(base.n);
+    let nq: usize = arg(a, "--queries").and_then(|s| s.parse().ok()).unwrap_or(200).min(queries.n);
+    let dim = base.dim;
+    let gt = ground_truth(&dir, &base, n, &queries, nq, k, &metric);
+    if a.iter().any(|x| x == "--gt-only") {
+        return;
+    }
+
+    let ns = b("real");
+    let mut st = Store::new();
+    let quant = match arm.as_str() {
+        "plain" => None,
+        "sq8" | "sq8-disk" => Some("sq8"),
+        other => panic!("--arm plain|sq8|sq8-disk, not {other}"),
+    };
+    if arm == "sq8-disk" {
+        let d = std::path::PathBuf::from(arg(a, "--vec-dir").expect("sq8-disk needs --vec-dir"));
+        std::fs::create_dir_all(&d).expect("--vec-dir");
+        st.set_vec_dir(d);
+    }
+    let mut create = vec![b("VEC.CREATE"), b("s"), b("DIM"), b(&dim.to_string()), b("METRIC"), b(&metric), b("INDEX"), b("hnsw")];
+    if let Some(q) = quant {
+        create.extend([b("QUANT"), b(q)]);
+    }
+    exec(&mut st, &ns, &create);
+    let (rss0, heap0) = (rss_anon(), HEAP.load(Ordering::Relaxed));
+    let t0 = Instant::now();
+    for i in 0..n {
+        exec(&mut st, &ns, &[b("VEC.SET"), b("s"), b(&i.to_string()), b(&vec_str(base.row(i)))]);
+        if (i + 1) % (n / 10).max(1) == 0 {
+            eprintln!("{arm}: {} of {n} in {:.0} s", i + 1, t0.elapsed().as_secs_f64());
+        }
+    }
+    let build = t0.elapsed().as_secs_f64();
+    let heap = (HEAP.load(Ordering::Relaxed) - heap0) as f64 / n as f64;
+    let rss = match (rss0, rss_anon()) {
+        (Some(r0), Some(r1)) => format!("{:.0}", (r1 as f64 - r0 as f64) / n as f64),
+        _ => "n/a".into(),
+    };
+    println!(
+        "arm={arm} n={n} dim={dim} metric={metric} build={build:.0}s rss_B_per_vector={rss} heap_B_per_vector={heap:.0} meter_B_per_vector={:.0}",
+        st.ns_mem_bytes(&ns) as f64 / n as f64
+    );
+
+    let reranks: Vec<usize> = if quant.is_some() { vec![k, 4 * k, 10 * k] } else { vec![k] };
+    for ef in [64usize, 128, 256] {
+        for &rr in &reranks {
+            let (mut hits, mut lat) = (0usize, Vec::with_capacity(nq));
+            for (qi, truth) in gt.iter().enumerate().take(nq) {
+                let args = [b("VEC.SEARCH"), b("s"), b(&vec_str(queries.row(qi))), b(&k.to_string()), b("EF"), b(&ef.to_string()), b("RERANK"), b(&rr.to_string())];
+                let t = Instant::now();
+                let reply = st.plan(&ns, &args, 0);
+                lat.push(t.elapsed().as_micros());
+                let Plan::Reply(v) = reply else { panic!("a search is a reply") };
+                hits += result_ids(&v)
+                    .iter()
+                    .filter_map(|id| std::str::from_utf8(id).ok()?.parse::<u32>().ok())
+                    .filter(|id| truth.contains(id))
+                    .count();
+            }
+            let (p50, p99, _) = stats(lat);
+            println!(
+                "arm={arm} n={n} ef={ef} rerank={rr} recall@{k}={:.4} p50_us={p50} p99_us={p99}",
+                hits as f64 / (nq * k) as f64
+            );
+        }
+    }
+}
+
