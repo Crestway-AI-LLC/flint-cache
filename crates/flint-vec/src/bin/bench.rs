@@ -14,12 +14,83 @@
 //!              [--quant sq8 [--rerank R] [--vec-dir D]]
 //!                (ADR-0049: adds a quantized HNSW arm; with --vec-dir, a second
 //!                 one whose full vectors are in a file in D, as step 2 serves)
+//!        bench --memory [--sizes ...] [--dim ...] [--vec-dir D]
+//!                (heap bytes each kind of set holds per vector, counted by
+//!                 this binary's allocator, beside what the D4 meter charges)
 //! Not wired into any gate — it allocates a corpus and takes seconds; run it by
 //! hand when the index engine or its parameters change.
 
 use flint_resp::Value;
 use flint_vec::{Plan, Store};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::Instant;
+
+/// Heap bytes this process holds, for `--memory`: requested sizes, so not the
+/// allocator's own rounding, and not what the OS reports, which on a host that
+/// compresses or swaps memory says less than was allocated.
+static HEAP: AtomicIsize = AtomicIsize::new(0);
+
+struct Counting;
+
+// SAFETY: every call is forwarded to `System` unchanged; this only counts.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        HEAP.fetch_add(l.size() as isize, Ordering::Relaxed);
+        // SAFETY: the caller's contract, passed through.
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        HEAP.fetch_sub(l.size() as isize, Ordering::Relaxed);
+        // SAFETY: the caller's contract, passed through.
+        unsafe { System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        HEAP.fetch_add(new as isize - l.size() as isize, Ordering::Relaxed);
+        // SAFETY: the caller's contract, passed through.
+        unsafe { System.realloc(p, l, new) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// `--memory`: for each kind of set, the heap held per vector after `n`
+/// inserts, beside the D4 meter's charge for them.
+fn memory(sizes: &[usize], dim: usize, metric: &str, vec_dir: Option<&std::path::Path>) {
+    println!(
+        "{:>8}  {:<22}  {:>14}  {:>14}",
+        "N", "set", "heap B/vector", "meter B/vector"
+    );
+    let mut rng = Rng(0x5EED_0049);
+    for &n in sizes {
+        let vecs = corpus(&mut rng, n, dim, &None, 0.0);
+        let mut arms = vec![
+            ("flat", None, "flat"),
+            ("hnsw", None, "hnsw"),
+            ("hnsw", Some("sq8"), "hnsw sq8, RAM"),
+        ];
+        if vec_dir.is_some() {
+            arms.push(("hnsw", Some("sq8"), "hnsw sq8, --vec-dir"));
+        }
+        for (kind, quant, label) in arms {
+            let ns = b("mem");
+            let before = HEAP.load(Ordering::Relaxed);
+            let mut st = Store::new();
+            if let (Some(d), true) = (vec_dir, label.ends_with("--vec-dir")) {
+                std::fs::create_dir_all(d).expect("--vec-dir");
+                st.set_vec_dir(d.to_path_buf());
+            }
+            build(&mut st, &ns, "s", kind, quant, dim, metric, &vecs);
+            let held = HEAP.load(Ordering::Relaxed) - before;
+            println!(
+                "{n:>8}  {label:<22}  {:>14.0}  {:>14.0}",
+                held as f64 / n as f64,
+                st.ns_mem_bytes(&ns) as f64 / n as f64
+            );
+        }
+    }
+}
 
 /// Deterministic xorshift64 — a bench must be reproducible, and pulling in a
 /// PRNG crate for uniform noise is not worth the dependency.
@@ -239,6 +310,10 @@ fn main() {
         .unwrap_or(0.10);
     let quant: Option<String> = arg(&a, "--quant");
     let vec_dir: Option<std::path::PathBuf> = arg(&a, "--vec-dir").map(Into::into);
+    if a.iter().any(|x| x == "--memory") {
+        memory(&sizes, dim, &metric, vec_dir.as_deref());
+        return;
+    }
     let rerank: usize = arg(&a, "--rerank")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4 * k);
