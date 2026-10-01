@@ -212,13 +212,14 @@ _gate_prune_runs 20
 # disk, and hdiutil/mkfs are heavy enough to move the number for anyone else
 # reading it). And its subject is a TRIGGER that fires on a threshold: a drill
 # whose whole premise is "the disk got full enough" cannot share a machine with
-# five other drills writing to it.
-CORE_EXCLUSIVE="${FLINT_CORE_EXCLUSIVE:-disk_pressure disk_selffill evictable_pressure}"
+# five other drills writing to it. snapshot_pressure (BUG-0195) is the same
+# shape: a small filesystem filled on purpose, asserted on its free space.
+CORE_EXCLUSIVE="${FLINT_CORE_EXCLUSIVE:-disk_pressure disk_selffill evictable_pressure snapshot_pressure}"
 
 CORE="${FLINT_CORE_ORDER:-kill_order bind_dial_sites seat_names restart repl kill_release failover proxy slot_migrate slot_map rebalance_execute expand_fill placed_tenant_rebalance subset_ratchet near_cache_cross_client
       bloom ns_escape coproc_cred coproc_channel coproc_family family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha cp_kill_datapath
-      decommission config_file federation_plumbing disk_pressure disk_selffill evictable_pressure ingest_saturation ctl_error
+      decommission config_file federation_plumbing disk_pressure disk_selffill evictable_pressure snapshot_pressure ingest_saturation ctl_error
       client_compat proxy_registry reseed lag_cap widowed_grace replica_starvation managed_slow_sync controller
       promote_notice fleet_guard ctl_cpha upgrade anti_affinity attached_chaos
       async_flag async_writes txn_failure backup restore_ns backup_schedule

@@ -517,6 +517,87 @@ const SNAP_RETAIN_FLOOR_S: u64 = 24 * 60 * 60;
 #[cfg(feature = "rocks")]
 const SNAP_RETAIN_MIN_COUNT: usize = 2_880;
 
+/// Under disk pressure keep only the newest this many, besides what LATEST
+/// names (BUG-0195). A rewind takes the newest snapshot at or below the
+/// promotion fence, and the fence trails the dead master by the replica's lag:
+/// milliseconds normally, and four snapshots is two minutes of it.
+#[cfg(feature = "rocks")]
+const SNAP_PRESSURE_KEEP: usize = 4;
+
+/// Release the oldest snapshots while free space is below `below` (BUG-0195).
+///
+/// [`prune_snapshots`] keeps every snapshot for a day, which is right for
+/// recovery options and wrong for disk. A snapshot is hard links, so on a
+/// churning pair it pins every SST that compaction has replaced since. On the
+/// 2026-09-30 soak, 20 MB/s through a 20 GB window, 108 minutes of 30-second
+/// snapshots filled a 468 GB NVMe, and the disk guard then refused every write.
+/// A rewind only makes a rejoin faster, and an outage of every write is worse
+/// than losing old rewind options.
+///
+/// Oldest first, re-measuring after each removal, and it stops as soon as there
+/// is room. It never touches `keep` or the newest `min_keep`, and it ages
+/// entries by mtime exactly like `prune_snapshots`. A sample that cannot be
+/// read stops it: the action is deletion, so a blind look must not continue it.
+#[cfg(feature = "rocks")]
+fn release_snapshots_under_pressure(
+    root: &std::path::Path,
+    keep: &str,
+    min_keep: usize,
+    mut free_now: impl FnMut() -> Option<u64>,
+    below: u64,
+) -> usize {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut aged: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("snap-") || name.starts_with(UNRESUMABLE_PREFIX)) || name == keep {
+            continue;
+        }
+        let Ok(age) = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| now.duration_since(t).map_err(std::io::Error::other))
+        else {
+            continue;
+        };
+        aged.push((age.as_secs(), e.path()));
+    }
+    // Newest first; everything past the floor is a candidate, oldest first.
+    aged.sort_by_key(|(age, _)| *age);
+    let mut released = 0usize;
+    for (_, path) in aged.into_iter().skip(min_keep).rev() {
+        match free_now() {
+            Some(free) if free < below => {}
+            _ => break,
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => released += 1,
+            Err(err) => eprintln!("snapshot relief: removing {}: {err}", path.display()),
+        }
+    }
+    released
+}
+
+/// Do two paths live on one filesystem? Releasing a snapshot frees space only
+/// on its own device, so relief for the data directory's disk is pointless,
+/// and would delete for nothing, when the snapshot root is elsewhere.
+#[cfg(all(feature = "rocks", unix))]
+fn same_filesystem(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev(),
+        _ => false,
+    }
+}
+
+#[cfg(all(feature = "rocks", not(unix)))]
+fn same_filesystem(_a: &std::path::Path, _b: &std::path::Path) -> bool {
+    false
+}
+
 /// Delete snapshots older than the WAL archive can reach (BUG-0163).
 ///
 /// A rewind is only worth anything if the node can then TAIL FORWARD from the
@@ -1182,6 +1263,11 @@ static RECLAIM_TARGET_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 static DISK: std::sync::LazyLock<diskguard::DiskGuard> =
     std::sync::LazyLock::new(diskguard::DiskGuard::default);
+
+/// The disk guard's thresholds, for the one caller outside its thread that
+/// needs them: snapshot relief (BUG-0195). Unset when no guard runs, and then
+/// nothing is released under pressure.
+static DISK_THRESHOLDS: std::sync::OnceLock<diskguard::Thresholds> = std::sync::OnceLock::new();
 
 // WAL fsync cadence in ms (0 = disabled), for FLINTINFO. Rocks-only.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
@@ -2948,6 +3034,7 @@ fn main() -> std::io::Result<()> {
             "disk guard: min-free {}% or {} bytes, sampling {} every {:?} OR SOONER",
             thresholds.min_free_pct, thresholds.min_free_bytes, dir, every
         );
+        let _ = DISK_THRESHOLDS.set(thresholds);
         // The guard thread reclaims as well as sheds, so it needs the engine:
         // reclaim marks keys and forces the compaction that drops them. Cloned
         // in rather than reached for, because this thread outlives the setup
@@ -7026,11 +7113,35 @@ fn flintsnapshot(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
     // reads. The zero case still says WHY, because "nothing was ever deleted"
     // reporting nothing is how this bug went unseen for two months.
     let (pruned, why) = prune_snapshots(root, kv.archive_span(), &id, SNAP_RETAIN_MIN_COUNT);
-    let prune_note = if pruned > 0 {
+    let mut prune_note = if pruned > 0 {
         format!("pruned {pruned} past the archive's reach")
     } else {
         format!("pruned 0: {why}")
     };
+    // BUG-0195: and then whatever disk pressure needs, before reclaim evicts a
+    // key or the guard sheds a write. Measured on the DATA directory, because
+    // that is the disk the guard protects, and only when the snapshots share it.
+    let data = kv.path().to_path_buf();
+    if let Some(below) = DISK_THRESHOLDS
+        .get()
+        .and_then(|t| diskguard::snapshot_relief_below(flint_storage::disk::sample(&data), *t))
+        && same_filesystem(root, &data)
+    {
+        let released = release_snapshots_under_pressure(
+            root,
+            &id,
+            SNAP_PRESSURE_KEEP,
+            || flint_storage::disk::sample(&data).map(|u| u.free_bytes),
+            below,
+        );
+        if released > 0 {
+            let free = flint_storage::disk::sample(&data).map(|u| u.free_bytes);
+            prune_note.push_str(&format!(
+                "; released {released} under disk pressure (free {} bytes, relief below {below})",
+                free.map_or_else(|| "unknown".to_string(), |f| f.to_string())
+            ));
+        }
+    }
     eprintln!("snapshot {id} written to {} ({prune_note})", root.display());
     Value::Simple(format!("OK {id}"))
 }
@@ -10046,6 +10157,70 @@ mod quarantine_tests {
         let (n, _) = prune_snapshots(&d, reach_12h(), "none", 3);
         assert_eq!(n, 1, "with floor+1 held, exactly the oldest is removed");
         assert_eq!(held(&d), 3);
+    }
+
+    // ---- BUG-0195: releasing snapshots under disk pressure ------------------
+
+    /// Ten snapshots, the i-th aged `(10 - i)` minutes, so index 0 is the
+    /// oldest. Returns their names, oldest first.
+    fn ten_aged(d: &std::path::Path) -> Vec<String> {
+        (0..10u64)
+            .map(|i| {
+                let n = touch_snap(d, i, 1_000 + i, 0, 7);
+                age_to(&d.join(&n), (10 - i) * 60);
+                n
+            })
+            .collect()
+    }
+
+    /// Each removal frees `per` bytes, as a snapshot pinning replaced SSTs does.
+    #[test]
+    fn pressure_releases_the_oldest_first_and_stops_once_there_is_room() {
+        let d = scratch("relief-oldest");
+        let names = ten_aged(&d);
+        // A quarantined snapshot is as releasable as any other: age decides.
+        let q = format!("{UNRESUMABLE_PREFIX}c5-{}", names[0]);
+        std::fs::rename(d.join(&names[0]), d.join(&q)).expect("quarantine one");
+        let (base, per) = (100u64, 50u64);
+        let dir = d.clone();
+        let free = move || Some(base + (10 - held(&dir) as u64) * per);
+        // Room once three are gone.
+        let n = release_snapshots_under_pressure(&d, "none", 4, free, base + 3 * per);
+        assert_eq!(n, 3, "exactly as many as it took to make room");
+        assert!(
+            !d.join(&q).exists(),
+            "the oldest (quarantined) one went first"
+        );
+        assert!(!d.join(&names[1]).exists() && !d.join(&names[2]).exists());
+        for kept in &names[3..] {
+            assert!(d.join(kept).exists(), "{kept} is newer than every removal");
+        }
+    }
+
+    #[test]
+    fn pressure_never_takes_the_newest_floor_or_what_latest_names() {
+        let d = scratch("relief-floor");
+        let names = ten_aged(&d);
+        // LATEST pointing at the OLDEST proves `keep` is spared by name, not age.
+        let keep = names[0].clone();
+        let n = release_snapshots_under_pressure(&d, &keep, 4, || Some(0), u64::MAX);
+        assert_eq!(n, 5, "of 9 candidates beside `keep`, all but the newest 4");
+        assert!(d.join(&keep).exists());
+        for kept in &names[6..] {
+            assert!(d.join(kept).exists(), "{kept} is in the newest 4");
+        }
+        assert_eq!(held(&d), 5);
+    }
+
+    #[test]
+    fn a_blind_sample_or_no_pressure_releases_nothing() {
+        let d = scratch("relief-blind");
+        let _ = ten_aged(&d);
+        let n = release_snapshots_under_pressure(&d, "none", 0, || None, u64::MAX);
+        assert_eq!(n, 0, "an unreadable disk must not license a deletion");
+        let n = release_snapshots_under_pressure(&d, "none", 0, || Some(500), 500);
+        assert_eq!(n, 0, "free at the relief line is not pressure");
+        assert_eq!(held(&d), 10);
     }
 }
 

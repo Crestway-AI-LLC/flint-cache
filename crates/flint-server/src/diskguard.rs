@@ -137,6 +137,43 @@ const RECLAIM_TARGET_PCT_OF_FLOOR: u64 = 200;
 /// the clamp in [`reclaim_action`].
 const CEILING_PCT_OF_TOTAL: u64 = 80;
 
+/// Old rewind snapshots are released below this much free space (BUG-0195):
+/// above where capacity reclaim STARTS and above where it aims, so the dead
+/// SSTs a snapshot pins go before a single tenant key is evicted, and long
+/// before writes shed. Snapshots exist only on the rocks engine.
+#[cfg(any(feature = "rocks", test))]
+const SNAPSHOT_RELIEF_PCT_OF_FLOOR: u64 = 250;
+
+/// Below how many free bytes should old snapshots be released? `None` when
+/// there is no signal or no shed line, and then nothing is released: like
+/// [`reclaim_action`], the action this licenses is deletion, so a blind sample
+/// must not authorise it.
+///
+/// BUG-0195. A snapshot is a set of hard links, so on a churning pair it pins
+/// every SST compaction has since replaced. Snapshot retention had no
+/// disk-pressure term, and on the 2026-09-30 soak 108 minutes of 30-second
+/// snapshots filled a 468 GB NVMe. The guard then refused every write to keep
+/// snapshots whose only use is to make a rejoin faster.
+///
+/// Never below where reclaim starts, even after the ceiling clamp. On a
+/// configuration demanding most of the device the clamp pulls 250% of the floor
+/// under 150% of it, and eviction would then start first, deleting tenant data
+/// while dead snapshots sat on disk.
+#[cfg(any(feature = "rocks", test))]
+pub fn snapshot_relief_below(
+    usage: Option<flint_storage::disk::Usage>,
+    t: Thresholds,
+) -> Option<u64> {
+    let u = usage?;
+    let floor = shed_floor_bytes(u, t);
+    if floor == 0 {
+        return None;
+    }
+    let ceiling = u.total_bytes.saturating_mul(CEILING_PCT_OF_TOTAL) / 100;
+    let relief = (floor.saturating_mul(SNAPSHOT_RELIEF_PCT_OF_FLOOR) / 100).min(ceiling);
+    Some(relief.max(floor.saturating_mul(RECLAIM_START_PCT_OF_FLOOR) / 100))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimAction {
     /// Nothing to do: either there is headroom, or there is no signal.
@@ -638,6 +675,80 @@ mod tests {
             shed_seen > 0 && reclaim_seen > 0,
             "positive control: shed_seen={shed_seen} reclaim_seen={reclaim_seen} — the \
              sweep never reached either state, so nothing above was actually checked"
+        );
+    }
+
+    /// BUG-0195: dead snapshots go before tenant data. Wherever eviction would
+    /// start, snapshot relief must already be engaged, across the same sweep
+    /// as the shed/reclaim ordering, including the configurations where the
+    /// ceiling clamp bites.
+    #[test]
+    fn snapshot_relief_engages_wherever_eviction_would() {
+        let mut evict_seen = 0u32;
+        let mut relief_only = 0u32;
+        for total_gb in [1u64, 8, 64, 512] {
+            let total = total_gb * GB;
+            for pct in [0u64, 5, 10, 25, 40, 50, 60, 75, 90, 100] {
+                for min_gb in [0u64, 1, 2, 8] {
+                    let t = Thresholds {
+                        min_free_pct: pct,
+                        min_free_bytes: min_gb * GB,
+                    };
+                    for step in 0..=100u64 {
+                        let u = flint_storage::disk::Usage {
+                            free_bytes: total * step / 100,
+                            total_bytes: total,
+                        };
+                        let evicts = reclaim_action(Some(u), t, false) != ReclaimAction::Idle;
+                        let relieves =
+                            snapshot_relief_below(Some(u), t).is_some_and(|b| u.free_bytes < b);
+                        if evicts {
+                            evict_seen += 1;
+                            assert!(
+                                relieves,
+                                "eviction starts while snapshot relief is idle: \
+                                 total={total_gb}GB free={step}% min_free_pct={pct} \
+                                 min_free_bytes={min_gb}GB — tenant keys would go while \
+                                 dead snapshots hold the disk"
+                            );
+                        } else if relieves {
+                            relief_only += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            evict_seen > 0 && relief_only > 0,
+            "positive control: evict_seen={evict_seen} relief_only={relief_only} — the \
+             sweep must reach eviction, and a band where only snapshots are released"
+        );
+    }
+
+    #[test]
+    fn snapshot_relief_does_nothing_on_a_blind_sample_or_without_a_shed_line() {
+        let t = Thresholds {
+            min_free_pct: 10,
+            min_free_bytes: 0,
+        };
+        assert_eq!(snapshot_relief_below(None, t), None);
+        let off = Thresholds {
+            min_free_pct: 0,
+            min_free_bytes: 0,
+        };
+        let u = flint_storage::disk::Usage {
+            free_bytes: 0,
+            total_bytes: 100 * GB,
+        };
+        assert_eq!(snapshot_relief_below(Some(u), off), None);
+        // The soak's disk: 468 GB at the default 10%, relief below 25% free.
+        let soak = flint_storage::disk::Usage {
+            free_bytes: 46_736_224_256,
+            total_bytes: 467_771_486_208,
+        };
+        assert_eq!(
+            snapshot_relief_below(Some(soak), t),
+            Some(467_771_486_208 / 10 * 250 / 100)
         );
     }
 

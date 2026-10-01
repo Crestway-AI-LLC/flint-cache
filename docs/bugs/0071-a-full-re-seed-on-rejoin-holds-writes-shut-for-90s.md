@@ -603,6 +603,21 @@ longest dial and hold). The three readings are then distinct:
 
 Nothing has been reproduced yet; that needs the same soak again.
 
+**Reproduced 2026-09-30, and it was none of the three.** The BUG-0194 fix soak
+(the same harness, 5 x `i4i.large`, a data plane built from public `4be5b78`)
+failed at its own cycle 9 with the identical panic, and the new verdict named a
+fourth reading: *"since the kill 25713 sent, 0 acked, 0 THROTTLED, 25713 other
+errors (last: ... QUOTA server is low on disk space; writes rejected until space
+is reclaimed ...)"*, with no ack at all in that cycle's run. Both seats had
+logged `disk guard: Ok -> Shed` at 10% free. Snapshot retention kept every
+30-second snapshot for a day, and on a churning pair their hard links pin every
+SST compaction has replaced. That is
+[BUG-0195](0195-snapshot-retention-filled-the-disk-and-every-write-was-refused.md),
+fixed. 9/21 failed at the same cycle with the same panic. Disk filling is a
+function of time at a fixed ingest rate, which is why it lands on the same
+cycle. So 9/21's cycle 9 is very likely the same, but its evidence was not kept,
+and that stays an inference.
+
 ### What the run did settle about the instrument
 
 The Open section above says the collection *"cannot see the cycles that
