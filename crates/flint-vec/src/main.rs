@@ -36,7 +36,7 @@
 
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_vec::{
-    Apply, IndexKind, Metric, Persist, Plan, Store, decode_config, decode_vec_row,
+    Apply, IndexKind, Metric, Persist, Plan, Quant, Store, decode_config, decode_vec_row,
     parse_durable_key,
 };
 use std::collections::HashMap;
@@ -109,7 +109,7 @@ enum Chunk {
 }
 
 /// A decoded config row awaiting install: `(set, dim, metric, index)`.
-type LoadedConfig = (Vec<u8>, usize, Metric, IndexKind);
+type LoadedConfig = (Vec<u8>, usize, Metric, IndexKind, Quant);
 /// A decoded vector row awaiting install: `(set, id, vector, meta, expires_at)`.
 type LoadedVector = (Vec<u8>, Vec<u8>, Vec<f32>, Option<Vec<u8>>, Option<u64>);
 
@@ -531,8 +531,8 @@ fn rebuild_chunk_inner(
         send_cmd(&mut ch, &[b"GET", &keys[i]]).map_err(|e| format!("GET send: {e}"))?;
         match read_reply(&mut ch).map_err(|e| format!("GET read: {e}"))? {
             Value::Bulk(Some(val)) if kind == b'c' => {
-                if let Some((dim, metric, index)) = decode_config(&val) {
-                    configs.push((set, dim, metric, index));
+                if let Some((dim, metric, index, quant)) = decode_config(&val) {
+                    configs.push((set, dim, metric, index, quant));
                 }
                 i += 1;
             }
@@ -579,7 +579,7 @@ fn install(
     vectors: Vec<LoadedVector>,
 ) -> usize {
     let mut st = store.lock().expect("store lock");
-    for (set, dim, metric, index) in configs {
+    for (set, dim, metric, index, quant) in configs {
         st.commit(
             ns,
             Apply::CreateSet {
@@ -587,6 +587,7 @@ fn install(
                 dim,
                 metric,
                 index,
+                quant,
             },
         );
     }

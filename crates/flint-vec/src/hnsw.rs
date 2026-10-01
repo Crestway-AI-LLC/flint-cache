@@ -13,7 +13,7 @@
 //! appears in results, and a cold-start rebuild drops tombstones (only live
 //! vectors are re-inserted from KV), which also compacts churn.
 
-use crate::Metric;
+use crate::{Metric, Quant};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -24,9 +24,74 @@ const EF_CONSTRUCTION: usize = 100;
 /// knob. Higher searches more of the graph: better recall, more work.
 pub const EF_SEARCH_DEFAULT: usize = 64;
 
+/// How a node holds its vector in the graph (ADR-0049 D1).
+enum Code {
+    /// The full float32 vector: today's index, and the re-rank source itself.
+    F32(Vec<f32>),
+    /// Per-vector 8-bit scalar quantization: value `i` is `lo + step * bytes[i]`.
+    /// One byte a dimension instead of four, and no training: the range is the
+    /// vector's own, so an online insert needs nothing learned beforehand.
+    Sq8 { bytes: Vec<u8>, lo: f32, step: f32 },
+}
+
+impl Code {
+    fn encode(quant: Quant, v: Vec<f32>) -> Code {
+        match quant {
+            Quant::None => Code::F32(v),
+            Quant::Sq8 => {
+                let (lo, hi) = v
+                    .iter()
+                    .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &x| {
+                        (l.min(x), h.max(x))
+                    });
+                let step = if hi > lo { (hi - lo) / 255.0 } else { 0.0 };
+                let bytes = v
+                    .iter()
+                    .map(|&x| {
+                        if step > 0.0 {
+                            ((x - lo) / step).round().clamp(0.0, 255.0) as u8
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                Code::Sq8 {
+                    bytes,
+                    lo: if lo.is_finite() { lo } else { 0.0 },
+                    step,
+                }
+            }
+        }
+    }
+
+    /// The vector's values, decoded on the fly: no allocation per distance.
+    fn vals(&self) -> Vals<'_> {
+        match self {
+            Code::F32(v) => Vals::F(v.iter()),
+            Code::Sq8 { bytes, lo, step } => Vals::Q(bytes.iter(), *lo, *step),
+        }
+    }
+}
+
+enum Vals<'a> {
+    F(std::slice::Iter<'a, f32>),
+    Q(std::slice::Iter<'a, u8>, f32, f32),
+}
+
+impl Iterator for Vals<'_> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        match self {
+            Vals::F(i) => i.next().copied(),
+            Vals::Q(i, lo, step) => i.next().map(|&b| *lo + *step * b as f32),
+        }
+    }
+}
+
 struct Node {
     id: Vec<u8>,
-    vec: Vec<f32>,
+    code: Code,
+    /// The ORIGINAL vector's norm, whatever the code: cosine divides by it.
     norm: f32,
     meta: Option<Vec<u8>>,
     deleted: bool,
@@ -36,7 +101,13 @@ struct Node {
 
 pub struct Hnsw {
     metric: Metric,
+    quant: Quant,
     nodes: Vec<Node>,
+    /// The full vectors when the graph holds codes, indexed like `nodes`: the
+    /// re-rank reads them, and `get` returns them so VEC.GET stays lossless.
+    /// Empty for `Quant::None`, whose codes ARE the full vectors. ADR-0049 step
+    /// 1 keeps these in RAM; step 2 moves them to a local file.
+    full: Vec<Vec<f32>>,
     id_to_idx: HashMap<Vec<u8>, u32>,
     entry: Option<u32>,
     max_level: usize,
@@ -87,6 +158,31 @@ fn dist(metric: Metric, a: &[f32], an: f32, b: &[f32], bn: f32) -> f32 {
     }
 }
 
+/// [`dist`] over decoded values, for when either side is a code. The all-float
+/// case keeps [`dist`] itself, so an unquantized set pays nothing for this.
+fn dist_vals(metric: Metric, a: Vals<'_>, an: f32, b: Vals<'_>, bn: f32) -> f32 {
+    match metric {
+        Metric::L2 => a.zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
+        Metric::Ip => -a.zip(b).map(|(x, y)| x * y).sum::<f32>(),
+        Metric::Cosine => {
+            let den = an * bn;
+            if den == 0.0 {
+                1.0
+            } else {
+                1.0 - a.zip(b).map(|(x, y)| x * y).sum::<f32>() / den
+            }
+        }
+    }
+}
+
+/// Distance between a code and a full vector, SMALLER nearer.
+fn dist_code(metric: Metric, c: &Code, cn: f32, q: &[f32], qn: f32) -> f32 {
+    match c {
+        Code::F32(v) => dist(metric, v, cn, q, qn),
+        Code::Sq8 { .. } => dist_vals(metric, c.vals(), cn, Vals::F(q.iter()), qn),
+    }
+}
+
 /// Convert an internal distance back to flat's score (HIGHER is nearer), so a
 /// mixed fleet of flat and HNSW sets answers `VEC.SEARCH` identically.
 fn dist_to_score(metric: Metric, d: f32) -> f32 {
@@ -98,10 +194,12 @@ fn dist_to_score(metric: Metric, d: f32) -> f32 {
 }
 
 impl Hnsw {
-    pub fn new(metric: Metric) -> Self {
+    pub fn new(metric: Metric, quant: Quant) -> Self {
         Hnsw {
             metric,
+            quant,
             nodes: Vec::new(),
+            full: Vec::new(),
             id_to_idx: HashMap::new(),
             entry: None,
             max_level: 0,
@@ -114,6 +212,9 @@ impl Hnsw {
     pub fn len(&self) -> usize {
         self.live
     }
+    pub fn quant(&self) -> Quant {
+        self.quant
+    }
     pub fn contains(&self, id: &[u8]) -> bool {
         self.id_to_idx
             .get(id)
@@ -125,7 +226,16 @@ impl Hnsw {
         if n.deleted {
             return None;
         }
-        Some((&n.vec, n.meta.as_deref()))
+        Some((self.full_vec(i), n.meta.as_deref()))
+    }
+
+    /// The full-precision vector for node `i`: its code when unquantized, the
+    /// side store otherwise.
+    fn full_vec(&self, i: u32) -> &[f32] {
+        match &self.nodes[i as usize].code {
+            Code::F32(v) => v,
+            Code::Sq8 { .. } => &self.full[i as usize],
+        }
     }
 
     fn next_f64(&mut self) -> f64 {
@@ -143,11 +253,20 @@ impl Hnsw {
 
     fn dnn(&self, a: u32, b: u32) -> f32 {
         let (na, nb) = (&self.nodes[a as usize], &self.nodes[b as usize]);
-        dist(self.metric, &na.vec, na.norm, &nb.vec, nb.norm)
+        match (&na.code, &nb.code) {
+            (Code::F32(x), Code::F32(y)) => dist(self.metric, x, na.norm, y, nb.norm),
+            _ => dist_vals(
+                self.metric,
+                na.code.vals(),
+                na.norm,
+                nb.code.vals(),
+                nb.norm,
+            ),
+        }
     }
     fn dnq(&self, a: u32, q: &[f32], qn: f32) -> f32 {
         let na = &self.nodes[a as usize];
-        dist(self.metric, &na.vec, na.norm, q, qn)
+        dist_code(self.metric, &na.code, na.norm, q, qn)
     }
 
     /// Insert (or upsert) a vector. An upsert tombstones the old node and adds a
@@ -164,9 +283,13 @@ impl Hnsw {
         let idx = self.nodes.len() as u32;
         let level = self.gen_level();
         let q = vec.clone();
+        if self.quant != Quant::None {
+            // Indexed like `nodes`: pushed in the same order, never removed.
+            self.full.push(vec.clone());
+        }
         self.nodes.push(Node {
             id: id.clone(),
-            vec,
+            code: Code::encode(self.quant, vec),
             norm,
             meta,
             deleted: false,
@@ -343,7 +466,13 @@ impl Hnsw {
 
     /// k-NN query: greedy descent to layer 0, then a beam search with `ef`, then
     /// the `k` nearest as `(id, score)` with score in flat's convention.
-    pub fn knn(&self, q: &[f32], k: usize, ef: usize) -> Vec<(Vec<u8>, f32)> {
+    ///
+    /// When the graph holds codes (ADR-0049), the beam ranks by code distance,
+    /// so its best `rerank` (at least `k`) are re-scored against the full
+    /// vectors and only then cut to `k`. That is what lets an aggressive code
+    /// keep recall: the code only has to get the right answers into the top
+    /// `rerank`, not into the right order.
+    pub fn knn(&self, q: &[f32], k: usize, ef: usize, rerank: usize) -> Vec<(Vec<u8>, f32)> {
         if k == 0 {
             return Vec::new();
         }
@@ -354,8 +483,21 @@ impl Hnsw {
         for lc in (1..=self.max_level).rev() {
             ep = self.greedy(q, qn, ep, lc);
         }
-        let mut w = self.search_layer(q, qn, &[ep], ef.max(k), 0);
+        let depth = if self.quant == Quant::None {
+            k
+        } else {
+            rerank.max(k)
+        };
+        let mut w = self.search_layer(q, qn, &[ep], ef.max(depth), 0);
         w.sort();
+        w.truncate(depth);
+        if self.quant != Quant::None {
+            for di in &mut w {
+                let n = &self.nodes[di.idx as usize];
+                di.dist = dist(self.metric, self.full_vec(di.idx), n.norm, q, qn);
+            }
+            w.sort();
+        }
         w.truncate(k);
         w.into_iter()
             .map(|di| {
@@ -397,7 +539,7 @@ mod tests {
             Metric::Ip => 0xF00D3,
         };
         let mut rng = Rng(seed);
-        let mut h = Hnsw::new(metric);
+        let mut h = Hnsw::new(metric, Quant::None);
         let mut data: Vec<Vec<f32>> = Vec::new();
         for i in 0..n {
             let v = rng.vec(dim);
@@ -420,7 +562,7 @@ mod tests {
                 .iter()
                 .map(|(_, i)| format!("{i}").into_bytes())
                 .collect();
-            for (id, _) in h.knn(&q, k, ef) {
+            for (id, _) in h.knn(&q, k, ef, k) {
                 if truth.contains(&id) {
                     hit += 1;
                 }
@@ -447,16 +589,102 @@ mod tests {
         assert!(r >= 0.80, "ip recall {r} < 0.80");
     }
 
+    /// Clustered data, the way real embeddings sit (the bench's lesson: uniform
+    /// random data is the ANN worst case and says little about either index).
+    fn clustered(rng: &mut Rng, n: usize, dim: usize, centroids: usize) -> Vec<Vec<f32>> {
+        let cs: Vec<Vec<f32>> = (0..centroids).map(|_| rng.vec(dim)).collect();
+        (0..n)
+            .map(|i| {
+                let c = &cs[i % centroids];
+                c.iter().map(|x| x + 0.1 * rng.f32()).collect()
+            })
+            .collect()
+    }
+
+    fn recall_on(metric: Metric, quant: Quant, rerank: usize) -> f64 {
+        let (n, dim, k, ef) = (2000usize, 32usize, 10usize, 64usize);
+        let mut rng = Rng(0xADC0_0049);
+        let data = clustered(&mut rng, n, dim, 40);
+        let mut h = Hnsw::new(metric, quant);
+        for (i, v) in data.iter().enumerate() {
+            h.set(format!("{i}").into_bytes(), v.clone(), None);
+        }
+        let (mut hit, mut tot) = (0usize, 0usize);
+        for qi in 0..100 {
+            let q: Vec<f32> = data[(qi * 29) % n]
+                .iter()
+                .map(|x| x + 0.05 * rng.f32())
+                .collect();
+            let qn = l2norm(&q);
+            let mut bf: Vec<(f32, usize)> = data
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (dist(metric, &q, qn, v, l2norm(v)), i))
+                .collect();
+            bf.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: HashSet<Vec<u8>> = bf[..k]
+                .iter()
+                .map(|(_, i)| format!("{i}").into_bytes())
+                .collect();
+            hit += h
+                .knn(&q, k, ef, rerank)
+                .iter()
+                .filter(|(id, _)| truth.contains(id))
+                .count();
+            tot += k;
+        }
+        hit as f64 / tot as f64
+    }
+
+    /// ADR-0049: 8-bit codes plus a re-rank keep recall where the full-vector
+    /// graph has it, on every metric, against the same brute-force oracle.
+    #[test]
+    fn sq8_with_rerank_keeps_the_full_vector_recall() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Ip] {
+            let full = recall_on(metric, Quant::None, 10);
+            let sq8 = recall_on(metric, Quant::Sq8, 40);
+            assert!(
+                sq8 >= full - 0.02,
+                "{metric:?}: sq8+rerank recall {sq8} fell more than 0.02 below full {full}"
+            );
+            assert!(sq8 >= 0.85, "{metric:?}: sq8+rerank recall {sq8} < 0.85");
+        }
+    }
+
+    /// The codes are lossy; VEC.GET is not. A quantized set returns the vector
+    /// exactly as stored, and a search scores against the full vector too.
+    #[test]
+    fn a_quantized_set_returns_and_scores_the_exact_vector() {
+        let mut h = Hnsw::new(Metric::L2, Quant::Sq8);
+        let v = vec![0.123_456_7, -9.876_543, 3.25, 1e-7];
+        h.set(b"a".to_vec(), v.clone(), Some(b"m".to_vec()));
+        h.set(b"b".to_vec(), vec![100.0, 100.0, 100.0, 100.0], None);
+        let (got, meta) = h.get(b"a").expect("present");
+        assert_eq!(got, v.as_slice(), "lossless, bit for bit");
+        assert_eq!(meta, Some(&b"m"[..]));
+        let top = h.knn(&v, 1, 16, 4);
+        assert_eq!(top[0].0, b"a".to_vec());
+        assert_eq!(
+            top[0].1, 0.0,
+            "re-ranked on the full vector: exact match scores 0"
+        );
+        // An upsert keeps `full` aligned with the nodes it belongs to.
+        let w = vec![5.0, 5.0, 5.0, 5.5];
+        h.set(b"a".to_vec(), w.clone(), None);
+        assert_eq!(h.get(b"a").map(|(x, _)| x.to_vec()), Some(w));
+        assert_eq!(h.get(b"b").map(|(x, _)| x.to_vec()), Some(vec![100.0; 4]));
+    }
+
     #[test]
     fn upsert_and_delete_are_reflected() {
-        let mut h = Hnsw::new(Metric::L2);
+        let mut h = Hnsw::new(Metric::L2, Quant::None);
         h.set(b"a".to_vec(), vec![0.0, 0.0], None);
         h.set(b"b".to_vec(), vec![1.0, 0.0], None);
         assert_eq!(h.len(), 2);
         // upsert a moves it far away
         h.set(b"a".to_vec(), vec![9.0, 9.0], None);
         assert_eq!(h.len(), 2, "upsert is not a new live node");
-        let near_origin = h.knn(&[0.0, 0.0], 1, 32);
+        let near_origin = h.knn(&[0.0, 0.0], 1, 32, 1);
         assert_eq!(
             near_origin[0].0,
             b"b".to_vec(),
@@ -466,7 +694,7 @@ mod tests {
         assert!(h.del(b"b"));
         assert!(!h.contains(b"b"));
         assert_eq!(h.len(), 1);
-        let all = h.knn(&[0.0, 0.0], 5, 32);
+        let all = h.knn(&[0.0, 0.0], 5, 32, 5);
         assert!(
             all.iter().all(|(id, _)| id != b"b"),
             "deleted 'b' never in results"

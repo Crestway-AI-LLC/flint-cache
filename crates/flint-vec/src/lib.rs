@@ -15,8 +15,10 @@
 //! storage cap), and a search must never return a vector that isn't durable.
 //!
 //! v0.1 is flat/exact — the recall oracle. v0.2 replaces [`VectorSet`]'s search
-//! with an HNSW graph behind the SAME plan; v1 makes it disk-resident
-//! (DiskANN). None of those changes the `VEC.*` surface or the durable format.
+//! with an HNSW graph behind the SAME plan. ADR-0049 adds compressed codes in
+//! that graph (`QUANT sq8`) with the best `RERANK` re-scored on full vectors;
+//! it adds options to the `VEC.*` surface and a fourth config field that the
+//! binary before it reads past, so the vector rows themselves are unchanged.
 
 mod hnsw;
 
@@ -93,6 +95,38 @@ impl IndexKind {
     }
 }
 
+/// How an HNSW set holds its vectors in the graph (ADR-0049). Chosen at
+/// VEC.CREATE and recorded as the config's FOURTH field, which a binary older
+/// than this reads past: it loads the set as plain HNSW from the same full
+/// durable rows, costing RAM and nothing else, so a rollback stays safe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quant {
+    /// Full float32 vectors in the graph: today's HNSW. Default.
+    None,
+    /// Per-vector 8-bit codes in the graph; the top candidates are re-ranked
+    /// against the full vectors.
+    Sq8,
+}
+impl Quant {
+    pub fn parse(s: &[u8]) -> Option<Quant> {
+        match s.to_ascii_lowercase().as_slice() {
+            b"none" => Some(Quant::None),
+            b"sq8" => Some(Quant::Sq8),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Quant::None => "none",
+            Quant::Sq8 => "sq8",
+        }
+    }
+}
+
+/// How many candidates a quantized search re-ranks when `VEC.SEARCH` names no
+/// `RERANK`: this many times `k`.
+pub const RERANK_DEFAULT_MULTIPLE: usize = 4;
+
 /// The engine behind a set. Both hold the vectors (a rebuild restores either);
 /// flat scans them exactly, HNSW keeps a navigable graph over them.
 enum Index {
@@ -116,10 +150,12 @@ pub struct VectorSet {
 }
 
 impl VectorSet {
-    pub fn new(dim: usize, metric: Metric, kind: IndexKind) -> Self {
+    /// `quant` applies to HNSW only; a flat set always holds full vectors (it
+    /// is the exact oracle), and VEC.CREATE refuses QUANT with INDEX flat.
+    pub fn new(dim: usize, metric: Metric, kind: IndexKind, quant: Quant) -> Self {
         let index = match kind {
             IndexKind::Flat => Index::Flat(HashMap::new()),
-            IndexKind::Hnsw => Index::Hnsw(Hnsw::new(metric)),
+            IndexKind::Hnsw => Index::Hnsw(Hnsw::new(metric, quant)),
         };
         VectorSet {
             dim,
@@ -145,6 +181,12 @@ impl VectorSet {
         match &self.index {
             Index::Flat(_) => IndexKind::Flat,
             Index::Hnsw(_) => IndexKind::Hnsw,
+        }
+    }
+    pub fn quant(&self) -> Quant {
+        match &self.index {
+            Index::Flat(_) => Quant::None,
+            Index::Hnsw(h) => h.quant(),
         }
     }
     pub fn len(&self) -> usize {
@@ -228,12 +270,13 @@ impl VectorSet {
         }
     }
 
-    /// Top-k nearest, nearest first. `ef` is HNSW's recall/latency knob; flat
-    /// ignores it (it is always exact).
-    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(Vec<u8>, f32)> {
+    /// Top-k nearest, nearest first. `ef` is HNSW's recall/latency knob and
+    /// `rerank` how many a quantized set re-scores (ADR-0049); flat ignores
+    /// both (it is always exact).
+    fn search(&self, query: &[f32], k: usize, ef: usize, rerank: usize) -> Vec<(Vec<u8>, f32)> {
         match &self.index {
             Index::Flat(m) => flat_search(m, self.metric, query, k),
-            Index::Hnsw(h) => h.knn(query, k, ef),
+            Index::Hnsw(h) => h.knn(query, k, ef, rerank),
         }
     }
 }
@@ -352,6 +395,7 @@ pub enum Apply {
         dim: usize,
         metric: Metric,
         index: IndexKind,
+        quant: Quant,
     },
     Insert {
         set: Vec<u8>,
@@ -495,7 +539,7 @@ fn floats_to_ascii(vec: &[f32]) -> String {
 /// slight OVER-estimate (the guard should trip before a real OOM, not after):
 /// the vector (dim×4) + id + meta + a fixed per-engine structural cost, where
 /// HNSW's neighbour lists dwarf flat's hashmap slot.
-fn entry_bytes(dim: usize, id_len: usize, meta_len: usize, kind: IndexKind) -> usize {
+fn entry_bytes(dim: usize, id_len: usize, meta_len: usize, kind: IndexKind, quant: Quant) -> usize {
     let structural = match kind {
         // Entry { vec, norm, meta } + a HashMap bucket.
         IndexKind::Flat => 64,
@@ -503,7 +547,15 @@ fn entry_bytes(dim: usize, id_len: usize, meta_len: usize, kind: IndexKind) -> u
         // (M0 at layer 0 plus a few at upper layers).
         IndexKind::Hnsw => 256,
     };
-    dim * 4 + id_len + meta_len + structural
+    let vector = match quant {
+        Quant::None => dim * 4,
+        // The 8-bit code and its (lo, step), PLUS the full vector, which ADR-0049
+        // step 1 still holds in RAM for the re-rank. Step 2 moves that to a
+        // local file and drops the `dim * 4` here; until then a quantized set
+        // costs MORE than a plain one, and this says so.
+        Quant::Sq8 => dim + 8 + dim * 4,
+    };
+    vector + id_len + meta_len + structural
 }
 
 /// Parse a query/stored vector from one bulk argument: comma-separated floats,
@@ -576,9 +628,13 @@ pub fn decode_vec_row(val: &[u8]) -> Result<DecodedVecRow, String> {
     Ok((parse_vector(floats)?, meta, expires_at))
 }
 
-/// Inverse of a config row: `<dim>|<metric>[|<index>]`. A 2-field config
-/// (written before v0.2 added the index kind) is flat.
-pub fn decode_config(val: &[u8]) -> Option<(usize, Metric, IndexKind)> {
+/// A decoded config row: `(dim, metric, index kind, quantization)`.
+pub type SetConfig = (usize, Metric, IndexKind, Quant);
+
+/// Inverse of a config row: `<dim>|<metric>[|<index>[|<quant>]]`. A 2-field
+/// config (written before v0.2 added the index kind) is flat, and a 3-field one
+/// (before ADR-0049) is unquantized.
+pub fn decode_config(val: &[u8]) -> Option<SetConfig> {
     let s = std::str::from_utf8(val).ok()?;
     let mut it = s.split('|');
     let dim = it.next()?.parse().ok()?;
@@ -587,7 +643,26 @@ pub fn decode_config(val: &[u8]) -> Option<(usize, Metric, IndexKind)> {
         Some(k) => IndexKind::parse(k.as_bytes())?,
         None => IndexKind::Flat,
     };
-    Some((dim, metric, index))
+    let quant = match it.next() {
+        Some(q) => Quant::parse(q.as_bytes())?,
+        None => Quant::None,
+    };
+    Some((dim, metric, index, quant))
+}
+
+/// The config row for a set. A plain set keeps the 3-field form, byte for byte
+/// what every earlier binary wrote; only a quantized set adds the fourth.
+fn encode_config(dim: usize, metric: Metric, index: IndexKind, quant: Quant) -> Vec<u8> {
+    match quant {
+        Quant::None => format!("{dim}|{}|{}", metric.as_str(), index.as_str()),
+        q => format!(
+            "{dim}|{}|{}|{}",
+            metric.as_str(),
+            index.as_str(),
+            q.as_str()
+        ),
+    }
+    .into_bytes()
 }
 
 fn valid_name(b: &[u8]) -> bool {
@@ -670,10 +745,11 @@ impl Store {
                 dim,
                 metric,
                 index,
+                quant,
             } => {
                 self.sets
                     .entry((ns.to_vec(), set))
-                    .or_insert_with(|| VectorSet::new(dim, metric, index));
+                    .or_insert_with(|| VectorSet::new(dim, metric, index, quant));
             }
             Apply::Insert {
                 set,
@@ -686,12 +762,17 @@ impl Store {
                 // change on an upsert), computed BEFORE the set replaces it.
                 let mut charge: Option<(usize, usize)> = None;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
-                    let (dim, kind) = (vs.dim(), vs.kind());
+                    let (dim, kind, quant) = (vs.dim(), vs.kind(), vs.quant());
                     let old = vs.get(&id).map_or(0, |(_, m)| {
-                        entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind)
+                        entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind, quant)
                     });
-                    let new =
-                        entry_bytes(dim, id.len(), meta.as_ref().map_or(0, |m| m.len()), kind);
+                    let new = entry_bytes(
+                        dim,
+                        id.len(),
+                        meta.as_ref().map_or(0, |m| m.len()),
+                        kind,
+                        quant,
+                    );
                     vs.set(id, vec, meta, expires_at);
                     charge = Some((new, old));
                 }
@@ -703,9 +784,9 @@ impl Store {
             Apply::Remove { set, id } => {
                 let mut freed = 0usize;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
-                    let (dim, kind) = (vs.dim(), vs.kind());
+                    let (dim, kind, quant) = (vs.dim(), vs.kind(), vs.quant());
                     if let Some((_, m)) = vs.get(&id) {
-                        freed = entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind);
+                        freed = entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind, quant);
                     }
                     vs.del(&id);
                 }
@@ -732,11 +813,11 @@ impl Store {
             if ids.is_empty() {
                 continue;
             }
-            let (dim, kind) = (vs.dim(), vs.kind());
+            let (dim, kind, quant) = (vs.dim(), vs.kind(), vs.quant());
             let mut freed = 0usize;
             for id in &ids {
                 if let Some((_, m)) = vs.get(id) {
-                    freed += entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind);
+                    freed += entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind, quant);
                 }
                 vs.del(id);
             }
@@ -772,15 +853,34 @@ impl Store {
         let Some(metric) = Metric::parse(&args[5]) else {
             return Plan::Reply(err("ERR METRIC must be one of cosine, l2, ip"));
         };
-        // Optional trailing `INDEX flat|hnsw`; default flat (exact, the oracle).
-        let index = if args.len() >= 8 && args[6].eq_ignore_ascii_case(b"INDEX") {
-            match IndexKind::parse(&args[7]) {
-                Some(k) => k,
-                None => return Plan::Reply(err("ERR INDEX must be flat or hnsw")),
+        // Optional trailing `INDEX flat|hnsw` (default flat, exact, the oracle)
+        // and `QUANT none|sq8` (ADR-0049; HNSW only), in either order.
+        let mut index = IndexKind::Flat;
+        let mut quant = Quant::None;
+        let mut i = 6;
+        while i < args.len() {
+            let Some(val) = args.get(i + 1) else {
+                return Plan::Reply(err("ERR VEC.CREATE option needs a value"));
+            };
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"INDEX" => match IndexKind::parse(val) {
+                    Some(k) => index = k,
+                    None => return Plan::Reply(err("ERR INDEX must be flat or hnsw")),
+                },
+                b"QUANT" => match Quant::parse(val) {
+                    Some(q) => quant = q,
+                    None => return Plan::Reply(err("ERR QUANT must be none or sq8")),
+                },
+                _ => {
+                    return Plan::Reply(err("ERR unknown VEC.CREATE option (want INDEX or QUANT)"));
+                }
             }
-        } else {
-            IndexKind::Flat
-        };
+            i += 2;
+        }
+        if quant != Quant::None && index != IndexKind::Hnsw {
+            // Flat is the exact recall oracle; a quantized flat would be neither.
+            return Plan::Reply(err("ERR QUANT needs INDEX hnsw"));
+        }
         if self.sets.contains_key(&(ns.to_vec(), set.to_vec())) {
             return Plan::Reply(err("ERR set already exists"));
         }
@@ -794,7 +894,7 @@ impl Store {
                 },
                 Persist::Put {
                     key: durable_key(b'c', set, b""),
-                    val: format!("{dim}|{}|{}", metric.as_str(), index.as_str()).into_bytes(),
+                    val: encode_config(dim, metric, index, quant),
                     // A set's config row never expires; TTL is per-vector.
                     ttl_ms: None,
                 },
@@ -804,6 +904,7 @@ impl Store {
                 dim,
                 metric,
                 index,
+                quant,
             },
             ok: Value::Simple("OK".into()),
         }
@@ -883,11 +984,11 @@ impl Store {
         // never an evict-and-desync. An UPSERT of an existing id only costs its
         // meta delta, so it is charged that, not a whole new entry.
         if self.index_cap > 0 {
-            let kind = vs.kind();
+            let (kind, quant) = (vs.kind(), vs.quant());
             let meta_len = meta.as_ref().map_or(0, |m| m.len());
-            let new = entry_bytes(vs.dim(), id.len(), meta_len, kind);
+            let new = entry_bytes(vs.dim(), id.len(), meta_len, kind, quant);
             let old = vs.get(id).map_or(0, |(_, m)| {
-                entry_bytes(vs.dim(), id.len(), m.map_or(0, |x| x.len()), kind)
+                entry_bytes(vs.dim(), id.len(), m.map_or(0, |x| x.len()), kind, quant)
             });
             let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
             if used.saturating_add(new).saturating_sub(old) > self.index_cap {
@@ -982,10 +1083,10 @@ impl Store {
         }
     }
 
-    /// VEC.SEARCH <set> <query> <k> [EF <n>]
+    /// VEC.SEARCH <set> <query> <k> [EF <n>] [RERANK <n>]
     fn search(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Value {
         if args.len() < 4 {
-            return err("ERR VEC.SEARCH <set> <query> <k> [EF <n>]");
+            return err("ERR VEC.SEARCH <set> <query> <k> [EF <n>] [RERANK <n>]");
         }
         let Some(vs) = self.sets.get(&(ns.to_vec(), args[1].to_vec())) else {
             return err("ERR no such set");
@@ -1008,22 +1109,30 @@ impl Store {
             Some(k) => k,
             None => return err("ERR k must be a non-negative integer"),
         };
-        // Optional `EF <n>`: HNSW's recall/latency knob. Flat ignores it.
-        let ef = if args.len() >= 6 && args[4].eq_ignore_ascii_case(b"EF") {
-            std::str::from_utf8(&args[5])
-                .ok()
+        // Optional `EF <n>` (HNSW's recall/latency knob) and `RERANK <n>` (how
+        // many candidates a quantized set re-scores, ADR-0049), in either order.
+        // Flat ignores both. Anything else is passed over, as before.
+        let opt = |name: &[u8]| -> Option<usize> {
+            args[4..]
+                .windows(2)
+                .find(|w| w[0].eq_ignore_ascii_case(name))
+                .and_then(|w| std::str::from_utf8(&w[1]).ok())
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(hnsw::EF_SEARCH_DEFAULT)
-        } else {
-            hnsw::EF_SEARCH_DEFAULT
         };
+        let ef = opt(b"EF").unwrap_or(hnsw::EF_SEARCH_DEFAULT);
+        let rerank = opt(b"RERANK").unwrap_or(k.saturating_mul(RERANK_DEFAULT_MULTIPLE));
         // Expired-but-unswept ids still sit in the index and can outrank live
         // ones, so over-fetch by the expired count and drop them post-hoc: with
         // at most `expired` stale hits, k+expired candidates always yield k live
         // ones. Engine-agnostic — no flat/HNSW code knows about TTL.
         let expired = vs.expired_count(now);
         let rows: Vec<Value> = vs
-            .search(&query, k.saturating_add(expired), ef)
+            .search(
+                &query,
+                k.saturating_add(expired),
+                ef,
+                rerank.saturating_add(expired),
+            )
             .into_iter()
             .filter(|(id, _)| !vs.is_expired(id, now))
             .take(k)
@@ -1065,6 +1174,9 @@ impl Store {
             Value::Integer(self.ns_mem_bytes(ns) as i64),
             bulk("ns_mem_cap"),
             Value::Integer(self.index_cap as i64),
+            // Last, so every earlier field keeps its position (ADR-0049).
+            bulk("quant"),
+            bulk(vs.quant().as_str()),
         ]))
     }
 
@@ -1207,6 +1319,128 @@ mod tests {
     /// (durable rows, error shapes) and do not care about the clock.
     fn plan0(st: &Store, ns: &[u8], args: &[Vec<u8>]) -> Plan {
         st.plan(ns, args, 0)
+    }
+
+    /// ADR-0049 at the command surface: QUANT is HNSW-only, rides the config's
+    /// fourth field, reads back, shows last in INFO, and a quantized set
+    /// answers SEARCH (with RERANK in either order beside EF) like a plain one.
+    #[test]
+    fn a_quantized_set_round_trips_through_the_commands() {
+        let mut st = Store::new();
+        let ns = b"nsQ";
+        assert_eq!(
+            run(
+                &mut st,
+                ns,
+                &cmd(&[
+                    "VEC.CREATE",
+                    "f",
+                    "DIM",
+                    "2",
+                    "METRIC",
+                    "l2",
+                    "QUANT",
+                    "sq8"
+                ])
+            ),
+            Value::Error("ERR QUANT needs INDEX hnsw".into()),
+            "a quantized flat would be neither exact nor the oracle"
+        );
+        let create = cmd(&[
+            "VEC.CREATE",
+            "q",
+            "DIM",
+            "2",
+            "METRIC",
+            "l2",
+            "QUANT",
+            "sq8",
+            "INDEX",
+            "hnsw",
+        ]);
+        match plan0(&st, ns, &create) {
+            Plan::Write { persist, .. } => {
+                let Some(Persist::Put { val, .. }) = persist.into_iter().nth(1) else {
+                    panic!("the config row is CREATE's second step")
+                };
+                assert_eq!(val, b"2|l2|hnsw|sq8".to_vec());
+                assert_eq!(
+                    decode_config(&val),
+                    Some((2, Metric::L2, IndexKind::Hnsw, Quant::Sq8))
+                );
+            }
+            _ => panic!("create should plan a write"),
+        }
+        assert_eq!(run(&mut st, ns, &create), Value::Simple("OK".into()));
+        for (id, x) in [("a", "0,0"), ("b", "5,5"), ("c", "9,9")] {
+            assert_eq!(
+                run(&mut st, ns, &cmd(&["VEC.SET", "q", id, x])),
+                Value::Simple("OK".into())
+            );
+        }
+        for opts in [
+            vec!["RERANK", "3", "EF", "16"],
+            vec!["EF", "16", "RERANK", "3"],
+            vec![],
+        ] {
+            let mut c = vec!["VEC.SEARCH", "q", "1,1", "1"];
+            c.extend(opts.iter());
+            let Value::Array(Some(rows)) = run(&mut st, ns, &cmd(&c)) else {
+                panic!("search reply")
+            };
+            assert_eq!(
+                rows,
+                vec![Value::Array(Some(vec![
+                    Value::Bulk(Some(v("a"))),
+                    Value::Double(-2.0),
+                ]))],
+                "nearest is a at -||(1,1)||^2, scored on the full vector (opts {opts:?})"
+            );
+        }
+        let Value::Array(Some(info)) = run(&mut st, ns, &cmd(&["VEC.INFO", "q"])) else {
+            panic!("info reply")
+        };
+        assert_eq!(info[info.len() - 2], Value::Bulk(Some(v("quant"))));
+        assert_eq!(info[info.len() - 1], Value::Bulk(Some(v("sq8"))));
+        assert_eq!(
+            info[10],
+            Value::Bulk(Some(v("ns_mem_bytes"))),
+            "earlier fields keep their places"
+        );
+    }
+
+    /// Rollback: a plain set's config is byte-identical to what every earlier
+    /// binary wrote, and a quantized set's fourth field is one an earlier binary
+    /// reads straight past. The decoder below is the pre-ADR-0049 one, verbatim.
+    #[test]
+    fn a_quantized_config_is_readable_by_the_binary_before_it() {
+        fn decode_before_adr_0049(val: &[u8]) -> Option<(usize, Metric, IndexKind)> {
+            let s = std::str::from_utf8(val).ok()?;
+            let mut it = s.split('|');
+            let dim = it.next()?.parse().ok()?;
+            let metric = Metric::parse(it.next()?.as_bytes())?;
+            let index = match it.next() {
+                Some(k) => IndexKind::parse(k.as_bytes())?,
+                None => IndexKind::Flat,
+            };
+            Some((dim, metric, index))
+        }
+        assert_eq!(
+            encode_config(8, Metric::Cosine, IndexKind::Hnsw, Quant::None),
+            b"8|cosine|hnsw".to_vec(),
+            "a plain set writes exactly what it always did"
+        );
+        let quantized = encode_config(8, Metric::Cosine, IndexKind::Hnsw, Quant::Sq8);
+        assert_eq!(
+            decode_before_adr_0049(&quantized),
+            Some((8, Metric::Cosine, IndexKind::Hnsw)),
+            "an older binary loads a quantized set as plain HNSW"
+        );
+        assert_eq!(
+            decode_config(b"8|cosine|hnsw"),
+            Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None))
+        );
+        assert_eq!(decode_config(b"8|cosine|hnsw|bogus"), None);
     }
 
     #[test]
@@ -1589,7 +1823,7 @@ mod tests {
                 assert_eq!(ttl_ms, None, "a set's config row never expires");
                 assert_eq!(
                     decode_config(&val),
-                    Some((4, Metric::Cosine, IndexKind::Flat))
+                    Some((4, Metric::Cosine, IndexKind::Flat, Quant::None))
                 );
             }
             _ => panic!("create should plan a config Put"),
@@ -1929,6 +2163,7 @@ mod tests {
                 dim: 2,
                 metric: Metric::L2,
                 index: IndexKind::Flat,
+                quant: Quant::None,
             },
         );
         let row = encode_vec_row(&[9.0, 9.0], None, Some(500));

@@ -11,6 +11,7 @@
 //!
 //! Usage: bench [--sizes 1000,10000,100000] [--dim 128] [--queries 200]
 //!              [--k 10] [--ef 64] [--metric cosine|l2|ip]
+//!              [--quant sq8 [--rerank R]]   (ADR-0049: adds a quantized HNSW arm)
 //! Not wired into any gate — it allocates a corpus and takes seconds; run it by
 //! hand when the index engine or its parameters change.
 
@@ -125,11 +126,14 @@ fn stats(mut xs: Vec<u128>) -> (u128, u128, u128) {
 }
 
 /// Build a set of `kind` (flat|hnsw) holding `vecs`, timed. Returns build ms.
+/// `quant` adds `QUANT <q>` (ADR-0049; hnsw only).
+#[allow(clippy::too_many_arguments)]
 fn build(
     st: &mut Store,
     ns: &[u8],
     set: &str,
     kind: &str,
+    quant: Option<&str>,
     dim: usize,
     metric: &str,
     vecs: &[String],
@@ -145,6 +149,10 @@ fn build(
     if kind == "hnsw" {
         create.push(b("INDEX"));
         create.push(b("hnsw"));
+    }
+    if let Some(q) = quant {
+        create.push(b("QUANT"));
+        create.push(b(q));
     }
     let t0 = Instant::now();
     exec(st, ns, &create);
@@ -163,6 +171,7 @@ fn search_all(
     queries: &[String],
     k: usize,
     ef: usize,
+    rerank: usize,
 ) -> (Vec<Vec<Vec<u8>>>, Vec<u128>) {
     let (mut all_ids, mut lat) = (
         Vec::with_capacity(queries.len()),
@@ -170,9 +179,19 @@ fn search_all(
     );
     let ef_s = ef.to_string();
     let k_s = k.to_string();
+    let rr_s = rerank.to_string();
     for q in queries {
         // Pre-build the arg vector so only plan() (parse + search) is timed.
-        let args = [b("VEC.SEARCH"), b(set), b(q), b(&k_s), b("EF"), b(&ef_s)];
+        let args = [
+            b("VEC.SEARCH"),
+            b(set),
+            b(q),
+            b(&k_s),
+            b("EF"),
+            b(&ef_s),
+            b("RERANK"),
+            b(&rr_s),
+        ];
         let t0 = Instant::now();
         let reply = st.plan(ns, &args, 0);
         lat.push(t0.elapsed().as_micros());
@@ -216,6 +235,10 @@ fn main() {
     let spread: f32 = arg(&a, "--spread")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.10);
+    let quant: Option<String> = arg(&a, "--quant");
+    let rerank: usize = arg(&a, "--rerank")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4 * k);
     let data = if clusters == 0 {
         "uniform-random (ANN worst case)".to_string()
     } else {
@@ -245,11 +268,11 @@ fn main() {
         let vecs = corpus(&mut rng, n, dim, &centroids, spread);
         let queries_s = corpus(&mut rng, queries, dim, &centroids, spread);
 
-        let flat_ms = build(&mut st, &ns, "f", "flat", dim, &metric, &vecs);
-        let hnsw_ms = build(&mut st, &ns, "h", "hnsw", dim, &metric, &vecs);
+        let flat_ms = build(&mut st, &ns, "f", "flat", None, dim, &metric, &vecs);
+        let hnsw_ms = build(&mut st, &ns, "h", "hnsw", None, dim, &metric, &vecs);
 
-        let (oracle, flat_lat) = search_all(&st, &ns, "f", &queries_s, k, ef);
-        let (approx, hnsw_lat) = search_all(&st, &ns, "h", &queries_s, k, ef);
+        let (oracle, flat_lat) = search_all(&st, &ns, "f", &queries_s, k, ef, k);
+        let (approx, hnsw_lat) = search_all(&st, &ns, "h", &queries_s, k, ef, k);
 
         let (f50, f99, fm) = stats(flat_lat);
         let (h50, h99, hm) = stats(hnsw_lat);
@@ -259,6 +282,19 @@ fn main() {
             format!("{f50}/{f99}/{fm}"),
             format!("{h50}/{h99}/{hm}"),
         );
+        if let Some(q) = quant.as_deref() {
+            let q_ms = build(&mut st, &ns, "q", "hnsw", Some(q), dim, &metric, &vecs);
+            let (qids, q_lat) = search_all(&st, &ns, "q", &queries_s, k, ef, rerank);
+            let (q50, q99, qm) = stats(q_lat);
+            let qr = recall(&oracle, &qids, k);
+            println!(
+                "{:>8}  {:>9}  {q_ms:>9}  {:>22}  {:>22}  {qr:>9.3}   <- hnsw QUANT {q} RERANK {rerank}",
+                "",
+                "",
+                "",
+                format!("{q50}/{q99}/{qm}"),
+            );
+        }
     }
 
     // EF sweep at the largest corpus: recall and latency are a dial, and the
@@ -271,14 +307,14 @@ fn main() {
             (clusters > 0).then(|| (0..clusters).map(|_| rng.vec(dim)).collect());
         let vecs = corpus(&mut rng, n, dim, &centroids, spread);
         let queries_s = corpus(&mut rng, queries, dim, &centroids, spread);
-        build(&mut st, &ns, "f", "flat", dim, &metric, &vecs);
-        build(&mut st, &ns, "h", "hnsw", dim, &metric, &vecs);
-        let (oracle, _) = search_all(&st, &ns, "f", &queries_s, k, ef);
+        build(&mut st, &ns, "f", "flat", None, dim, &metric, &vecs);
+        build(&mut st, &ns, "h", "hnsw", None, dim, &metric, &vecs);
+        let (oracle, _) = search_all(&st, &ns, "f", &queries_s, k, ef, k);
 
         println!("\nEF sweep @ N={n} (hnsw):");
         println!("{:>6}  {:>9}  {:>16}", "ef", "recall", "µs p50/p99/mean");
         for &e in &[16usize, 32, 64, 128, 256] {
-            let (approx, lat) = search_all(&st, &ns, "h", &queries_s, k, e);
+            let (approx, lat) = search_all(&st, &ns, "h", &queries_s, k, e, k);
             let (p50, p99, mean) = stats(lat);
             let r = recall(&oracle, &approx, k);
             println!("{e:>6}  {r:>9.3}  {:>16}", format!("{p50}/{p99}/{mean}"));
