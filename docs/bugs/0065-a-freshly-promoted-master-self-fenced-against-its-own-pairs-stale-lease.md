@@ -6,7 +6,15 @@ kept here rather than erased, because it records that the cross-pair framing
 came from a single sample where pair 1 happened to promote 79ms earlier —
 coincidence read as mechanism.*
 
-Status: FIXED in code, UNCONFIRMED against a live recurrence — cause narrowed
+Status: FIXED in two parts, the second only on 2026-09-17, and still
+UNCONFIRMED by absence. The 2026-08-28 fix made every lease row resolve one way;
+the CP's in-memory mirror of those rows ("the cache-update path", which this
+line already called unfixed) was the rest. This exact shape then recurred three
+times in ops CI (2026-09-05 to 09-17) and nobody reopened the file, until
+ADR-0032 step 4 (public `0993734`) derived the mirror from the durable record.
+None since in 290 real ops CI runs, against 6 in 795 before. See *It recurred
+six times* at the end, which also records a second shape that is not explained.
+Was: FIXED in code, UNCONFIRMED against a live recurrence — cause narrowed
 to (a) by the second occurrence on 2026-08-28 and the path that makes (a)
 possible is now closed;
 the instrument added on the first firing worked and the (a)/(b) question is
@@ -194,3 +202,55 @@ the fact. What is established is that the fence committed, the renewal
 disagreed, and this asymmetry is the only remaining path between those two
 facts. If canary aborts on `SelfFenced` again with this in place, the mechanism
 is something else and this file should reopen rather than be trusted.
+
+## It recurred six times, and nobody reopened this file (found 2026-09-30)
+
+This file's last paragraph said a canary abort on `SelfFenced` with the fix in
+place means "the mechanism is something else and this file should reopen".
+That happened six times in ops CI, from 2026-09-05 to 09-17, and nobody
+reopened it. They were found on 2026-09-30, while reviewing this file's open
+status, by pulling every failed `gate.yml` run since the fix: 100 failed runs,
+20 canary failures, 6 of them this abort.
+
+| run | date (UTC) | fenced node, final role | named successor, final role |
+|---|---|---|---|
+| `33989262913` | 09-05 20:09 | 6922, master (0,5) | 6923, replica (0,4) |
+| `34045097592` | 09-06 16:20 | 6921, replica (0,3) | 6920, master (0,4) |
+| `34086714119` | 09-07 05:24 | 6921, replica (0,3) | 6920, master (0,4) |
+| `34193284018` | 09-08 06:06 | 6922, master (0,5) | 6923, replica (0,4) |
+| `34283902778` | 09-08 22:03 | 6921, replica (0,3) | 6920, master (0,4) |
+| `35264305765` | 09-17 19:20 | 6922, master (0,5) | 6923, replica (0,4) |
+
+**Two shapes, not one.**
+
+- **Pair 1, three runs, this bug exactly.** The node that fenced is the pair's
+  master at the top epoch, and the "successor" it was told about is the member
+  it replaced: a stale own-pair record, reading (a). This file's status line
+  still said *"what is unfixed is the cache-update path itself"*, and that was
+  right. The 08-28 fix made every lease ROW resolve one way; the CP's in-memory
+  mirror of those rows was still patched separately by each verb, and a patch
+  that drifted from the durable row is a renewal reading the old holder. ADR-0032
+  step 4 (public `0993734`, 2026-09-17 20:00 UTC, 40 minutes after the last
+  recurrence) made the mirror a copy of the durable record taken under the state
+  lock. A copy cannot disagree with what it copies.
+- **Pair 0, three runs, not explained.** The node that fenced ends as a replica
+  at (0,3), superseded by the real master at (0,4). That is a deposed master
+  being fenced correctly; what is unexplained is why it still held a lease, and
+  why the roll saw it after its own window opened. Each of those runs had just
+  passed the canary's negative arm (a master killed mid-soak, a failover, a
+  recovery), so pair 0's history going in was not a clean one. The logs kept do
+  not carry enough to say more.
+
+**Since `0993734`: zero, of either shape, in 290 real ops CI runs** (273
+passed, 17 failed in other drills, all at least ten minutes long), against 6 in
+795 before (0.75%). Zero in 290 at that rate happens about 11% of the time by
+chance alone. So this is evidence and not proof. The status stays UNCONFIRMED by
+absence, now with a number attached.
+
+**Why six recurrences went unfiled.** Each was a red ops CI run that the next
+run turned green, and an abort reading "unexpected SelfFenced" in a roll drill
+looks like a flake unless you know this file asked to be told. A sentence in a
+bug file is an intention; the mechanism would be the canary itself naming this
+bug when it aborts on a `SelfFenced` whose successor is the actor's own pair
+member. That belongs in the ops drill, and is passed to that repo rather than
+made from here.
