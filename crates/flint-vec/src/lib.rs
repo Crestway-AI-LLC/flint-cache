@@ -137,7 +137,7 @@ type Stored = (Vec<f32>, Option<Vec<u8>>);
 /// flat scans them exactly, HNSW keeps a navigable graph over them.
 enum Index {
     Flat(HashMap<Vec<u8>, Entry>),
-    Hnsw(Hnsw),
+    Hnsw(Box<Hnsw>),
 }
 
 /// One vector set: fixed dim + metric + index engine. `search` dispatches to the
@@ -161,7 +161,7 @@ impl VectorSet {
     pub fn new(dim: usize, metric: Metric, kind: IndexKind, quant: Quant) -> Self {
         let index = match kind {
             IndexKind::Flat => Index::Flat(HashMap::new()),
-            IndexKind::Hnsw => Index::Hnsw(Hnsw::new(metric, quant)),
+            IndexKind::Hnsw => Index::Hnsw(Box::new(Hnsw::new(metric, quant))),
         };
         VectorSet {
             dim,
@@ -609,14 +609,15 @@ fn entry_bytes(
 ) -> usize {
     // Measured by counting allocations (`tests/meter.rs`, BUG-0198) with the
     // containers just past a doubling, their worst case: beyond the vector,
-    // id and meta, a flat entry held 163 B and an HNSW node 457 B. These were
+    // id and meta, a flat entry held 163 B and an HNSW node 284 B. These were
     // 64 and 256, and the meter charged up to a third less than a set held.
     let structural = match kind {
         // Entry { vec, norm, meta }, its key, and its slot in the map.
         IndexKind::Flat => 192,
-        // Node { id, code, norm, meta, deleted, links }, its link lists (M0
-        // at layer 0, a few above), and its slots in `nodes` and the id map.
-        IndexKind::Hnsw => 512,
+        // A slot in each of the node arrays (ADR-0049 step 3), its layer-0
+        // links among them, a share of the upper layers' map, and the id map.
+        // 457 B before step 3 flattened the layout.
+        IndexKind::Hnsw => 320,
     };
     let vector = match quant {
         Quant::None => dim * 4,
@@ -626,8 +627,8 @@ fn entry_bytes(
         // D2) it costs no RAM; a vector whose write failed and stayed in RAM
         // is charged separately (`VectorSet::spill_bytes`).
         Quant::Sq8 if on_disk => dim + 8,
-        // The full vector is a Vec of its own in RAM, header included.
-        Quant::Sq8 => dim + 8 + dim * 4 + 24,
+        // The full vector is a box of its own in RAM, pointer included.
+        Quant::Sq8 => dim + 8 + dim * 4 + 16,
     };
     vector + id_len + meta_len + structural
 }
@@ -1592,7 +1593,7 @@ mod tests {
         );
         assert_eq!(
             ram.ns_mem_bytes(b"ns") - disk.ns_mem_bytes(b"ns"),
-            10 * (8 * 4 + 24),
+            10 * (8 * 4 + 16),
             "the meter stops charging dim x 4 per vector, and the Vec that held it"
         );
         for st in [&mut ram, &mut disk] {

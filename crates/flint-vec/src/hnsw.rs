@@ -12,6 +12,11 @@
 //! Deletion marks a node: it stays in the graph for ROUTING but never appears
 //! in results, until the next insert takes its slot (BUG-0197). A cold-start
 //! rebuild re-inserts only live vectors from KV.
+//!
+//! A node is a SLOT: an index into flat arrays, one a field (ADR-0049 step 3),
+//! not a struct with a heap allocation for each of its parts. The layer-0
+//! links, which every node has, are a fixed stride of one array; the few nodes
+//! on higher layers keep those in a map.
 
 use crate::vecfile::VecFile;
 use crate::{Metric, Quant};
@@ -21,6 +26,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 const M: usize = 16; // neighbours per node on upper layers
 const M0: usize = 32; // neighbours at layer 0 (2*M — denser base layer)
+/// A slot's layer-0 entry: its link count, then room for `M0` links.
+const STRIDE0: usize = M0 + 1;
 const EF_CONSTRUCTION: usize = 100;
 /// Default `ef` for a query when `VEC.SEARCH` gives no `EF` — the recall/latency
 /// knob. Higher searches more of the graph: better recall, more work.
@@ -51,28 +58,78 @@ impl Walk {
     }
 }
 
-/// How a node holds its vector in the graph (ADR-0049 D1).
-enum Code {
-    /// The full float32 vector: today's index, and the re-rank source itself.
-    F32(Vec<f32>),
-    /// Per-vector 8-bit scalar quantization: value `i` is `lo + step * bytes[i]`.
-    /// One byte a dimension instead of four, and no training: the range is the
-    /// vector's own, so an online insert needs nothing learned beforehand.
-    Sq8 { bytes: Vec<u8>, lo: f32, step: f32 },
+/// Make room in `v` for `extra` more by a quarter of what it holds, not by the
+/// doubling `Vec` does on its own. These arrays hold every node, and just past
+/// a doubling half of one is empty: most of what BUG-0198 measured beyond the
+/// vectors themselves.
+fn grow<T>(v: &mut Vec<T>, extra: usize) {
+    if v.len() + extra > v.capacity() {
+        v.reserve_exact((v.capacity() / 4).max(extra));
+    }
 }
 
-impl Code {
-    fn encode(quant: Quant, v: Vec<f32>) -> Code {
+/// Write `vals` as slot `slot` of an array `vals.len()` wide a slot, appending
+/// when `slot` is the next one. For the small fixed-width fields only: an array
+/// of whole vectors would carry up to a quarter of a vector of spare room each,
+/// which at 1536 dimensions is more than the rest of a node.
+fn put_slot<T: Copy>(v: &mut Vec<T>, slot: u32, vals: &[T]) {
+    let at = slot as usize * vals.len();
+    if at == v.len() {
+        grow(v, vals.len());
+        v.extend_from_slice(vals);
+    } else {
+        v[at..at + vals.len()].copy_from_slice(vals);
+    }
+}
+
+/// Set slot `slot` of an array of boxes, appending when it is the next one.
+/// What holds a slot's vector or code: one allocation of exactly its size.
+fn put_box<T>(v: &mut Vec<Box<[T]>>, slot: u32, b: Box<[T]>) {
+    if slot as usize == v.len() {
+        grow(v, 1);
+        v.push(b);
+    } else {
+        v[slot as usize] = b;
+    }
+}
+
+/// How the graph holds its vectors (ADR-0049 D1), one box a slot.
+enum Codes {
+    /// The full float32 vectors: the index without codes, and its re-rank
+    /// source itself.
+    F32(Vec<Box<[f32]>>),
+    /// Per-vector 8-bit scalar quantization: value `i` of a slot is
+    /// `lo + step * byte[i]`, with the slot's `[lo, step]` in `scale`. One byte
+    /// a dimension instead of four, and no training: the range is the vector's
+    /// own, so an online insert needs nothing learned beforehand.
+    Sq8 {
+        bytes: Vec<Box<[u8]>>,
+        scale: Vec<[f32; 2]>,
+    },
+}
+
+impl Codes {
+    fn new(quant: Quant) -> Codes {
         match quant {
-            Quant::None => Code::F32(v),
-            Quant::Sq8 => {
+            Quant::None => Codes::F32(Vec::new()),
+            Quant::Sq8 => Codes::Sq8 {
+                bytes: Vec::new(),
+                scale: Vec::new(),
+            },
+        }
+    }
+
+    fn put(&mut self, slot: u32, v: &[f32]) {
+        match self {
+            Codes::F32(f) => put_box(f, slot, v.into()),
+            Codes::Sq8 { bytes, scale } => {
                 let (lo, hi) = v
                     .iter()
                     .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &x| {
                         (l.min(x), h.max(x))
                     });
                 let step = if hi > lo { (hi - lo) / 255.0 } else { 0.0 };
-                let bytes = v
+                let code: Box<[u8]> = v
                     .iter()
                     .map(|&x| {
                         if step > 0.0 {
@@ -82,20 +139,32 @@ impl Code {
                         }
                     })
                     .collect();
-                Code::Sq8 {
-                    bytes,
-                    lo: if lo.is_finite() { lo } else { 0.0 },
-                    step,
-                }
+                put_box(bytes, slot, code);
+                put_slot(
+                    scale,
+                    slot,
+                    &[[if lo.is_finite() { lo } else { 0.0 }, step]],
+                );
             }
         }
     }
 
-    /// The vector's values, decoded on the fly: no allocation per distance.
-    fn vals(&self) -> Vals<'_> {
+    /// Slot `slot`'s full vector, when the codes are full vectors.
+    fn f32(&self, slot: u32) -> Option<&[f32]> {
         match self {
-            Code::F32(v) => Vals::F(v.iter()),
-            Code::Sq8 { bytes, lo, step } => Vals::Q(bytes.iter(), *lo, *step),
+            Codes::F32(f) => Some(&f[slot as usize]),
+            Codes::Sq8 { .. } => None,
+        }
+    }
+
+    /// Slot `slot`'s values, decoded on the fly: no allocation per distance.
+    fn vals(&self, slot: u32) -> Vals<'_> {
+        match self {
+            Codes::F32(f) => Vals::F(f[slot as usize].iter()),
+            Codes::Sq8 { bytes, scale } => {
+                let [lo, step] = scale[slot as usize];
+                Vals::Q(bytes[slot as usize].iter(), lo, step)
+            }
         }
     }
 }
@@ -115,31 +184,35 @@ impl Iterator for Vals<'_> {
     }
 }
 
-struct Node {
-    id: Vec<u8>,
-    code: Code,
-    /// The ORIGINAL vector's norm, whatever the code: cosine divides by it.
-    norm: f32,
-    meta: Option<Vec<u8>>,
-    deleted: bool,
-    /// `links[layer]` = neighbour node indices; `len() == level + 1`.
-    links: Vec<Vec<u32>>,
-}
-
 pub struct Hnsw {
     metric: Metric,
     quant: Quant,
-    nodes: Vec<Node>,
+    /// Values a vector: the set's, taken from its first insert.
+    dim: usize,
+    // One entry a slot, live or deleted.
+    ids: Vec<Box<[u8]>>,
+    meta: Vec<Option<Box<[u8]>>>,
+    /// The ORIGINAL vector's norm, whatever the code: cosine divides by it.
+    norms: Vec<f32>,
+    deleted: Vec<bool>,
+    /// The highest layer a slot is on.
+    levels: Vec<u8>,
+    codes: Codes,
+    /// Layer 0, [`STRIDE0`] a slot: the link count, then the links.
+    links0: Vec<u32>,
+    /// Layers 1 and up, for the slots on them (about one in `M`): slot `n`'s
+    /// links on layer `l` are `upper[&n][l - 1]`.
+    upper: HashMap<u32, Vec<Vec<u32>>>,
     /// The full vectors when the graph holds codes, by slot: the re-rank
     /// reads them, and `get` returns them so VEC.GET stays lossless. Unused
     /// for `Quant::None`, whose codes ARE the full vectors.
     full: Full,
-    id_to_idx: HashMap<Vec<u8>, u32>,
-    /// Deleted slots the next insert takes before growing `nodes` (BUG-0197).
-    /// Without it a tombstone stayed until a restart's rebuild, so a set whose
-    /// ids churn (`VEC.DEL`, TTL expiry, an upsert's old node) grew without
-    /// bound while the D4 meter credited every delete as freed. Never holds the
-    /// entry point: that slot is freed when the entry moves.
+    id_to_idx: HashMap<Box<[u8]>, u32>,
+    /// Deleted slots the next insert takes before growing the arrays
+    /// (BUG-0197). Without it a tombstone stayed until a restart's rebuild, so
+    /// a set whose ids churn (`VEC.DEL`, TTL expiry, an upsert's old node) grew
+    /// without bound while the D4 meter credited every delete as freed. Never
+    /// holds the entry point: that slot is freed when the entry moves.
     free: Vec<u32>,
     entry: Option<u32>,
     max_level: usize,
@@ -153,8 +226,8 @@ pub type Found<'a> = (Cow<'a, [f32]>, Option<&'a [u8]>);
 
 /// Where a quantized graph keeps its full vectors (ADR-0049).
 enum Full {
-    /// In RAM, indexed like `nodes`: a co-processor with no `--vec-dir`.
-    Ram(Vec<Vec<f32>>),
+    /// In RAM, one box a slot: a co-processor with no `--vec-dir`.
+    Ram(Vec<Box<[f32]>>),
     /// In a local file (D2). `spill` holds, in RAM, the vector of a slot whose
     /// write failed, so the index never lacks a vector it acknowledged; the D4
     /// meter is charged for it ([`Hnsw::spill_bytes`]).
@@ -223,14 +296,6 @@ fn dist_vals(metric: Metric, a: Vals<'_>, an: f32, b: Vals<'_>, bn: f32) -> f32 
     }
 }
 
-/// Distance between a code and a full vector, SMALLER nearer.
-fn dist_code(metric: Metric, c: &Code, cn: f32, q: &[f32], qn: f32) -> f32 {
-    match c {
-        Code::F32(v) => dist(metric, v, cn, q, qn),
-        Code::Sq8 { .. } => dist_vals(metric, c.vals(), cn, Vals::F(q.iter()), qn),
-    }
-}
-
 /// Convert an internal distance back to flat's score (HIGHER is nearer), so a
 /// mixed fleet of flat and HNSW sets answers `VEC.SEARCH` identically.
 fn dist_to_score(metric: Metric, d: f32) -> f32 {
@@ -246,7 +311,15 @@ impl Hnsw {
         Hnsw {
             metric,
             quant,
-            nodes: Vec::new(),
+            dim: 0,
+            ids: Vec::new(),
+            meta: Vec::new(),
+            norms: Vec::new(),
+            deleted: Vec::new(),
+            levels: Vec::new(),
+            codes: Codes::new(quant),
+            links0: Vec::new(),
+            upper: HashMap::new(),
             full: Full::Ram(Vec::new()),
             id_to_idx: HashMap::new(),
             free: Vec::new(),
@@ -268,7 +341,7 @@ impl Hnsw {
     /// serves.
     #[cfg(test)]
     fn slots(&self) -> usize {
-        self.nodes.len()
+        self.levels.len()
     }
     pub fn contains(&self, id: &[u8]) -> bool {
         self.id_to_idx.contains_key(id)
@@ -279,22 +352,19 @@ impl Hnsw {
         let Some(&i) = self.id_to_idx.get(id) else {
             return Ok(None);
         };
-        Ok(Some((
-            self.full_vec(i)?,
-            self.nodes[i as usize].meta.as_deref(),
-        )))
+        Ok(Some((self.full_vec(i)?, self.meta[i as usize].as_deref())))
     }
 
     /// The meta of `id`, without reading its vector: what the D4 meter needs.
     pub fn meta(&self, id: &[u8]) -> Option<Option<&[u8]>> {
         let &i = self.id_to_idx.get(id)?;
-        Some(self.nodes[i as usize].meta.as_deref())
+        Some(self.meta[i as usize].as_deref())
     }
 
     /// Keep this set's full vectors in `file` rather than RAM (ADR-0049 D2).
     /// Only for a quantized set with nothing in it yet.
     pub fn attach_vec_file(&mut self, file: VecFile) {
-        debug_assert!(self.quant != Quant::None && self.nodes.is_empty());
+        debug_assert!(self.quant != Quant::None && self.levels.is_empty());
         self.full = Full::File {
             file,
             spill: HashMap::new(),
@@ -325,7 +395,7 @@ impl Hnsw {
     /// The full-precision vector for node `i`: its code when unquantized, the
     /// side store otherwise.
     fn full_vec(&self, i: u32) -> Result<Cow<'_, [f32]>, String> {
-        if let Code::F32(v) = &self.nodes[i as usize].code {
+        if let Some(v) = self.codes.f32(i) {
             return Ok(Cow::Borrowed(v));
         }
         match &self.full {
@@ -369,8 +439,7 @@ impl Hnsw {
     /// Store slot `slot`'s full vector: a new slot is the next one.
     fn put_full(&mut self, slot: u32, v: Vec<f32>) {
         match &mut self.full {
-            Full::Ram(f) if (slot as usize) < f.len() => f[slot as usize] = v,
-            Full::Ram(f) => f.push(v),
+            Full::Ram(f) => put_box(f, slot, v.into_boxed_slice()),
             Full::File { file, spill } => {
                 if file.put(slot, &v).is_ok() {
                     spill.remove(&slot);
@@ -394,22 +463,92 @@ impl Hnsw {
         (-(u.ln()) * self.m_l).floor() as usize
     }
 
+    /// The highest layer slot `n` is on.
+    fn level(&self, n: u32) -> usize {
+        self.levels[n as usize] as usize
+    }
+
+    /// Slot `n`'s links on `layer`; none when it is not on that layer.
+    fn links(&self, n: u32, layer: usize) -> &[u32] {
+        if layer == 0 {
+            let at = n as usize * STRIDE0;
+            let count = self.links0[at] as usize;
+            &self.links0[at + 1..at + 1 + count]
+        } else {
+            self.upper
+                .get(&n)
+                .and_then(|u| u.get(layer - 1))
+                .map_or(&[], |l| l.as_slice())
+        }
+    }
+
+    /// Replace slot `n`'s links on `layer`, which it is on. At most `M0` on
+    /// layer 0, which is the room a slot has there.
+    fn set_links(&mut self, n: u32, layer: usize, l: &[u32]) {
+        if layer == 0 {
+            debug_assert!(l.len() <= M0);
+            let at = n as usize * STRIDE0;
+            self.links0[at] = l.len() as u32;
+            self.links0[at + 1..at + 1 + l.len()].copy_from_slice(l);
+        } else if let Some(mine) = self.upper.get_mut(&n).and_then(|u| u.get_mut(layer - 1)) {
+            mine.clear();
+            mine.extend_from_slice(l);
+        }
+    }
+
+    /// Write a node into slot `slot`, a free one or the next: every array, no
+    /// links yet.
+    fn write_slot(
+        &mut self,
+        slot: u32,
+        id: Box<[u8]>,
+        meta: Option<Box<[u8]>>,
+        v: &[f32],
+        norm: f32,
+        level: usize,
+    ) {
+        // `gen_level` floors its draw at 1e-12, which bounds a level near 9.
+        let level8 = level.min(u8::MAX as usize) as u8;
+        let s = slot as usize;
+        if s == self.levels.len() {
+            grow(&mut self.ids, 1);
+            self.ids.push(id);
+            grow(&mut self.meta, 1);
+            self.meta.push(meta);
+            grow(&mut self.norms, 1);
+            self.norms.push(norm);
+            grow(&mut self.deleted, 1);
+            self.deleted.push(false);
+            grow(&mut self.levels, 1);
+            self.levels.push(level8);
+            put_slot(&mut self.links0, slot, &[0; STRIDE0]);
+        } else {
+            self.ids[s] = id;
+            self.meta[s] = meta;
+            self.norms[s] = norm;
+            self.deleted[s] = false;
+            self.levels[s] = level8;
+            self.links0[s * STRIDE0] = 0;
+        }
+        if level > 0 {
+            self.upper.insert(slot, vec![Vec::new(); level]);
+        }
+        self.codes.put(slot, v);
+    }
+
     fn dnn(&self, a: u32, b: u32) -> f32 {
-        let (na, nb) = (&self.nodes[a as usize], &self.nodes[b as usize]);
-        match (&na.code, &nb.code) {
-            (Code::F32(x), Code::F32(y)) => dist(self.metric, x, na.norm, y, nb.norm),
-            _ => dist_vals(
-                self.metric,
-                na.code.vals(),
-                na.norm,
-                nb.code.vals(),
-                nb.norm,
-            ),
+        let (an, bn) = (self.norms[a as usize], self.norms[b as usize]);
+        match (self.codes.f32(a), self.codes.f32(b)) {
+            (Some(x), Some(y)) => dist(self.metric, x, an, y, bn),
+            _ => dist_vals(self.metric, self.codes.vals(a), an, self.codes.vals(b), bn),
         }
     }
     fn dnq(&self, a: u32, q: &[f32], qn: f32) -> f32 {
-        let na = &self.nodes[a as usize];
-        dist_code(self.metric, &na.code, na.norm, q, qn)
+        let an = self.norms[a as usize];
+        match self.codes.f32(a) {
+            Some(x) => dist(self.metric, x, an, q, qn),
+            None => dist_vals(self.metric, self.codes.vals(a), an, Vals::F(q.iter()), qn),
+        }
     }
 
     /// Insert (or upsert) a vector. An upsert deletes the old node and inserts
@@ -417,34 +556,38 @@ impl Hnsw {
     /// deleted slot when there is one (BUG-0197), so a set's slots are bounded
     /// by the most it ever held at once, not by how many writes it has seen.
     pub fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
+        if self.dim == 0 {
+            self.dim = vec.len();
+        }
+        debug_assert_eq!(vec.len(), self.dim, "VEC.SET checks dim before here");
         let norm = l2norm(&vec);
         self.del(&id);
         let level = self.gen_level();
-        let q = vec.clone();
-        let node = Node {
-            id: id.clone(),
-            code: Code::encode(self.quant, vec.clone()),
-            norm,
-            meta,
-            deleted: false,
-            links: vec![Vec::new(); level + 1],
-        };
         let idx = match self.free.pop() {
             Some(i) => {
                 self.unlink(i);
-                self.nodes[i as usize] = node;
                 i
             }
-            None => {
-                self.nodes.push(node);
-                (self.nodes.len() - 1) as u32
-            }
+            None => self.levels.len() as u32,
         };
-        if self.quant != Quant::None {
-            self.put_full(idx, vec);
-        }
+        let id: Box<[u8]> = id.into_boxed_slice();
+        self.write_slot(
+            idx,
+            id.clone(),
+            meta.map(Vec::into_boxed_slice),
+            &vec,
+            norm,
+            level,
+        );
         self.id_to_idx.insert(id, idx);
         self.live += 1;
+        let q = if self.quant != Quant::None {
+            let q = vec.clone();
+            self.put_full(idx, vec);
+            q
+        } else {
+            vec
+        };
 
         let Some(mut ep) = self.entry else {
             self.entry = Some(idx);
@@ -474,20 +617,21 @@ impl Hnsw {
                 })
                 .collect();
             let selected = self.select_heuristic(&cand, mmax);
-            self.nodes[idx as usize].links[lc] = selected.clone();
+            self.set_links(idx, lc, &selected);
             for &n in &selected {
-                self.nodes[n as usize].links[lc].push(idx);
-                if self.nodes[n as usize].links[lc].len() > mmax {
-                    let ncand: Vec<DI> = self.nodes[n as usize].links[lc]
+                let mut theirs = self.links(n, lc).to_vec();
+                theirs.push(idx);
+                if theirs.len() > mmax {
+                    let ncand: Vec<DI> = theirs
                         .iter()
                         .map(|&x| DI {
                             dist: self.dnn(n, x),
                             idx: x,
                         })
                         .collect();
-                    let pruned = self.select_heuristic(&ncand, mmax);
-                    self.nodes[n as usize].links[lc] = pruned;
+                    theirs = self.select_heuristic(&ncand, mmax);
                 }
+                self.set_links(n, lc, &theirs);
             }
             ep_set = w.iter().map(|di| di.idx).collect();
         }
@@ -495,7 +639,7 @@ impl Hnsw {
             // The old entry, if deleted, was held back from `free`; it is an
             // ordinary deleted slot from here.
             if let Some(old) = self.entry
-                && self.nodes[old as usize].deleted
+                && self.deleted[old as usize]
             {
                 self.free.push(old);
             }
@@ -508,7 +652,7 @@ impl Hnsw {
         let Some(i) = self.id_to_idx.remove(id) else {
             return false;
         };
-        self.nodes[i as usize].deleted = true;
+        self.deleted[i as usize] = true;
         self.live -= 1;
         // A deleted node routes by its code; its full vector is dead.
         if let Full::File { spill, .. } = &mut self.full {
@@ -531,7 +675,11 @@ impl Hnsw {
     /// its neighbourhood is left; a walk takes it as an ordinary link, or as
     /// stale when the new node does not reach that layer (`steps_onto`).
     fn unlink(&mut self, i: u32) {
-        let old = std::mem::take(&mut self.nodes[i as usize].links);
+        let old: Vec<Vec<u32>> = (0..=self.level(i))
+            .map(|layer| self.links(i, layer).to_vec())
+            .collect();
+        self.links0[i as usize * STRIDE0] = 0;
+        self.upper.remove(&i);
         for (layer, around) in old.iter().enumerate() {
             let mmax = if layer == 0 { M0 } else { M };
             let mut seen: HashSet<u32> = HashSet::from([i]);
@@ -540,24 +688,26 @@ impl Hnsw {
                 if seen.insert(x) {
                     pool.push(x);
                 }
-                if let Some(xl) = self.nodes[x as usize].links.get(layer) {
-                    pool.extend(xl.iter().copied().filter(|&y| seen.insert(y)));
-                }
+                pool.extend(
+                    self.links(x, layer)
+                        .iter()
+                        .copied()
+                        .filter(|&y| seen.insert(y)),
+                );
             }
             // A deleted node in the pool is likely the next slot reused, and a
             // link to it would go stale with it.
-            pool.retain(|&x| {
-                let nd = &self.nodes[x as usize];
-                !nd.deleted && nd.links.len() > layer
-            });
+            pool.retain(|&x| !self.deleted[x as usize] && self.level(x) >= layer);
             for &n in around {
-                let Some(nl) = self.nodes[n as usize].links.get(layer) else {
-                    continue;
-                };
-                if n == i || !nl.contains(&i) {
+                if n == i || self.level(n) < layer || !self.links(n, layer).contains(&i) {
                     continue;
                 }
-                let own: Vec<u32> = nl.iter().copied().filter(|&x| x != i).collect();
+                let own: Vec<u32> = self
+                    .links(n, layer)
+                    .iter()
+                    .copied()
+                    .filter(|&x| x != i)
+                    .collect();
                 let mut cand: Vec<DI> = pool
                     .iter()
                     .copied()
@@ -575,7 +725,8 @@ impl Hnsw {
                     dist: self.dnn(n, x),
                     idx: x,
                 }));
-                self.nodes[n as usize].links[layer] = self.select_heuristic(&cand, mmax);
+                let relinked = self.select_heuristic(&cand, mmax);
+                self.set_links(n, layer, &relinked);
             }
         }
     }
@@ -585,7 +736,7 @@ impl Hnsw {
     /// [`Hnsw::unlink`] repairs only the old node's own neighbourhood. Such a
     /// link is stale, and the node is not on this layer.
     fn steps_onto(&self, walk: Walk, n: u32, layer: usize) -> bool {
-        !walk.hides(n) && self.nodes[n as usize].links.len() > layer
+        !walk.hides(n) && self.level(n) >= layer
     }
 
     /// Greedy ef=1 descent at one layer: hop to the nearest neighbour until no
@@ -595,17 +746,15 @@ impl Hnsw {
         let mut cur_d = self.dnq(cur, q, qn);
         loop {
             let mut changed = false;
-            if let Some(neigh) = self.nodes[cur as usize].links.get(layer) {
-                for &n in neigh {
-                    if !self.steps_onto(walk, n, layer) {
-                        continue;
-                    }
-                    let d = self.dnq(n, q, qn);
-                    if d < cur_d {
-                        cur_d = d;
-                        cur = n;
-                        changed = true;
-                    }
+            for &n in self.links(cur, layer) {
+                if !self.steps_onto(walk, n, layer) {
+                    continue;
+                }
+                let d = self.dnq(n, q, qn);
+                if d < cur_d {
+                    cur_d = d;
+                    cur = n;
+                    changed = true;
                 }
             }
             if !changed {
@@ -636,7 +785,7 @@ impl Hnsw {
             }
             let d = self.dnq(e, q, qn);
             cands.push(std::cmp::Reverse(DI { dist: d, idx: e }));
-            if !(walk == Walk::Query && self.nodes[e as usize].deleted) {
+            if !(walk == Walk::Query && self.deleted[e as usize]) {
                 w.push(DI { dist: d, idx: e });
             }
         }
@@ -645,12 +794,7 @@ impl Hnsw {
             if c.dist > worst && w.len() >= ef {
                 break;
             }
-            let neigh = self.nodes[c.idx as usize]
-                .links
-                .get(layer)
-                .cloned()
-                .unwrap_or_default();
-            for n in neigh {
+            for &n in self.links(c.idx, layer) {
                 if !self.steps_onto(walk, n, layer) || !visited.insert(n) {
                     continue;
                 }
@@ -658,7 +802,7 @@ impl Hnsw {
                 let worst = w.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
                 if d < worst || w.len() < ef {
                     cands.push(std::cmp::Reverse(DI { dist: d, idx: n }));
-                    if !(walk == Walk::Query && self.nodes[n as usize].deleted) {
+                    if !(walk == Walk::Query && self.deleted[n as usize]) {
                         w.push(DI { dist: d, idx: n });
                         if w.len() > ef {
                             w.pop();
@@ -744,7 +888,7 @@ impl Hnsw {
         if self.quant != Quant::None {
             let idxs: Vec<u32> = w.iter().map(|di| di.idx).collect();
             for (di, v) in w.iter_mut().zip(self.full_many(&idxs)?) {
-                di.dist = dist(self.metric, &v, self.nodes[di.idx as usize].norm, q, qn);
+                di.dist = dist(self.metric, &v, self.norms[di.idx as usize], q, qn);
             }
             w.sort();
         }
@@ -752,7 +896,7 @@ impl Hnsw {
         Ok(w.into_iter()
             .map(|di| {
                 (
-                    self.nodes[di.idx as usize].id.clone(),
+                    self.ids[di.idx as usize].to_vec(),
                     dist_to_score(self.metric, di.dist),
                 )
             })
@@ -980,14 +1124,10 @@ mod tests {
             if !seen.insert(n) {
                 continue;
             }
-            for &x in &h.nodes[n as usize].links[0] {
-                stack.push(x);
-            }
+            stack.extend_from_slice(h.links(n, 0));
         }
-        h.nodes
-            .iter()
-            .enumerate()
-            .filter(|(i, nd)| !nd.deleted && !seen.contains(&(*i as u32)))
+        (0..h.slots() as u32)
+            .filter(|&i| !h.deleted[i as usize] && !seen.contains(&i))
             .count()
     }
 
@@ -1008,21 +1148,26 @@ mod tests {
             .expect("a node besides the entry");
         // A node that does not link to `x`, so the relink leaves its new link.
         let p = (0..200u32)
-            .find(|&i| i != x && i != entry && !h.nodes[i as usize].links[0].contains(&x))
+            .find(|&i| i != x && i != entry && !h.links(i, 0).contains(&x))
             .expect("a node that does not link to x");
         assert!(h.del(format!("{x}").as_bytes()));
-        h.nodes[p as usize].links[0].push(x);
-        let near_p: Vec<f32> = h.nodes[p as usize].code.vals().map(|v| v + 1e-3).collect();
+        let mut planted = h.links(p, 0).to_vec();
+        if planted.len() == M0 {
+            planted.pop();
+        }
+        planted.push(x);
+        h.set_links(p, 0, &planted);
+        let near_p: Vec<f32> = h.codes.vals(p).map(|v| v + 1e-3).collect();
         h.set(b"new".to_vec(), near_p.clone(), None);
         assert_eq!(
             h.id_to_idx[b"new".as_slice()],
             x,
             "the insert reused x's slot"
         );
-        for (i, nd) in h.nodes.iter().enumerate() {
-            for (layer, l) in nd.links.iter().enumerate() {
+        for i in 0..h.slots() as u32 {
+            for layer in 0..=h.level(i) {
                 assert!(
-                    !l.contains(&(i as u32)),
+                    !h.links(i, layer).contains(&i),
                     "node {i} links to itself on layer {layer}"
                 );
             }

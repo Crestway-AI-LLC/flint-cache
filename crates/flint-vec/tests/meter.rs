@@ -52,16 +52,17 @@ fn exec(st: &mut Store, ns: &[u8], args: &[Vec<u8>]) {
 
 #[test]
 fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
-    // Just past a power of two: the Vec and the map that hold the entries
-    // have just doubled, so about half of each is empty and charged to the
-    // vectors already in it. The worst case for any count.
-    let n = 257;
+    // Each count is just past a power of two: the arrays and maps that hold
+    // the entries have just grown, so their spare room is charged to the
+    // vectors already in them. The worst case for any count.
     let dir = std::env::temp_dir().join(format!("flint-vec-meter-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let mut x = 0x0198_u64;
     let mut short = Vec::new();
-    // 200 is not a power of two: a parsed vector's spare capacity showed there.
-    for dim in [128usize, 200] {
+    // 200 is not a power of two: a parsed vector's spare capacity showed
+    // there. 1536 is a real embedding's size, where spare room that grows with
+    // the vector outweighs everything else a node holds (ADR-0049 step 3).
+    for (dim, n) in [(128usize, 257usize), (200, 257), (1536, 33)] {
         let vectors: Vec<Vec<u8>> = (0..n)
             .map(|_| {
                 let v: Vec<String> = (0..dim)
@@ -87,7 +88,6 @@ fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
             ),
         ] {
             let ns = b("meter");
-            let before = HEAP.load(Ordering::Relaxed);
             let mut st = Store::new();
             if on_disk {
                 st.set_vec_dir(dir.clone());
@@ -103,6 +103,10 @@ fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
             ];
             create.extend(extra.iter().map(|s| b(s)));
             exec(&mut st, &ns, &create);
+            // From here: the meter charges each entry, not the set's own
+            // struct and the maps VEC.CREATE makes, which a count of 33 would
+            // otherwise spread over too few vectors to mean anything.
+            let before = HEAP.load(Ordering::Relaxed);
             for (id, v) in ids.iter().zip(&vectors) {
                 exec(&mut st, &ns, &[b("VEC.SET"), b("s"), id.clone(), v.clone()]);
             }
