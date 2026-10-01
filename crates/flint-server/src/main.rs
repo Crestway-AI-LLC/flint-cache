@@ -6848,6 +6848,33 @@ fn flintsync(
             }
         }
     }
+    // A CURSOR AHEAD OF THIS MASTER is a copy holding sequences this node does
+    // not have (BUG-0196). Same-epoch cursors are in this node's own space and
+    // translated ones were mapped into it above, so a correct replica can only
+    // ever have applied what this node served: at most `latest`. Ahead means
+    // its data and this WAL disagree. The shape that gets here is a master that
+    // lost an unsynced WAL tail with its host and came back as master, while its
+    // replica still held those writes. Admitted, nothing ships until new writes
+    // pass the cursor, and every write numbered in the gap is skipped for good,
+    // silently.
+    //
+    // Refused, but NOT as a WALGAP. That would send the copy to a full re-seed
+    // and delete the very writes the master lost. This says why on every
+    // reconnect and leaves the copy intact for whoever decides which side is
+    // right.
+    let latest = kv.latest_seq();
+    if cursor > latest {
+        let mut out = Vec::new();
+        encode(
+            &Value::Error(format!(
+                "ERR FLINTSYNC cursor {cursor} is ahead of this master's latest sequence \
+                 {latest}: the copy holds writes this node does not, so it is not \
+                 streamed (BUG-0196)"
+            )),
+            &mut out,
+        );
+        return stream.write_all(&out);
+    }
     // RETENTION, the last admission term (BUG-0015). The fence check above
     // says this cursor is on our timeline; it does not say the WAL can still
     // REACH it. Those are different questions and only the second one is
@@ -7329,7 +7356,7 @@ mod replica {
     /// fixed by reconnecting from the durable cursor, and the loop must not
     /// give up on it. Exactly one condition is not, and treating it like the
     /// others is what left a node reconnecting once a second all night.
-    enum TailError {
+    pub(super) enum TailError {
         Transient(std::io::Error),
         /// The bytes we are waiting for no longer exist on the master.
         ///
@@ -7537,7 +7564,7 @@ mod replica {
         }
     }
 
-    fn tail_once(
+    pub(super) fn tail_once(
         target: &str,
         kv: &Arc<RocksKv>,
         stop: &Arc<AtomicBool>,
@@ -7745,6 +7772,26 @@ mod replica {
                                     "malformed replication frame",
                                 )
                             })?;
+                            // A WHOLE batch at or below our cursor is the master
+                            // and this copy disagreeing about where the stream
+                            // is, not a duplicate (BUG-0196). The master filters
+                            // and clamps on its side, so a correct stream never
+                            // sends one. `apply_batch` would drop it as already
+                            // applied (the library's idempotence, ADR-0003), and
+                            // that is how BUG-0194's wrong-space cursor lost 900
+                            // keys without a word. Say so and re-request. The
+                            // straddling batch of the same disagreement already
+                            // arrives below as a SequenceGap; this treats both
+                            // alike.
+                            let cursor = kv.last_applied();
+                            if batch.last_seq <= cursor {
+                                return Err(TailError::Transient(std::io::Error::other(format!(
+                                    "the master sent a batch ending at {} (from {}), at or \
+                                     below this copy's cursor {cursor}: the two disagree \
+                                     about where the stream is",
+                                    batch.last_seq, batch.first_seq
+                                ))));
+                            }
                             kv.apply_batch(&batch).map_err(|e| match e {
                                 // A batch starting AFTER the sequence we need
                                 // means the span between was purged from the
@@ -8597,6 +8644,123 @@ mod serve_tests {
     /// A pipeline whose replies overflow OUT_FLUSH_THRESHOLD must flush
     /// incrementally and stay correct — every reply arrives, in order, and
     /// the connection remains usable.
+    /// BUG-0196: a whole batch at or below the replica's cursor is a
+    /// disagreement about where the stream is, and the tail must say so and
+    /// re-request rather than drop it as already applied. A fake master
+    /// accepts at cursor 100 and then ships 50..=60, the shape BUG-0194's
+    /// wrong-space cursor produced. Before the check the batch vanished, the
+    /// cursor stayed put, and nothing was logged; the tail only ended when the
+    /// master hung up, for an unrelated reason.
+    #[cfg(feature = "rocks")]
+    #[test]
+    fn a_batch_at_or_below_the_cursor_is_a_disagreement_not_a_duplicate() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let master = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf); // FLINTSYNC <cursor> <g> <c>
+            let mut out = Vec::new();
+            encode(&Value::Simple("FLINTSYNC-OK 100 e0.1".into()), &mut out);
+            let put = Value::Array(Some(vec![
+                Value::Bulk(Some(b"P".to_vec())),
+                Value::Bulk(Some(b"bug0196-key".to_vec())),
+                Value::Bulk(Some(b"v".to_vec())),
+            ]));
+            encode(
+                &Value::Array(Some(vec![
+                    Value::Integer(50),
+                    Value::Integer(60),
+                    Value::Array(Some(vec![put])),
+                ])),
+                &mut out,
+            );
+            s.write_all(&out).expect("write");
+            // Long enough for a replica that silently skipped to show it by
+            // still being connected; then hang up so that one returns too.
+            std::thread::sleep(std::time::Duration::from_millis(1_500));
+        });
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "flint-bug0196-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kv = Arc::new(flint_storage::rocks::RocksKv::open(&dir).expect("open rocks"));
+        kv.adopt_timeline(100, None).expect("cursor 100");
+        let link = Arc::new(ReplicaLink {
+            target: std::sync::Mutex::new(addr.clone()),
+            repoint: AtomicBool::new(false),
+        });
+        let started = std::time::Instant::now();
+        let r = replica::tail_once(&addr, &kv, &Arc::new(AtomicBool::new(false)), &link);
+        let took = started.elapsed();
+        master.join().expect("master thread");
+        match r {
+            Err(replica::TailError::Transient(e)) => assert!(
+                e.to_string().contains("the two disagree"),
+                "ended for another reason: {e}"
+            ),
+            Err(other) => panic!("ended as {other}, not as a disagreement"),
+            Ok(()) => panic!("the tail returned Ok after a batch below its cursor"),
+        }
+        assert!(
+            took < std::time::Duration::from_millis(1_000),
+            "took {took:?}: the tail kept listening instead of refusing the batch"
+        );
+        assert_eq!(kv.last_applied(), 100, "the cursor must not move");
+        assert!(
+            kv.get(b"bug0196-key").is_none(),
+            "the batch must not have been applied"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG-0196, the master's half: a FLINTSYNC cursor ahead of the master's
+    /// latest sequence is refused, and not as a WALGAP (which would send the
+    /// copy to a re-seed and delete the writes the master lost). A cursor at
+    /// the tip is still accepted, as the control.
+    #[cfg(feature = "rocks")]
+    #[test]
+    fn a_cursor_ahead_of_the_master_is_refused_but_not_as_a_walgap() {
+        let (addr, _dir) = spawn_rocks_server();
+        let mut c = TcpStream::connect(addr).expect("connect");
+        for i in 0..5 {
+            let k = format!("k{i}");
+            roundtrip(&mut c, &["SET", &k, "v"]);
+        }
+        let info = roundtrip(&mut c, &["FLINTINFO"]);
+        let Value::Bulk(Some(raw)) = info else {
+            panic!("FLINTINFO reply: {info:?}")
+        };
+        let latest: u64 = String::from_utf8_lossy(&raw)
+            .lines()
+            .find_map(|l| l.strip_prefix("latest_seq:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("latest_seq in FLINTINFO");
+        let ask = |cursor: u64| -> Value {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            let c = cursor.to_string();
+            roundtrip(&mut s, &["FLINTSYNC", &c, "0", "0"])
+        };
+        match ask(latest + 1_000) {
+            Value::Error(e) => {
+                assert!(e.contains("ahead of this master"), "refused, but why: {e}");
+                assert!(
+                    !e.starts_with("WALGAP"),
+                    "a WALGAP would re-seed the copy: {e}"
+                );
+            }
+            other => panic!("a cursor ahead of the tip was admitted: {other:?}"),
+        }
+        match ask(latest) {
+            Value::Simple(ok) => assert!(ok.starts_with("FLINTSYNC-OK"), "{ok}"),
+            other => panic!("a cursor AT the tip must still be admitted: {other:?}"),
+        }
+    }
+
     /// A rocks-backed server, because ADR-0027's batching is rocks-only:
     /// `spawn_server` uses MemKv with `rocks: None`, so every test through it
     /// takes the unbatched path and proves nothing about this.
