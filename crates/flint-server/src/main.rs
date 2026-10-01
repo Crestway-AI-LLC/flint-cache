@@ -1269,6 +1269,62 @@ static DISK: std::sync::LazyLock<diskguard::DiskGuard> =
 /// nothing is released under pressure.
 static DISK_THRESHOLDS: std::sync::OnceLock<diskguard::Thresholds> = std::sync::OnceLock::new();
 
+/// One role transition at a time, as far as FLINTINFO can see (BUG-0042).
+///
+/// A promotion writes the durable role and THEN flips the runtime flag, and a
+/// demotion does the same in reverse role; that order is right ("no window
+/// where a crash resurrects a writable master"). FLINTINFO reads the flag for
+/// `role:` and the durable manifest for `role_epoch:`. Unlocked, one reply
+/// could fall between the two writes and report `role:replica` at the NEW
+/// epoch, which the controller reads as a master-less pair and answers by
+/// promoting the winner again, one epoch higher. Held across both writes in
+/// `commit_role` and both reads in `role_snapshot`, so a reply is wholly
+/// before or wholly after. FLINTINFO and two admin verbs; no data path.
+static ROLE_TRANSITION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn role_transition() -> std::sync::MutexGuard<'static, ()> {
+    ROLE_TRANSITION.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Write the durable role, run `before_flip`, then set the runtime flag to
+/// match, as one step to every FLINTINFO (BUG-0042). Durable first, exactly as
+/// the callers always ordered it. Nothing changes if the write is refused.
+#[cfg(feature = "rocks")]
+fn commit_role(
+    kv: &dyn flint_storage::Kv,
+    claim: flint_storage::manifest::RoleClaim,
+    read_only: &AtomicBool,
+    before_flip: impl FnOnce(),
+) -> Result<(), flint_storage::manifest::ManifestError> {
+    let _t = role_transition();
+    flint_storage::manifest::set_role(kv, claim)?;
+    before_flip();
+    read_only.store(
+        claim.role == flint_storage::manifest::Role::Replica,
+        Ordering::Relaxed,
+    );
+    Ok(())
+}
+
+/// The runtime flag and the durable role epoch, read as one (BUG-0042).
+fn role_snapshot(
+    read_only: &AtomicBool,
+    rocks: &Option<RocksHandle>,
+) -> (bool, Option<flint_storage::manifest::Epoch>) {
+    let _t = role_transition();
+    #[cfg(feature = "rocks")]
+    let epoch = rocks
+        .as_ref()
+        .and_then(|kv| flint_storage::manifest::read_role(kv.as_ref()))
+        .map(|c| c.epoch);
+    #[cfg(not(feature = "rocks"))]
+    let epoch = {
+        let _ = rocks;
+        None
+    };
+    (read_only.load(Ordering::Relaxed), epoch)
+}
+
 // WAL fsync cadence in ms (0 = disabled), for FLINTINFO. Rocks-only.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static WAL_FSYNC_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5581,7 +5637,9 @@ fn execute(
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTINFO"))
     {
-        return flintinfo(ro, rocks, hub, write_queue.map(|q| q.depth()));
+        // BUG-0042: the flag and the durable role epoch as ONE read.
+        let (ro, role_epoch) = role_snapshot(read_only, rocks);
+        return flintinfo(ro, role_epoch, rocks, hub, write_queue.map(|q| q.depth()));
     }
     if args
         .first()
@@ -6006,17 +6064,18 @@ fn flintpromote(
         .map(|c| c.epoch)
         .unwrap_or(Epoch::ZERO);
     manifest::record_promo_fence(kv.as_ref(), epoch, superseded, kv.last_applied());
-    match manifest::set_role(
+    match commit_role(
         kv.as_ref(),
         RoleClaim {
             role: Role::Master,
             epoch,
         },
+        read_only,
+        || tailer_stop.store(true, Ordering::Relaxed),
     ) {
         Ok(()) => {
-            // Durable role first; only then flip runtime state.
-            tailer_stop.store(true, Ordering::Relaxed);
-            read_only.store(false, Ordering::Relaxed);
+            // Durable role first; only then flip runtime state. `commit_role`
+            // makes the pair one step to FLINTINFO (BUG-0042).
             // DROP THE OLD LEASE DEADLINE (#168). It was issued to the
             // PREVIOUS lineage and says nothing about this one — but the
             // watchdog only compares it to the clock, so a deadline already in
@@ -6244,7 +6303,7 @@ fn flintdemote(
     rocks: &Option<RocksHandle>,
     args: &[Vec<u8>],
 ) -> Value {
-    use flint_storage::manifest::{self, Epoch, ManifestError, Role, RoleClaim};
+    use flint_storage::manifest::{Epoch, ManifestError, Role, RoleClaim};
     let Some(kv) = rocks else {
         return Value::Error("ERR FLINTDEMOTE requires the rocks engine".into());
     };
@@ -6278,17 +6337,19 @@ fn flintdemote(
     // small delta. Ahead is the unsafe one, and this ordering cannot produce
     // it.
     let own_at_demote = kv.latest_seq();
-    match manifest::set_role(
+    match commit_role(
         kv.as_ref(),
         RoleClaim {
             role: Role::Replica,
             epoch,
         },
+        read_only,
+        || {},
     ) {
         Ok(()) => {
             // Durable role first, then flip runtime state: no window where a
-            // crash resurrects a writable master.
-            read_only.store(true, Ordering::Relaxed);
+            // crash resurrects a writable master. One step to FLINTINFO
+            // (BUG-0042).
             // Record the resync contract this command's own docstring states,
             // rather than trusting whichever tool restarts the seat to know
             // it. `flintctl roll-node` wipes; `flintctl start` did not, and a
@@ -6366,6 +6427,7 @@ fn flintdemote(
 #[cfg(feature = "rocks")]
 fn flintinfo(
     read_only: bool,
+    role_epoch: Option<flint_storage::manifest::Epoch>,
     rocks: &Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     async_queue_depth: Option<usize>,
@@ -6373,10 +6435,10 @@ fn flintinfo(
     let now = flint_storage::strings::system_clock();
     let latest = rocks.as_ref().map(|kv| kv.latest_seq()).unwrap_or(0);
     let last_applied = rocks.as_ref().map(|kv| kv.last_applied()).unwrap_or(0);
-    let role_epoch = rocks
-        .as_ref()
-        .and_then(|kv| flint_storage::manifest::read_role(kv.as_ref()))
-        .map(|c| c.epoch.to_string())
+    // Taken with `read_only` in one `role_snapshot`, not read here: read here,
+    // the two could straddle a promotion (BUG-0042).
+    let role_epoch = role_epoch
+        .map(|e| e.to_string())
         .unwrap_or_else(|| "none".into());
     // Sequence lag: how many master sequence numbers the freshest live
     // replica still trails. Unlike time-lag (age of the oldest un-acked
@@ -6629,6 +6691,7 @@ fn last_reseed_fields() -> String {
 #[cfg(not(feature = "rocks"))]
 fn flintinfo(
     read_only: bool,
+    _role_epoch: Option<flint_storage::manifest::Epoch>,
     _rocks: &Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     _async_queue_depth: Option<usize>,
@@ -9546,52 +9609,161 @@ mod promote_window_tests {
     /// **This does not prove it is what fired on 2026-08-22** — no log from
     /// that run records both fields at the instant of the poll. It establishes
     /// that the shape is producible, which is what that file has been missing.
+    ///
+    /// **CLOSED 2026-09-30 by `role_snapshot` and `commit_role`.** The
+    /// renderer still draws whatever pair it is handed (the control at the end),
+    /// but no FLINTINFO can be handed a pair from inside a transition: the
+    /// snapshot waits for an open one to finish.
     #[test]
-    fn flintinfo_can_report_replica_at_the_new_epoch() {
+    fn a_role_snapshot_never_lands_inside_a_promotion() {
         let d =
             TempDir(std::env::temp_dir().join(format!("flint-promowin-{}", std::process::id())));
         let _ = std::fs::remove_dir_all(&d.0);
         let kv = std::sync::Arc::new(RocksKv::open(&d.0).expect("open"));
+        let at = |counter| Epoch {
+            generation: 0,
+            counter,
+        };
+        manifest::force_role(
+            kv.as_ref(),
+            RoleClaim {
+                role: Role::Replica,
+                epoch: at(1),
+            },
+        );
+        let read_only = Arc::new(AtomicBool::new(true));
+        let handle: Option<RocksHandle> = Some(kv.clone());
 
-        // The durable half of a promotion has landed: role Master at (0,2).
+        // A promotion held open between its two writes, exactly where
+        // `flintpromote` used to be exposed: the durable role is Master at
+        // (0,2) and the runtime flag still says replica.
+        let open = role_transition();
         manifest::force_role(
             kv.as_ref(),
             RoleClaim {
                 role: Role::Master,
-                epoch: Epoch {
-                    generation: 0,
-                    counter: 2,
-                },
+                epoch: at(2),
             },
         );
-
-        // The runtime half has NOT: read_only is still true. This is the
-        // window, expressed as the argument it is.
-        let out = flintinfo(true, &Some(kv.clone()), &Arc::new(ReplHub::default()), None);
-        let text = match out {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ro2, h2) = (Arc::clone(&read_only), handle.clone());
+        let reader = std::thread::spawn(move || {
+            tx.send(role_snapshot(&ro2, &h2)).expect("send");
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a snapshot was taken inside an open role transition"
+        );
+        read_only.store(false, Ordering::Relaxed);
+        drop(open);
+        let (ro, epoch) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the snapshot after the transition");
+        reader.join().expect("reader");
+        assert!(
+            !ro && epoch == Some(at(2)),
+            "after the transition: master at (0,2); got read_only={ro} epoch={epoch:?}"
+        );
+        let text = |v: Value| match v {
             Value::Bulk(Some(b)) => String::from_utf8_lossy(&b).to_string(),
             other => panic!("FLINTINFO did not return a bulk reply: {other:?}"),
         };
-
-        assert!(
-            text.contains("role:replica\r\n"),
-            "expected the runtime flag to still say replica; got:\n{text}"
-        );
-        assert!(
-            text.contains("role_epoch:(0,2)\r\n"),
-            "expected the durable manifest's NEW epoch; got:\n{text}"
-        );
-
-        // THE CONTROL. Once the flag flips, the two agree — so the disagreement
-        // above is the window and not simply how this function always renders.
-        let after = flintinfo(false, &Some(kv), &Arc::new(ReplHub::default()), None);
-        let after = match after {
-            Value::Bulk(Some(b)) => String::from_utf8_lossy(&b).to_string(),
-            other => panic!("FLINTINFO did not return a bulk reply: {other:?}"),
-        };
+        let after = text(flintinfo(
+            ro,
+            epoch,
+            &handle,
+            &Arc::new(ReplHub::default()),
+            None,
+        ));
         assert!(
             after.contains("role:master\r\n") && after.contains("role_epoch:(0,2)\r\n"),
-            "control: after the flag flips the two fields must agree; got:\n{after}"
+            "rendered from the snapshot; got:\n{after}"
+        );
+
+        // THE CONTROL. The renderer draws the straddled pair if handed it, so
+        // it is the lock, not the renderer, that removed the window.
+        let straddled = text(flintinfo(
+            true,
+            Some(at(2)),
+            &handle,
+            &Arc::new(ReplHub::default()),
+            None,
+        ));
+        assert!(
+            straddled.contains("role:replica\r\n") && straddled.contains("role_epoch:(0,2)\r\n"),
+            "control: the renderer must still draw what it is given; got:\n{straddled}"
+        );
+    }
+
+    /// And the writers take the same lock: `commit_role` waits for a transition
+    /// in progress, then writes the durable role and flips the flag together.
+    /// Promote and demote both go through it (BUG-0042).
+    #[test]
+    fn commit_role_writes_and_flips_inside_the_lock() {
+        let d =
+            TempDir(std::env::temp_dir().join(format!("flint-commitrole-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&d.0);
+        let kv = std::sync::Arc::new(RocksKv::open(&d.0).expect("open"));
+        let at = |counter| Epoch {
+            generation: 0,
+            counter,
+        };
+        manifest::force_role(
+            kv.as_ref(),
+            RoleClaim {
+                role: Role::Replica,
+                epoch: at(1),
+            },
+        );
+        let read_only = Arc::new(AtomicBool::new(true));
+        let held = role_transition();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (kv2, ro2) = (Arc::clone(&kv), Arc::clone(&read_only));
+        let writer = std::thread::spawn(move || {
+            let r = commit_role(
+                kv2.as_ref(),
+                RoleClaim {
+                    role: Role::Master,
+                    epoch: at(2),
+                },
+                &ro2,
+                || {},
+            );
+            tx.send(r.is_ok()).expect("send");
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "commit_role ran while another transition held the lock"
+        );
+        assert!(read_only.load(Ordering::Relaxed), "nothing flipped yet");
+        drop(held);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("commit_role finished"),
+            "the promotion was accepted"
+        );
+        writer.join().expect("writer");
+        assert!(!read_only.load(Ordering::Relaxed), "flag flipped to master");
+        assert_eq!(
+            manifest::read_role(kv.as_ref()).map(|c| (c.role, c.epoch)),
+            Some((Role::Master, at(2)))
+        );
+        // A refused write changes nothing: (0,2) again is not above (0,2).
+        let refused = commit_role(
+            kv.as_ref(),
+            RoleClaim {
+                role: Role::Replica,
+                epoch: at(2),
+            },
+            &read_only,
+            || panic!("before_flip must not run when the write is refused"),
+        );
+        assert!(refused.is_err());
+        assert!(
+            !read_only.load(Ordering::Relaxed),
+            "a refused demote left the flag alone"
         );
     }
 }

@@ -5,7 +5,7 @@ Renumbered from 0041 on 2026-08-22: a peer filed a different BUG-0041
 c134191 and 8767399 say 0041 and are left as written — history is not
 rewritten to tidy a number.
 
-Status: drill half FIXED 2026-08-22; the product question OPEN, but the MECHANISM IS REPRODUCED 2026-09-10 (see the last section) · found 2026-08-22 · Severity: medium — the second promotion is of
+Status: **FIXED 2026-09-30.** The drill half was fixed on 2026-08-22. The window the 2026-09-10 section reproduced is now closed at its source by a third option, which neither of that section's two candidates was: promote and demote make their two writes, and FLINTINFO its two reads, under one lock (see the last section). The 2026-09-05 controller guard stays as the second line. Was: drill half FIXED 2026-08-22; the product question OPEN, but the MECHANISM IS REPRODUCED 2026-09-10 (see the last section) · found 2026-08-22 · Severity: medium — the second promotion is of
 the SAME survivor at a higher epoch, so it is not split-brain and not acked-write
 loss; but it contradicts the invariant ADR-0004's whole argument rests on, and
 the check meant to hold that invariant has been passing without exercising it.
@@ -584,3 +584,45 @@ which is a reason to keep it rather than a reason to close this.
 (1) is the honest place and (2) is what is already deployed. Choosing between
 them is the design question this file has always ended on — but it is now a
 choice between two understood options rather than a search for a mechanism.
+
+## FIXED 2026-09-30 — neither candidate: one lock across the transition
+
+The two options above were (1) render `role:` from the durable manifest, and
+(2) leave it to the guard. Both had a cost the section did not price.
+
+- **(1) would have broken recovery.** A master that self-fences on a superseded
+  lease sets the runtime flag and leaves its durable role at Master. The
+  #168/#171 recovery paths re-promote exactly that node, and they find it
+  because FLINTINFO reports it as `role:replica`. Rendered from the manifest,
+  it would read `role:master`, so the pair would look healthy and the recovery
+  would never start.
+- **(2) left the window open.** The guard catches this shape by re-reading the
+  pair before `CPFENCE`, but the reply that straddles a promotion still exists
+  and every other reader of FLINTINFO still sees it.
+
+**(3), built: make the transition atomic to its reader.** `ROLE_TRANSITION` is
+one mutex. `commit_role` holds it across the durable `set_role` and the flag
+flip; promote and demote both go through it, in the same order as before
+(durable first, so a crash never resurrects a writable master). `role_snapshot`
+holds it while it reads the flag and the durable epoch, and FLINTINFO renders
+from that snapshot after releasing it, so the lock covers two loads, not the
+whole reply. A self-fence still sets the flag alone, with no durable write to
+pair it with, so a self-fenced master still reads `role:replica` and is still
+re-promotable.
+
+Held by `a_role_snapshot_never_lands_inside_a_promotion`, which is the old
+window test turned round. It holds a promotion open between its two writes and
+asserts that no snapshot can be taken until the transition finishes, and that
+the snapshot then reads master at the new epoch. Its control keeps the old
+assertion: given the straddled pair, the renderer still draws `role:replica`
+at the new epoch, so it is the lock, not the renderer, that removed the window.
+And by `commit_role_writes_and_flips_inside_the_lock`: the writer waits for a
+transition in progress, and a refused write runs nothing and flips nothing.
+Two mutants checked: removing the lock from either side fails exactly the test
+aimed at that side.
+
+**Still not established, and unchanged:** that this window is what fired on
+2026-08-22. That run recorded neither field at the instant of the poll. What is
+established is that the only producible shape is now closed, and that the
+guard which caught it stays in place.
+
