@@ -23,6 +23,31 @@ const EF_CONSTRUCTION: usize = 100;
 /// Default `ef` for a query when `VEC.SEARCH` gives no `EF` — the recall/latency
 /// knob. Higher searches more of the graph: better recall, more work.
 pub const EF_SEARCH_DEFAULT: usize = 64;
+/// How many of a reused slot's live neighbourhood each of its old neighbours
+/// re-selects from (BUG-0197), besides its own links. Measured on 5,000 vectors
+/// replaced half at a time for ten rounds: 128 kept recall@10 at a fresh
+/// build's, 64 lost up to 0.014 of it on clustered data, and no bound let the
+/// selection walk ~1,000 candidates for each neighbour.
+const REPAIR_POOL: usize = 4 * M0;
+
+/// Who is walking the graph, which decides what a deleted node is to the walk.
+#[derive(Clone, Copy, PartialEq)]
+enum Walk {
+    /// A search: deleted nodes route but are never returned.
+    Query,
+    /// Inserting node `.0`: deleted nodes are candidates too, since they still
+    /// route, and a layer whose nodes are mostly deleted would otherwise give
+    /// the new node no links and the next layer no place to start. The node
+    /// itself is hidden: a reused slot can be reached through a link that
+    /// pointed at its previous occupant (BUG-0197).
+    Insert(u32),
+}
+
+impl Walk {
+    fn hides(self, n: u32) -> bool {
+        self == Walk::Insert(n)
+    }
+}
 
 /// How a node holds its vector in the graph (ADR-0049 D1).
 enum Code {
@@ -109,6 +134,12 @@ pub struct Hnsw {
     /// 1 keeps these in RAM; step 2 moves them to a local file.
     full: Vec<Vec<f32>>,
     id_to_idx: HashMap<Vec<u8>, u32>,
+    /// Deleted slots the next insert takes before growing `nodes` (BUG-0197).
+    /// Without it a tombstone stayed until a restart's rebuild, so a set whose
+    /// ids churn (`VEC.DEL`, TTL expiry, an upsert's old node) grew without
+    /// bound while the D4 meter credited every delete as freed. Never holds the
+    /// entry point: that slot is freed when the entry moves.
+    free: Vec<u32>,
     entry: Option<u32>,
     max_level: usize,
     live: usize,
@@ -201,6 +232,7 @@ impl Hnsw {
             nodes: Vec::new(),
             full: Vec::new(),
             id_to_idx: HashMap::new(),
+            free: Vec::new(),
             entry: None,
             max_level: 0,
             live: 0,
@@ -215,18 +247,18 @@ impl Hnsw {
     pub fn quant(&self) -> Quant {
         self.quant
     }
+    /// Slots held, live or deleted: what the set costs, as `len` is what it
+    /// serves.
+    #[cfg(test)]
+    fn slots(&self) -> usize {
+        self.nodes.len()
+    }
     pub fn contains(&self, id: &[u8]) -> bool {
-        self.id_to_idx
-            .get(id)
-            .is_some_and(|&i| !self.nodes[i as usize].deleted)
+        self.id_to_idx.contains_key(id)
     }
     pub fn get(&self, id: &[u8]) -> Option<(&[f32], Option<&[u8]>)> {
         let &i = self.id_to_idx.get(id)?;
-        let n = &self.nodes[i as usize];
-        if n.deleted {
-            return None;
-        }
-        Some((self.full_vec(i), n.meta.as_deref()))
+        Some((self.full_vec(i), self.nodes[i as usize].meta.as_deref()))
     }
 
     /// The full-precision vector for node `i`: its code when unquantized, the
@@ -269,32 +301,41 @@ impl Hnsw {
         dist_code(self.metric, &na.code, na.norm, q, qn)
     }
 
-    /// Insert (or upsert) a vector. An upsert tombstones the old node and adds a
-    /// fresh one — HNSW has no cheap in-place move, and a new node keeps the
-    /// graph valid; the tombstone is dropped on the next rebuild.
+    /// Insert (or upsert) a vector. An upsert deletes the old node and inserts
+    /// a fresh one, since HNSW has no cheap in-place move. The insert takes a
+    /// deleted slot when there is one (BUG-0197), so a set's slots are bounded
+    /// by the most it ever held at once, not by how many writes it has seen.
     pub fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
         let norm = l2norm(&vec);
-        if let Some(&old) = self.id_to_idx.get(&id)
-            && !self.nodes[old as usize].deleted
-        {
-            self.nodes[old as usize].deleted = true;
-            self.live -= 1;
-        }
-        let idx = self.nodes.len() as u32;
+        self.del(&id);
         let level = self.gen_level();
         let q = vec.clone();
-        if self.quant != Quant::None {
-            // Indexed like `nodes`: pushed in the same order, never removed.
-            self.full.push(vec.clone());
-        }
-        self.nodes.push(Node {
+        let node = Node {
             id: id.clone(),
-            code: Code::encode(self.quant, vec),
+            code: Code::encode(self.quant, vec.clone()),
             norm,
             meta,
             deleted: false,
             links: vec![Vec::new(); level + 1],
-        });
+        };
+        let idx = match self.free.pop() {
+            Some(i) => {
+                self.unlink(i);
+                self.nodes[i as usize] = node;
+                if self.quant != Quant::None {
+                    self.full[i as usize] = vec;
+                }
+                i
+            }
+            None => {
+                // `full` is indexed like `nodes`: grown in the same order.
+                if self.quant != Quant::None {
+                    self.full.push(vec);
+                }
+                self.nodes.push(node);
+                (self.nodes.len() - 1) as u32
+            }
+        };
         self.id_to_idx.insert(id, idx);
         self.live += 1;
 
@@ -307,14 +348,15 @@ impl Hnsw {
         // Descend the layers ABOVE the new node's top with a greedy ef=1 walk.
         let mut lc = self.max_level;
         while lc > level {
-            ep = self.greedy(&q, norm, ep, lc);
+            ep = self.greedy(&q, norm, ep, lc, Walk::Insert(idx));
             lc -= 1;
         }
-        // Then connect on each layer from the node's top down to 0.
+        // Then connect on each layer from the node's top down to 0, deleted
+        // nodes included (see `Walk::Insert`).
         let mut ep_set = vec![ep];
         let top = level.min(self.max_level);
         for lc in (0..=top).rev() {
-            let w = self.search_layer(&q, norm, &ep_set, EF_CONSTRUCTION, lc);
+            let w = self.search_layer(&q, norm, &ep_set, EF_CONSTRUCTION, lc, Walk::Insert(idx));
             let mmax = if lc == 0 { M0 } else { M };
             // Candidates ranked by distance to the NEW node (idx).
             let cand: Vec<DI> = w
@@ -343,31 +385,110 @@ impl Hnsw {
             ep_set = w.iter().map(|di| di.idx).collect();
         }
         if level > self.max_level {
+            // The old entry, if deleted, was held back from `free`; it is an
+            // ordinary deleted slot from here.
+            if let Some(old) = self.entry
+                && self.nodes[old as usize].deleted
+            {
+                self.free.push(old);
+            }
             self.entry = Some(idx);
             self.max_level = level;
         }
     }
 
     pub fn del(&mut self, id: &[u8]) -> bool {
-        if let Some(&i) = self.id_to_idx.get(id)
-            && !self.nodes[i as usize].deleted
-        {
-            self.nodes[i as usize].deleted = true;
-            self.live -= 1;
-            return true;
+        let Some(i) = self.id_to_idx.remove(id) else {
+            return false;
+        };
+        self.nodes[i as usize].deleted = true;
+        self.live -= 1;
+        // A deleted node keeps routing until its slot is taken. The entry
+        // point is never taken: every search starts there.
+        if self.entry != Some(i) {
+            self.free.push(i);
         }
-        false
+        true
+    }
+
+    /// Detach deleted slot `i` from the graph before it is reused. A node that
+    /// links to `i` would otherwise point at whatever vector moves in, and a
+    /// node reachable only through `i` would be lost. So each of `i`'s old
+    /// neighbours that links back re-selects its links from its own (less `i`)
+    /// and the nearest [`REPAIR_POOL`] live nodes within two hops of `i`: the
+    /// repair hnswlib makes on a replace, narrowed. A link to `i` from outside
+    /// its neighbourhood is left; a walk takes it as an ordinary link, or as
+    /// stale when the new node does not reach that layer (`steps_onto`).
+    fn unlink(&mut self, i: u32) {
+        let old = std::mem::take(&mut self.nodes[i as usize].links);
+        for (layer, around) in old.iter().enumerate() {
+            let mmax = if layer == 0 { M0 } else { M };
+            let mut seen: HashSet<u32> = HashSet::from([i]);
+            let mut pool: Vec<u32> = Vec::new();
+            for &x in around {
+                if seen.insert(x) {
+                    pool.push(x);
+                }
+                if let Some(xl) = self.nodes[x as usize].links.get(layer) {
+                    pool.extend(xl.iter().copied().filter(|&y| seen.insert(y)));
+                }
+            }
+            // A deleted node in the pool is likely the next slot reused, and a
+            // link to it would go stale with it.
+            pool.retain(|&x| {
+                let nd = &self.nodes[x as usize];
+                !nd.deleted && nd.links.len() > layer
+            });
+            for &n in around {
+                let Some(nl) = self.nodes[n as usize].links.get(layer) else {
+                    continue;
+                };
+                if n == i || !nl.contains(&i) {
+                    continue;
+                }
+                let own: Vec<u32> = nl.iter().copied().filter(|&x| x != i).collect();
+                let mut cand: Vec<DI> = pool
+                    .iter()
+                    .copied()
+                    .filter(|&x| x != n && !own.contains(&x))
+                    .map(|x| DI {
+                        dist: self.dnn(n, x),
+                        idx: x,
+                    })
+                    .collect();
+                if cand.len() > REPAIR_POOL {
+                    cand.select_nth_unstable(REPAIR_POOL);
+                    cand.truncate(REPAIR_POOL);
+                }
+                cand.extend(own.iter().map(|&x| DI {
+                    dist: self.dnn(n, x),
+                    idx: x,
+                }));
+                self.nodes[n as usize].links[layer] = self.select_heuristic(&cand, mmax);
+            }
+        }
+    }
+
+    /// Whether the walk may step onto `n` at `layer`. Besides [`Walk::hides`],
+    /// a link can name a reused slot whose new node does not reach this layer:
+    /// [`Hnsw::unlink`] repairs only the old node's own neighbourhood. Such a
+    /// link is stale, and the node is not on this layer.
+    fn steps_onto(&self, walk: Walk, n: u32, layer: usize) -> bool {
+        !walk.hides(n) && self.nodes[n as usize].links.len() > layer
     }
 
     /// Greedy ef=1 descent at one layer: hop to the nearest neighbour until no
     /// neighbour is closer to the query.
-    fn greedy(&self, q: &[f32], qn: f32, ep: u32, layer: usize) -> u32 {
+    fn greedy(&self, q: &[f32], qn: f32, ep: u32, layer: usize, walk: Walk) -> u32 {
         let mut cur = ep;
         let mut cur_d = self.dnq(cur, q, qn);
         loop {
             let mut changed = false;
             if let Some(neigh) = self.nodes[cur as usize].links.get(layer) {
                 for &n in neigh {
+                    if !self.steps_onto(walk, n, layer) {
+                        continue;
+                    }
                     let d = self.dnq(n, q, qn);
                     if d < cur_d {
                         cur_d = d;
@@ -383,9 +504,18 @@ impl Hnsw {
         cur
     }
 
-    /// Beam search at one layer: return up to `ef` nearest LIVE nodes. Deleted
-    /// nodes still route (their links are followed) but never enter the result.
-    fn search_layer(&self, q: &[f32], qn: f32, ep: &[u32], ef: usize, layer: usize) -> Vec<DI> {
+    /// Beam search at one layer: return up to `ef` nearest nodes. Deleted
+    /// nodes always route (their links are followed); what else they are to
+    /// the walk is [`Walk`]'s to say.
+    fn search_layer(
+        &self,
+        q: &[f32],
+        qn: f32,
+        ep: &[u32],
+        ef: usize,
+        layer: usize,
+        walk: Walk,
+    ) -> Vec<DI> {
         let mut visited: HashSet<u32> = HashSet::new();
         let mut cands: BinaryHeap<std::cmp::Reverse<DI>> = BinaryHeap::new();
         let mut w: BinaryHeap<DI> = BinaryHeap::new(); // max-heap: worst on top
@@ -395,7 +525,7 @@ impl Hnsw {
             }
             let d = self.dnq(e, q, qn);
             cands.push(std::cmp::Reverse(DI { dist: d, idx: e }));
-            if !self.nodes[e as usize].deleted {
+            if !(walk == Walk::Query && self.nodes[e as usize].deleted) {
                 w.push(DI { dist: d, idx: e });
             }
         }
@@ -410,14 +540,14 @@ impl Hnsw {
                 .cloned()
                 .unwrap_or_default();
             for n in neigh {
-                if !visited.insert(n) {
+                if !self.steps_onto(walk, n, layer) || !visited.insert(n) {
                     continue;
                 }
                 let d = self.dnq(n, q, qn);
                 let worst = w.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
                 if d < worst || w.len() < ef {
                     cands.push(std::cmp::Reverse(DI { dist: d, idx: n }));
-                    if !self.nodes[n as usize].deleted {
+                    if !(walk == Walk::Query && self.nodes[n as usize].deleted) {
                         w.push(DI { dist: d, idx: n });
                         if w.len() > ef {
                             w.pop();
@@ -481,14 +611,14 @@ impl Hnsw {
         };
         let qn = l2norm(q);
         for lc in (1..=self.max_level).rev() {
-            ep = self.greedy(q, qn, ep, lc);
+            ep = self.greedy(q, qn, ep, lc, Walk::Query);
         }
         let depth = if self.quant == Quant::None {
             k
         } else {
             rerank.max(k)
         };
-        let mut w = self.search_layer(q, qn, &[ep], ef.max(depth), 0);
+        let mut w = self.search_layer(q, qn, &[ep], ef.max(depth), 0, Walk::Query);
         w.sort();
         w.truncate(depth);
         if self.quant != Quant::None {
@@ -634,6 +764,224 @@ mod tests {
             tot += k;
         }
         hit as f64 / tot as f64
+    }
+
+    /// BUG-0197: an insert searched each layer for LIVE neighbours only, so
+    /// under churn a new node could get no links, and one that reached a new
+    /// top level became an entry point nothing led away from. Unfixed, every
+    /// one of these searches returned nothing.
+    #[test]
+    fn a_search_finds_live_vectors_among_deleted_ones() {
+        let mut rng = Rng(0x0197_0001);
+        let mut h = Hnsw::new(Metric::L2, Quant::None);
+        let live: Vec<Vec<f32>> = (0..100).map(|_| rng.vec(16)).collect();
+        for (i, v) in live.iter().enumerate() {
+            h.set(format!("live{i}").into_bytes(), v.clone(), None);
+        }
+        for round in 0..10 {
+            let ids: Vec<Vec<u8>> = (0..100)
+                .map(|i| format!("r{round}-{i}").into_bytes())
+                .collect();
+            for id in &ids {
+                h.set(id.clone(), rng.vec(16), None);
+            }
+            for id in &ids {
+                assert!(h.del(id));
+            }
+        }
+        assert_eq!(h.len(), 100);
+        let found = live
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| {
+                h.knn(v, 1, EF_SEARCH_DEFAULT, 1)
+                    .first()
+                    .map(|(id, _)| id.clone())
+                    == Some(format!("live{i}").into_bytes())
+            })
+            .count();
+        assert_eq!(found, 100, "live vectors that find themselves after churn");
+    }
+
+    /// BUG-0197: a delete's slot is taken by the next insert, so the slots a
+    /// set holds are bounded by the most it ever held live, plus the entry
+    /// point (never reused, since every search starts there). Unfixed, every
+    /// write added a slot and nothing removed one until a restart.
+    #[test]
+    fn deleted_slots_are_reused_so_churn_does_not_grow_the_set() {
+        let mut rng = Rng(0x0197_0002);
+        let mut h = Hnsw::new(Metric::L2, Quant::Sq8);
+        for _ in 0..1000 {
+            h.set(b"a".to_vec(), rng.vec(16), None);
+        }
+        assert_eq!(h.len(), 1);
+        assert!(
+            h.slots() <= 2,
+            "1,000 upserts of one id hold {} slots",
+            h.slots()
+        );
+
+        let mut h = Hnsw::new(Metric::L2, Quant::None);
+        for i in 0..100 {
+            h.set(format!("live{i}").into_bytes(), rng.vec(16), None);
+        }
+        for round in 0..20 {
+            let ids: Vec<Vec<u8>> = (0..100)
+                .map(|i| format!("r{round}-{i}").into_bytes())
+                .collect();
+            for id in &ids {
+                h.set(id.clone(), rng.vec(16), None);
+            }
+            for id in &ids {
+                h.del(id);
+            }
+        }
+        assert_eq!(h.len(), 100);
+        assert!(
+            h.slots() <= 201,
+            "peak 200 live, {} slots after 20 rounds",
+            h.slots()
+        );
+    }
+
+    /// Live nodes no walk from the entry can reach on layer 0.
+    fn unreachable_live(h: &Hnsw) -> usize {
+        let Some(e) = h.entry else { return 0 };
+        let mut seen = HashSet::new();
+        let mut stack = vec![e];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            for &x in &h.nodes[n as usize].links[0] {
+                stack.push(x);
+            }
+        }
+        h.nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, nd)| !nd.deleted && !seen.contains(&(*i as u32)))
+            .count()
+    }
+
+    /// BUG-0197: a link from outside a deleted node's neighbourhood survives
+    /// the relink, so the insert that reuses the slot can walk onto it. Hidden
+    /// from its own walk, the new node links to others; not hidden, it found
+    /// itself at distance 0 and linked to itself.
+    #[test]
+    fn a_reused_slot_never_links_to_itself() {
+        let mut rng = Rng(0x0197_0005);
+        let mut h = Hnsw::new(Metric::L2, Quant::None);
+        for i in 0..200 {
+            h.set(format!("{i}").into_bytes(), rng.vec(8), None);
+        }
+        let entry = h.entry.expect("a set of 200 has an entry point");
+        let x = (0..200u32)
+            .find(|&i| i != entry)
+            .expect("a node besides the entry");
+        // A node that does not link to `x`, so the relink leaves its new link.
+        let p = (0..200u32)
+            .find(|&i| i != x && i != entry && !h.nodes[i as usize].links[0].contains(&x))
+            .expect("a node that does not link to x");
+        assert!(h.del(format!("{x}").as_bytes()));
+        h.nodes[p as usize].links[0].push(x);
+        let near_p: Vec<f32> = h.nodes[p as usize].code.vals().map(|v| v + 1e-3).collect();
+        h.set(b"new".to_vec(), near_p.clone(), None);
+        assert_eq!(
+            h.id_to_idx[b"new".as_slice()],
+            x,
+            "the insert reused x's slot"
+        );
+        for (i, nd) in h.nodes.iter().enumerate() {
+            for (layer, l) in nd.links.iter().enumerate() {
+                assert!(
+                    !l.contains(&(i as u32)),
+                    "node {i} links to itself on layer {layer}"
+                );
+            }
+        }
+        assert_eq!(
+            h.knn(&near_p, 1, EF_SEARCH_DEFAULT, 1)[0].0,
+            b"new".to_vec()
+        );
+    }
+
+    /// BUG-0197: a reused slot's neighbourhood is relinked, so a set that has
+    /// replaced its vectors three times over searches like one built fresh
+    /// from the vectors it now holds, both against brute force: 0.995 against
+    /// 1.000 here. Without the relink it reads 0.960. Across six seeds at 3,000
+    /// vectors and ten rounds, it was never more than 0.01 below a fresh build
+    /// in 11 of 12 runs (the twelfth 0.025 below); without it, 0.014-0.064.
+    #[test]
+    fn recall_after_churn_matches_a_fresh_build() {
+        let (n, dim, k, ef) = (2500usize, 32usize, 10usize, 40usize);
+        let mut rng = Rng(0x0197_0004);
+        let cs: Vec<Vec<f32>> = (0..40).map(|_| rng.vec(dim)).collect();
+        let point = |rng: &mut Rng, i: usize| -> Vec<f32> {
+            cs[i % 40].iter().map(|x| x + 0.1 * rng.f32()).collect()
+        };
+        let mut h = Hnsw::new(Metric::L2, Quant::None);
+        let mut live: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
+        for i in 0..n {
+            let v = point(&mut rng, i);
+            h.set(format!("{i}").into_bytes(), v.clone(), None);
+            live.push((format!("{i}").into_bytes(), v));
+        }
+        // Six rounds, each deleting half of what is live and inserting as many.
+        let mut next = n;
+        for round in 0..6 {
+            let mut keep = Vec::new();
+            for (j, (id, v)) in live.drain(..).enumerate() {
+                if (j + round) % 2 == 0 {
+                    h.del(&id);
+                } else {
+                    keep.push((id, v));
+                }
+            }
+            live = keep;
+            while live.len() < n {
+                let v = point(&mut rng, next);
+                h.set(format!("{next}").into_bytes(), v.clone(), None);
+                live.push((format!("{next}").into_bytes(), v));
+                next += 1;
+            }
+        }
+        assert_eq!(h.len(), n);
+        assert_eq!(unreachable_live(&h), 0, "live nodes no search can reach");
+        let mut fresh = Hnsw::new(Metric::L2, Quant::None);
+        for (id, v) in &live {
+            fresh.set(id.clone(), v.clone(), None);
+        }
+        let mut q_rng = Rng(77);
+        let (mut churned, mut built, mut tot) = (0usize, 0usize, 0usize);
+        for qi in 0..200 {
+            let q: Vec<f32> = live[(qi * 13) % n]
+                .1
+                .iter()
+                .map(|x| x + 0.3 * q_rng.f32())
+                .collect();
+            let qn = l2norm(&q);
+            let mut bf: Vec<(f32, &Vec<u8>)> = live
+                .iter()
+                .map(|(id, v)| (dist(Metric::L2, &q, qn, v, l2norm(v)), id))
+                .collect();
+            bf.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: HashSet<&Vec<u8>> = bf[..k].iter().map(|(_, id)| *id).collect();
+            let hits = |g: &Hnsw| {
+                g.knn(&q, k, ef, k)
+                    .iter()
+                    .filter(|(id, _)| truth.contains(id))
+                    .count()
+            };
+            churned += hits(&h);
+            built += hits(&fresh);
+            tot += k;
+        }
+        let (churned, built) = (churned as f64 / tot as f64, built as f64 / tot as f64);
+        assert!(
+            churned >= built - 0.02,
+            "recall@{k} after churn {churned:.3}, more than 0.02 below a fresh build's {built:.3}"
+        );
     }
 
     /// ADR-0049: 8-bit codes plus a re-rank keep recall where the full-vector
