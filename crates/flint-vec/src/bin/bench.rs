@@ -11,7 +11,9 @@
 //!
 //! Usage: bench [--sizes 1000,10000,100000] [--dim 128] [--queries 200]
 //!              [--k 10] [--ef 64] [--metric cosine|l2|ip]
-//!              [--quant sq8 [--rerank R]]   (ADR-0049: adds a quantized HNSW arm)
+//!              [--quant sq8 [--rerank R] [--vec-dir D]]
+//!                (ADR-0049: adds a quantized HNSW arm; with --vec-dir, a second
+//!                 one whose full vectors are in a file in D, as step 2 serves)
 //! Not wired into any gate — it allocates a corpus and takes seconds; run it by
 //! hand when the index engine or its parameters change.
 
@@ -236,6 +238,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.10);
     let quant: Option<String> = arg(&a, "--quant");
+    let vec_dir: Option<std::path::PathBuf> = arg(&a, "--vec-dir").map(Into::into);
     let rerank: usize = arg(&a, "--rerank")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4 * k);
@@ -283,17 +286,31 @@ fn main() {
             format!("{h50}/{h99}/{hm}"),
         );
         if let Some(q) = quant.as_deref() {
-            let q_ms = build(&mut st, &ns, "q", "hnsw", Some(q), dim, &metric, &vecs);
-            let (qids, q_lat) = search_all(&st, &ns, "q", &queries_s, k, ef, rerank);
-            let (q50, q99, qm) = stats(q_lat);
-            let qr = recall(&oracle, &qids, k);
-            println!(
-                "{:>8}  {:>9}  {q_ms:>9}  {:>22}  {:>22}  {qr:>9.3}   <- hnsw QUANT {q} RERANK {rerank}",
-                "",
-                "",
-                "",
-                format!("{q50}/{q99}/{qm}"),
-            );
+            // Each quantized arm in a Store of its own, so its D4 meter is
+            // the set's alone.
+            let mut arms = vec![(None, "vectors in RAM")];
+            if let Some(d) = vec_dir.as_ref() {
+                arms.push((Some(d), "vectors in --vec-dir"));
+            }
+            for (dir, label) in arms {
+                let mut sq = Store::new();
+                if let Some(d) = dir {
+                    std::fs::create_dir_all(d).expect("--vec-dir");
+                    sq.set_vec_dir(d.clone());
+                }
+                let q_ms = build(&mut sq, &ns, "q", "hnsw", Some(q), dim, &metric, &vecs);
+                let (qids, q_lat) = search_all(&sq, &ns, "q", &queries_s, k, ef, rerank);
+                let (q50, q99, qm) = stats(q_lat);
+                let qr = recall(&oracle, &qids, k);
+                println!(
+                    "{:>8}  {:>9}  {q_ms:>9}  {:>22}  {:>22}  {qr:>9.3}   <- hnsw QUANT {q} RERANK {rerank}, {label}, meter {} MB",
+                    "",
+                    "",
+                    "",
+                    format!("{q50}/{q99}/{qm}"),
+                    sq.ns_mem_bytes(&ns) / (1024 * 1024),
+                );
+            }
         }
     }
 

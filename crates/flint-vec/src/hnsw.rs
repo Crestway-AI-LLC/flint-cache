@@ -9,11 +9,13 @@
 //! "higher is nearer" score so `VEC.SEARCH` replies are identical in shape and
 //! ordering whichever index a set uses.
 //!
-//! Deletion tombstones a node: it stays in the graph for ROUTING but never
-//! appears in results, and a cold-start rebuild drops tombstones (only live
-//! vectors are re-inserted from KV), which also compacts churn.
+//! Deletion marks a node: it stays in the graph for ROUTING but never appears
+//! in results, until the next insert takes its slot (BUG-0197). A cold-start
+//! rebuild re-inserts only live vectors from KV.
 
+use crate::vecfile::VecFile;
 use crate::{Metric, Quant};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -128,11 +130,10 @@ pub struct Hnsw {
     metric: Metric,
     quant: Quant,
     nodes: Vec<Node>,
-    /// The full vectors when the graph holds codes, indexed like `nodes`: the
-    /// re-rank reads them, and `get` returns them so VEC.GET stays lossless.
-    /// Empty for `Quant::None`, whose codes ARE the full vectors. ADR-0049 step
-    /// 1 keeps these in RAM; step 2 moves them to a local file.
-    full: Vec<Vec<f32>>,
+    /// The full vectors when the graph holds codes, by slot: the re-rank
+    /// reads them, and `get` returns them so VEC.GET stays lossless. Unused
+    /// for `Quant::None`, whose codes ARE the full vectors.
+    full: Full,
     id_to_idx: HashMap<Vec<u8>, u32>,
     /// Deleted slots the next insert takes before growing `nodes` (BUG-0197).
     /// Without it a tombstone stayed until a restart's rebuild, so a set whose
@@ -145,6 +146,22 @@ pub struct Hnsw {
     live: usize,
     rng: u64,
     m_l: f64,
+}
+
+/// A stored vector and its meta, as [`Hnsw::get`] finds them.
+pub type Found<'a> = (Cow<'a, [f32]>, Option<&'a [u8]>);
+
+/// Where a quantized graph keeps its full vectors (ADR-0049).
+enum Full {
+    /// In RAM, indexed like `nodes`: a co-processor with no `--vec-dir`.
+    Ram(Vec<Vec<f32>>),
+    /// In a local file (D2). `spill` holds, in RAM, the vector of a slot whose
+    /// write failed, so the index never lacks a vector it acknowledged; the D4
+    /// meter is charged for it ([`Hnsw::spill_bytes`]).
+    File {
+        file: VecFile,
+        spill: HashMap<u32, Vec<f32>>,
+    },
 }
 
 /// A (distance, node) pair ordered by distance (smaller first via `Reverse`),
@@ -230,7 +247,7 @@ impl Hnsw {
             metric,
             quant,
             nodes: Vec::new(),
-            full: Vec::new(),
+            full: Full::Ram(Vec::new()),
             id_to_idx: HashMap::new(),
             free: Vec::new(),
             entry: None,
@@ -256,17 +273,111 @@ impl Hnsw {
     pub fn contains(&self, id: &[u8]) -> bool {
         self.id_to_idx.contains_key(id)
     }
-    pub fn get(&self, id: &[u8]) -> Option<(&[f32], Option<&[u8]>)> {
+    /// The stored vector and meta of `id`. Errs only when the vector file
+    /// cannot be read.
+    pub fn get(&self, id: &[u8]) -> Result<Option<Found<'_>>, String> {
+        let Some(&i) = self.id_to_idx.get(id) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            self.full_vec(i)?,
+            self.nodes[i as usize].meta.as_deref(),
+        )))
+    }
+
+    /// The meta of `id`, without reading its vector: what the D4 meter needs.
+    pub fn meta(&self, id: &[u8]) -> Option<Option<&[u8]>> {
         let &i = self.id_to_idx.get(id)?;
-        Some((self.full_vec(i), self.nodes[i as usize].meta.as_deref()))
+        Some(self.nodes[i as usize].meta.as_deref())
+    }
+
+    /// Keep this set's full vectors in `file` rather than RAM (ADR-0049 D2).
+    /// Only for a quantized set with nothing in it yet.
+    pub fn attach_vec_file(&mut self, file: VecFile) {
+        debug_assert!(self.quant != Quant::None && self.nodes.is_empty());
+        self.full = Full::File {
+            file,
+            spill: HashMap::new(),
+        };
+    }
+
+    /// Whether the full vectors are in a file rather than RAM.
+    pub fn vectors_on_disk(&self) -> bool {
+        matches!(self.full, Full::File { .. })
+    }
+
+    /// The vector file's size: slots written, live or not.
+    pub fn disk_bytes(&self) -> u64 {
+        match &self.full {
+            Full::File { file, .. } => file.len_bytes(),
+            Full::Ram(_) => 0,
+        }
+    }
+
+    /// RAM held for vectors whose file write failed.
+    pub fn spill_bytes(&self) -> usize {
+        match &self.full {
+            Full::File { spill, .. } => spill.values().map(|v| v.len() * 4).sum(),
+            Full::Ram(_) => 0,
+        }
     }
 
     /// The full-precision vector for node `i`: its code when unquantized, the
     /// side store otherwise.
-    fn full_vec(&self, i: u32) -> &[f32] {
-        match &self.nodes[i as usize].code {
-            Code::F32(v) => v,
-            Code::Sq8 { .. } => &self.full[i as usize],
+    fn full_vec(&self, i: u32) -> Result<Cow<'_, [f32]>, String> {
+        if let Code::F32(v) = &self.nodes[i as usize].code {
+            return Ok(Cow::Borrowed(v));
+        }
+        match &self.full {
+            Full::Ram(f) => Ok(Cow::Borrowed(&f[i as usize])),
+            Full::File { file, spill } => match spill.get(&i) {
+                Some(v) => Ok(Cow::Borrowed(v)),
+                None => file
+                    .get(i)
+                    .map(Cow::Owned)
+                    .map_err(|e| format!("vector file {} slot {i}: {e}", file.path().display())),
+            },
+        }
+    }
+
+    /// The full vectors of several nodes, in order: one batch of file reads,
+    /// hinted together ([`VecFile::get_many`]).
+    fn full_many(&self, idxs: &[u32]) -> Result<Vec<Cow<'_, [f32]>>, String> {
+        let Full::File { file, spill } = &self.full else {
+            return idxs.iter().map(|&i| self.full_vec(i)).collect();
+        };
+        let on_file: Vec<u32> = idxs
+            .iter()
+            .copied()
+            .filter(|i| !spill.contains_key(i))
+            .collect();
+        let mut read = file
+            .get_many(&on_file)
+            .map_err(|e| format!("vector file {}: {e}", file.path().display()))?
+            .into_iter();
+        idxs.iter()
+            .map(|i| match spill.get(i) {
+                Some(v) => Ok(Cow::Borrowed(v.as_slice())),
+                None => read
+                    .next()
+                    .map(Cow::Owned)
+                    .ok_or_else(|| "vector file read came back short".to_string()),
+            })
+            .collect()
+    }
+
+    /// Store slot `slot`'s full vector: a new slot is the next one.
+    fn put_full(&mut self, slot: u32, v: Vec<f32>) {
+        match &mut self.full {
+            Full::Ram(f) if (slot as usize) < f.len() => f[slot as usize] = v,
+            Full::Ram(f) => f.push(v),
+            Full::File { file, spill } => {
+                if file.put(slot, &v).is_ok() {
+                    spill.remove(&slot);
+                } else {
+                    spill.insert(slot, v);
+                }
+            }
         }
     }
 
@@ -322,20 +433,16 @@ impl Hnsw {
             Some(i) => {
                 self.unlink(i);
                 self.nodes[i as usize] = node;
-                if self.quant != Quant::None {
-                    self.full[i as usize] = vec;
-                }
                 i
             }
             None => {
-                // `full` is indexed like `nodes`: grown in the same order.
-                if self.quant != Quant::None {
-                    self.full.push(vec);
-                }
                 self.nodes.push(node);
                 (self.nodes.len() - 1) as u32
             }
         };
+        if self.quant != Quant::None {
+            self.put_full(idx, vec);
+        }
         self.id_to_idx.insert(id, idx);
         self.live += 1;
 
@@ -403,6 +510,10 @@ impl Hnsw {
         };
         self.nodes[i as usize].deleted = true;
         self.live -= 1;
+        // A deleted node routes by its code; its full vector is dead.
+        if let Full::File { spill, .. } = &mut self.full {
+            spill.remove(&i);
+        }
         // A deleted node keeps routing until its slot is taken. The entry
         // point is never taken: every search starts there.
         if self.entry != Some(i) {
@@ -602,12 +713,21 @@ impl Hnsw {
     /// vectors and only then cut to `k`. That is what lets an aggressive code
     /// keep recall: the code only has to get the right answers into the top
     /// `rerank`, not into the right order.
-    pub fn knn(&self, q: &[f32], k: usize, ef: usize, rerank: usize) -> Vec<(Vec<u8>, f32)> {
+    ///
+    /// Errs only when the vector file cannot be read: a search answers from
+    /// the full vectors or not at all, never from codes alone.
+    pub fn knn(
+        &self,
+        q: &[f32],
+        k: usize,
+        ef: usize,
+        rerank: usize,
+    ) -> Result<Vec<(Vec<u8>, f32)>, String> {
         if k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let Some(mut ep) = self.entry else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let qn = l2norm(q);
         for lc in (1..=self.max_level).rev() {
@@ -622,21 +742,28 @@ impl Hnsw {
         w.sort();
         w.truncate(depth);
         if self.quant != Quant::None {
-            for di in &mut w {
-                let n = &self.nodes[di.idx as usize];
-                di.dist = dist(self.metric, self.full_vec(di.idx), n.norm, q, qn);
+            let idxs: Vec<u32> = w.iter().map(|di| di.idx).collect();
+            for (di, v) in w.iter_mut().zip(self.full_many(&idxs)?) {
+                di.dist = dist(self.metric, &v, self.nodes[di.idx as usize].norm, q, qn);
             }
             w.sort();
         }
         w.truncate(k);
-        w.into_iter()
+        Ok(w.into_iter()
             .map(|di| {
                 (
                     self.nodes[di.idx as usize].id.clone(),
                     dist_to_score(self.metric, di.dist),
                 )
             })
-            .collect()
+            .collect())
+    }
+
+    /// [`Hnsw::knn`] for a set whose vectors are in RAM, which cannot fail.
+    #[cfg(test)]
+    fn knn_ok(&self, q: &[f32], k: usize, ef: usize, rerank: usize) -> Vec<(Vec<u8>, f32)> {
+        self.knn(q, k, ef, rerank)
+            .expect("an in-RAM set reads no file")
     }
 }
 
@@ -692,7 +819,7 @@ mod tests {
                 .iter()
                 .map(|(_, i)| format!("{i}").into_bytes())
                 .collect();
-            for (id, _) in h.knn(&q, k, ef, k) {
+            for (id, _) in h.knn_ok(&q, k, ef, k) {
                 if truth.contains(&id) {
                     hit += 1;
                 }
@@ -757,7 +884,7 @@ mod tests {
                 .map(|(_, i)| format!("{i}").into_bytes())
                 .collect();
             hit += h
-                .knn(&q, k, ef, rerank)
+                .knn_ok(&q, k, ef, rerank)
                 .iter()
                 .filter(|(id, _)| truth.contains(id))
                 .count();
@@ -794,7 +921,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|(i, v)| {
-                h.knn(v, 1, EF_SEARCH_DEFAULT, 1)
+                h.knn_ok(v, 1, EF_SEARCH_DEFAULT, 1)
                     .first()
                     .map(|(id, _)| id.clone())
                     == Some(format!("live{i}").into_bytes())
@@ -901,7 +1028,7 @@ mod tests {
             }
         }
         assert_eq!(
-            h.knn(&near_p, 1, EF_SEARCH_DEFAULT, 1)[0].0,
+            h.knn_ok(&near_p, 1, EF_SEARCH_DEFAULT, 1)[0].0,
             b"new".to_vec()
         );
     }
@@ -968,7 +1095,7 @@ mod tests {
             bf.sort_by(|a, b| a.0.total_cmp(&b.0));
             let truth: HashSet<&Vec<u8>> = bf[..k].iter().map(|(_, id)| *id).collect();
             let hits = |g: &Hnsw| {
-                g.knn(&q, k, ef, k)
+                g.knn_ok(&q, k, ef, k)
                     .iter()
                     .filter(|(id, _)| truth.contains(id))
                     .count()
@@ -999,28 +1126,71 @@ mod tests {
         }
     }
 
-    /// The codes are lossy; VEC.GET is not. A quantized set returns the vector
-    /// exactly as stored, and a search scores against the full vector too.
-    #[test]
-    fn a_quantized_set_returns_and_scores_the_exact_vector() {
-        let mut h = Hnsw::new(Metric::L2, Quant::Sq8);
+    /// A scratch directory for one test's vector file.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("flint-vec-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("temp dir");
+        d
+    }
+
+    /// ADR-0049: a quantized set returns the vector exactly as stored, and a
+    /// search scores against the full vector, whether the full vectors are in
+    /// RAM or in the local file (step 2).
+    fn returns_and_scores_the_exact_vector(mut h: Hnsw) {
         let v = vec![0.123_456_7, -9.876_543, 3.25, 1e-7];
         h.set(b"a".to_vec(), v.clone(), Some(b"m".to_vec()));
         h.set(b"b".to_vec(), vec![100.0, 100.0, 100.0, 100.0], None);
-        let (got, meta) = h.get(b"a").expect("present");
-        assert_eq!(got, v.as_slice(), "lossless, bit for bit");
+        let (got, meta) = h.get(b"a").expect("readable").expect("present");
+        assert_eq!(&*got, v.as_slice(), "lossless, bit for bit");
         assert_eq!(meta, Some(&b"m"[..]));
-        let top = h.knn(&v, 1, 16, 4);
+        let top = h.knn(&v, 1, 16, 4).expect("readable");
         assert_eq!(top[0].0, b"a".to_vec());
         assert_eq!(
             top[0].1, 0.0,
             "re-ranked on the full vector: exact match scores 0"
         );
-        // An upsert keeps `full` aligned with the nodes it belongs to.
+        // An upsert takes the slot it frees, and its vector replaces the old.
         let w = vec![5.0, 5.0, 5.0, 5.5];
         h.set(b"a".to_vec(), w.clone(), None);
-        assert_eq!(h.get(b"a").map(|(x, _)| x.to_vec()), Some(w));
-        assert_eq!(h.get(b"b").map(|(x, _)| x.to_vec()), Some(vec![100.0; 4]));
+        let get = |h: &Hnsw, id: &[u8]| h.get(id).expect("readable").map(|(x, _)| x.to_vec());
+        assert_eq!(get(&h, b"a"), Some(w));
+        assert_eq!(get(&h, b"b"), Some(vec![100.0; 4]));
+    }
+
+    #[test]
+    fn a_quantized_set_returns_and_scores_the_exact_vector() {
+        returns_and_scores_the_exact_vector(Hnsw::new(Metric::L2, Quant::Sq8));
+    }
+
+    #[test]
+    fn a_set_with_a_vector_file_returns_and_scores_the_exact_vector() {
+        let d = scratch("exact");
+        let f = VecFile::create(&d.join("0.vecs"), 4).expect("create");
+        let mut h = Hnsw::new(Metric::L2, Quant::Sq8);
+        h.attach_vec_file(f);
+        assert!(h.vectors_on_disk());
+        returns_and_scores_the_exact_vector(h);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A vector whose file write fails is kept in RAM rather than lost, and
+    /// reported, so the index never lacks a vector it acknowledged.
+    #[test]
+    fn a_failed_file_write_keeps_the_vector_in_ram() {
+        let d = scratch("spill");
+        let f = VecFile::read_only(&d.join("0.vecs"), 4).expect("create");
+        let mut h = Hnsw::new(Metric::L2, Quant::Sq8);
+        h.attach_vec_file(f);
+        let v = vec![1.5, 2.5, 3.5, 4.5];
+        h.set(b"a".to_vec(), v.clone(), None);
+        assert_eq!(h.spill_bytes(), 16);
+        let (got, _) = h.get(b"a").expect("readable").expect("present");
+        assert_eq!(&*got, v.as_slice());
+        assert_eq!(h.knn(&v, 1, 16, 4).expect("readable")[0].1, 0.0);
+        // Deleted, its vector is dead and the RAM is given back.
+        assert!(h.del(b"a"));
+        assert_eq!(h.spill_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1032,7 +1202,7 @@ mod tests {
         // upsert a moves it far away
         h.set(b"a".to_vec(), vec![9.0, 9.0], None);
         assert_eq!(h.len(), 2, "upsert is not a new live node");
-        let near_origin = h.knn(&[0.0, 0.0], 1, 32, 1);
+        let near_origin = h.knn_ok(&[0.0, 0.0], 1, 32, 1);
         assert_eq!(
             near_origin[0].0,
             b"b".to_vec(),
@@ -1042,7 +1212,7 @@ mod tests {
         assert!(h.del(b"b"));
         assert!(!h.contains(b"b"));
         assert_eq!(h.len(), 1);
-        let all = h.knn(&[0.0, 0.0], 5, 32, 5);
+        let all = h.knn_ok(&[0.0, 0.0], 5, 32, 5);
         assert!(
             all.iter().all(|(id, _)| id != b"b"),
             "deleted 'b' never in results"

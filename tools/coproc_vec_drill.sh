@@ -12,12 +12,14 @@
 #     index from the durable rows, and then returns the SAME results — proving
 #     the vectors survived in the namespace, not just in the co-processor
 #   - a QUANT sq8 set (ADR-0049) ranks right, GETs the exact vector, and
-#     rebuilds as sq8, not as plain hnsw
+#     rebuilds as sq8, not as plain hnsw; with --vec-dir its full vectors are
+#     in a local file (step 2), which a restart sweeps and the rebuild refills,
+#     and a second co-processor cannot take the same directory
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-vecd 6676 6677 6678
+fleet_init $FLINT_DRILL_ROOT/flint-vecd 6676 6677 6678 6679
 fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
@@ -34,8 +36,19 @@ trap cleanup EXIT
 cargo build --release -q -p flint-server -p flint-proxy -p flint-vec --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 echo "== cluster: master + proxy (static --families) + the real flint-vec co-processor"
-$VEC --port 6678 2>"$D/vec1.log" & COPROC_PID=$!
+VD="$D/vecs"
+$VEC --port 6678 --vec-dir "$VD" 2>"$D/vec1.log" & COPROC_PID=$!
 fleet_wait_listen 6678
+# The directory is locked: a second co-processor on it must refuse to start
+# rather than delete the first one's vector files at its own startup sweep.
+$VEC --port 6679 --vec-dir "$VD" 2>"$D/vec-second.log" & SECOND=$!
+for _ in $(seq 1 50); do kill -0 "$SECOND" 2>/dev/null || break; sleep 0.2; done
+if kill -0 "$SECOND" 2>/dev/null; then
+  kill -9 "$SECOND"; echo "FAIL: a second flint-vec started on a locked --vec-dir"; exit 1
+fi
+wait "$SECOND" && { echo "FAIL: a second flint-vec on a locked --vec-dir exited 0"; exit 1; }
+grep -q "held by another flint-vec" "$D/vec-second.log" \
+  || { echo "FAIL: the second flint-vec did not say why it refused:"; sed 's/^/    /' "$D/vec-second.log"; exit 1; }
 # --engine mem: the server stays up across the co-processor restart and holds
 # the durable rows, so this drill isolates the CO-PROCESSOR's rebuild, not the
 # server's own restart durability (that is repl/warm_restart's job).
@@ -138,12 +151,18 @@ case "$PREQ" in *b*c*) : ;; *) echo "FAIL: sq8 SEARCH order, got: $PREQ"; exit 1
 case "$(vexec VEC.INFO docsq)" in *quant*sq8*) : ;; *) echo "FAIL: VEC.INFO should report quant sq8"; exit 1 ;; esac
 # The code is lossy; what GET returns must not be.
 case "$(vexec VEC.GET docsq a)" in *"0.123,0.456,0.789"*) : ;; *) echo "FAIL: sq8 GET is not the exact vector: $(vexec VEC.GET docsq a)"; exit 1 ;; esac
-echo "  sq8 VEC.SEARCH -> $PREQ"
+case "$(vexec VEC.INFO docsq)" in *vectors_on*disk*) : ;; *) echo "FAIL: with --vec-dir the sq8 set's vectors should be on disk: $(vexec VEC.INFO docsq)"; exit 1 ;; esac
+NFILES=$(ls "$VD"/*.vecs 2>/dev/null | wc -l | tr -d ' ')
+[ "$NFILES" = 1 ] || { echo "FAIL: expected one vector file in $VD (the sq8 set's), found $NFILES"; ls -la "$VD"; exit 1; }
+echo "  sq8 VEC.SEARCH -> $PREQ  (full vectors in $VD)"
 
 echo "== CRASH DURABILITY: kill the co-processor, restart it EMPTY, SEARCH rebuilds"
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+# A file the dead process might have held for a set the new one never makes:
+# the restart must remove it, not just overwrite the names it reuses.
+: > "$VD/99.vecs"
 sleep 0.3
-$VEC --port 6678 2>"$D/vec2.log" & COPROC_PID=$!
+$VEC --port 6678 --vec-dir "$VD" 2>"$D/vec2.log" & COPROC_PID=$!
 fleet_wait_listen 6678
 POST="$(vexec VEC.SEARCH docs 0.9,0.1,0 2)"
 [ "$POST" = "$PRE" ] \
@@ -167,6 +186,12 @@ POSTQ="$(vexec VEC.SEARCH docsq 0.85,0.1,0.2 2)"
   || { echo "FAIL: sq8 rebuild changed results. pre=[$PREQ] post=[$POSTQ]"; exit 1; }
 case "$(vexec VEC.INFO docsq)" in *quant*sq8*) : ;; *) echo "FAIL: rebuilt set is not sq8 (quant lost in the durable config)"; exit 1 ;; esac
 case "$(vexec VEC.GET docsq a)" in *"0.123,0.456,0.789"*) : ;; *) echo "FAIL: sq8 GET after rebuild is not the exact vector"; exit 1 ;; esac
+# The dead process's file was swept at startup (derived, never trusted) and the
+# rebuild wrote a new one.
+grep -q "removed 2 vector file" "$D/vec2.log" \
+  || { echo "FAIL: the restart did not sweep the old vector files:"; sed 's/^/    /' "$D/vec2.log"; exit 1; }
+[ ! -e "$VD/99.vecs" ] || { echo "FAIL: a vector file no set owns survived the restart"; exit 1; }
+case "$(vexec VEC.INFO docsq)" in *vectors_on*disk*) : ;; *) echo "FAIL: the rebuilt sq8 set is not on disk"; exit 1 ;; esac
 echo "  post-restart sq8 VEC.SEARCH -> $POSTQ  (rebuilt as sq8)"
 
 echo "== VEC.DEL is durable too"
@@ -236,7 +261,7 @@ case "$(vexec VEC.INFO sess)" in *expiring*0*) : ;; *) echo "FAIL: INFO expiring
 grep -qi "swept" "$D/vec4.log" || { echo "FAIL: no expiry sweep logged"; exit 1; }
 echo "  after expiry: 'gone' masked/swept, VEC.TTL -2; 'keep' still served"
 
-echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8), writes are durable, a"
+echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 on a local file), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
 echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
 echo "      per-vector TTL (D7) expires+sweeps while permanent ids stay — with VEC.TTL/"

@@ -1682,6 +1682,11 @@ fn coproc_seat_name(inv: &Inventory, i: usize) -> String {
 /// unlimited, which is right for a laptop and wrong for a fleet: the index
 /// is RAM-resident (ADR-0017 v0), so an uncapped one grows until the host
 /// OOMs and takes the seat's PROXYCHAN writes with it.
+///
+/// `--vec-dir` is the seat's own directory under the statedir, as a node's
+/// data dir is: a quantized set keeps its full vectors there rather than in
+/// RAM (ADR-0049 D2). A binary from before that flag ignores it, as it ignores
+/// any flag it does not know, so a rollback keeps working.
 fn coproc_args(inv: &Inventory, i: usize) -> Vec<String> {
     let (_, addr) = &inv.coprocs[i];
     let d = &inv.statedir;
@@ -1695,6 +1700,8 @@ fn coproc_args(inv: &Inventory, i: usize) -> Vec<String> {
         inv.coproc_index_bytes
             .unwrap_or(DEFAULT_COPROC_INDEX_BYTES)
             .to_string(),
+        "--vec-dir".to_string(),
+        format!("{d}/{}", coproc_seat_name(inv, i)),
     ];
     if inv.tls {
         args.extend([
@@ -10181,6 +10188,33 @@ mod cert_manifest_tests {
             .find(|(f, _)| *f == "coproc.key")
             .map(|(_, m)| m);
         assert_eq!(mode, Some("600"), "the co-processor key must be 600");
+    }
+
+    /// ADR-0049 D2: each co-processor seat keeps quantized vectors in its own
+    /// directory, so two seats on one host cannot share (and lock each other
+    /// out of) one.
+    #[test]
+    fn each_coproc_seat_gets_its_own_vec_dir() {
+        let inv = inv_from(
+            "statedir /var/lib/flint\n\
+             bins /opt/flint/bin\n\
+             cp 10.0.0.1:7500\n\
+             pair 10.0.0.2:7001,10.0.0.3:7002\n\
+             proxy 0.0.0.0:7379\n\
+             coproc VEC. 10.0.0.5:7411\n\
+             coproc VEC. 10.0.0.5:7412\n",
+            "vecdir",
+        );
+        let dir = |i| {
+            let a = coproc_args(&inv, i);
+            let at = a
+                .iter()
+                .position(|x| x == "--vec-dir")
+                .expect("--vec-dir passed");
+            a[at + 1].clone()
+        };
+        assert_eq!(dir(0), "/var/lib/flint/vec-7411");
+        assert_eq!(dir(1), "/var/lib/flint/vec-7412");
     }
 
     /// ...and ONLY a co-processor host. The leaf is server-auth only by design

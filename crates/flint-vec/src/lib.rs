@@ -21,11 +21,14 @@
 //! binary before it reads past, so the vector rows themselves are unchanged.
 
 mod hnsw;
+pub mod vecfile;
 
 use flint_resp::Value;
 use hnsw::Hnsw;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::path::PathBuf;
+use vecfile::VecFile;
 
 /// Distance metric, fixed per set. Scores are normalised so HIGHER is nearer,
 /// so one bounded-heap top-k serves all three without a per-metric direction.
@@ -127,6 +130,9 @@ impl Quant {
 /// `RERANK`: this many times `k`.
 pub const RERANK_DEFAULT_MULTIPLE: usize = 4;
 
+/// A stored vector and its meta, owned.
+type Stored = (Vec<f32>, Option<Vec<u8>>);
+
 /// The engine behind a set. Both hold the vectors (a rebuild restores either);
 /// flat scans them exactly, HNSW keeps a navigable graph over them.
 enum Index {
@@ -188,6 +194,50 @@ impl VectorSet {
             Index::Flat(_) => Quant::None,
             Index::Hnsw(h) => h.quant(),
         }
+    }
+    /// Keep this set's full vectors in `file` (ADR-0049 D2): a quantized HNSW
+    /// set with nothing in it yet.
+    fn attach_vec_file(&mut self, file: VecFile) {
+        if let Index::Hnsw(h) = &mut self.index {
+            h.attach_vec_file(file);
+        }
+    }
+    /// Whether the full vectors are in a local file (ADR-0049 D2), which the
+    /// D4 meter then does not charge for.
+    pub fn vectors_on_disk(&self) -> bool {
+        matches!(&self.index, Index::Hnsw(h) if h.vectors_on_disk())
+    }
+    fn disk_bytes(&self) -> u64 {
+        match &self.index {
+            Index::Flat(_) => 0,
+            Index::Hnsw(h) => h.disk_bytes(),
+        }
+    }
+    /// RAM held for vectors whose file write failed, which the meter charges.
+    fn spill_bytes(&self) -> usize {
+        match &self.index {
+            Index::Flat(_) => 0,
+            Index::Hnsw(h) => h.spill_bytes(),
+        }
+    }
+    /// What `id` costs the D4 meter, with no file read.
+    fn entry_cost(&self, id: &[u8]) -> Option<usize> {
+        let meta_len = match &self.index {
+            Index::Flat(m) => m.get(id)?.meta.as_ref().map_or(0, |x| x.len()),
+            Index::Hnsw(h) => h.meta(id)?.map_or(0, |x| x.len()),
+        };
+        Some(self.cost(id.len(), meta_len))
+    }
+    /// What an entry with this id and meta length costs the D4 meter.
+    fn cost(&self, id_len: usize, meta_len: usize) -> usize {
+        entry_bytes(
+            self.dim,
+            id_len,
+            meta_len,
+            self.kind(),
+            self.quant(),
+            self.vectors_on_disk(),
+        )
     }
     pub fn len(&self) -> usize {
         match &self.index {
@@ -262,20 +312,29 @@ impl VectorSet {
             .collect()
     }
 
-    /// The stored vector + meta for VEC.GET (lossless), or None.
-    fn get(&self, id: &[u8]) -> Option<(Vec<f32>, Option<Vec<u8>>)> {
-        match &self.index {
+    /// The stored vector + meta for VEC.GET (lossless), or None. Errs only
+    /// when a vector file cannot be read.
+    fn get(&self, id: &[u8]) -> Result<Option<Stored>, String> {
+        Ok(match &self.index {
             Index::Flat(m) => m.get(id).map(|e| (e.vec.clone(), e.meta.clone())),
-            Index::Hnsw(h) => h.get(id).map(|(v, m)| (v.to_vec(), m.map(|x| x.to_vec()))),
-        }
+            Index::Hnsw(h) => h
+                .get(id)?
+                .map(|(v, m)| (v.into_owned(), m.map(|x| x.to_vec()))),
+        })
     }
 
     /// Top-k nearest, nearest first. `ef` is HNSW's recall/latency knob and
     /// `rerank` how many a quantized set re-scores (ADR-0049); flat ignores
-    /// both (it is always exact).
-    fn search(&self, query: &[f32], k: usize, ef: usize, rerank: usize) -> Vec<(Vec<u8>, f32)> {
+    /// both (it is always exact). Errs only when a vector file cannot be read.
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        rerank: usize,
+    ) -> Result<Vec<(Vec<u8>, f32)>, String> {
         match &self.index {
-            Index::Flat(m) => flat_search(m, self.metric, query, k),
+            Index::Flat(m) => Ok(flat_search(m, self.metric, query, k)),
             Index::Hnsw(h) => h.knn(query, k, ef, rerank),
         }
     }
@@ -539,7 +598,14 @@ fn floats_to_ascii(vec: &[f32]) -> String {
 /// slight OVER-estimate (the guard should trip before a real OOM, not after):
 /// the vector (dim×4) + id + meta + a fixed per-engine structural cost, where
 /// HNSW's neighbour lists dwarf flat's hashmap slot.
-fn entry_bytes(dim: usize, id_len: usize, meta_len: usize, kind: IndexKind, quant: Quant) -> usize {
+fn entry_bytes(
+    dim: usize,
+    id_len: usize,
+    meta_len: usize,
+    kind: IndexKind,
+    quant: Quant,
+    on_disk: bool,
+) -> usize {
     let structural = match kind {
         // Entry { vec, norm, meta } + a HashMap bucket.
         IndexKind::Flat => 64,
@@ -549,10 +615,12 @@ fn entry_bytes(dim: usize, id_len: usize, meta_len: usize, kind: IndexKind, quan
     };
     let vector = match quant {
         Quant::None => dim * 4,
-        // The 8-bit code and its (lo, step), PLUS the full vector, which ADR-0049
-        // step 1 still holds in RAM for the re-rank. Step 2 moves that to a
-        // local file and drops the `dim * 4` here; until then a quantized set
-        // costs MORE than a plain one, and this says so.
+        // The 8-bit code and its (lo, step), plus the full vector for the
+        // re-rank when it is in RAM: with no `--vec-dir`, a quantized set costs
+        // MORE than a plain one, and this says so. In the local file (ADR-0049
+        // D2) it costs no RAM; a vector whose write failed and stayed in RAM
+        // is charged separately (`VectorSet::spill_bytes`).
+        Quant::Sq8 if on_disk => dim + 8,
         Quant::Sq8 => dim + 8 + dim * 4,
     };
     vector + id_len + meta_len + structural
@@ -687,6 +755,11 @@ pub struct Store {
     /// Per-namespace index-memory cap in bytes; 0 = unlimited (opt-in, set by
     /// the binary from `--index-mem-bytes`).
     index_cap: usize,
+    /// Where a quantized set keeps its full vectors (ADR-0049 D2, the binary's
+    /// `--vec-dir`); `None` keeps them in RAM.
+    vec_dir: Option<PathBuf>,
+    /// Vector files made, which names the next one.
+    vec_files: u64,
 }
 
 impl Store {
@@ -700,6 +773,31 @@ impl Store {
     /// stored-but-unsearchable; the tenant frees space with `VEC.DEL`.
     pub fn set_index_cap(&mut self, bytes: usize) {
         self.index_cap = bytes;
+    }
+
+    /// Keep each quantized set's full vectors in a file in `dir` (ADR-0049
+    /// D2). The binary owns `dir`: it locks it and empties it of vector files
+    /// before calling this.
+    pub fn set_vec_dir(&mut self, dir: PathBuf) {
+        self.vec_dir = Some(dir);
+    }
+
+    /// A new set, with a vector file when it is quantized and there is a
+    /// `vec_dir`. A file that cannot be created leaves the vectors in RAM,
+    /// where the meter charges them, rather than refusing the set.
+    fn new_set(&mut self, dim: usize, metric: Metric, index: IndexKind, quant: Quant) -> VectorSet {
+        let mut vs = VectorSet::new(dim, metric, index, quant);
+        if let Some(dir) = &self.vec_dir
+            && index == IndexKind::Hnsw
+            && quant != Quant::None
+        {
+            let path = dir.join(format!("{}.{}", self.vec_files, vecfile::EXTENSION));
+            self.vec_files += 1;
+            if let Ok(f) = VecFile::create(&path, dim) {
+                vs.attach_vec_file(f);
+            }
+        }
+        vs
     }
 
     /// Estimated index bytes currently attributed to `ns` (for INFO/metrics).
@@ -747,9 +845,11 @@ impl Store {
                 index,
                 quant,
             } => {
-                self.sets
-                    .entry((ns.to_vec(), set))
-                    .or_insert_with(|| VectorSet::new(dim, metric, index, quant));
+                let key = (ns.to_vec(), set);
+                if !self.sets.contains_key(&key) {
+                    let vs = self.new_set(dim, metric, index, quant);
+                    self.sets.insert(key, vs);
+                }
             }
             Apply::Insert {
                 set,
@@ -760,21 +860,14 @@ impl Store {
             } => {
                 // Charge the byte delta to the namespace (new entry, or the meta
                 // change on an upsert), computed BEFORE the set replaces it.
+                // A failed vector-file write keeps the vector in RAM, which is
+                // charged as the change in `spill_bytes`.
                 let mut charge: Option<(usize, usize)> = None;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
-                    let (dim, kind, quant) = (vs.dim(), vs.kind(), vs.quant());
-                    let old = vs.get(&id).map_or(0, |(_, m)| {
-                        entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind, quant)
-                    });
-                    let new = entry_bytes(
-                        dim,
-                        id.len(),
-                        meta.as_ref().map_or(0, |m| m.len()),
-                        kind,
-                        quant,
-                    );
+                    let old = vs.entry_cost(&id).unwrap_or(0) + vs.spill_bytes();
+                    let new_entry = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
                     vs.set(id, vec, meta, expires_at);
-                    charge = Some((new, old));
+                    charge = Some((new_entry + vs.spill_bytes(), old));
                 }
                 if let Some((new, old)) = charge {
                     let e = self.ns_bytes.entry(ns.to_vec()).or_default();
@@ -784,11 +877,10 @@ impl Store {
             Apply::Remove { set, id } => {
                 let mut freed = 0usize;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
-                    let (dim, kind, quant) = (vs.dim(), vs.kind(), vs.quant());
-                    if let Some((_, m)) = vs.get(&id) {
-                        freed = entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind, quant);
-                    }
+                    let before = vs.spill_bytes();
+                    freed = vs.entry_cost(&id).unwrap_or(0);
                     vs.del(&id);
+                    freed += before - vs.spill_bytes();
                 }
                 if freed > 0
                     && let Some(e) = self.ns_bytes.get_mut(ns)
@@ -813,14 +905,13 @@ impl Store {
             if ids.is_empty() {
                 continue;
             }
-            let (dim, kind, quant) = (vs.dim(), vs.kind(), vs.quant());
+            let before = vs.spill_bytes();
             let mut freed = 0usize;
             for id in &ids {
-                if let Some((_, m)) = vs.get(id) {
-                    freed += entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind, quant);
-                }
+                freed += vs.entry_cost(id).unwrap_or(0);
                 vs.del(id);
             }
+            freed += before - vs.spill_bytes();
             swept += ids.len();
             if freed > 0
                 && let Some(e) = self.ns_bytes.get_mut(ns)
@@ -984,12 +1075,8 @@ impl Store {
         // never an evict-and-desync. An UPSERT of an existing id only costs its
         // meta delta, so it is charged that, not a whole new entry.
         if self.index_cap > 0 {
-            let (kind, quant) = (vs.kind(), vs.quant());
-            let meta_len = meta.as_ref().map_or(0, |m| m.len());
-            let new = entry_bytes(vs.dim(), id.len(), meta_len, kind, quant);
-            let old = vs.get(id).map_or(0, |(_, m)| {
-                entry_bytes(vs.dim(), id.len(), m.map_or(0, |x| x.len()), kind, quant)
-            });
+            let new = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
+            let old = vs.entry_cost(id).unwrap_or(0);
             let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
             if used.saturating_add(new).saturating_sub(old) > self.index_cap {
                 return Plan::Reply(err(&format!(
@@ -1072,8 +1159,9 @@ impl Store {
             return Value::Null;
         }
         match vs.get(&args[2]) {
-            None => Value::Null,
-            Some((vec, meta)) => {
+            Err(e) => err(&format!("ERR {e}")),
+            Ok(None) => Value::Null,
+            Ok(Some((vec, meta))) => {
                 let mut row = vec![Value::Bulk(Some(floats_to_ascii(&vec).into_bytes()))];
                 if let Some(m) = meta {
                     row.push(Value::Bulk(Some(m)));
@@ -1126,13 +1214,16 @@ impl Store {
         // at most `expired` stale hits, k+expired candidates always yield k live
         // ones. Engine-agnostic — no flat/HNSW code knows about TTL.
         let expired = vs.expired_count(now);
-        let rows: Vec<Value> = vs
-            .search(
-                &query,
-                k.saturating_add(expired),
-                ef,
-                rerank.saturating_add(expired),
-            )
+        let found = match vs.search(
+            &query,
+            k.saturating_add(expired),
+            ef,
+            rerank.saturating_add(expired),
+        ) {
+            Ok(found) => found,
+            Err(e) => return err(&format!("ERR {e}")),
+        };
+        let rows: Vec<Value> = found
             .into_iter()
             .filter(|(id, _)| !vs.is_expired(id, now))
             .take(k)
@@ -1177,6 +1268,15 @@ impl Store {
             // Last, so every earlier field keeps its position (ADR-0049).
             bulk("quant"),
             bulk(vs.quant().as_str()),
+            // Where the full vectors are (step 2): "disk" is the local file,
+            // which costs `disk_bytes` and no RAM; `ram_spill_bytes` is RAM
+            // held for vectors whose file write failed.
+            bulk("vectors_on"),
+            bulk(if vs.vectors_on_disk() { "disk" } else { "ram" }),
+            bulk("disk_bytes"),
+            Value::Integer(vs.disk_bytes() as i64),
+            bulk("ram_spill_bytes"),
+            Value::Integer(vs.spill_bytes() as i64),
         ]))
     }
 
@@ -1217,8 +1317,10 @@ impl Store {
         if vs.is_expired(id, now) {
             return Plan::Reply(Value::Integer(0));
         }
-        let Some((vec, meta)) = vs.get(id) else {
-            return Plan::Reply(Value::Integer(0));
+        let (vec, meta) = match vs.get(id) {
+            Ok(Some(found)) => found,
+            Ok(None) => return Plan::Reply(Value::Integer(0)),
+            Err(e) => return Plan::Reply(err(&format!("ERR {e}"))),
         };
         let ttl_ms = match std::str::from_utf8(&args[3])
             .ok()
@@ -1262,8 +1364,10 @@ impl Store {
         if vs.is_expired(id, now) {
             return Plan::Reply(Value::Integer(0));
         }
-        let Some((vec, meta)) = vs.get(id) else {
-            return Plan::Reply(Value::Integer(0));
+        let (vec, meta) = match vs.get(id) {
+            Ok(Some(found)) => found,
+            Ok(None) => return Plan::Reply(Value::Integer(0)),
+            Err(e) => return Plan::Reply(err(&format!("ERR {e}"))),
         };
         if vs.expiry_at(id).is_none() {
             return Plan::Reply(Value::Integer(0)); // nothing to persist
@@ -1400,8 +1504,13 @@ mod tests {
         let Value::Array(Some(info)) = run(&mut st, ns, &cmd(&["VEC.INFO", "q"])) else {
             panic!("info reply")
         };
-        assert_eq!(info[info.len() - 2], Value::Bulk(Some(v("quant"))));
-        assert_eq!(info[info.len() - 1], Value::Bulk(Some(v("sq8"))));
+        assert_eq!(info[14], Value::Bulk(Some(v("quant"))));
+        assert_eq!(info[15], Value::Bulk(Some(v("sq8"))));
+        assert_eq!(
+            info[16],
+            Value::Bulk(Some(v("vectors_on"))),
+            "step 2's fields come after it"
+        );
         assert_eq!(
             info[10],
             Value::Bulk(Some(v("ns_mem_bytes"))),
@@ -1412,6 +1521,111 @@ mod tests {
     /// Rollback: a plain set's config is byte-identical to what every earlier
     /// binary wrote, and a quantized set's fourth field is one an earlier binary
     /// reads straight past. The decoder below is the pre-ADR-0049 one, verbatim.
+    /// The value after `field` in a VEC.INFO reply.
+    fn info_field(v: &Value, field: &str) -> Value {
+        let Value::Array(Some(items)) = v else {
+            panic!("INFO is an array: {v:?}")
+        };
+        let at = items
+            .iter()
+            .position(|x| x == &Value::Bulk(Some(field.as_bytes().to_vec())))
+            .unwrap_or_else(|| panic!("INFO has no {field}"));
+        items[at + 1].clone()
+    }
+
+    /// ADR-0049 step 2: with a vector directory, a quantized set's full
+    /// vectors are in a file, the D4 meter stops charging for them, and what a
+    /// tenant reads back is unchanged.
+    #[test]
+    fn a_vec_dir_moves_quantized_vectors_out_of_ram() {
+        let dir = std::env::temp_dir().join(format!("flint-vec-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let create = |name: &str| {
+            cmd(&[
+                "VEC.CREATE",
+                name,
+                "DIM",
+                "8",
+                "METRIC",
+                "l2",
+                "INDEX",
+                "hnsw",
+                "QUANT",
+                "sq8",
+            ])
+        };
+        let x = "0.5,1.5,2.5,3.5,4.5,5.5,6.5,7.25";
+        let fill = |st: &mut Store, ns: &[u8]| {
+            assert_eq!(run(st, ns, &create("q")), Value::Simple("OK".into()));
+            for i in 0..10 {
+                let set = cmd(&["VEC.SET", "q", &format!("id{i}"), x]);
+                assert_eq!(run(st, ns, &set), Value::Simple("OK".into()));
+            }
+        };
+        let mut ram = Store::new();
+        fill(&mut ram, b"ns");
+        let mut disk = Store::new();
+        disk.set_vec_dir(dir.clone());
+        fill(&mut disk, b"ns");
+
+        let info = run(&mut disk, b"ns", &cmd(&["VEC.INFO", "q"]));
+        assert_eq!(
+            info_field(&info, "vectors_on"),
+            Value::Bulk(Some(b"disk".to_vec()))
+        );
+        assert_eq!(info_field(&info, "disk_bytes"), Value::Integer(10 * 8 * 4));
+        assert_eq!(info_field(&info, "ram_spill_bytes"), Value::Integer(0));
+        let ram_info = run(&mut ram, b"ns", &cmd(&["VEC.INFO", "q"]));
+        assert_eq!(
+            info_field(&ram_info, "vectors_on"),
+            Value::Bulk(Some(b"ram".to_vec()))
+        );
+        assert_eq!(
+            ram.ns_mem_bytes(b"ns") - disk.ns_mem_bytes(b"ns"),
+            10 * 8 * 4,
+            "the meter stops charging dim x 4 per vector"
+        );
+        for st in [&mut ram, &mut disk] {
+            let got = run(st, b"ns", &cmd(&["VEC.GET", "q", "id3"]));
+            assert_eq!(
+                got,
+                Value::Array(Some(vec![Value::Bulk(Some(x.as_bytes().to_vec()))]))
+            );
+            let top = run(st, b"ns", &cmd(&["VEC.SEARCH", "q", x, "1"]));
+            let Value::Array(Some(rows)) = top else {
+                panic!("rows")
+            };
+            let Value::Array(Some(row)) = &rows[0] else {
+                panic!("row")
+            };
+            assert_eq!(row[1], Value::Double(0.0), "scored on the exact vector");
+        }
+        // A plain HNSW set keeps its vectors in the graph, file or no file.
+        let plain = cmd(&[
+            "VEC.CREATE",
+            "p",
+            "DIM",
+            "2",
+            "METRIC",
+            "l2",
+            "INDEX",
+            "hnsw",
+        ]);
+        assert_eq!(run(&mut disk, b"ns", &plain), Value::Simple("OK".into()));
+        let info = run(&mut disk, b"ns", &cmd(&["VEC.INFO", "p"]));
+        assert_eq!(
+            info_field(&info, "vectors_on"),
+            Value::Bulk(Some(b"ram".to_vec()))
+        );
+        drop(disk);
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir").count(),
+            0,
+            "a set's file goes with the set"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_quantized_config_is_readable_by_the_binary_before_it() {
         fn decode_before_adr_0049(val: &[u8]) -> Option<(usize, Metric, IndexKind)> {

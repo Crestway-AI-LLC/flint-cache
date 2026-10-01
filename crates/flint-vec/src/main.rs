@@ -156,6 +156,18 @@ fn main() {
         .unwrap_or(0);
     let mut initial = Store::new();
     initial.set_index_cap(index_cap);
+    // ADR-0049 D2: where a quantized set keeps its full vectors. The files are
+    // derived like the index, so every one found here is deleted before
+    // serving and the rebuild writes them again. The lock is what makes that
+    // safe: a second co-processor on the same directory would otherwise delete
+    // the first one's files from under it. Held until the process exits.
+    let vec_dir = arg(&args, "--vec-dir").map(std::path::PathBuf::from);
+    let _vec_lock = vec_dir.as_ref().map(|dir| {
+        let lock =
+            claim_vec_dir(dir).unwrap_or_else(|e| panic!("--vec-dir {}: {e}", dir.display()));
+        initial.set_vec_dir(dir.clone());
+        lock
+    });
     let store: Arc<Mutex<Store>> = Arc::new(Mutex::new(initial));
     let loads: Loads = Arc::new(Mutex::new(HashMap::new()));
     let tls = build_tls(&args);
@@ -165,13 +177,19 @@ fn main() {
     } else {
         format!("index mem cap {index_cap} B/ns")
     };
+    let vec_note = match &vec_dir {
+        Some(d) => format!("quantized vectors in {}", d.display()),
+        None => "quantized vectors in RAM".to_string(),
+    };
     let tls_note = match (tls.inbound.is_some(), tls.edge.is_some()) {
         (false, false) => "plaintext",
         (true, false) => "mesh mTLS",
         (true, true) => "mesh mTLS + edge TLS",
         (false, true) => "edge TLS only",
     };
-    eprintln!("flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note})");
+    eprintln!(
+        "flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note}, {vec_note})"
+    );
 
     // Background reclamation of expired vectors. Reads/searches already mask an
     // expired id the instant its deadline passes (so cadence is not a correctness
@@ -197,6 +215,34 @@ fn main() {
         let (store, loads, tls) = (store.clone(), loads.clone(), tls.clone());
         std::thread::spawn(move || serve(conn, store, loads, tls));
     }
+}
+
+/// Take `--vec-dir` for this process: create it, lock it, and delete the
+/// vector files a previous process left. Returns the lock, which must live as
+/// long as the process does.
+fn claim_vec_dir(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    let lock = std::fs::File::create(dir.join("LOCK"))?;
+    lock.try_lock()
+        .map_err(|e| std::io::Error::other(format!("held by another flint-vec ({e})")))?;
+    let mut swept = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|x| x == flint_vec::vecfile::EXTENSION)
+        {
+            std::fs::remove_file(&path)?;
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        eprintln!(
+            "flint-vec: removed {swept} vector file(s) from {} (derived; the rebuild writes them again)",
+            dir.display()
+        );
+    }
+    Ok(lock)
 }
 
 fn arg(args: &[String], flag: &str) -> Option<String> {
