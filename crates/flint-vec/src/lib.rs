@@ -21,6 +21,7 @@
 //! binary before it reads past, so the vector rows themselves are unchanged.
 
 mod hnsw;
+mod kernel;
 pub mod vecfile;
 
 use flint_resp::Value;
@@ -61,7 +62,7 @@ impl Metric {
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    kernel::dot(a, b)
 }
 
 /// A stored vector: the original vector (VEC.GET is lossless), its cached L2

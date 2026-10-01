@@ -18,6 +18,7 @@
 //! links, which every node has, are a fixed stride of one array; the few nodes
 //! on higher layers keep those in a map.
 
+use crate::kernel::{self, Sq8};
 use crate::vecfile::VecFile;
 use crate::{Metric, Quant};
 use std::borrow::Cow;
@@ -157,31 +158,44 @@ impl Codes {
         }
     }
 
-    /// Slot `slot`'s values, decoded on the fly: no allocation per distance.
-    fn vals(&self, slot: u32) -> Vals<'_> {
+    /// The distance between slots `a` and `b` (norms `an`, `bn`).
+    fn between(&self, metric: Metric, a: u32, an: f32, b: u32, bn: f32) -> f32 {
         match self {
-            Codes::F32(f) => Vals::F(f[slot as usize].iter()),
+            Codes::F32(f) => dist(metric, &f[a as usize], an, &f[b as usize], bn),
             Codes::Sq8 { bytes, scale } => {
-                let [lo, step] = scale[slot as usize];
-                Vals::Q(bytes[slot as usize].iter(), lo, step)
+                let (x, y) = (sq8_at(bytes, scale, a), sq8_at(bytes, scale, b));
+                dist_from(
+                    metric,
+                    || kernel::sq8_l2sq_sq8(x, y),
+                    || kernel::sq8_dot_sq8(x, y),
+                    an,
+                    bn,
+                )
+            }
+        }
+    }
+
+    /// The distance between slot `a` (norm `an`) and a full vector `q`.
+    fn to(&self, metric: Metric, a: u32, an: f32, q: &[f32], qn: f32) -> f32 {
+        match self {
+            Codes::F32(f) => dist(metric, &f[a as usize], an, q, qn),
+            Codes::Sq8 { bytes, scale } => {
+                let c = sq8_at(bytes, scale, a);
+                dist_from(
+                    metric,
+                    || kernel::sq8_l2sq(c, q),
+                    || kernel::sq8_dot(c, q),
+                    an,
+                    qn,
+                )
             }
         }
     }
 }
 
-enum Vals<'a> {
-    F(std::slice::Iter<'a, f32>),
-    Q(std::slice::Iter<'a, u8>, f32, f32),
-}
-
-impl Iterator for Vals<'_> {
-    type Item = f32;
-    fn next(&mut self) -> Option<f32> {
-        match self {
-            Vals::F(i) => i.next().copied(),
-            Vals::Q(i, lo, step) => i.next().map(|&b| *lo + *step * b as f32),
-        }
-    }
+fn sq8_at<'a>(bytes: &'a [Box<[u8]>], scale: &[[f32; 2]], slot: u32) -> Sq8<'a> {
+    let [lo, step] = scale[slot as usize];
+    (&bytes[slot as usize], lo, step)
 }
 
 pub struct Hnsw {
@@ -256,44 +270,36 @@ impl Ord for DI {
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
 fn l2norm(v: &[f32]) -> f32 {
-    dot(v, v).sqrt()
+    kernel::dot(v, v).sqrt()
 }
 
-/// Distance where SMALLER is nearer.
+/// Distance where SMALLER is nearer, from whichever of a squared L2 and a dot
+/// product the metric needs; each is computed only when asked for.
+fn dist_from(
+    metric: Metric,
+    l2sq: impl FnOnce() -> f32,
+    dot: impl FnOnce() -> f32,
+    an: f32,
+    bn: f32,
+) -> f32 {
+    match metric {
+        Metric::L2 => l2sq(),
+        Metric::Ip => -dot(),
+        Metric::Cosine => {
+            let den = an * bn;
+            if den == 0.0 {
+                1.0
+            } else {
+                1.0 - dot() / den
+            }
+        }
+    }
+}
+
+/// [`dist_from`] over two full vectors.
 fn dist(metric: Metric, a: &[f32], an: f32, b: &[f32], bn: f32) -> f32 {
-    match metric {
-        Metric::L2 => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
-        Metric::Ip => -dot(a, b),
-        Metric::Cosine => {
-            let den = an * bn;
-            if den == 0.0 {
-                1.0
-            } else {
-                1.0 - dot(a, b) / den
-            }
-        }
-    }
-}
-
-/// [`dist`] over decoded values, for when either side is a code. The all-float
-/// case keeps [`dist`] itself, so an unquantized set pays nothing for this.
-fn dist_vals(metric: Metric, a: Vals<'_>, an: f32, b: Vals<'_>, bn: f32) -> f32 {
-    match metric {
-        Metric::L2 => a.zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
-        Metric::Ip => -a.zip(b).map(|(x, y)| x * y).sum::<f32>(),
-        Metric::Cosine => {
-            let den = an * bn;
-            if den == 0.0 {
-                1.0
-            } else {
-                1.0 - a.zip(b).map(|(x, y)| x * y).sum::<f32>() / den
-            }
-        }
-    }
+    dist_from(metric, || kernel::l2sq(a, b), || kernel::dot(a, b), an, bn)
 }
 
 /// Convert an internal distance back to flat's score (HIGHER is nearer), so a
@@ -538,17 +544,10 @@ impl Hnsw {
 
     fn dnn(&self, a: u32, b: u32) -> f32 {
         let (an, bn) = (self.norms[a as usize], self.norms[b as usize]);
-        match (self.codes.f32(a), self.codes.f32(b)) {
-            (Some(x), Some(y)) => dist(self.metric, x, an, y, bn),
-            _ => dist_vals(self.metric, self.codes.vals(a), an, self.codes.vals(b), bn),
-        }
+        self.codes.between(self.metric, a, an, b, bn)
     }
     fn dnq(&self, a: u32, q: &[f32], qn: f32) -> f32 {
-        let an = self.norms[a as usize];
-        match self.codes.f32(a) {
-            Some(x) => dist(self.metric, x, an, q, qn),
-            None => dist_vals(self.metric, self.codes.vals(a), an, Vals::F(q.iter()), qn),
-        }
+        self.codes.to(self.metric, a, self.norms[a as usize], q, qn)
     }
 
     /// Insert (or upsert) a vector. An upsert deletes the old node and inserts
@@ -1157,7 +1156,13 @@ mod tests {
         }
         planted.push(x);
         h.set_links(p, 0, &planted);
-        let near_p: Vec<f32> = h.codes.vals(p).map(|v| v + 1e-3).collect();
+        let near_p: Vec<f32> = h
+            .codes
+            .f32(p)
+            .expect("an unquantized set")
+            .iter()
+            .map(|v| v + 1e-3)
+            .collect();
         h.set(b"new".to_vec(), near_p.clone(), None);
         assert_eq!(
             h.id_to_idx[b"new".as_slice()],
