@@ -1,4 +1,4 @@
-# BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (defect 1 FIXED 2026-09-02; defect 2 NARROWED to one call 2026-09-02, still unreproduced)
+# BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (defect 1 FIXED 2026-09-02; defect 2 CLOSED 2026-09-30: narrowed to one call, self-identifying, not reproduced)
 
 **Found** 2026-09-01, in the tail of an `elasticache-bench --regime a` run. The
 benchmark produced every number correctly and then **exited 1**, on this,
@@ -181,3 +181,23 @@ fix, in a third place.
 The `--regime a` numbers taken in that run are unaffected: the failure is
 after the measurement legs, on the control path, and the data path never
 consults it. Recorded so the exit code is not read as the benchmark failing.
+
+## Defect 2 CLOSED 2026-09-30 — the fault in the tree is fixed, and the cause is the platform's
+
+By BUG-0127's rule. What was wrong in the tree was an error that could not say
+where it came from, and that is fixed: the watch now labels the phase, and a
+`connect` failing with `EAGAIN` names both of the errno's documented causes and
+points at `ss -s`. The call is narrowed to the one site that can fail before
+the read (`TcpStream::connect_timeout`), and the once-a-second cadence fits it.
+What is left is the cause, ephemeral port exhaustion by the benchmark sharing
+the host, and that is the host's state rather than this code's. Not
+reproduced, and if it recurs, the next occurrence names itself. Reopen with
+that line if it does.
+
+A data point from 2026-09-30, on a different platform and so not a
+reproduction: a neighbouring session's observation run left about 16,000
+TIME_WAIT sockets to one local server on the development Mac, and local
+connects failed with `EADDRNOTAVAIL` (macOS's errno for the same exhaustion)
+until it ended. It is the shape this file predicted, and on Linux the errno
+would be `EAGAIN`.
+

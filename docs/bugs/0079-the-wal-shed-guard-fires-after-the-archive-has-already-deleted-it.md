@@ -1,4 +1,4 @@
-# BUG-0079 — the WAL shed guard fires at twice the distance the archive keeps (budget FIXED and OBSERVABLE 2026-09-02; the residue is a silent mount no-op, NOT the ordering — re-aimed 2026-09-05)
+# BUG-0079 — the WAL shed guard fires at twice the distance the archive keeps (FIXED: budget FIXED and OBSERVABLE 2026-09-02; the mount residue CLOSED 2026-09-07)
 
 **Found** 2026-08-30 by a 2 TB ingest run, and reproduced exactly by a second
 one. Both stalled at the same place: **163–165 GB**, ~15 minutes into a

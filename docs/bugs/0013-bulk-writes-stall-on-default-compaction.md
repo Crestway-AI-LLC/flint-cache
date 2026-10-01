@@ -1,6 +1,6 @@
-# BUG-0013: bulk writes stall because compaction is left at RocksDB defaults (OPEN)
+# BUG-0013: bulk writes stall because compaction is left at RocksDB defaults (CLOSED 2026-09-30)
 
-Status: OPEN, re-scoped 2026-08-24 (found 2026-08-18) · Severity: medium-high.
+Status: **CLOSED 2026-09-30**, by the rule BUG-0127 closed on: what is left is a decision and a measurement, not a fault in the tree (see the last section). Was: OPEN, re-scoped 2026-08-24 (found 2026-08-18) · Severity: medium-high.
 Two separable claims, and they now have different answers. The FILL half is
 CONFIRMED twice: at RocksDB defaults a bulk load builds an unbounded
 compaction backlog and crosses the slowdown trigger, which is what silently
@@ -1166,3 +1166,27 @@ throughput and percentiles within each arm: they split one seat's capacity.
 The number above is therefore a read latency under concurrent mixed load,
 which is the right shape for "does turning this on hurt reads", and is not an
 isolated read-path figure.
+
+## CLOSED 2026-09-30 — what was wrong is answered, and what is left is a decision
+
+BUG-0127 closed on a rule worth applying here: an open bug list that carries
+"someone should measure this" stops being a list of things that are wrong.
+
+- **The FILL half is confirmed, and answered by published, opt-in tuning.** At
+  RocksDB defaults a bulk load builds an unbounded compaction backlog. The
+  pairing (`FLINT_LEVEL_BASE_MB=64`, `FLINT_BG_JOBS=4`) is in
+  `docs/self-hosting.md`, settable per seat through `node-env`, and now
+  measured against STOCK at production shape (ops roadmap, settled
+  2026-09-14): ingest 1.49x, steady write and read throughput +24%, p99.9 on
+  both paths -59%. The 2026-09-08 read run went the same way (beyond-RAM GET
+  p50 -33%).
+- **The REFILL half, which this file is named for, never reproduced:** three
+  attempts, the last a run that finished and proved its writes landed.
+
+**Left, and carried to the ops roadmap rather than kept open here:** whether
+the pairing becomes the fleet default. Its gains are now measured against what
+operators actually run, which was the missing half when that was refused on
+2026-09-03. That is a product decision (Jeff's), and its one unmeasured input
+is resident disk against stock (the +36% figure is against the 8 MB base).
+The rate limiter "Then" listed was never measured, and nothing asks for it.
+
