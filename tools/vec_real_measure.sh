@@ -9,7 +9,7 @@
 # `bench --data` process per arm, in parallel. Not a drill and in no gate.
 #
 #   VEC_N     base vectors to index (default: all 999,000)
-#   VEC_ARMS  arms to run (default "plain sq8 sq8-disk")
+#   VEC_ARMS  arms to run (default "plain sq8-disk bin-disk pq-disk")
 #   VEC_DATA  where the data goes (default /mnt/d/vecdata, the instance store)
 #   VEC_OUT   where the results go (default /tmp/flint-vecreal)
 set -euo pipefail
@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 D="${VEC_DATA:-/mnt/d/vecdata}"
 OUT="${VEC_OUT:-/tmp/flint-vecreal}"
 N="${VEC_N:-}"
-ARMS="${VEC_ARMS:-plain sq8 sq8-disk}"
+ARMS="${VEC_ARMS:-plain sq8-disk bin-disk pq-disk}"
 mkdir -p "$D/parquet" "$D/py" "$OUT"
 
 # The wheels are cp39: say so now rather than fail at an import.

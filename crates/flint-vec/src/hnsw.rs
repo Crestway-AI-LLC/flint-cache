@@ -18,7 +18,8 @@
 //! links, which every node has, are a fixed stride of one array; the few nodes
 //! on higher layers keep those in a map.
 
-use crate::kernel::{self, Sq8};
+use crate::kernel::{self, CENTROIDS, Sq8};
+use crate::quant::{self, BinQuery, Book};
 use crate::vecfile::VecFile;
 use crate::{Metric, Quant};
 use std::borrow::Cow;
@@ -40,6 +41,11 @@ pub const EF_SEARCH_DEFAULT: usize = 64;
 /// build's, 64 lost up to 0.014 of it on clustered data, and no bound let the
 /// selection walk ~1,000 candidates for each neighbour.
 const REPAIR_POOL: usize = 4 * M0;
+/// Live vectors a `QUANT pq` set holds before it trains its codebook on them
+/// and re-encodes (ADR-0049 D1's training threshold). k-means wants many
+/// points a centroid, and a subspace has 256; below this a set keeps full
+/// vectors in the graph.
+pub const PQ_TRAIN_DEFAULT: usize = 10_000;
 
 /// Hashes a slot number for the sets a walk keeps: one multiply. The default
 /// SipHash is built to withstand keys an adversary picks, which slot numbers,
@@ -130,22 +136,95 @@ enum Codes {
         bytes: Vec<Box<[u8]>>,
         scale: Vec<[f32; 2]>,
     },
+    /// One bit a dimension after a fixed rotation, and the factor the
+    /// estimate divides by (`quant.rs`), each a fixed width a slot in one
+    /// array: a box a slot would cost more than a 192-byte code's spare room.
+    Bin {
+        bits: Vec<u8>,
+        factor: Vec<f32>,
+        dim: usize,
+    },
+    /// Product-quantization codes, `dim / 16` bytes a slot, once the set has
+    /// trained its codebook; until then the full vectors, as `F32` holds them
+    /// (`quant.rs`). Every estimate goes through PQ's squared distance, whose
+    /// error scales with the gap between the two vectors rather than with
+    /// either one, as a dot product's does: a cosine set encodes unit
+    /// vectors, and an inner product comes from the distance and the norms.
+    Pq {
+        book: Option<Box<Book>>,
+        raw: Vec<Box<[f32]>>,
+        codes: Vec<u8>,
+        dim: usize,
+        unit: bool,
+    },
+}
+
+/// A query, or a node being inserted, prepared once for the many distances a
+/// walk takes to codes: a 1-bit code's rotation and table, a PQ code's table.
+struct Query<'a> {
+    v: &'a [f32],
+    norm: f32,
+    prep: Prep,
+}
+
+enum Prep {
+    Plain,
+    Bin(BinQuery),
+    Pq(Vec<[f32; CENTROIDS]>),
 }
 
 impl Codes {
-    fn new(quant: Quant) -> Codes {
+    fn new(quant: Quant, metric: Metric) -> Codes {
         match quant {
             Quant::None => Codes::F32(Vec::new()),
             Quant::Sq8 => Codes::Sq8 {
                 bytes: Vec::new(),
                 scale: Vec::new(),
             },
+            Quant::Bin => Codes::Bin {
+                bits: Vec::new(),
+                factor: Vec::new(),
+                dim: 0,
+            },
+            Quant::Pq => Codes::Pq {
+                book: None,
+                raw: Vec::new(),
+                codes: Vec::new(),
+                dim: 0,
+                unit: metric == Metric::Cosine,
+            },
         }
     }
 
-    fn put(&mut self, slot: u32, v: &[f32]) {
+    fn put(&mut self, slot: u32, v: &[f32], norm: f32) {
         match self {
             Codes::F32(f) => put_box(f, slot, v.into()),
+            Codes::Bin { bits, factor, dim } => {
+                *dim = v.len();
+                let mut code = vec![0u8; quant::bin_bytes(v.len())];
+                let f = quant::bin_encode(v, norm, &mut code);
+                put_slot(bits, slot, &code);
+                put_slot(factor, slot, &[f]);
+            }
+            Codes::Pq {
+                book: None,
+                raw,
+                dim,
+                ..
+            } => {
+                *dim = v.len();
+                put_box(raw, slot, v.into());
+            }
+            Codes::Pq {
+                book: Some(book),
+                codes,
+                unit,
+                ..
+            } => {
+                let mut code = vec![0u8; quant::pq_bytes(v.len())];
+                book.encode(&pq_input(v, norm, *unit), &mut code);
+                put_slot(codes, slot, &code);
+            }
             Codes::Sq8 { bytes, scale } => {
                 let (lo, hi) = v
                     .iter()
@@ -176,15 +255,88 @@ impl Codes {
     /// Slot `slot`'s full vector, when the codes are full vectors.
     fn f32(&self, slot: u32) -> Option<&[f32]> {
         match self {
-            Codes::F32(f) => Some(&f[slot as usize]),
-            Codes::Sq8 { .. } => None,
+            Codes::F32(f)
+            | Codes::Pq {
+                book: None, raw: f, ..
+            } => Some(&f[slot as usize]),
+            Codes::Sq8 { .. } | Codes::Bin { .. } | Codes::Pq { .. } => None,
         }
+    }
+
+    /// RAM the codes hold beyond what each slot is charged: a PQ set's
+    /// codebook, or its full vectors before it trains one. O(1): the meter
+    /// asks on every write.
+    fn held_bytes(&self) -> usize {
+        match self {
+            Codes::Pq {
+                book: None,
+                raw,
+                dim,
+                ..
+            } => raw.len() * dim * 4 + raw.capacity() * std::mem::size_of::<Box<[f32]>>(),
+            Codes::Pq { book: Some(b), .. } => b.bytes(),
+            _ => 0,
+        }
+    }
+
+    /// Whether this is a PQ set still without its codebook.
+    fn untrained(&self) -> bool {
+        matches!(self, Codes::Pq { book: None, .. })
+    }
+
+    /// Train a PQ set's codebook on the full vectors it holds, encode every
+    /// slot, live or deleted (a deleted one still routes), and let the vectors
+    /// go: the "re-encodes once" of ADR-0049 D1.
+    fn train(&mut self) {
+        let Codes::Pq {
+            book,
+            raw,
+            codes,
+            dim,
+            unit,
+        } = self
+        else {
+            return;
+        };
+        if book.is_some() || raw.is_empty() {
+            return;
+        }
+        let inputs: Vec<Cow<'_, [f32]>> =
+            raw.iter().map(|v| pq_input(v, l2norm(v), *unit)).collect();
+        let samples: Vec<&[f32]> = inputs.iter().map(|v| &v[..]).collect();
+        let trained = Box::new(Book::train(&samples, *dim));
+        let width = quant::pq_bytes(*dim);
+        let mut all = vec![0u8; raw.len() * width];
+        for (v, code) in samples.iter().zip(all.chunks_exact_mut(width)) {
+            trained.encode(v, code);
+        }
+        drop(inputs);
+        *codes = all;
+        *raw = Vec::new();
+        *book = Some(trained);
+    }
+
+    /// `v`, of norm `norm`, prepared for distances to these codes.
+    fn query<'a>(&self, v: &'a [f32], norm: f32) -> Query<'a> {
+        let prep = match self {
+            Codes::Bin { .. } => Prep::Bin(BinQuery::new(v)),
+            Codes::Pq {
+                book: Some(b),
+                unit,
+                ..
+            } => Prep::Pq(b.table(&pq_input(v, norm, *unit))),
+            _ => Prep::Plain,
+        };
+        Query { v, norm, prep }
     }
 
     /// The distance between slots `a` and `b` (norms `an`, `bn`).
     fn between(&self, metric: Metric, a: u32, an: f32, b: u32, bn: f32) -> f32 {
         match self {
-            Codes::F32(f) => dist(metric, &f[a as usize], an, &f[b as usize], bn),
+            Codes::F32(f)
+            | Codes::Pq {
+                book: None, raw: f, ..
+            } => dist(metric, &f[a as usize], an, &f[b as usize], bn),
             Codes::Sq8 { bytes, scale } => {
                 let (x, y) = (sq8_at(bytes, scale, a), sq8_at(bytes, scale, b));
                 dist_from(
@@ -195,25 +347,90 @@ impl Codes {
                     bn,
                 )
             }
+            Codes::Bin { bits, dim, .. } => {
+                let w = quant::bin_bytes(*dim);
+                let dot = quant::bin_dot(at(bits, w, a), at(bits, w, b), *dim, an, bn);
+                dist_from(metric, || an * an + bn * bn - 2.0 * dot, || dot, an, bn)
+            }
+            Codes::Pq {
+                book: Some(book),
+                codes,
+                dim,
+                ..
+            } => {
+                let w = quant::pq_bytes(*dim);
+                pq_dist(metric, book.l2sq(at(codes, w, a), at(codes, w, b)), an, bn)
+            }
         }
     }
 
-    /// The distance between slot `a` (norm `an`) and a full vector `q`.
-    fn to(&self, metric: Metric, a: u32, an: f32, q: &[f32], qn: f32) -> f32 {
-        match self {
-            Codes::F32(f) => dist(metric, &f[a as usize], an, q, qn),
-            Codes::Sq8 { bytes, scale } => {
+    /// The distance between slot `a` (norm `an`) and a prepared query.
+    fn to(&self, metric: Metric, a: u32, an: f32, q: &Query<'_>) -> f32 {
+        let qn = q.norm;
+        match (self, &q.prep) {
+            (
+                Codes::F32(f)
+                | Codes::Pq {
+                    book: None, raw: f, ..
+                },
+                _,
+            ) => dist(metric, &f[a as usize], an, q.v, qn),
+            (Codes::Sq8 { bytes, scale }, _) => {
                 let c = sq8_at(bytes, scale, a);
                 dist_from(
                     metric,
-                    || kernel::sq8_l2sq(c, q),
-                    || kernel::sq8_dot(c, q),
+                    || kernel::sq8_l2sq(c, q.v),
+                    || kernel::sq8_dot(c, q.v),
                     an,
                     qn,
                 )
             }
+            (Codes::Bin { bits, factor, dim }, Prep::Bin(bq)) => {
+                let code = at(bits, quant::bin_bytes(*dim), a);
+                let dot = bq.dot(code, an, factor[a as usize]);
+                dist_from(metric, || an * an + qn * qn - 2.0 * dot, || dot, an, qn)
+            }
+            (Codes::Pq { codes, dim, .. }, Prep::Pq(lut)) => {
+                let l2 = kernel::lut_sum(lut, at(codes, quant::pq_bytes(*dim), a));
+                pq_dist(metric, l2, an, qn)
+            }
+            // A query prepared before the codes changed (a PQ set trains only
+            // between walks, so none is): prepare it again.
+            _ => self.to(metric, a, an, &self.query(q.v, qn)),
         }
     }
+}
+
+/// What a PQ code is taken of: the vector, or for a cosine set the unit
+/// vector, so the code's squared distances are of directions alone.
+fn pq_input(v: &[f32], norm: f32, unit: bool) -> Cow<'_, [f32]> {
+    if unit && norm > 0.0 {
+        Cow::Owned(v.iter().map(|x| x / norm).collect())
+    } else {
+        Cow::Borrowed(v)
+    }
+}
+
+/// The distance from PQ's estimate `l2` of the squared distance between two
+/// vectors of norms `an` and `bn` (unit vectors' for cosine): the inner
+/// product is `(‖a‖² + ‖b‖² − ‖a − b‖²) / 2`, and two unit vectors' cosine
+/// `1 − ‖a − b‖² / 2`.
+fn pq_dist(metric: Metric, l2: f32, an: f32, bn: f32) -> f32 {
+    dist_from(
+        metric,
+        || l2,
+        || match metric {
+            Metric::Cosine => an * bn * (1.0 - l2 / 2.0),
+            _ => (an * an + bn * bn - l2) / 2.0,
+        },
+        an,
+        bn,
+    )
+}
+
+/// Slot `slot`'s entry in an array `width` wide a slot.
+fn at(v: &[u8], width: usize, slot: u32) -> &[u8] {
+    &v[slot as usize * width..(slot as usize + 1) * width]
 }
 
 fn sq8_at<'a>(bytes: &'a [Box<[u8]>], scale: &[[f32; 2]], slot: u32) -> Sq8<'a> {
@@ -256,6 +473,8 @@ pub struct Hnsw {
     live: usize,
     rng: u64,
     m_l: f64,
+    /// Live vectors at which a PQ set trains ([`PQ_TRAIN_DEFAULT`]).
+    pq_train: usize,
 }
 
 /// A stored vector and its meta, as [`Hnsw::get`] finds them.
@@ -342,7 +561,7 @@ impl Hnsw {
             norms: Vec::new(),
             deleted: Vec::new(),
             levels: Vec::new(),
-            codes: Codes::new(quant),
+            codes: Codes::new(quant, metric),
             links0: Vec::new(),
             upper: HashMap::new(),
             full: Full::Ram(Vec::new()),
@@ -353,7 +572,25 @@ impl Hnsw {
             live: 0,
             rng: 0x9e3779b97f4a7c15,
             m_l: 1.0 / (M as f64).ln(),
+            pq_train: PQ_TRAIN_DEFAULT,
         }
+    }
+
+    /// Train a PQ set's codebook at `n` live vectors instead of
+    /// [`PQ_TRAIN_DEFAULT`]; for tests and the bench.
+    pub fn set_pq_train(&mut self, n: usize) {
+        self.pq_train = n;
+    }
+
+    /// RAM held for the set as a whole rather than a slot: a PQ codebook, or a
+    /// PQ set's full vectors before it trains. The D4 meter charges it.
+    pub fn held_bytes(&self) -> usize {
+        self.codes.held_bytes()
+    }
+
+    /// Whether this is a PQ set that has not trained its codebook yet.
+    pub fn untrained(&self) -> bool {
+        self.codes.untrained()
     }
 
     pub fn len(&self) -> usize {
@@ -558,22 +795,32 @@ impl Hnsw {
         if level > 0 {
             self.upper.insert(slot, vec![Vec::new(); level]);
         }
-        self.codes.put(slot, v);
+        self.codes.put(slot, v, norm);
     }
 
     fn dnn(&self, a: u32, b: u32) -> f32 {
         let (an, bn) = (self.norms[a as usize], self.norms[b as usize]);
         self.codes.between(self.metric, a, an, b, bn)
     }
-    fn dnq(&self, a: u32, q: &[f32], qn: f32) -> f32 {
-        self.codes.to(self.metric, a, self.norms[a as usize], q, qn)
+    fn dnq(&self, a: u32, q: &Query<'_>) -> f32 {
+        self.codes.to(self.metric, a, self.norms[a as usize], q)
     }
 
     /// Insert (or upsert) a vector. An upsert deletes the old node and inserts
     /// a fresh one, since HNSW has no cheap in-place move. The insert takes a
     /// deleted slot when there is one (BUG-0197), so a set's slots are bounded
     /// by the most it ever held at once, not by how many writes it has seen.
+    ///
+    /// A PQ set that reaches its training threshold trains here, after the
+    /// insert, so no walk sees the codes change under it.
     pub fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
+        self.insert(id, vec, meta);
+        if self.codes.untrained() && self.live >= self.pq_train {
+            self.codes.train();
+        }
+    }
+
+    fn insert(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
         if self.dim == 0 {
             self.dim = vec.len();
         }
@@ -612,11 +859,12 @@ impl Hnsw {
             self.max_level = level;
             return;
         };
+        let q = self.codes.query(&q, norm);
 
         // Descend the layers ABOVE the new node's top with a greedy ef=1 walk.
         let mut lc = self.max_level;
         while lc > level {
-            ep = self.greedy(&q, norm, ep, lc, Walk::Insert(idx));
+            ep = self.greedy(&q, ep, lc, Walk::Insert(idx));
             lc -= 1;
         }
         // Then connect on each layer from the node's top down to 0, deleted
@@ -624,17 +872,12 @@ impl Hnsw {
         let mut ep_set = vec![ep];
         let top = level.min(self.max_level);
         for lc in (0..=top).rev() {
-            let w = self.search_layer(&q, norm, &ep_set, EF_CONSTRUCTION, lc, Walk::Insert(idx));
+            let w = self.search_layer(&q, &ep_set, EF_CONSTRUCTION, lc, Walk::Insert(idx));
             let mmax = if lc == 0 { M0 } else { M };
-            // Candidates ranked by distance to the NEW node (idx).
-            let cand: Vec<DI> = w
-                .iter()
-                .map(|di| DI {
-                    dist: self.dnn(idx, di.idx),
-                    idx: di.idx,
-                })
-                .collect();
-            let selected = self.select_heuristic(&cand, mmax);
+            // The walk ranked the candidates by distance to the NEW node, from
+            // its full vector: with codes, a better estimate than one between
+            // its code and theirs.
+            let selected = self.select_heuristic(&w, mmax);
             self.set_links(idx, lc, &selected);
             for &n in &selected {
                 let mut theirs = self.links(n, lc).to_vec();
@@ -760,16 +1003,16 @@ impl Hnsw {
 
     /// Greedy ef=1 descent at one layer: hop to the nearest neighbour until no
     /// neighbour is closer to the query.
-    fn greedy(&self, q: &[f32], qn: f32, ep: u32, layer: usize, walk: Walk) -> u32 {
+    fn greedy(&self, q: &Query<'_>, ep: u32, layer: usize, walk: Walk) -> u32 {
         let mut cur = ep;
-        let mut cur_d = self.dnq(cur, q, qn);
+        let mut cur_d = self.dnq(cur, q);
         loop {
             let mut changed = false;
             for &n in self.links(cur, layer) {
                 if !self.steps_onto(walk, n, layer) {
                     continue;
                 }
-                let d = self.dnq(n, q, qn);
+                let d = self.dnq(n, q);
                 if d < cur_d {
                     cur_d = d;
                     cur = n;
@@ -788,8 +1031,7 @@ impl Hnsw {
     /// the walk is [`Walk`]'s to say.
     fn search_layer(
         &self,
-        q: &[f32],
-        qn: f32,
+        q: &Query<'_>,
         ep: &[u32],
         ef: usize,
         layer: usize,
@@ -802,7 +1044,7 @@ impl Hnsw {
             if !visited.insert(e) {
                 continue;
             }
-            let d = self.dnq(e, q, qn);
+            let d = self.dnq(e, q);
             cands.push(std::cmp::Reverse(DI { dist: d, idx: e }));
             if !(walk == Walk::Query && self.deleted[e as usize]) {
                 w.push(DI { dist: d, idx: e });
@@ -817,7 +1059,7 @@ impl Hnsw {
                 if !self.steps_onto(walk, n, layer) || !visited.insert(n) {
                     continue;
                 }
-                let d = self.dnq(n, q, qn);
+                let d = self.dnq(n, q);
                 let worst = w.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
                 if d < worst || w.len() < ef {
                     cands.push(std::cmp::Reverse(DI { dist: d, idx: n }));
@@ -893,15 +1135,16 @@ impl Hnsw {
             return Ok(Vec::new());
         };
         let qn = l2norm(q);
+        let query = self.codes.query(q, qn);
         for lc in (1..=self.max_level).rev() {
-            ep = self.greedy(q, qn, ep, lc, Walk::Query);
+            ep = self.greedy(&query, ep, lc, Walk::Query);
         }
         let depth = if self.quant == Quant::None {
             k
         } else {
             rerank.max(k)
         };
-        let mut w = self.search_layer(q, qn, &[ep], ef.max(depth), 0, Walk::Query);
+        let mut w = self.search_layer(&query, &[ep], ef.max(depth), 0, Walk::Query);
         w.sort();
         w.truncate(depth);
         if self.quant != Quant::None {
@@ -1022,13 +1265,21 @@ mod tests {
     }
 
     fn recall_on(metric: Metric, quant: Quant, rerank: usize) -> f64 {
-        let (n, dim, k, ef) = (2000usize, 32usize, 10usize, 64usize);
+        recall_at(metric, quant, 32, rerank)
+    }
+
+    /// As [`recall_on`], at `dim`. A PQ set trains a quarter of the way in,
+    /// so most of its graph is built on codes.
+    fn recall_at(metric: Metric, quant: Quant, dim: usize, rerank: usize) -> f64 {
+        let (n, k, ef) = (2000usize, 10usize, 64usize);
         let mut rng = Rng(0xADC0_0049);
         let data = clustered(&mut rng, n, dim, 40);
         let mut h = Hnsw::new(metric, quant);
+        h.set_pq_train(n / 4);
         for (i, v) in data.iter().enumerate() {
             h.set(format!("{i}").into_bytes(), v.clone(), None);
         }
+        assert!(!h.untrained(), "a PQ set trains at its threshold");
         let (mut hit, mut tot) = (0usize, 0usize);
         for qi in 0..100 {
             let q: Vec<f32> = data[(qi * 29) % n]
@@ -1293,6 +1544,24 @@ mod tests {
                 "{metric:?}: sq8+rerank recall {sq8} fell more than 0.02 below full {full}"
             );
             assert!(sq8 >= 0.85, "{metric:?}: sq8+rerank recall {sq8} < 0.85");
+        }
+    }
+
+    /// ADR-0049 item 2: the 1-bit and PQ codes, re-ranked deeper than `sq8`
+    /// needs, find what the full-vector graph finds, on every metric. At 256
+    /// dimensions a 1-bit code is 32 bytes and a PQ code 16.
+    #[test]
+    fn bin_and_pq_with_rerank_keep_the_full_vector_recall() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Ip] {
+            let full = recall_at(metric, Quant::None, 256, 10);
+            for quant in [Quant::Bin, Quant::Pq] {
+                let got = recall_at(metric, quant, 256, 100);
+                eprintln!("{metric:?} {quant:?}: {got:.3} against full {full:.3}");
+                assert!(
+                    got >= full - 0.03,
+                    "{metric:?}: {quant:?}+rerank recall {got} fell more than 0.03 below full {full}"
+                );
+            }
         }
     }
 

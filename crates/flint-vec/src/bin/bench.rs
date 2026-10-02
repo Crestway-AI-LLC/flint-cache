@@ -17,11 +17,14 @@
 //!        bench --memory [--sizes ...] [--dim ...] [--vec-dir D]
 //!                (heap bytes each kind of set holds per vector, counted by
 //!                 this binary's allocator, beside what the D4 meter charges)
-//!        bench --data DIR --arm plain|sq8|sq8-disk [--n N] [--queries Q]
-//!              [--k 10] [--metric cosine] [--vec-dir D] [--gt-only]
+//!        bench --data DIR --arm plain|<code>|<code>-disk [--n N] [--queries Q]
+//!              [--k 10] [--metric cosine] [--vec-dir D] [--pq-train N]
+//!              [--gt-only]
 //!                (ADR-0049 verifications 1 and 2 on a real corpus: one set a
 //!                 process, its RSS growth, and recall against brute force
-//!                 across EF and RERANK; DIR holds base.fbin and query.fbin)
+//!                 across EF and RERANK; DIR holds base.fbin and query.fbin.
+//!                 A code is sq8, bin or pq; `-disk` keeps the full vectors in
+//!                 --vec-dir)
 //! Not wired into any gate — it allocates a corpus and takes seconds; run it by
 //! hand when the index engine or its parameters change.
 
@@ -607,15 +610,22 @@ fn real_data(a: &[String]) {
 
     let ns = b("real");
     let mut st = Store::new();
-    let quant = match arm.as_str() {
-        "plain" => None,
-        "sq8" | "sq8-disk" => Some("sq8"),
-        other => panic!("--arm plain|sq8|sq8-disk, not {other}"),
+    let (code, disk) = match arm.strip_suffix("-disk") {
+        Some(c) => (c, true),
+        None => (arm.as_str(), false),
     };
-    if arm == "sq8-disk" {
-        let d = std::path::PathBuf::from(arg(a, "--vec-dir").expect("sq8-disk needs --vec-dir"));
+    let quant = match code {
+        "plain" if !disk => None,
+        "sq8" | "bin" | "pq" => Some(code),
+        _ => panic!("--arm plain|<code>|<code>-disk, the code sq8, bin or pq; not {arm}"),
+    };
+    if disk {
+        let d = std::path::PathBuf::from(arg(a, "--vec-dir").expect("a -disk arm needs --vec-dir"));
         std::fs::create_dir_all(&d).expect("--vec-dir");
         st.set_vec_dir(d);
+    }
+    if let Some(t) = arg(a, "--pq-train").and_then(|s| s.parse().ok()) {
+        st.set_pq_train(t);
     }
     let mut create = vec![
         b("VEC.CREATE"),
@@ -633,7 +643,10 @@ fn real_data(a: &[String]) {
     exec(&mut st, &ns, &create);
     let (rss0, heap0) = (rss_anon(), HEAP.load(Ordering::Relaxed));
     let t0 = Instant::now();
+    // The slowest single VEC.SET, and when: a PQ set trains inside one.
+    let (mut slowest, mut slowest_at) = (0f64, 0usize);
     for i in 0..n {
+        let t = Instant::now();
         exec(
             &mut st,
             &ns,
@@ -644,6 +657,10 @@ fn real_data(a: &[String]) {
                 b(&vec_str(base.row(i))),
             ],
         );
+        let took = t.elapsed().as_secs_f64();
+        if took > slowest {
+            (slowest, slowest_at) = (took, i + 1);
+        }
         if (i + 1) % (n / 10).max(1) == 0 {
             eprintln!(
                 "{arm}: {} of {n} in {:.0} s",
@@ -659,14 +676,16 @@ fn real_data(a: &[String]) {
         _ => "n/a".into(),
     };
     println!(
-        "arm={arm} n={n} dim={dim} metric={metric} build={build:.0}s rss_B_per_vector={rss} heap_B_per_vector={heap:.0} meter_B_per_vector={:.0}",
-        st.ns_mem_bytes(&ns) as f64 / n as f64
+        "arm={arm} n={n} dim={dim} metric={metric} build={build:.0}s rss_B_per_vector={rss} heap_B_per_vector={heap:.0} meter_B_per_vector={:.0} slowest_set_ms={:.0} at={slowest_at}",
+        st.ns_mem_bytes(&ns) as f64 / n as f64,
+        slowest * 1e3
     );
 
-    let reranks: Vec<usize> = if quant.is_some() {
-        vec![k, 4 * k, 10 * k]
-    } else {
-        vec![k]
+    // Verification 2's depths, 2k to 10k, and 20k for the codes that may need
+    // more than that.
+    let reranks: Vec<usize> = match quant {
+        None => vec![k],
+        Some(_) => vec![2 * k, 4 * k, 10 * k, 20 * k],
     };
     for ef in [64usize, 128, 256] {
         for &rr in &reranks {

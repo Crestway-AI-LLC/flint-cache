@@ -77,20 +77,38 @@ fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
             })
             .collect();
         let ids: Vec<Vec<u8>> = (0..n).map(|i| b(&format!("id-{i:06}"))).collect();
-        for (label, extra, on_disk) in [
-            ("flat", &[][..], false),
-            ("hnsw", &["INDEX", "hnsw"][..], false),
-            ("hnsw sq8", &["INDEX", "hnsw", "QUANT", "sq8"][..], false),
+        // A PQ set holds full vectors until it trains, then its codebook
+        // and codes: one arm never reaches its threshold, one trains half way.
+        let bin = &["INDEX", "hnsw", "QUANT", "bin"][..];
+        let pq = &["INDEX", "hnsw", "QUANT", "pq"][..];
+        for (label, extra, on_disk, pq_train) in [
+            ("flat", &[][..], false, None),
+            ("hnsw", &["INDEX", "hnsw"][..], false, None),
+            (
+                "hnsw sq8",
+                &["INDEX", "hnsw", "QUANT", "sq8"][..],
+                false,
+                None,
+            ),
             (
                 "hnsw sq8 on disk",
                 &["INDEX", "hnsw", "QUANT", "sq8"][..],
                 true,
+                None,
             ),
+            ("hnsw bin", bin, false, None),
+            ("hnsw bin on disk", bin, true, None),
+            ("hnsw pq untrained on disk", pq, true, None),
+            ("hnsw pq on disk", pq, true, Some(n / 2)),
+            ("hnsw pq", pq, false, Some(n / 2)),
         ] {
             let ns = b("meter");
             let mut st = Store::new();
             if on_disk {
                 st.set_vec_dir(dir.clone());
+            }
+            if let Some(t) = pq_train {
+                st.set_pq_train(t);
             }
             let dim_s = dim.to_string();
             let mut create = vec![

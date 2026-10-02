@@ -16,12 +16,14 @@
 //!
 //! v0.1 is flat/exact — the recall oracle. v0.2 replaces [`VectorSet`]'s search
 //! with an HNSW graph behind the SAME plan. ADR-0049 adds compressed codes in
-//! that graph (`QUANT sq8`) with the best `RERANK` re-scored on full vectors;
-//! it adds options to the `VEC.*` surface and a fourth config field that the
-//! binary before it reads past, so the vector rows themselves are unchanged.
+//! that graph (`QUANT sq8|bin|pq`) with the best `RERANK` re-scored on full
+//! vectors; it adds options to the `VEC.*` surface and a fourth config field
+//! that the binary before it reads past, so the vector rows themselves are
+//! unchanged.
 
 mod hnsw;
 mod kernel;
+mod quant;
 pub mod vecfile;
 
 use flint_resp::Value;
@@ -110,12 +112,21 @@ pub enum Quant {
     /// Per-vector 8-bit codes in the graph; the top candidates are re-ranked
     /// against the full vectors.
     Sq8,
+    /// One bit a dimension, after a fixed random rotation (ADR-0049 item 2):
+    /// no training, a 32nd of the vector.
+    Bin,
+    /// Product quantization, a byte per 16 dimensions (ADR-0049 item 2): a
+    /// 64th of the vector, from a codebook the set trains once it holds
+    /// enough vectors, holding full ones until then.
+    Pq,
 }
 impl Quant {
     pub fn parse(s: &[u8]) -> Option<Quant> {
         match s.to_ascii_lowercase().as_slice() {
             b"none" => Some(Quant::None),
             b"sq8" => Some(Quant::Sq8),
+            b"bin" => Some(Quant::Bin),
+            b"pq" => Some(Quant::Pq),
             _ => None,
         }
     }
@@ -123,6 +134,8 @@ impl Quant {
         match self {
             Quant::None => "none",
             Quant::Sq8 => "sq8",
+            Quant::Bin => "bin",
+            Quant::Pq => "pq",
         }
     }
 }
@@ -219,6 +232,29 @@ impl VectorSet {
         match &self.index {
             Index::Flat(_) => 0,
             Index::Hnsw(h) => h.spill_bytes(),
+        }
+    }
+    /// What the meter charges the set as a whole rather than an entry: the
+    /// vectors whose file write failed, a PQ codebook, and a PQ set's full
+    /// vectors before it trains. Each write charges the change in it.
+    fn held_bytes(&self) -> usize {
+        match &self.index {
+            Index::Flat(_) => 0,
+            Index::Hnsw(h) => h.spill_bytes() + h.held_bytes(),
+        }
+    }
+    /// What one more vector adds to [`VectorSet::held_bytes`], at most: its
+    /// full vector, in the graph of a PQ set that has not trained.
+    fn pending_bytes(&self) -> usize {
+        match &self.index {
+            Index::Hnsw(h) if h.untrained() => self.dim * 4 + 16,
+            _ => 0,
+        }
+    }
+    /// Train a PQ set at `n` live vectors (see [`Store::set_pq_train`]).
+    fn set_pq_train(&mut self, n: usize) {
+        if let Index::Hnsw(h) = &mut self.index {
+            h.set_pq_train(n);
         }
     }
     /// What `id` costs the D4 meter, with no file read.
@@ -620,16 +656,22 @@ fn entry_bytes(
         // 457 B before step 3 flattened the layout.
         IndexKind::Hnsw => 320,
     };
+    // The full vector for the re-rank, when it is in RAM: with no
+    // `--vec-dir`, a quantized set costs MORE than a plain one, and this says
+    // so. A box of its own, pointer included. In the local file (ADR-0049 D2)
+    // it costs no RAM; a vector whose write failed and stayed in RAM is
+    // charged with the set (`VectorSet::held_bytes`).
+    let full = if on_disk { 0 } else { dim * 4 + 16 };
     let vector = match quant {
         Quant::None => dim * 4,
-        // The 8-bit code and its (lo, step), plus the full vector for the
-        // re-rank when it is in RAM: with no `--vec-dir`, a quantized set costs
-        // MORE than a plain one, and this says so. In the local file (ADR-0049
-        // D2) it costs no RAM; a vector whose write failed and stayed in RAM
-        // is charged separately (`VectorSet::spill_bytes`).
-        Quant::Sq8 if on_disk => dim + 8,
-        // The full vector is a box of its own in RAM, pointer included.
-        Quant::Sq8 => dim + 8 + dim * 4 + 16,
+        // The 8-bit code and its (lo, step).
+        Quant::Sq8 => dim + 8 + full,
+        // The 1-bit code and its factor, in arrays a fixed width a slot that
+        // grow by a quarter: up to a quarter more, spare.
+        Quant::Bin => (quant::bin_bytes(dim) + 4) * 5 / 4 + full,
+        // The code, likewise. Its codebook, and its full vectors before it
+        // trains, are charged with the set (`VectorSet::held_bytes`).
+        Quant::Pq => quant::pq_bytes(dim) * 5 / 4 + full,
     };
     vector + id_len + meta_len + structural
 }
@@ -778,6 +820,8 @@ pub struct Store {
     vec_dir: Option<PathBuf>,
     /// Vector files made, which names the next one.
     vec_files: u64,
+    /// Live vectors at which a new PQ set trains; `None` is the default.
+    pq_train: Option<usize>,
 }
 
 impl Store {
@@ -793,6 +837,13 @@ impl Store {
         self.index_cap = bytes;
     }
 
+    /// Train each PQ set created from here on at `n` live vectors, instead of
+    /// the default 10,000. For tests and the bench: the meter test needs a set
+    /// that trains at a few hundred.
+    pub fn set_pq_train(&mut self, n: usize) {
+        self.pq_train = Some(n);
+    }
+
     /// Keep each quantized set's full vectors in a file in `dir` (ADR-0049
     /// D2). The binary owns `dir`: it locks it and empties it of vector files
     /// before calling this.
@@ -805,6 +856,9 @@ impl Store {
     /// where the meter charges them, rather than refusing the set.
     fn new_set(&mut self, dim: usize, metric: Metric, index: IndexKind, quant: Quant) -> VectorSet {
         let mut vs = VectorSet::new(dim, metric, index, quant);
+        if let Some(n) = self.pq_train {
+            vs.set_pq_train(n);
+        }
         if let Some(dir) = &self.vec_dir
             && index == IndexKind::Hnsw
             && quant != Quant::None
@@ -878,14 +932,16 @@ impl Store {
             } => {
                 // Charge the byte delta to the namespace (new entry, or the meta
                 // change on an upsert), computed BEFORE the set replaces it.
-                // A failed vector-file write keeps the vector in RAM, which is
-                // charged as the change in `spill_bytes`.
+                // What the set holds as a whole (a failed vector-file write's
+                // vector, a PQ set's codebook or untrained vectors) is charged
+                // as the change in `held_bytes`, which a PQ set's training
+                // brings down.
                 let mut charge: Option<(usize, usize)> = None;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
-                    let old = vs.entry_cost(&id).unwrap_or(0) + vs.spill_bytes();
+                    let old = vs.entry_cost(&id).unwrap_or(0) + vs.held_bytes();
                     let new_entry = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
                     vs.set(id, vec, meta, expires_at);
-                    charge = Some((new_entry + vs.spill_bytes(), old));
+                    charge = Some((new_entry + vs.held_bytes(), old));
                 }
                 if let Some((new, old)) = charge {
                     let e = self.ns_bytes.entry(ns.to_vec()).or_default();
@@ -895,10 +951,10 @@ impl Store {
             Apply::Remove { set, id } => {
                 let mut freed = 0usize;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
-                    let before = vs.spill_bytes();
+                    let before = vs.held_bytes();
                     freed = vs.entry_cost(&id).unwrap_or(0);
                     vs.del(&id);
-                    freed += before - vs.spill_bytes();
+                    freed += before.saturating_sub(vs.held_bytes());
                 }
                 if freed > 0
                     && let Some(e) = self.ns_bytes.get_mut(ns)
@@ -923,13 +979,13 @@ impl Store {
             if ids.is_empty() {
                 continue;
             }
-            let before = vs.spill_bytes();
+            let before = vs.held_bytes();
             let mut freed = 0usize;
             for id in &ids {
                 freed += vs.entry_cost(id).unwrap_or(0);
                 vs.del(id);
             }
-            freed += before - vs.spill_bytes();
+            freed += before.saturating_sub(vs.held_bytes());
             swept += ids.len();
             if freed > 0
                 && let Some(e) = self.ns_bytes.get_mut(ns)
@@ -963,7 +1019,7 @@ impl Store {
             return Plan::Reply(err("ERR METRIC must be one of cosine, l2, ip"));
         };
         // Optional trailing `INDEX flat|hnsw` (default flat, exact, the oracle)
-        // and `QUANT none|sq8` (ADR-0049; HNSW only), in either order.
+        // and `QUANT none|sq8|bin|pq` (ADR-0049; HNSW only), in either order.
         let mut index = IndexKind::Flat;
         let mut quant = Quant::None;
         let mut i = 6;
@@ -978,7 +1034,7 @@ impl Store {
                 },
                 b"QUANT" => match Quant::parse(val) {
                     Some(q) => quant = q,
-                    None => return Plan::Reply(err("ERR QUANT must be none or sq8")),
+                    None => return Plan::Reply(err("ERR QUANT must be none, sq8, bin or pq")),
                 },
                 _ => {
                     return Plan::Reply(err("ERR unknown VEC.CREATE option (want INDEX or QUANT)"));
@@ -1093,7 +1149,7 @@ impl Store {
         // never an evict-and-desync. An UPSERT of an existing id only costs its
         // meta delta, so it is charged that, not a whole new entry.
         if self.index_cap > 0 {
-            let new = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
+            let new = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len())) + vs.pending_bytes();
             let old = vs.entry_cost(id).unwrap_or(0);
             let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
             if used.saturating_add(new).saturating_sub(old) > self.index_cap {
@@ -1673,10 +1729,16 @@ mod tests {
             Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None))
         );
         assert_eq!(
-            decode_config(b"8|cosine|hnsw|pq|96"),
+            decode_config(b"8|cosine|hnsw|later|96"),
             Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None)),
             "a later binary's code loads unquantized, its further fields read past"
         );
+        for q in [Quant::Sq8, Quant::Bin, Quant::Pq] {
+            assert_eq!(
+                decode_config(&encode_config(8, Metric::Cosine, IndexKind::Hnsw, q)),
+                Some((8, Metric::Cosine, IndexKind::Hnsw, q))
+            );
+        }
         assert_eq!(decode_config(b"8|cosine|bogus|sq8"), None);
     }
 
