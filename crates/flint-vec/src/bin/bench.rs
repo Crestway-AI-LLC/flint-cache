@@ -25,14 +25,25 @@
 //!                 across EF and RERANK; DIR holds base.fbin and query.fbin.
 //!                 A code is sq8, bin or pq; `-disk` keeps the full vectors in
 //!                 --vec-dir)
+//!        bench --edge HOST:PORT [--auth TOKEN] --data DIR --label L
+//!              [--set NAME] [--quant none|sq8|bin|pq] [--n N] [--queries Q]
+//!              [--k 10] [--metric cosine] [--cold-dir D] [--window 64]
+//!              [--load-only | --search-only]
+//!                (ADR-0049 verification 3: the same corpus through a running
+//!                 proxy and co-processor, as a client sees it. Loads with
+//!                 pipelined VEC.SETs, then times one VEC.SEARCH at a time;
+//!                 with --cold-dir, also with the co-processor's vector files
+//!                 in D dropped from the page cache before each query, so the
+//!                 re-rank reads the device. Linux.)
 //! Not wired into any gate — it allocates a corpus and takes seconds; run it by
 //! hand when the index engine or its parameters change.
 
-use flint_resp::Value;
+use flint_resp::{Decoded, Value};
 use flint_vec::{Plan, Store};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicIsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Heap bytes this process holds, for `--memory`: requested sizes, so not the
 /// allocator's own rounding, and not what the OS reports, which on a host that
@@ -296,6 +307,10 @@ fn recall(oracle: &[Vec<Vec<u8>>], approx: &[Vec<Vec<u8>>], k: usize) -> f64 {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    if a.iter().any(|x| x == "--edge") {
+        edge(&a);
+        return;
+    }
     if a.iter().any(|x| x == "--data") {
         real_data(&a);
         return;
@@ -723,6 +738,234 @@ fn real_data(a: &[String]) {
                 "arm={arm} n={n} ef={ef} rerank={rr} recall@{k}={:.4} p50_us={p50} p99_us={p99}",
                 hits as f64 / (nq * k) as f64
             );
+        }
+    }
+}
+
+/// A client connection to the edge, for `--edge`: RESP2 over plain TCP.
+struct Conn {
+    s: std::net::TcpStream,
+    buf: Vec<u8>,
+}
+
+impl Conn {
+    fn open(addr: &str, auth: Option<&str>) -> Conn {
+        let s = std::net::TcpStream::connect(addr).expect("connect to the edge");
+        let _ = s.set_nodelay(true);
+        let mut c = Conn { s, buf: Vec::new() };
+        if let Some(t) = auth
+            && let Value::Error(e) = c.call(&[b("AUTH"), b(t)])
+        {
+            panic!("AUTH: {e}");
+        }
+        c
+    }
+
+    fn send(&mut self, parts: &[Vec<u8>]) {
+        let arr = Value::Array(Some(
+            parts.iter().map(|p| Value::Bulk(Some(p.clone()))).collect(),
+        ));
+        let mut out = Vec::new();
+        flint_resp::encode(&arr, &mut out);
+        self.s.write_all(&out).expect("write to the edge");
+    }
+
+    fn recv(&mut self) -> Value {
+        let mut chunk = vec![0u8; 1 << 16];
+        loop {
+            match flint_resp::decode(&self.buf) {
+                Ok(Decoded::Complete(v, used)) => {
+                    self.buf.drain(..used);
+                    return v;
+                }
+                Ok(Decoded::NeedMore) => {
+                    let n = self.s.read(&mut chunk).expect("read from the edge");
+                    assert!(n > 0, "the edge closed the connection");
+                    self.buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) => panic!("a reply the edge should not send: {e:?}"),
+            }
+        }
+    }
+
+    /// One command, sent again while the answer says to wait: `-LOADING`
+    /// while a cold namespace's index rebuilds (ADR-0017 D3).
+    fn call(&mut self, parts: &[Vec<u8>]) -> Value {
+        loop {
+            self.send(parts);
+            match self.recv() {
+                Value::Error(e) if transient(&e) => std::thread::sleep(Duration::from_millis(100)),
+                v => return v,
+            }
+        }
+    }
+}
+
+/// An error that says to try again rather than that the command is wrong:
+/// not `-QUOTA` or `-VECFULL`, which are caps a retry never gets past.
+fn transient(e: &str) -> bool {
+    ["LOADING", "TRYAGAIN", "BUSY"].iter().any(|w| e.contains(w))
+}
+
+/// Drop the pages of every vector file in `dir` from the page cache, so the
+/// next re-rank reads the device: write back what is dirty, then
+/// `POSIX_FADV_DONTNEED`, which only drops clean pages.
+#[cfg(target_os = "linux")]
+fn drop_vec_pages(dir: &std::path::Path) {
+    use std::os::fd::AsRawFd;
+    for e in std::fs::read_dir(dir).expect("--cold-dir").flatten() {
+        let path = e.path();
+        if path.extension().is_some_and(|x| x == "vecs")
+            && let Ok(f) = std::fs::File::open(&path)
+        {
+            let _ = f.sync_data();
+            // SAFETY: posix_fadvise reads only its integer arguments.
+            unsafe {
+                libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_vec_pages(_dir: &std::path::Path) {
+    panic!("--cold-dir drops pages with posix_fadvise: Linux only");
+}
+
+/// `--edge`: ADR-0049 verification 3. The corpus through a running proxy and
+/// co-processor, timed as a client sees it, one query in flight.
+fn edge(a: &[String]) {
+    let addr = arg(a, "--edge").expect("--edge HOST:PORT");
+    let auth = arg(a, "--auth");
+    let dir = std::path::PathBuf::from(arg(a, "--data").expect("--data DIR"));
+    let label = arg(a, "--label").expect("--label");
+    let set = arg(a, "--set").unwrap_or_else(|| "real".into());
+    let quant = arg(a, "--quant").unwrap_or_else(|| "none".into());
+    let k: usize = arg(a, "--k").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let metric = arg(a, "--metric").unwrap_or_else(|| "cosine".into());
+    let window: usize = arg(a, "--window")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    let cold_dir = arg(a, "--cold-dir").map(std::path::PathBuf::from);
+    let base = Fbin::open(&dir.join("base.fbin"));
+    let queries = Fbin::open(&dir.join("query.fbin"));
+    let n: usize = arg(a, "--n")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(base.n)
+        .min(base.n);
+    let nq: usize = arg(a, "--queries")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200)
+        .min(queries.n);
+    let mut c = Conn::open(&addr, auth.as_deref());
+
+    if !a.iter().any(|x| x == "--search-only") {
+        let mut create = vec![
+            b("VEC.CREATE"),
+            b(&set),
+            b("DIM"),
+            b(&base.dim.to_string()),
+            b("METRIC"),
+            b(&metric),
+            b("INDEX"),
+            b("hnsw"),
+        ];
+        if quant != "none" {
+            create.extend([b("QUANT"), b(&quant)]);
+        }
+        if let Value::Error(e) = c.call(&create) {
+            panic!("VEC.CREATE: {e}");
+        }
+        let t0 = Instant::now();
+        let set_cmd = |i: usize| {
+            vec![
+                b("VEC.SET"),
+                b(&set),
+                b(&i.to_string()),
+                b(&vec_str(base.row(i))),
+            ]
+        };
+        let mut retried = 0usize;
+        for start in (0..n).step_by(window) {
+            let end = (start + window).min(n);
+            for i in start..end {
+                c.send(&set_cmd(i));
+            }
+            let mut again = Vec::new();
+            for i in start..end {
+                match c.recv() {
+                    Value::Error(e) if transient(&e) => again.push(i),
+                    Value::Error(e) => panic!("VEC.SET {i}: {e}"),
+                    _ => {}
+                }
+            }
+            retried += again.len();
+            for i in again {
+                if let Value::Error(e) = c.call(&set_cmd(i)) {
+                    panic!("VEC.SET {i}: {e}");
+                }
+            }
+            if end % (n / 10).max(1) < window {
+                eprintln!("{label}: {end} of {n} in {:.0} s", t0.elapsed().as_secs_f64());
+            }
+        }
+        let load = t0.elapsed().as_secs_f64();
+        println!(
+            "edge={label} n={n} load={load:.0}s rate={:.0}/s retried={retried}",
+            n as f64 / load
+        );
+    }
+    if a.iter().any(|x| x == "--load-only") {
+        return;
+    }
+
+    let gt = ground_truth(&dir, &base, n, &queries, nq, k, &metric);
+    let reranks: Vec<usize> = if quant == "none" {
+        vec![k]
+    } else {
+        vec![2 * k, 4 * k, 10 * k, 20 * k]
+    };
+    let temps: &[bool] = if cold_dir.is_some() {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for ef in [64usize, 128, 256] {
+        for &rr in &reranks {
+            for &cold in temps {
+                let (mut hits, mut lat) = (0usize, Vec::with_capacity(nq));
+                for (qi, truth) in gt.iter().enumerate().take(nq) {
+                    let args = [
+                        b("VEC.SEARCH"),
+                        b(&set),
+                        b(&vec_str(queries.row(qi))),
+                        b(&k.to_string()),
+                        b("EF"),
+                        b(&ef.to_string()),
+                        b("RERANK"),
+                        b(&rr.to_string()),
+                    ];
+                    if cold && let Some(d) = &cold_dir {
+                        drop_vec_pages(d);
+                    }
+                    let t = Instant::now();
+                    let reply = c.call(&args);
+                    lat.push(t.elapsed().as_micros());
+                    if let Value::Error(e) = &reply {
+                        panic!("VEC.SEARCH: {e}");
+                    }
+                    hits += result_ids(&reply)
+                        .iter()
+                        .filter_map(|id| std::str::from_utf8(id).ok()?.parse::<u32>().ok())
+                        .filter(|id| truth.contains(id))
+                        .count();
+                }
+                let (p50, p99, _) = stats(lat);
+                println!(
+                    "edge={label} n={n} ef={ef} rerank={rr} cold={cold} recall@{k}={:.4} p50_us={p50} p99_us={p99}",
+                    hits as f64 / (nq * k) as f64
+                );
+            }
         }
     }
 }
