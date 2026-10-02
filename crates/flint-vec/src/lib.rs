@@ -714,6 +714,12 @@ pub type SetConfig = (usize, Metric, IndexKind, Quant);
 /// Inverse of a config row: `<dim>|<metric>[|<index>[|<quant>]]`. A 2-field
 /// config (written before v0.2 added the index kind) is flat, and a 3-field one
 /// (before ADR-0049) is unquantized.
+///
+/// A code this binary does not know is a later binary's (ADR-0049 item 2 adds
+/// codes): the set loads unquantized, from the same full durable rows, as a
+/// binary from before ADR-0049 loads a `sq8` one. Refusing the row instead
+/// would drop the set from the index on a rollback, and a `VEC.CREATE` while
+/// rolled back could then replace its config.
 pub fn decode_config(val: &[u8]) -> Option<SetConfig> {
     let s = std::str::from_utf8(val).ok()?;
     let mut it = s.split('|');
@@ -723,10 +729,10 @@ pub fn decode_config(val: &[u8]) -> Option<SetConfig> {
         Some(k) => IndexKind::parse(k.as_bytes())?,
         None => IndexKind::Flat,
     };
-    let quant = match it.next() {
-        Some(q) => Quant::parse(q.as_bytes())?,
-        None => Quant::None,
-    };
+    let quant = it
+        .next()
+        .and_then(|q| Quant::parse(q.as_bytes()))
+        .unwrap_or(Quant::None);
     Some((dim, metric, index, quant))
 }
 
@@ -1666,7 +1672,12 @@ mod tests {
             decode_config(b"8|cosine|hnsw"),
             Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None))
         );
-        assert_eq!(decode_config(b"8|cosine|hnsw|bogus"), None);
+        assert_eq!(
+            decode_config(b"8|cosine|hnsw|pq|96"),
+            Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None)),
+            "a later binary's code loads unquantized, its further fields read past"
+        );
+        assert_eq!(decode_config(b"8|cosine|bogus|sq8"), None);
     }
 
     #[test]
