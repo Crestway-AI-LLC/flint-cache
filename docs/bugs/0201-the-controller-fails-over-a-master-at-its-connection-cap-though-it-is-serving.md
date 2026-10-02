@@ -1,7 +1,9 @@
-# BUG-0201: the controller fails over a master at its connection cap, though it is serving (OPEN)
+# BUG-0201: the controller fails over a master at its connection cap, though it is serving (FIXED 2026-10-02)
 
-**Status:** **OPEN.** Filed 2026-10-02 by the ops session; handed to the
-public session ("Cache technology vs Redis") to fix, by Jeff's decision.
+**Status:** **FIXED 2026-10-02.** Filed the same day by the ops session and
+handed to the public session ("Cache technology vs Redis") to fix, by Jeff's
+decision. Held by the new CORE drill `conn_cap`, which reproduces the
+playground's failover on the unfixed node and passes on the fixed one.
 **Severity:** high when it fires. A master that is serving every client is
 promoted away, which on 2026-09-27 produced a fence split (ops OPS-0348) and
 half an hour of refused writes (ops OPS-0349). BUG-0199 removed the leak that
@@ -60,3 +62,67 @@ however the cap is reached.
 - **The leak.** Fixed as BUG-0199 (public `2f9c3f8`).
 - **Seeing the cap coming.** The ops agent's early warning is OPS-0361:
   `active_conns`/`max_conns`, flagged by the sweep at 50%.
+
+## Fix
+
+Directions 1 and 2 together, at the node. Over the cap, a new connection is
+no longer dropped. It is answered once, on a thread of its own, and closed
+(`answer_over_cap`):
+
+- **PING and FLINTINFO** answer as on a node with room. They are what every
+  liveness check sends, so the controller, `flintctl status` and the ops
+  agent read a full master as the master it is. FLINTINFO's `active_conns`
+  and `max_conns` say why it is full.
+- **Anything else** gets `-ERR max number of clients reached`, Redis's own
+  reply at its `maxclients`. A proxy dialling a full node fails that dial
+  with a reason, not a reset.
+- **Bounded:** at most 16 such answers at once, each with 1 s for its TLS
+  handshake and 1 s for its command. Past 16, the node drops the connection
+  as before, so a connection storm still cannot exhaust its threads.
+
+So the reserve for the mesh's probes is a reply, not a slot: a probe needs
+one answer, not a connection to keep.
+
+The controller is unchanged. It never sees the error, because it only sends
+what the node now answers.
+
+## Verification
+
+`tools/conn_cap_drill.sh`, a CORE drill. It bootstraps a real fleet (CP, one
+pair, proxy, controller, mutual TLS), warms the proxy's pool, and lowers the
+master's cap with `FLINTCONFIG max-conns` to six above what it holds. A holder
+fills the cap and keeps taking any slot that frees. Then each check runs on a
+connection of its own:
+
+- PING answers PONG.
+- FLINTINFO answers `role:master`, with `active_conns` at `max_conns`.
+- SET answers the max-clients error.
+- For 10 s the replica still reports `role:replica`, and the master is still
+  master at its epoch. That is past the controller's confirm ticks (3 × 150
+  ms) and its 4 s slow-promote window.
+- The edge takes a write every second throughout.
+- Released, the master takes new connections again.
+
+Measured on the gate box:
+
+- **Fixed:** all of the above. The holder's next connection got the
+  max-clients error, and FLINTINFO read `active_conns 12 of 12`.
+- **Unfixed:** every probe saw the TLS stream close (EOF). With the probe
+  checks made non-fatal, the controller logged
+  `no master for 28/3 ticks (t1: 127.0.0.1:6513 FLINTINFO unexpected end of
+  file; PING no; socket open, …)`, then `PROMOTED 127.0.0.1:6514`. The drill
+  failed at 5 s: the playground's 2026-09-27 failover, reproduced.
+
+## What this does not do
+
+- **A replica cannot re-attach to a full master.** Its replication handshake
+  is not a probe, so it gets the max-clients error until the master has room.
+  A link that drops while the master is full stays down until then, and
+  `min-replicas-to-write` may shed writes meanwhile. The ops agent's early
+  warning (OPS-0361, at 50% of the cap) is the defence. A reserve for
+  replication, by first command or by identity, would be the next step.
+- **A node still loading** (the `-LOADING` acceptor) drops over-cap
+  connections as before. A loading node is never a master.
+- **Direction 3**, a second liveness signal before promoting, is not built.
+  A full node now answers, so it is not needed for this failure.
+

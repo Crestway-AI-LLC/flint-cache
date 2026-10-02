@@ -1097,12 +1097,23 @@ static REPLICA_STALE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// storm exhausts the node's threads. This is the INTERNAL mesh surface, so
 /// only a buggy proxy fleet or runaway internal tooling can approach it — a
 /// generous safety valve, not a tenant-facing limit. Over the cap a new
-/// connection is DROPPED (a reset the peer backs off on; writing a
-/// pre-handshake shed frame over mutual TLS is not possible). Tunable with
-/// --max-conns.
+/// connection is answered once and closed ([`answer_over_cap`], BUG-0201),
+/// not served. Tunable with --max-conns.
 static MAX_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
 static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CONNS_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a connection over the cap is told when it asks for anything but
+/// liveness: Redis's own reply at its `maxclients`, word for word.
+const MAX_CLIENTS_ERR: &str = "ERR max number of clients reached";
+/// Connections over the cap being answered at once ([`answer_over_cap`]).
+/// Each is a thread for at most two [`OVER_CAP_DEADLINE`]s; past this many, a
+/// connection is dropped unanswered, so a storm still cannot exhaust threads.
+const OVER_CAP_ANSWERS_MAX: usize = 16;
+static OVER_CAP_ANSWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How long an over-cap connection has for its handshake and its one command,
+/// each: the controller's own read timeout is 800 ms.
+const OVER_CAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Startup state (#176). Set from process start until the real accept loop
 /// takes the listener over; while it holds, the port is OPEN and answers, but
@@ -3568,12 +3579,33 @@ fn main() -> std::io::Result<()> {
         if std::env::var_os("FLINT_NAGLE_TEST").is_none() {
             let _ = stream.set_nodelay(true);
         }
-        // B1: shed over the connection cap (drop = reset; the peer backs
-        // off). Reserve the slot before spawning so the count is accurate.
+        // B1: shed over the connection cap. Reserve the slot before spawning
+        // so the count is accurate. A shed connection is answered, not
+        // dropped: dropped, every new-connection probe read a FULL node as a
+        // dead one, and the controller failed over a master that was serving
+        // every client it had (BUG-0201).
         if ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS.load(Ordering::Relaxed) {
             ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
             CONNS_SHED.fetch_add(1, Ordering::Relaxed);
-            drop(stream);
+            let read_only = Arc::clone(&read_only);
+            #[allow(clippy::clone_on_copy)]
+            let rocks = rocks.clone();
+            let hub = Arc::clone(&hub);
+            let write_queue = write_queue.clone();
+            answer_over_cap(
+                stream,
+                internal_reload.as_ref().and_then(|r| r.current()),
+                move || {
+                    let (ro, role_epoch) = role_snapshot(&read_only, &rocks);
+                    flintinfo(
+                        ro,
+                        role_epoch,
+                        &rocks,
+                        &hub,
+                        write_queue.as_ref().map(|q| q.depth()),
+                    )
+                },
+            );
             continue;
         }
         let store: Arc<dyn Kv> = Arc::clone(&store);
@@ -3617,6 +3649,99 @@ fn main() -> std::io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Answer one connection over `--max-conns`, on a thread of its own, and close
+/// it (BUG-0201).
+///
+/// The node used to drop it unanswered. The connections it already held kept
+/// serving, so clients on pooled connections saw nothing, but every probe
+/// that opens a NEW connection saw a reset, the same as from a dead process.
+/// On 2026-09-27 the controller's FLINTINFO and PING read the playground's
+/// master that way for 41 ticks, and it promoted the replica away from a
+/// master that was serving: a fence split and refused writes (ops OPS-0348,
+/// OPS-0349).
+///
+/// So the node now answers the first command, which is all a probe sends:
+/// PING and FLINTINFO as a node with room would, since they are what every
+/// liveness check asks and they cost no connection slot; anything else
+/// [`MAX_CLIENTS_ERR`], as Redis answers at its `maxclients`. A FULL node is
+/// then alive and says so, and FLINTINFO's `active_conns` and `max_conns`
+/// say why. At most [`OVER_CAP_ANSWERS_MAX`] at once, each bounded by
+/// [`OVER_CAP_DEADLINE`]; past that the connection is dropped as before.
+fn answer_over_cap(
+    stream: std::net::TcpStream,
+    tls: Option<Arc<flint_tls::ServerConfig>>,
+    flintinfo: impl FnOnce() -> Value + Send + 'static,
+) {
+    if OVER_CAP_ANSWERS.fetch_add(1, Ordering::Relaxed) >= OVER_CAP_ANSWERS_MAX {
+        OVER_CAP_ANSWERS.fetch_sub(1, Ordering::Relaxed);
+        drop(stream);
+        return;
+    }
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            OVER_CAP_ANSWERS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let release = Release;
+    std::thread::spawn(move || {
+        let _release = release;
+        if stream.set_read_timeout(Some(OVER_CAP_DEADLINE)).is_err()
+            || stream.set_write_timeout(Some(OVER_CAP_DEADLINE)).is_err()
+        {
+            return;
+        }
+        let Ok(mut conn) = flint_tls::accept(stream, &tls) else {
+            return;
+        };
+        let reply = match read_one_command(&mut conn) {
+            Some(args) => match args[0].to_ascii_uppercase().as_slice() {
+                b"PING" => Value::Simple("PONG".into()),
+                b"FLINTINFO" => flintinfo(),
+                _ => Value::Error(MAX_CLIENTS_ERR.into()),
+            },
+            None => Value::Error(MAX_CLIENTS_ERR.into()),
+        };
+        let mut out = Vec::new();
+        encode(&reply, &mut out);
+        let _ = conn.write_all(&out);
+    });
+}
+
+/// The first command on `conn`, RESP or inline, or `None` when the peer sends
+/// none (in time), closes, or sends something that is not one.
+fn read_one_command(conn: &mut flint_tls::Stream) -> Option<Vec<Vec<u8>>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4 * 1024];
+    loop {
+        if buf.first() == Some(&b'*') {
+            match decode(&buf) {
+                Ok(Decoded::Complete(frame, _)) => {
+                    return frame_to_args(frame).filter(|a| !a.is_empty());
+                }
+                Ok(Decoded::NeedMore) => {}
+                Err(_) => return None,
+            }
+        } else if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line = buf[..nl].strip_suffix(b"\r").unwrap_or(&buf[..nl]);
+            let args: Vec<Vec<u8>> = line
+                .split(|&b| b == b' ')
+                .filter(|p| !p.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect();
+            return (!args.is_empty()).then_some(args);
+        }
+        if buf.len() > MAX_INLINE_LEN {
+            return None;
+        }
+        let n = conn.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
 }
 
 /// Accept and answer connections while the node is still coming up (#176).
