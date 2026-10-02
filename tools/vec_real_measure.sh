@@ -59,4 +59,4 @@ for arm in $ARMS; do
     > "$OUT/$arm.txt" 2> "$OUT/$arm.log" &
 done
 wait
-cat "$OUT"/*.txt
+[ -z "$ARMS" ] || cat "$OUT"/*.txt
