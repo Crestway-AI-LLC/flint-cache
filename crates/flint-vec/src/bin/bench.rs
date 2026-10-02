@@ -19,7 +19,7 @@
 //!                 this binary's allocator, beside what the D4 meter charges)
 //!        bench --data DIR --arm plain|<code>|<code>-disk [--n N] [--queries Q]
 //!              [--k 10] [--metric cosine] [--vec-dir D] [--pq-train N]
-//!              [--gt-only]
+//!              [--efs 64,128,256] [--reranks 20,40,100,200] [--gt-only]
 //!                (ADR-0049 verifications 1 and 2 on a real corpus: one set a
 //!                 process, its RSS growth, and recall against brute force
 //!                 across EF and RERANK; DIR holds base.fbin and query.fbin.
@@ -702,12 +702,15 @@ fn real_data(a: &[String]) {
     );
 
     // Verification 2's depths, 2k to 10k, and 20k for the codes that may need
-    // more than that.
+    // more than that, unless --reranks names others; --efs likewise.
+    let list = |flag: &str| -> Option<Vec<usize>> {
+        arg(a, flag).map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+    };
     let reranks: Vec<usize> = match quant {
         None => vec![k],
-        Some(_) => vec![2 * k, 4 * k, 10 * k, 20 * k],
+        Some(_) => list("--reranks").unwrap_or_else(|| vec![2 * k, 4 * k, 10 * k, 20 * k]),
     };
-    for ef in [64usize, 128, 256] {
+    for ef in list("--efs").unwrap_or_else(|| vec![64, 128, 256]) {
         for &rr in &reranks {
             let (mut hits, mut lat) = (0usize, Vec::with_capacity(nq));
             for (qi, truth) in gt.iter().enumerate().take(nq) {
