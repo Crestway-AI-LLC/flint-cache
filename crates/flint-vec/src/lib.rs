@@ -1536,8 +1536,9 @@ mod tests {
     }
 
     /// ADR-0049 at the command surface: QUANT is HNSW-only, rides the config's
-    /// fourth field, reads back, shows last in INFO, and a quantized set
-    /// answers SEARCH (with RERANK in either order beside EF) like a plain one.
+    /// fourth field, reads back, shows last in INFO, and a quantized set of
+    /// each code answers SEARCH (with RERANK in either order beside EF) like a
+    /// plain one.
     #[test]
     fn a_quantized_set_round_trips_through_the_commands() {
         let mut st = Store::new();
@@ -1560,71 +1561,92 @@ mod tests {
             Value::Error("ERR QUANT needs INDEX hnsw".into()),
             "a quantized flat would be neither exact nor the oracle"
         );
-        let create = cmd(&[
-            "VEC.CREATE",
-            "q",
-            "DIM",
-            "2",
-            "METRIC",
-            "l2",
-            "QUANT",
-            "sq8",
-            "INDEX",
-            "hnsw",
-        ]);
-        match plan0(&st, ns, &create) {
-            Plan::Write { persist, .. } => {
-                let Some(Persist::Put { val, .. }) = persist.into_iter().nth(1) else {
-                    panic!("the config row is CREATE's second step")
-                };
-                assert_eq!(val, b"2|l2|hnsw|sq8".to_vec());
+        for (code, quant) in [("sq8", Quant::Sq8), ("bin", Quant::Bin), ("pq", Quant::Pq)] {
+            let create = cmd(&[
+                "VEC.CREATE",
+                code,
+                "DIM",
+                "2",
+                "METRIC",
+                "l2",
+                "QUANT",
+                code,
+                "INDEX",
+                "hnsw",
+            ]);
+            match plan0(&st, ns, &create) {
+                Plan::Write { persist, .. } => {
+                    let Some(Persist::Put { val, .. }) = persist.into_iter().nth(1) else {
+                        panic!("the config row is CREATE's second step")
+                    };
+                    assert_eq!(val, format!("2|l2|hnsw|{code}").into_bytes());
+                    assert_eq!(
+                        decode_config(&val),
+                        Some((2, Metric::L2, IndexKind::Hnsw, quant))
+                    );
+                }
+                _ => panic!("create should plan a write"),
+            }
+            assert_eq!(run(&mut st, ns, &create), Value::Simple("OK".into()));
+            for (id, x) in [("a", "0,0"), ("b", "5,5"), ("c", "9,9")] {
                 assert_eq!(
-                    decode_config(&val),
-                    Some((2, Metric::L2, IndexKind::Hnsw, Quant::Sq8))
+                    run(&mut st, ns, &cmd(&["VEC.SET", code, id, x])),
+                    Value::Simple("OK".into())
                 );
             }
-            _ => panic!("create should plan a write"),
-        }
-        assert_eq!(run(&mut st, ns, &create), Value::Simple("OK".into()));
-        for (id, x) in [("a", "0,0"), ("b", "5,5"), ("c", "9,9")] {
-            assert_eq!(
-                run(&mut st, ns, &cmd(&["VEC.SET", "q", id, x])),
-                Value::Simple("OK".into())
-            );
-        }
-        for opts in [
-            vec!["RERANK", "3", "EF", "16"],
-            vec!["EF", "16", "RERANK", "3"],
-            vec![],
-        ] {
-            let mut c = vec!["VEC.SEARCH", "q", "1,1", "1"];
-            c.extend(opts.iter());
-            let Value::Array(Some(rows)) = run(&mut st, ns, &cmd(&c)) else {
-                panic!("search reply")
+            for opts in [
+                vec!["RERANK", "3", "EF", "16"],
+                vec!["EF", "16", "RERANK", "3"],
+                vec![],
+            ] {
+                let mut c = vec!["VEC.SEARCH", code, "1,1", "1"];
+                c.extend(opts.iter());
+                let Value::Array(Some(rows)) = run(&mut st, ns, &cmd(&c)) else {
+                    panic!("search reply")
+                };
+                assert_eq!(
+                    rows,
+                    vec![Value::Array(Some(vec![
+                        Value::Bulk(Some(v("a"))),
+                        Value::Double(-2.0),
+                    ]))],
+                    "{code}: nearest is a at -||(1,1)||^2, scored on the full vector (opts {opts:?})"
+                );
+            }
+            let Value::Array(Some(info)) = run(&mut st, ns, &cmd(&["VEC.INFO", code])) else {
+                panic!("info reply")
             };
+            assert_eq!(info[14], Value::Bulk(Some(v("quant"))));
+            assert_eq!(info[15], Value::Bulk(Some(v(code))));
             assert_eq!(
-                rows,
-                vec![Value::Array(Some(vec![
-                    Value::Bulk(Some(v("a"))),
-                    Value::Double(-2.0),
-                ]))],
-                "nearest is a at -||(1,1)||^2, scored on the full vector (opts {opts:?})"
+                info[16],
+                Value::Bulk(Some(v("vectors_on"))),
+                "step 2's fields come after it"
+            );
+            assert_eq!(
+                info[10],
+                Value::Bulk(Some(v("ns_mem_bytes"))),
+                "earlier fields keep their places"
             );
         }
-        let Value::Array(Some(info)) = run(&mut st, ns, &cmd(&["VEC.INFO", "q"])) else {
-            panic!("info reply")
-        };
-        assert_eq!(info[14], Value::Bulk(Some(v("quant"))));
-        assert_eq!(info[15], Value::Bulk(Some(v("sq8"))));
         assert_eq!(
-            info[16],
-            Value::Bulk(Some(v("vectors_on"))),
-            "step 2's fields come after it"
-        );
-        assert_eq!(
-            info[10],
-            Value::Bulk(Some(v("ns_mem_bytes"))),
-            "earlier fields keep their places"
+            run(
+                &mut st,
+                ns,
+                &cmd(&[
+                    "VEC.CREATE",
+                    "x",
+                    "DIM",
+                    "2",
+                    "METRIC",
+                    "l2",
+                    "INDEX",
+                    "hnsw",
+                    "QUANT",
+                    "pq8"
+                ])
+            ),
+            Value::Error("ERR QUANT must be none, sq8, bin or pq".into())
         );
     }
 
