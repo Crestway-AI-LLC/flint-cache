@@ -50,6 +50,8 @@ wheel "$PY/54/30/c2a907b9443cf42b90c17ad10c1e8fa801975f01cb9764f3f8eb8aea638b/nu
 
 cargo build --release -q -p flint-vec --bin bench
 B=./target/release/bench
+# A warm box keeps the last run's results: only this run's are reported.
+rm -f "$OUT"/*.txt "$OUT"/*.log
 "$B" --data "$D" ${N:+--n "$N"} --queries 200 --gt-only 2>&1 | tee "$OUT/gt.log"
 for arm in $ARMS; do
   "$B" --data "$D" --arm "$arm" ${N:+--n "$N"} --queries 200 --vec-dir "/mnt/d/vecdir-$arm" \
