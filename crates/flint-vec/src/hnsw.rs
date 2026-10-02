@@ -181,6 +181,9 @@ struct Pq {
     raw: Vec<Arc<[f32]>>,
     /// Training or encoding under way, and what it has returned so far.
     pending: Option<Pending>,
+    /// A thread panicked: the set keeps walking its full vectors, which the
+    /// meter goes on charging, rather than start one after another.
+    failed: bool,
 }
 
 struct Pending {
@@ -212,6 +215,7 @@ impl Pq {
             codes: Vec::new(),
             raw: Vec::new(),
             pending: None,
+            failed: false,
         }
     }
 
@@ -257,7 +261,7 @@ impl Pq {
     /// set is `ready`, collect a finished one, and install once few enough
     /// slots are left to encode here. With `wait`, block until installed.
     fn step(&mut self, ready: bool, wait: bool) {
-        while self.book.is_none() && !self.raw.is_empty() {
+        while self.book.is_none() && !self.raw.is_empty() && !self.failed {
             let Some(p) = &mut self.pending else {
                 if !ready {
                     return;
@@ -278,24 +282,26 @@ impl Pq {
                 return;
             };
             let width = quant::pq_bytes(self.dim);
-            if let Ok(done) = job.join() {
-                self.codes.resize(self.raw.len() * width, 0);
-                p.fresh.resize(self.raw.len(), false);
-                p.dirty.sort_unstable();
-                for (s, code) in done.slots.iter().zip(done.codes.chunks_exact(width)) {
-                    if p.dirty.binary_search(s).is_err() {
-                        let at = *s as usize * width;
-                        self.codes[at..at + width].copy_from_slice(code);
-                        p.fresh[*s as usize] = true;
-                    }
+            let Ok(done) = job.join() else {
+                eprintln!("flint-vec: a PQ thread panicked; this set keeps its full vectors");
+                self.failed = true;
+                self.pending = None;
+                self.codes = Vec::new();
+                return;
+            };
+            self.codes.resize(self.raw.len() * width, 0);
+            p.fresh.resize(self.raw.len(), false);
+            p.dirty.sort_unstable();
+            for (s, code) in done.slots.iter().zip(done.codes.chunks_exact(width)) {
+                if p.dirty.binary_search(s).is_err() {
+                    let at = *s as usize * width;
+                    self.codes[at..at + width].copy_from_slice(code);
+                    p.fresh[*s as usize] = true;
                 }
-                p.learned = Some(done.book);
             }
             p.dirty.clear();
-            let Some(book) = p.learned.clone() else {
-                self.pending = None; // the training thread failed: start over
-                continue;
-            };
+            let book = done.book;
+            p.learned = Some(book.clone());
             let todo: Vec<u32> = (0..self.raw.len() as u32)
                 .filter(|&s| !p.fresh[s as usize])
                 .collect();
