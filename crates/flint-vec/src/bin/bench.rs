@@ -804,7 +804,9 @@ impl Conn {
 /// An error that says to try again rather than that the command is wrong:
 /// not `-QUOTA` or `-VECFULL`, which are caps a retry never gets past.
 fn transient(e: &str) -> bool {
-    ["LOADING", "TRYAGAIN", "BUSY"].iter().any(|w| e.contains(w))
+    ["LOADING", "TRYAGAIN", "BUSY"]
+        .iter()
+        .any(|w| e.contains(w))
 }
 
 /// Drop the pages of every vector file in `dir` from the page cache, so the
@@ -906,7 +908,10 @@ fn edge(a: &[String]) {
                 }
             }
             if end % (n / 10).max(1) < window {
-                eprintln!("{label}: {end} of {n} in {:.0} s", t0.elapsed().as_secs_f64());
+                eprintln!(
+                    "{label}: {end} of {n} in {:.0} s",
+                    t0.elapsed().as_secs_f64()
+                );
             }
         }
         let load = t0.elapsed().as_secs_f64();
