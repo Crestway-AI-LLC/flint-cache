@@ -128,6 +128,8 @@ fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
             for (id, v) in ids.iter().zip(&vectors) {
                 exec(&mut st, &ns, &[b("VEC.SET"), b("s"), id.clone(), v.clone()]);
             }
+            // A PQ set trains on a thread: count once its codebook is in.
+            st.settle();
             let held = HEAP.load(Ordering::Relaxed) - before;
             let meter = st.ns_mem_bytes(&ns) as isize;
             eprintln!(

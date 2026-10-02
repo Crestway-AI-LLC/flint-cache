@@ -26,6 +26,8 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 const M: usize = 16; // neighbours per node on upper layers
 const M0: usize = 32; // neighbours at layer 0 (2*M — denser base layer)
@@ -114,7 +116,7 @@ fn put_slot<T: Copy>(v: &mut Vec<T>, slot: u32, vals: &[T]) {
 
 /// Set slot `slot` of an array of boxes, appending when it is the next one.
 /// What holds a slot's vector or code: one allocation of exactly its size.
-fn put_box<T>(v: &mut Vec<Box<[T]>>, slot: u32, b: Box<[T]>) {
+fn put_box<B>(v: &mut Vec<B>, slot: u32, b: B) {
     if slot as usize == v.len() {
         grow(v, 1);
         v.push(b);
@@ -144,19 +146,214 @@ enum Codes {
         factor: Vec<f32>,
         dim: usize,
     },
-    /// Product-quantization codes, `dim / 16` bytes a slot, once the set has
-    /// trained its codebook; until then the full vectors, as `F32` holds them
-    /// (`quant.rs`). Every estimate goes through PQ's squared distance, whose
-    /// error scales with the gap between the two vectors rather than with
-    /// either one, as a dot product's does: a cosine set encodes unit
-    /// vectors, and an inner product comes from the distance and the norms.
-    Pq {
-        book: Option<Box<Book>>,
-        raw: Vec<Box<[f32]>>,
-        codes: Vec<u8>,
-        dim: usize,
-        unit: bool,
-    },
+    /// Product-quantization codes ([`Pq`]).
+    Pq(Box<Pq>),
+}
+
+/// Slots whose codes the thread that encodes a PQ set's vectors may leave to
+/// the write that installs its codebook: about 20-40 ms of encoding at 1536
+/// dimensions, the most an install may hold the store for.
+const CATCH_UP: usize = 1024;
+
+/// A PQ set's codes (ADR-0049 item 2), `dim / 16` bytes a slot (`quant.rs`).
+///
+/// Its codebook is learned from its own vectors once it holds enough
+/// ([`PQ_TRAIN_DEFAULT`]), and until it is installed the graph walks on the
+/// full vectors, exactly. Learning it took 16 s at 10,000 vectors of 1536
+/// dimensions, and a write holds the whole store, every tenant's, while it
+/// runs: so a thread trains the codebook and encodes the vectors, which it
+/// shares rather than copies, and the set keeps taking writes meanwhile. A
+/// write or the binary's sweeper ([`Hnsw::tend`]) collects the result,
+/// re-encodes what was written since, and installs it.
+///
+/// Every estimate goes through PQ's squared distance, whose error scales with
+/// the gap between two vectors rather than with either one, as a dot
+/// product's does: a cosine set encodes unit vectors, and an inner product
+/// comes from the distance and the norms.
+struct Pq {
+    dim: usize,
+    unit: bool,
+    /// The codebook, once installed: from then on `codes` holds every slot's
+    /// code and the walk uses them.
+    book: Option<Arc<Book>>,
+    codes: Vec<u8>,
+    /// The full vectors until the codebook is installed, by slot.
+    raw: Vec<Arc<[f32]>>,
+    /// Training or encoding under way, and what it has returned so far.
+    pending: Option<Pending>,
+}
+
+struct Pending {
+    job: Option<JoinHandle<Encoded>>,
+    /// The codebook, once a thread has trained it.
+    learned: Option<Arc<Book>>,
+    /// Which slots' codes in [`Pq::codes`] a thread returned and no write has
+    /// replaced since.
+    fresh: Vec<bool>,
+    /// Slots written since the running job took their vectors: what it
+    /// returns for them is stale.
+    dirty: Vec<u32>,
+}
+
+/// What a PQ thread returns: the codebook it trained or was given, and the
+/// codes of the slots it was given, `pq_bytes(dim)` each, in order.
+struct Encoded {
+    book: Arc<Book>,
+    slots: Vec<u32>,
+    codes: Vec<u8>,
+}
+
+impl Pq {
+    fn new(unit: bool) -> Pq {
+        Pq {
+            dim: 0,
+            unit,
+            book: None,
+            codes: Vec::new(),
+            raw: Vec::new(),
+            pending: None,
+        }
+    }
+
+    fn put(&mut self, slot: u32, v: &[f32], norm: f32) {
+        self.dim = v.len();
+        let width = quant::pq_bytes(v.len());
+        if let Some(book) = &self.book {
+            let mut code = vec![0u8; width];
+            book.encode(&pq_input(v, norm, self.unit), &mut code);
+            put_slot(&mut self.codes, slot, &code);
+            return;
+        }
+        put_box(&mut self.raw, slot, Arc::from(v));
+        if let Some(p) = &mut self.pending {
+            if let Some(f) = p.fresh.get_mut(slot as usize) {
+                *f = false;
+            }
+            p.dirty.push(slot);
+        }
+    }
+
+    /// Slot `slot`'s full vector, while the walk uses them.
+    fn raw(&self, slot: u32) -> Option<&[f32]> {
+        self.book.is_none().then(|| &self.raw[slot as usize][..])
+    }
+
+    /// RAM held for the set rather than a slot: the codebook once installed;
+    /// before, the full vectors and whatever a thread has returned. O(1).
+    fn held_bytes(&self) -> usize {
+        if let Some(b) = &self.book {
+            return b.bytes();
+        }
+        let arc = std::mem::size_of::<Arc<[f32]>>();
+        let mut n = self.raw.len() * (self.dim * 4 + arc) + self.raw.capacity() * arc;
+        if let Some(p) = &self.pending {
+            n += self.codes.capacity() + p.fresh.capacity() + p.dirty.capacity() * 4;
+            n += p.learned.as_ref().map_or(0, |b| b.bytes());
+        }
+        n
+    }
+
+    /// Take a step towards an installed codebook: start the thread when the
+    /// set is `ready`, collect a finished one, and install once few enough
+    /// slots are left to encode here. With `wait`, block until installed.
+    fn step(&mut self, ready: bool, wait: bool) {
+        while self.book.is_none() && !self.raw.is_empty() {
+            let Some(p) = &mut self.pending else {
+                if !ready {
+                    return;
+                }
+                let all: Vec<u32> = (0..self.raw.len() as u32).collect();
+                let Some(job) = self.spawn(None, &all) else {
+                    return; // no thread to be had: try again on a later step
+                };
+                self.pending = Some(Pending {
+                    job: Some(job),
+                    learned: None,
+                    fresh: Vec::new(),
+                    dirty: Vec::new(),
+                });
+                continue;
+            };
+            let Some(job) = p.job.take_if(|j| wait || j.is_finished()) else {
+                return;
+            };
+            let width = quant::pq_bytes(self.dim);
+            if let Ok(done) = job.join() {
+                self.codes.resize(self.raw.len() * width, 0);
+                p.fresh.resize(self.raw.len(), false);
+                p.dirty.sort_unstable();
+                for (s, code) in done.slots.iter().zip(done.codes.chunks_exact(width)) {
+                    if p.dirty.binary_search(s).is_err() {
+                        let at = *s as usize * width;
+                        self.codes[at..at + width].copy_from_slice(code);
+                        p.fresh[*s as usize] = true;
+                    }
+                }
+                p.learned = Some(done.book);
+            }
+            p.dirty.clear();
+            let Some(book) = p.learned.clone() else {
+                self.pending = None; // the training thread failed: start over
+                continue;
+            };
+            let todo: Vec<u32> = (0..self.raw.len() as u32)
+                .filter(|&s| !p.fresh[s as usize])
+                .collect();
+            if todo.len() > CATCH_UP {
+                let job = self.spawn(Some(book), &todo);
+                if let Some(p) = &mut self.pending {
+                    p.job = job;
+                }
+                continue;
+            }
+            for &s in &todo {
+                let v = &self.raw[s as usize];
+                let at = s as usize * width;
+                book.encode(
+                    &pq_input(v, l2norm(v), self.unit),
+                    &mut self.codes[at..at + width],
+                );
+            }
+            self.codes.shrink_to_fit();
+            self.raw = Vec::new();
+            self.pending = None;
+            self.book = Some(book);
+        }
+    }
+
+    /// A thread that encodes `slots`' vectors, training a codebook on them
+    /// first when not given one. `None` when no thread can be started.
+    fn spawn(&self, book: Option<Arc<Book>>, slots: &[u32]) -> Option<JoinHandle<Encoded>> {
+        let vecs: Vec<Arc<[f32]>> = slots
+            .iter()
+            .map(|&s| self.raw[s as usize].clone())
+            .collect();
+        let (slots, dim, unit) = (slots.to_vec(), self.dim, self.unit);
+        std::thread::Builder::new()
+            .name("flint-vec-pq".into())
+            .spawn(move || {
+                let inputs: Vec<Cow<'_, [f32]>> =
+                    vecs.iter().map(|v| pq_input(v, l2norm(v), unit)).collect();
+                let book = book.unwrap_or_else(|| {
+                    let samples: Vec<&[f32]> = inputs.iter().map(|v| &v[..]).collect();
+                    Arc::new(Book::train(&samples, dim))
+                });
+                let width = quant::pq_bytes(dim);
+                let mut codes = vec![0u8; inputs.len() * width];
+                for (v, code) in inputs.iter().zip(codes.chunks_exact_mut(width)) {
+                    book.encode(v, code);
+                }
+                Encoded { book, slots, codes }
+            })
+            .ok()
+    }
+
+    fn query(&self, v: &[f32], norm: f32) -> Prep {
+        match &self.book {
+            Some(b) => Prep::Pq(b.table(&pq_input(v, norm, self.unit))),
+            None => Prep::Plain,
+        }
+    }
 }
 
 /// A query, or a node being inserted, prepared once for the many distances a
@@ -186,13 +383,7 @@ impl Codes {
                 factor: Vec::new(),
                 dim: 0,
             },
-            Quant::Pq => Codes::Pq {
-                book: None,
-                raw: Vec::new(),
-                codes: Vec::new(),
-                dim: 0,
-                unit: metric == Metric::Cosine,
-            },
+            Quant::Pq => Codes::Pq(Box::new(Pq::new(metric == Metric::Cosine))),
         }
     }
 
@@ -206,25 +397,7 @@ impl Codes {
                 put_slot(bits, slot, &code);
                 put_slot(factor, slot, &[f]);
             }
-            Codes::Pq {
-                book: None,
-                raw,
-                dim,
-                ..
-            } => {
-                *dim = v.len();
-                put_box(raw, slot, v.into());
-            }
-            Codes::Pq {
-                book: Some(book),
-                codes,
-                unit,
-                ..
-            } => {
-                let mut code = vec![0u8; quant::pq_bytes(v.len())];
-                book.encode(&pq_input(v, norm, *unit), &mut code);
-                put_slot(codes, slot, &code);
-            }
+            Codes::Pq(p) => p.put(slot, v, norm),
             Codes::Sq8 { bytes, scale } => {
                 let (lo, hi) = v
                     .iter()
@@ -255,76 +428,39 @@ impl Codes {
     /// Slot `slot`'s full vector, when the codes are full vectors.
     fn f32(&self, slot: u32) -> Option<&[f32]> {
         match self {
-            Codes::F32(f)
-            | Codes::Pq {
-                book: None, raw: f, ..
-            } => Some(&f[slot as usize]),
-            Codes::Sq8 { .. } | Codes::Bin { .. } | Codes::Pq { .. } => None,
+            Codes::F32(f) => Some(&f[slot as usize]),
+            Codes::Pq(p) => p.raw(slot),
+            Codes::Sq8 { .. } | Codes::Bin { .. } => None,
         }
     }
 
     /// RAM the codes hold beyond what each slot is charged: a PQ set's
-    /// codebook, or its full vectors before it trains one. O(1): the meter
-    /// asks on every write.
+    /// codebook, or its full vectors before it has one. O(1): the meter asks
+    /// on every write.
     fn held_bytes(&self) -> usize {
         match self {
-            Codes::Pq {
-                book: None,
-                raw,
-                dim,
-                ..
-            } => raw.len() * dim * 4 + raw.capacity() * std::mem::size_of::<Box<[f32]>>(),
-            Codes::Pq { book: Some(b), .. } => b.bytes(),
+            Codes::Pq(p) => p.held_bytes(),
             _ => 0,
         }
     }
 
     /// Whether this is a PQ set still without its codebook.
     fn untrained(&self) -> bool {
-        matches!(self, Codes::Pq { book: None, .. })
+        matches!(self, Codes::Pq(p) if p.book.is_none())
     }
 
-    /// Train a PQ set's codebook on the full vectors it holds, encode every
-    /// slot, live or deleted (a deleted one still routes), and let the vectors
-    /// go: the "re-encodes once" of ADR-0049 D1.
-    fn train(&mut self) {
-        let Codes::Pq {
-            book,
-            raw,
-            codes,
-            dim,
-            unit,
-        } = self
-        else {
-            return;
-        };
-        if book.is_some() || raw.is_empty() {
-            return;
+    /// See [`Pq::step`].
+    fn tend(&mut self, ready: bool, wait: bool) {
+        if let Codes::Pq(p) = self {
+            p.step(ready, wait);
         }
-        let inputs: Vec<Cow<'_, [f32]>> =
-            raw.iter().map(|v| pq_input(v, l2norm(v), *unit)).collect();
-        let samples: Vec<&[f32]> = inputs.iter().map(|v| &v[..]).collect();
-        let trained = Box::new(Book::train(&samples, *dim));
-        let width = quant::pq_bytes(*dim);
-        let mut all = vec![0u8; raw.len() * width];
-        for (v, code) in samples.iter().zip(all.chunks_exact_mut(width)) {
-            trained.encode(v, code);
-        }
-        drop(inputs);
-        *codes = all;
-        *raw = Vec::new();
-        *book = Some(trained);
     }
 
     /// `v`, of norm `norm`, prepared for distances to these codes.
     fn query<'a>(&self, v: &'a [f32], norm: f32) -> Query<'a> {
         let prep = match self {
             Codes::Bin { .. } => Prep::Bin(BinQuery::new(v)),
-            Codes::Pq {
-                book: Some(b),
-                unit,
-                ..
-            } => Prep::Pq(b.table(&pq_input(v, norm, *unit))),
+            Codes::Pq(p) => p.query(v, norm),
             _ => Prep::Plain,
         };
         Query { v, norm, prep }
@@ -333,10 +469,7 @@ impl Codes {
     /// The distance between slots `a` and `b` (norms `an`, `bn`).
     fn between(&self, metric: Metric, a: u32, an: f32, b: u32, bn: f32) -> f32 {
         match self {
-            Codes::F32(f)
-            | Codes::Pq {
-                book: None, raw: f, ..
-            } => dist(metric, &f[a as usize], an, &f[b as usize], bn),
+            Codes::F32(f) => dist(metric, &f[a as usize], an, &f[b as usize], bn),
             Codes::Sq8 { bytes, scale } => {
                 let (x, y) = (sq8_at(bytes, scale, a), sq8_at(bytes, scale, b));
                 dist_from(
@@ -352,15 +485,18 @@ impl Codes {
                 let dot = quant::bin_dot(at(bits, w, a), at(bits, w, b), *dim, an, bn);
                 dist_from(metric, || an * an + bn * bn - 2.0 * dot, || dot, an, bn)
             }
-            Codes::Pq {
-                book: Some(book),
-                codes,
-                dim,
-                ..
-            } => {
-                let w = quant::pq_bytes(*dim);
-                pq_dist(metric, book.l2sq(at(codes, w, a), at(codes, w, b)), an, bn)
-            }
+            Codes::Pq(p) => match &p.book {
+                Some(book) => {
+                    let w = quant::pq_bytes(p.dim);
+                    pq_dist(
+                        metric,
+                        book.l2sq(at(&p.codes, w, a), at(&p.codes, w, b)),
+                        an,
+                        bn,
+                    )
+                }
+                None => dist(metric, &p.raw[a as usize], an, &p.raw[b as usize], bn),
+            },
         }
     }
 
@@ -368,13 +504,10 @@ impl Codes {
     fn to(&self, metric: Metric, a: u32, an: f32, q: &Query<'_>) -> f32 {
         let qn = q.norm;
         match (self, &q.prep) {
-            (
-                Codes::F32(f)
-                | Codes::Pq {
-                    book: None, raw: f, ..
-                },
-                _,
-            ) => dist(metric, &f[a as usize], an, q.v, qn),
+            (Codes::F32(f), _) => dist(metric, &f[a as usize], an, q.v, qn),
+            (Codes::Pq(p), Prep::Plain) if p.book.is_none() => {
+                dist(metric, &p.raw[a as usize], an, q.v, qn)
+            }
             (Codes::Sq8 { bytes, scale }, _) => {
                 let c = sq8_at(bytes, scale, a);
                 dist_from(
@@ -390,12 +523,12 @@ impl Codes {
                 let dot = bq.dot(code, an, factor[a as usize]);
                 dist_from(metric, || an * an + qn * qn - 2.0 * dot, || dot, an, qn)
             }
-            (Codes::Pq { codes, dim, .. }, Prep::Pq(lut)) => {
-                let l2 = kernel::lut_sum(lut, at(codes, quant::pq_bytes(*dim), a));
+            (Codes::Pq(p), Prep::Pq(lut)) if p.book.is_some() => {
+                let l2 = kernel::lut_sum(lut, at(&p.codes, quant::pq_bytes(p.dim), a));
                 pq_dist(metric, l2, an, qn)
             }
-            // A query prepared before the codes changed (a PQ set trains only
-            // between walks, so none is): prepare it again.
+            // A query prepared before the codes changed (a PQ set installs its
+            // codebook only between walks, so none is): prepare it again.
             _ => self.to(metric, a, an, &self.query(q.v, qn)),
         }
     }
@@ -811,13 +944,25 @@ impl Hnsw {
     /// deleted slot when there is one (BUG-0197), so a set's slots are bounded
     /// by the most it ever held at once, not by how many writes it has seen.
     ///
-    /// A PQ set that reaches its training threshold trains here, after the
-    /// insert, so no walk sees the codes change under it.
+    /// A PQ set's codebook goes in here, after the insert ([`Hnsw::tend`]), so
+    /// no walk sees the codes change under it.
     pub fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
         self.insert(id, vec, meta);
-        if self.codes.untrained() && self.live >= self.pq_train {
-            self.codes.train();
-        }
+        self.tend();
+    }
+
+    /// Move a PQ set towards its codebook ([`Pq`]): start training once it
+    /// holds enough vectors, and install what a thread has finished. Every
+    /// write calls it, and so does the binary's sweeper, so a set that stops
+    /// being written still gets its codes.
+    pub fn tend(&mut self) {
+        self.codes.tend(self.live >= self.pq_train, false);
+    }
+
+    /// As [`Hnsw::tend`], waiting for the thread until the codebook is in:
+    /// for tests and the bench.
+    pub fn settle(&mut self) {
+        self.codes.tend(self.live >= self.pq_train, true);
     }
 
     fn insert(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
@@ -1279,6 +1424,7 @@ mod tests {
         for (i, v) in data.iter().enumerate() {
             h.set(format!("{i}").into_bytes(), v.clone(), None);
         }
+        h.settle();
         assert!(!h.untrained(), "a PQ set trains at its threshold");
         let (mut hit, mut tot) = (0usize, 0usize);
         for qi in 0..100 {
@@ -1562,6 +1708,42 @@ mod tests {
                     "{metric:?}: {quant:?}+rerank recall {got} fell more than 0.03 below full {full}"
                 );
             }
+        }
+    }
+
+    /// A PQ set trains on a thread while it keeps taking writes. A slot
+    /// rewritten after the thread took its vector must not keep the code of
+    /// the old one, and slots added meanwhile, more than an install encodes
+    /// itself, must get codes too: every slot's code is its current vector's.
+    #[test]
+    fn writes_during_pq_training_get_their_own_codes() {
+        let mut rng = Rng(0x0049_0002);
+        let dim = 40;
+        let mut p = Pq::new(false);
+        let mut vecs: Vec<Vec<f32>> = (0..300).map(|_| rng.vec(dim)).collect();
+        for (s, v) in vecs.iter().enumerate() {
+            p.put(s as u32, v, l2norm(v));
+        }
+        p.step(true, false);
+        assert!(p.pending.is_some(), "the thread starts at the threshold");
+        for s in [5usize, 7] {
+            vecs[s] = rng.vec(dim);
+            p.put(s as u32, &vecs[s], l2norm(&vecs[s]));
+        }
+        for _ in 0..CATCH_UP + 200 {
+            let v = rng.vec(dim);
+            p.put(vecs.len() as u32, &v, l2norm(&v));
+            vecs.push(v);
+        }
+        p.step(true, true);
+        let book = p.book.clone().expect("installed");
+        assert!(p.raw.is_empty() && p.pending.is_none());
+        let w = quant::pq_bytes(dim);
+        assert_eq!(p.codes.len(), vecs.len() * w);
+        for (s, v) in vecs.iter().enumerate() {
+            let mut want = vec![0u8; w];
+            book.encode(v, &mut want);
+            assert_eq!(&p.codes[s * w..(s + 1) * w], &want[..], "slot {s}");
         }
     }
 

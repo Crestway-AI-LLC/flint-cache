@@ -257,6 +257,16 @@ impl VectorSet {
             h.set_pq_train(n);
         }
     }
+    /// See [`Store::tend`]; `wait` blocks until a PQ codebook is in.
+    fn tend(&mut self, wait: bool) {
+        if let Index::Hnsw(h) = &mut self.index {
+            if wait {
+                h.settle();
+            } else {
+                h.tend();
+            }
+        }
+    }
     /// What `id` costs the D4 meter, with no file read.
     fn entry_cost(&self, id: &[u8]) -> Option<usize> {
         let meta_len = match &self.index {
@@ -870,6 +880,32 @@ impl Store {
             }
         }
         vs
+    }
+
+    /// Install any PQ codebook a training thread has finished (ADR-0049 item
+    /// 2), charging each tenant the change: its full vectors go, the codebook
+    /// stays. The binary's sweeper calls it, so a set that stops being written
+    /// still gets its codes; a write to the set does the same.
+    pub fn tend(&mut self) {
+        self.tend_all(false);
+    }
+
+    /// As [`Store::tend`], waiting for every training thread to finish: for
+    /// tests and the bench.
+    pub fn settle(&mut self) {
+        self.tend_all(true);
+    }
+
+    fn tend_all(&mut self, wait: bool) {
+        for ((ns, _), vs) in self.sets.iter_mut() {
+            let before = vs.held_bytes();
+            vs.tend(wait);
+            let after = vs.held_bytes();
+            if after != before {
+                let e = self.ns_bytes.entry(ns.clone()).or_default();
+                *e = e.saturating_add(after).saturating_sub(before);
+            }
+        }
     }
 
     /// Estimated index bytes currently attributed to `ns` (for INFO/metrics).

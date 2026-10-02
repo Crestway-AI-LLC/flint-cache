@@ -203,7 +203,13 @@ fn main() {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(sweep_ms));
-                let swept = store.lock().expect("store lock").sweep_expired(now_ms());
+                let swept = {
+                    let mut st = store.lock().expect("store lock");
+                    // A PQ set's codebook, trained on a thread, goes in here
+                    // if no write has collected it (ADR-0049 item 2).
+                    st.tend();
+                    st.sweep_expired(now_ms())
+                };
                 if swept > 0 {
                     eprintln!("flint-vec: swept {swept} expired vector(s)");
                 }

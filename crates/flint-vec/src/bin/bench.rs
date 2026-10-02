@@ -669,6 +669,11 @@ fn real_data(a: &[String]) {
             );
         }
     }
+    // A PQ set trains on a thread: wait for its codebook, and say how long
+    // that took past the last insert.
+    let t1 = Instant::now();
+    st.settle();
+    let settle = t1.elapsed().as_secs_f64();
     let build = t0.elapsed().as_secs_f64();
     let heap = (HEAP.load(Ordering::Relaxed) - heap0) as f64 / n as f64;
     let rss = match (rss0, rss_anon()) {
@@ -676,7 +681,7 @@ fn real_data(a: &[String]) {
         _ => "n/a".into(),
     };
     println!(
-        "arm={arm} n={n} dim={dim} metric={metric} build={build:.0}s rss_B_per_vector={rss} heap_B_per_vector={heap:.0} meter_B_per_vector={:.0} slowest_set_ms={:.0} at={slowest_at}",
+        "arm={arm} n={n} dim={dim} metric={metric} build={build:.0}s settle={settle:.1}s rss_B_per_vector={rss} heap_B_per_vector={heap:.0} meter_B_per_vector={:.0} slowest_set_ms={:.0} at={slowest_at}",
         st.ns_mem_bytes(&ns) as f64 / n as f64,
         slowest * 1e3
     );
