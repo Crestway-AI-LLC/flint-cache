@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Elastic-2.0
-"""ADR-0049 verification 2: Qdrant's DBpedia OpenAI-embedding Parquet files
+"""ADR-0049 verification 2: a corpus's embedding Parquet files to the float32
+.fbin files `bench --data` reads. The last QUERIES rows are held out as queries
+and the rest are the base set. COLUMN names the embedding column; the default
+is Qdrant's DBpedia OpenAI set
 (huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M,
-MIT) to the float32 .fbin files `bench --data` reads. The last QUERIES rows are
-held out as queries and the rest are the base set.
+MIT), and tools/vec_real_measure.sh names the others.
 
-Usage: vec_fbin_from_parquet.py PARQUET_DIR OUT_DIR [QUERIES]
+Usage: vec_fbin_from_parquet.py PARQUET_DIR OUT_DIR [QUERIES [COLUMN]]
 Needs pyarrow and numpy; tools/vec_real_measure.sh supplies both.
 """
 import glob
@@ -21,6 +23,7 @@ COL = "text-embedding-3-large-1536-embedding"
 def main():
     src, out = sys.argv[1], sys.argv[2]
     nq = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
+    col_name = sys.argv[4] if len(sys.argv) > 4 else COL
     files = sorted(glob.glob(f"{src}/*.parquet"))
     if not files:
         sys.exit(f"no parquet files in {src}")
@@ -30,7 +33,7 @@ def main():
     done = 0
     with open(f"{out}/base.fbin", "wb") as base, open(f"{out}/query.fbin", "wb") as query:
         for f in files:
-            for batch in pq.ParquetFile(f).iter_batches(columns=[COL], batch_size=10000):
+            for batch in pq.ParquetFile(f).iter_batches(columns=[col_name], batch_size=10000):
                 col = batch.column(0)
                 if col.null_count:
                     sys.exit(f"{f}: {col.null_count} rows have no embedding")
