@@ -460,10 +460,20 @@ impl Fbin {
         let map = map as *const u8;
         // SAFETY: the mapping is at least the 8-byte header (checked below).
         let head = unsafe { std::slice::from_raw_parts(map, 8.min(len)) };
-        assert_eq!(head.len(), 8, "{} is shorter than its header", path.display());
+        assert_eq!(
+            head.len(),
+            8,
+            "{} is shorter than its header",
+            path.display()
+        );
         let n = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
         let dim = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
-        assert_eq!(len, 8 + n * dim * 4, "{}: size disagrees with its header", path.display());
+        assert_eq!(
+            len,
+            8 + n * dim * 4,
+            "{}: size disagrees with its header",
+            path.display()
+        );
         Fbin { map, len, n, dim }
     }
 
@@ -505,7 +515,15 @@ fn exact_score(metric: &str, q: &[f32], qn: f32, v: &[f32], vn: f32) -> f32 {
 /// The exact top-`k` ids of each query over the first `n` base rows, by
 /// brute force on every core, cached in `dir` because it is the same for
 /// every arm.
-fn ground_truth(dir: &std::path::Path, base: &Fbin, n: usize, queries: &Fbin, nq: usize, k: usize, metric: &str) -> Vec<Vec<u32>> {
+fn ground_truth(
+    dir: &std::path::Path,
+    base: &Fbin,
+    n: usize,
+    queries: &Fbin,
+    nq: usize,
+    k: usize,
+    metric: &str,
+) -> Vec<Vec<u32>> {
     let cache = dir.join(format!("gt-n{n}-q{nq}-k{k}-{metric}.ibin"));
     if let Ok(bytes) = std::fs::read(&cache)
         && bytes.len() == nq * k * 4
@@ -556,7 +574,10 @@ fn ground_truth(dir: &std::path::Path, base: &Fbin, n: usize, queries: &Fbin, nq
     });
     let bytes: Vec<u8> = gt.iter().flatten().flat_map(|i| i.to_le_bytes()).collect();
     let _ = std::fs::write(&cache, bytes);
-    eprintln!("ground truth: {nq} queries over {n} in {:.0} s, {threads} threads", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "ground truth: {nq} queries over {n} in {:.0} s, {threads} threads",
+        t0.elapsed().as_secs_f64()
+    );
     gt
 }
 
@@ -570,8 +591,14 @@ fn real_data(a: &[String]) {
     let base = Fbin::open(&dir.join("base.fbin"));
     let queries = Fbin::open(&dir.join("query.fbin"));
     assert_eq!(base.dim, queries.dim, "base and queries disagree on dim");
-    let n: usize = arg(a, "--n").and_then(|s| s.parse().ok()).unwrap_or(base.n).min(base.n);
-    let nq: usize = arg(a, "--queries").and_then(|s| s.parse().ok()).unwrap_or(200).min(queries.n);
+    let n: usize = arg(a, "--n")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(base.n)
+        .min(base.n);
+    let nq: usize = arg(a, "--queries")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200)
+        .min(queries.n);
     let dim = base.dim;
     let gt = ground_truth(&dir, &base, n, &queries, nq, k, &metric);
     if a.iter().any(|x| x == "--gt-only") {
@@ -590,7 +617,16 @@ fn real_data(a: &[String]) {
         std::fs::create_dir_all(&d).expect("--vec-dir");
         st.set_vec_dir(d);
     }
-    let mut create = vec![b("VEC.CREATE"), b("s"), b("DIM"), b(&dim.to_string()), b("METRIC"), b(&metric), b("INDEX"), b("hnsw")];
+    let mut create = vec![
+        b("VEC.CREATE"),
+        b("s"),
+        b("DIM"),
+        b(&dim.to_string()),
+        b("METRIC"),
+        b(&metric),
+        b("INDEX"),
+        b("hnsw"),
+    ];
     if let Some(q) = quant {
         create.extend([b("QUANT"), b(q)]);
     }
@@ -598,9 +634,22 @@ fn real_data(a: &[String]) {
     let (rss0, heap0) = (rss_anon(), HEAP.load(Ordering::Relaxed));
     let t0 = Instant::now();
     for i in 0..n {
-        exec(&mut st, &ns, &[b("VEC.SET"), b("s"), b(&i.to_string()), b(&vec_str(base.row(i)))]);
+        exec(
+            &mut st,
+            &ns,
+            &[
+                b("VEC.SET"),
+                b("s"),
+                b(&i.to_string()),
+                b(&vec_str(base.row(i))),
+            ],
+        );
         if (i + 1) % (n / 10).max(1) == 0 {
-            eprintln!("{arm}: {} of {n} in {:.0} s", i + 1, t0.elapsed().as_secs_f64());
+            eprintln!(
+                "{arm}: {} of {n} in {:.0} s",
+                i + 1,
+                t0.elapsed().as_secs_f64()
+            );
         }
     }
     let build = t0.elapsed().as_secs_f64();
@@ -614,16 +663,31 @@ fn real_data(a: &[String]) {
         st.ns_mem_bytes(&ns) as f64 / n as f64
     );
 
-    let reranks: Vec<usize> = if quant.is_some() { vec![k, 4 * k, 10 * k] } else { vec![k] };
+    let reranks: Vec<usize> = if quant.is_some() {
+        vec![k, 4 * k, 10 * k]
+    } else {
+        vec![k]
+    };
     for ef in [64usize, 128, 256] {
         for &rr in &reranks {
             let (mut hits, mut lat) = (0usize, Vec::with_capacity(nq));
             for (qi, truth) in gt.iter().enumerate().take(nq) {
-                let args = [b("VEC.SEARCH"), b("s"), b(&vec_str(queries.row(qi))), b(&k.to_string()), b("EF"), b(&ef.to_string()), b("RERANK"), b(&rr.to_string())];
+                let args = [
+                    b("VEC.SEARCH"),
+                    b("s"),
+                    b(&vec_str(queries.row(qi))),
+                    b(&k.to_string()),
+                    b("EF"),
+                    b(&ef.to_string()),
+                    b("RERANK"),
+                    b(&rr.to_string()),
+                ];
                 let t = Instant::now();
                 let reply = st.plan(&ns, &args, 0);
                 lat.push(t.elapsed().as_micros());
-                let Plan::Reply(v) = reply else { panic!("a search is a reply") };
+                let Plan::Reply(v) = reply else {
+                    panic!("a search is a reply")
+                };
                 hits += result_ids(&v)
                     .iter()
                     .filter_map(|id| std::str::from_utf8(id).ok()?.parse::<u32>().ok())
@@ -638,4 +702,3 @@ fn real_data(a: &[String]) {
         }
     }
 }
-

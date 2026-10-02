@@ -24,6 +24,7 @@ use crate::{Metric, Quant};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 
 const M: usize = 16; // neighbours per node on upper layers
 const M0: usize = 32; // neighbours at layer 0 (2*M — denser base layer)
@@ -39,6 +40,28 @@ pub const EF_SEARCH_DEFAULT: usize = 64;
 /// build's, 64 lost up to 0.014 of it on clustered data, and no bound let the
 /// selection walk ~1,000 candidates for each neighbour.
 const REPAIR_POOL: usize = 4 * M0;
+
+/// Hashes a slot number for the sets a walk keeps: one multiply. The default
+/// SipHash is built to withstand keys an adversary picks, which slot numbers,
+/// handed out by this index, are not.
+#[derive(Default)]
+struct SlotHasher(u64);
+
+impl Hasher for SlotHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type SlotSet = HashSet<u32, BuildHasherDefault<SlotHasher>>;
 
 /// Who is walking the graph, which decides what a deleted node is to the walk.
 #[derive(Clone, Copy, PartialEq)]
@@ -288,11 +311,7 @@ fn dist_from(
         Metric::Ip => -dot(),
         Metric::Cosine => {
             let den = an * bn;
-            if den == 0.0 {
-                1.0
-            } else {
-                1.0 - dot() / den
-            }
+            if den == 0.0 { 1.0 } else { 1.0 - dot() / den }
         }
     }
 }
@@ -681,7 +700,8 @@ impl Hnsw {
         self.upper.remove(&i);
         for (layer, around) in old.iter().enumerate() {
             let mmax = if layer == 0 { M0 } else { M };
-            let mut seen: HashSet<u32> = HashSet::from([i]);
+            let mut seen = SlotSet::default();
+            seen.insert(i);
             let mut pool: Vec<u32> = Vec::new();
             for &x in around {
                 if seen.insert(x) {
@@ -775,7 +795,7 @@ impl Hnsw {
         layer: usize,
         walk: Walk,
     ) -> Vec<DI> {
-        let mut visited: HashSet<u32> = HashSet::new();
+        let mut visited = SlotSet::default();
         let mut cands: BinaryHeap<std::cmp::Reverse<DI>> = BinaryHeap::new();
         let mut w: BinaryHeap<DI> = BinaryHeap::new(); // max-heap: worst on top
         for &e in ep {
