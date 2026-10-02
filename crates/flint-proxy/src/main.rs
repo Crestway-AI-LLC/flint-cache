@@ -3328,9 +3328,18 @@ async fn family_command(topo: &Arc<Topology>, ns: &[u8], args: &[Vec<u8>]) -> Va
     parts.push(ns);
     parts.extend(args.iter().map(|a| a.as_slice()));
     let frame = encode_cmd(&parts);
-    match topo.coproc_call(&endpoints, &frame, topo.family_deadline) {
-        Ok(v) => v,
-        Err(()) => unavail(),
+    // The call blocks on the co-processor's socket until it replies, and this
+    // worker is a single-threaded runtime. Made inline, it stopped every other
+    // connection on the worker, data-path reads included, for the command's
+    // whole duration; and the co-processor's own PROXYCHAN dial-back, dealt
+    // round-robin over the workers, landed on this blocked one once in
+    // `--workers` and waited out its token's deadline, so every 8th VEC.SET on
+    // a client connection failed after 5 s (BUG-0200). The blocking pool holds
+    // it instead, and `_slot` bounds how many it holds at once.
+    let (t, wait) = (Arc::clone(topo), topo.family_deadline);
+    match tokio::task::spawn_blocking(move || t.coproc_call(&endpoints, &frame, wait)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(())) | Err(_) => unavail(),
     }
 }
 

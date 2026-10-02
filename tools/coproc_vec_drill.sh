@@ -53,7 +53,9 @@ grep -q "held by another flint-vec" "$D/vec-second.log" \
 # the durable rows, so this drill isolates the CO-PROCESSOR's rebuild, not the
 # server's own restart durability (that is repl/warm_restart's job).
 $B --port 6676 --engine mem 2>"$D/n.log" & fleet_wait_listen 6676; fleet_wait_ping 6676
-$PX --port 6677 --pairs 127.0.0.1:6676 --tenants "tok=ns" \
+# Four workers, pinned: the BUG-0200 section writes more than that on one
+# connection, whatever the box's core count.
+$PX --port 6677 --workers 4 --pairs 127.0.0.1:6676 --tenants "tok=ns" \
     --families "VEC.=127.0.0.1:6678" --edge-advertise 127.0.0.1:6677 2>"$D/px.log" & fleet_wait_listen 6677
 for _ in $(seq 1 60); do case "$(valkey-cli -p 6677 PING 2>&1)" in *NOAUTH*|PONG) break;; esac; sleep 0.1; done
 
@@ -261,8 +263,28 @@ case "$(vexec VEC.INFO sess)" in *expiring*0*) : ;; *) echo "FAIL: INFO expiring
 grep -qi "swept" "$D/vec4.log" || { echo "FAIL: no expiry sweep logged"; exit 1; }
 echo "  after expiry: 'gone' masked/swept, VEC.TTL -2; 'keep' still served"
 
+echo "== BUG-0200: more writes on ONE client connection than the proxy has workers"
+# Every write above opens a connection of its own. A family command used to
+# block its proxy worker until the co-processor replied, and the
+# co-processor's PROXYCHAN dial-back, dealt round-robin over the workers,
+# landed on that blocked worker once in --workers (4 here) and waited out its
+# 5 s token: on one connection, every 4th of these failed.
+[ "$(vexec VEC.CREATE pipe DIM 3 METRIC l2)" = "OK " ] || { echo "FAIL: VEC.CREATE pipe"; exit 1; }
+T0=$(date +%s)
+OUT="$(for i in $(seq 1 24); do echo "VEC.SET pipe p$i $i,1,0"; done | $A 2>&1 | tr -d '\r')"
+SECS=$(( $(date +%s) - T0 ))
+OKS="$(grep -cx OK <<<"$OUT")"
+if [ "$OKS" != 24 ]; then
+  echo "FAIL (BUG-0200): $OKS of 24 VEC.SETs on one connection answered OK, in ${SECS}s:"
+  grep -vx OK <<<"$OUT" | sort | uniq -c | sed 's/^/    /'
+  exit 1
+fi
+case "$(vexec VEC.INFO pipe)" in *count*24*) : ;; *) echo "FAIL: VEC.INFO pipe should count 24"; exit 1 ;; esac
+echo "  24 VEC.SETs on one connection: all OK in ${SECS}s"
+
 echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 on a local file), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
 echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
 echo "      per-vector TTL (D7) expires+sweeps while permanent ids stay — with VEC.TTL/"
-echo "      EXPIRE/PERSIST introspection and the INFO expiring count over the wire."
+echo "      EXPIRE/PERSIST introspection and the INFO expiring count over the wire, and a"
+echo "      client connection takes more writes than the proxy has workers (BUG-0200)."
