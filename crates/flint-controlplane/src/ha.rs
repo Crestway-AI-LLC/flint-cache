@@ -1567,6 +1567,10 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
     // be in this tuple or a family-only change is silently suppressed — the
     // exact trap the promotion hint hit (registry.rs promote tests).
     let mut last_view: Option<(String, String, String, String, String, String)> = None;
+    // A keepalive with nothing to push, as the single-node watch() writes
+    // (BUG-0202): a watch whose proxy has gone otherwise kept its task and
+    // socket until the next version bump.
+    let mut quiet_since = tokio::time::Instant::now();
     loop {
         let reg = ha.store.registry().await;
         if reg.version > acked {
@@ -1600,6 +1604,7 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 &mut o,
             );
             sock.write_all(&o).await?;
+            quiet_since = tokio::time::Instant::now();
             // Read the ACK.
             loop {
                 match decode(&buf) {
@@ -1627,6 +1632,10 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
         } else {
+            if quiet_since.elapsed() >= crate::WATCH_KEEPALIVE {
+                sock.write_all(crate::KEEPALIVE_FRAME).await?;
+                quiet_since = tokio::time::Instant::now();
+            }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }

@@ -32,6 +32,13 @@ cleanup() {
 trap cleanup EXIT
 rm -f "$STATE"
 
+# Its own build, as every drill has. Without it this drill ran whatever
+# binaries target/ held: in the gate the prebuild's, but run alone a stale
+# build, which is how a run of it against a fixed tree reported the unfixed
+# control plane's behaviour (BUG-0202).
+cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
+  --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
+
 echo "== data plane: two single-master pairs"
 for p in 6730 6740; do
   d="$FLINT_DRILL_ROOT/flint-cpd-$p"; rm -rf "$d"
@@ -113,4 +120,55 @@ done
 [ "$OK" = "1" ] || { echo "FAIL: post-restart tenant never propagated"; exit 1; }
 echo "  initech live after CP restart — subscriptions self-heal"
 
-echo "PASS: control plane v1 — durable registry, shuffle-shard sub-groups enforced, live pushes, CP outage off the data path"
+echo "== BUG-0202: an idle watch keeps alive, and a watch whose proxy has gone ends"
+# A watch sent nothing while there was nothing to push. A proxy could not
+# tell a quiet seat from a dead one and abandoned it every ~5 minutes, and
+# the CP kept each abandoned watch's thread and socket until the next version
+# bump; on the playground, 534 threads in 40 hours. Twenty subscribers each
+# take their snapshot and ACK it; nineteen hang up at once, and one stays,
+# idle, for 25 s. No version moves in that time.
+CPPID=$(fleet_pids controlplane | head -1)
+[ -n "$CPPID" ] || { echo "FAIL: no control-plane process"; exit 1; }
+threads() {
+  if [ -r "/proc/$1/status" ]; then awk '/^Threads:/ {print $2}' "/proc/$1/status"
+  else ps -M -p "$1" | tail -n +2 | wc -l | tr -d ' '; fi
+}
+T0=$(threads "$CPPID")
+cat > "$FLINT_DRILL_ROOT/flint-cpd-watch.py" <<'PY'
+import re, socket, sys, time
+def resp(a):
+    return b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in (s.encode() for s in a))
+port, n, idle = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+subs = []
+for i in range(n):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(resp(["CPWATCH", "127.0.0.1:%d" % (7700 + i), "0"]))
+    buf = b""
+    while not re.search(rb"SNAPSHOT\r\n:(\d+)\r\n", buf):
+        c = s.recv(65536)
+        if not c:
+            sys.exit("watch %d closed before its snapshot" % i)
+        buf += c
+    s.sendall(resp(["ACK", re.search(rb"SNAPSHOT\r\n:(\d+)\r\n", buf).group(1).decode()]))
+    subs.append(s)
+for s in subs[1:]:
+    s.close()
+stay, got, t0 = subs[0], b"", time.time()
+stay.settimeout(1)
+while time.time() - t0 < idle:
+    try:
+        c = stay.recv(4096)
+    except socket.timeout:
+        continue
+    if not c:
+        break
+    got += c
+print(got.count(b"+KEEPALIVE\r\n"))
+PY
+K=$(python3 "$FLINT_DRILL_ROOT/flint-cpd-watch.py" 7241 20 25)
+T1=$(threads "$CPPID")
+echo "  keepalives to the idle watch in 25 s: $K; CP threads $T0 before, $T1 after"
+[ "${K:-0}" -ge 2 ] 2>/dev/null || { echo "FAIL (BUG-0202): an idle watch got ${K:-no} keepalives in 25 s, not 2 or more"; exit 1; }
+[ "$T1" -le $((T0 + 2)) ] || { echo "FAIL (BUG-0202): the CP holds $T1 threads, $((T1 - T0)) more than before twenty watches came and went"; exit 1; }
+
+echo "PASS: control plane v1 — durable registry, shuffle-shard sub-groups enforced, live pushes, CP outage off the data path, and watches keep alive and end with their proxies (BUG-0202)"

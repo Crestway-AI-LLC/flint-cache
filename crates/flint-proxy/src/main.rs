@@ -4917,9 +4917,12 @@ fn log_ms() -> u64 {
 /// control-plane seat is gone rather than quiet (BUG-0081).
 ///
 /// Ten is ~5 minutes. An idle fleet must never rotate; a silently partitioned
-/// seat must eventually be abandoned. With no keepalive on CPWATCH those two
-/// states are indistinguishable on the wire, so this constant is where the
-/// trade is made -- and it is a trade, not a measurement.
+/// seat must eventually be abandoned. A control plane before BUG-0202 sent
+/// nothing on CPWATCH while idle, so those two states were indistinguishable
+/// on the wire and an idle fleet DID rotate, every ~5 minutes per proxy. One
+/// from BUG-0202 on writes a keepalive every 10 s with nothing to push, and
+/// any read resets the count below, so against it this bound is reached only
+/// by a seat that has stopped talking. It stays for control planes before it.
 const MAX_IDLE_READS: u32 = 10;
 
 /// Label a control-plane dial failure with its phase, and say what EAGAIN
@@ -5096,11 +5099,11 @@ fn watch_control_plane(
                 //
                 // BOUNDED, because a silently partitioned seat times out forever
                 // and would otherwise never be rotated away from. This trades
-                // detection latency for not churning, and the trade is only
-                // necessary because silence and death look identical on this
-                // socket. The real fix is a keepalive on CPWATCH, which is a
-                // protocol change and is recorded in the bug rather than smuggled
-                // in here.
+                // detection latency for not churning. Against a control plane
+                // that keeps alive (BUG-0202: a `+KEEPALIVE` simple string
+                // every 10 s with nothing to push, which the decode above
+                // drops) silence means a dead seat, and the trade is only for
+                // control planes before it.
                 let n = match stream.read(&mut chunk) {
                     Ok(n) => {
                         idle_reads = 0;

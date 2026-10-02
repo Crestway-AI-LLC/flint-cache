@@ -65,7 +65,7 @@ mod tenant;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flint_resp::{Decoded, Value, decode, encode};
 use state::{State, canonical_members, clean, shuffle_shard};
@@ -1440,16 +1440,43 @@ fn snapshot_frame(
     ]))
 }
 
+/// How long a CPWATCH may sit with nothing to push before it writes a
+/// keepalive (BUG-0202).
+///
+/// A watch sent nothing while there was nothing to push, so two failures
+/// looked like silence. A watch whose proxy had gone kept its thread and its
+/// socket until the next version bump made it write and fail, and an idle
+/// fleet can go days without one: the playground's CP reached 534 threads
+/// in 40 hours. And a proxy could not tell an idle seat from a dead one, so
+/// it abandoned a quiet seat after ten silent 30 s reads (BUG-0081), every
+/// five minutes per proxy, each abandoned watch one more leak.
+///
+/// A keepalive answers both. Written to a proxy that has gone, it fails, and
+/// the watch returns. Read by a proxy, it is a read, which is what resets
+/// the proxy's idle count. Well inside that proxy's 30 s read timeout.
+pub(crate) const WATCH_KEEPALIVE: Duration = Duration::from_secs(10);
+
+/// The keepalive: a simple string, not an array. Every proxy's watch, back
+/// to the first, acts only on a `SNAPSHOT` array and drops any other frame
+/// it decodes, while any bytes at all count as the seat being alive. So a
+/// proxy from before this reads it as liveness and nothing else.
+pub(crate) const KEEPALIVE_FRAME: &[u8] = b"+KEEPALIVE\r\n";
+
 /// CPWATCH `<proxy-addr>` `<last-version>`: hijack the connection and push a
 /// filtered snapshot whenever the version advances past what the proxy has
-/// ACKed. Push -> ACK -> wait-for-change -> push...
+/// ACKed. Push -> ACK -> wait-for-change -> push..., and a keepalive every
+/// `keepalive` with nothing to push ([`WATCH_KEEPALIVE`]).
 fn watch(
     mut stream: flint_tls::Stream,
     shared: &Shared,
     proxy: String,
     mut acked: u64,
+    keepalive: Duration,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    // Bounded, so a keepalive to a peer that stopped reading cannot hold the
+    // thread either.
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     // Delta suppression: the last view actually sent. A version bump whose
@@ -1468,22 +1495,36 @@ fn watch(
     // suppressed — the exact trap the promotion hint carries a warning about.
     let mut last_view: Option<(String, String, String, String, String, String)> = None;
     loop {
-        // Wait until there is something newer than the proxy has ACKed.
-        let (v, pairs, tenants, admin, exc, promo, families) = {
+        // Wait until there is something newer than the proxy has ACKed, or
+        // until a keepalive is due. The keepalive is written outside the
+        // state lock: a write can block, and nothing else may wait on it.
+        let due = Instant::now() + keepalive;
+        let next = {
             let Ok(mut st) = shared.state.lock() else {
                 return Ok(());
             };
-            while st.version <= acked {
-                let Ok((guard, _timeout)) =
-                    shared.changed.wait_timeout(st, Duration::from_millis(500))
+            loop {
+                if st.version > acked {
+                    let (v, pairs, tenants, admin, exc, promo) = st.snapshot_for(&proxy);
+                    let families = crate::tenant::families_spec(&st.families);
+                    break Some((v, pairs, tenants, admin, exc, promo, families));
+                }
+                let left = due.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break None;
+                }
+                let Ok((guard, _timeout)) = shared
+                    .changed
+                    .wait_timeout(st, left.min(Duration::from_millis(500)))
                 else {
                     return Ok(());
                 };
                 st = guard;
             }
-            let (v, pairs, tenants, admin, exc, promo) = st.snapshot_for(&proxy);
-            let families = crate::tenant::families_spec(&st.families);
-            (v, pairs, tenants, admin, exc, promo, families)
+        };
+        let Some((v, pairs, tenants, admin, exc, promo, families)) = next else {
+            stream.write_all(KEEPALIVE_FRAME)?;
+            continue;
         };
         if last_view.as_ref()
             == Some(&(
@@ -1571,7 +1612,7 @@ fn serve(mut stream: flint_tls::Stream, shared: Arc<Shared>) -> std::io::Result<
                         }
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
-                        return watch(stream, &shared, proxy, last);
+                        return watch(stream, &shared, proxy, last, WATCH_KEEPALIVE);
                     }
                     let reply = handle(&shared, &args);
                     encode(&reply, &mut out);
@@ -2616,5 +2657,81 @@ mod placement_tests {
             Ok(()),
             "as before"
         );
+    }
+}
+
+#[cfg(test)]
+mod watch_keepalive_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+            journal_path: String::new(),
+            usage: Mutex::new(std::collections::HashMap::new()),
+            leases: Mutex::new(LeaseFast::default()),
+        })
+    }
+
+    /// BUG-0202. A watch with nothing to push writes keepalives, each a frame
+    /// an older proxy drops, and once its proxy has gone it returns, freeing
+    /// its thread and socket. Unfixed, it wrote nothing, and a watch whose
+    /// proxy had gone waited for a version bump that an idle fleet may not
+    /// see for days.
+    #[test]
+    fn an_idle_watch_keeps_alive_and_ends_when_its_proxy_goes() {
+        let sh = shared();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sh2 = Arc::clone(&sh);
+        std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let stream = flint_tls::accept(tcp, &None).expect("plaintext stream");
+            // Everything is ACKed, so there is nothing to push: only keepalives.
+            let acked = sh2.state.lock().expect("state").version;
+            let ended = watch(
+                stream,
+                &sh2,
+                "p:1".into(),
+                acked,
+                Duration::from_millis(100),
+            );
+            let _ = done_tx.send(ended.is_err());
+        });
+        let mut proxy = TcpStream::connect(addr).expect("connect");
+        proxy
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 64];
+        while got.len() < 2 * KEEPALIVE_FRAME.len() {
+            let n = proxy
+                .read(&mut chunk)
+                .expect("a keepalive within the read timeout");
+            assert!(n > 0, "the watch closed instead of keeping alive");
+            got.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(got, [KEEPALIVE_FRAME, KEEPALIVE_FRAME].concat());
+        assert!(
+            matches!(
+                decode(KEEPALIVE_FRAME),
+                Ok(Decoded::Complete(Value::Simple(ref s), _)) if s == "KEEPALIVE"
+            ),
+            "a simple string, which a proxy's watch drops: it acts only on SNAPSHOT arrays"
+        );
+        drop(proxy);
+        let t0 = std::time::Instant::now();
+        let failed = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the watch returned after its proxy went");
+        assert!(
+            failed,
+            "it returned because a keepalive could not be written"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(5));
     }
 }

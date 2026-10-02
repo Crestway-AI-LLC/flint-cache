@@ -1,7 +1,8 @@
-# BUG-0202: CPWATCH has no keepalive, so an idle proxy rotates every five minutes and the control plane leaks a thread per rotation (OPEN)
+# BUG-0202: CPWATCH has no keepalive, so an idle proxy rotates every five minutes and the control plane leaks a thread per rotation (FIXED 2026-10-02)
 
-**Status:** **OPEN.** Filed 2026-10-02 by the ops session, for the public
-session to fix (the same handling Jeff set for BUG-0201).
+**Status:** **FIXED 2026-10-02.** Filed the same day by the ops session, for
+the public session to fix (the same handling Jeff set for BUG-0201). Held by
+a unit test of the watch and a new section of `controlplane_drill`.
 **Severity:** medium, and it grows with the number of proxies.
 - The single-seat control plane leaks one thread and one socket each time a
   proxy abandons its watch. On an idle fleet that is every five minutes per
@@ -60,3 +61,56 @@ write, fail, and return. On an idle fleet that can be days.
 
 The proxy connection leak toward the nodes (BUG-0199), and the controller's
 reading of a full node as a dead one (BUG-0201), are separate bugs.
+
+## Fix
+
+The first direction, at the control plane alone. A CPWATCH with nothing to
+push now writes a keepalive every 10 s (`WATCH_KEEPALIVE`): `+KEEPALIVE`, a
+RESP simple string. This applies to both the single-seat `watch()` and the
+raft-mode `watch_loop`.
+
+- **The leak.** A keepalive written to a proxy that has gone fails within
+  two of them: the first draws a reset, the second errors. The watch then
+  returns, and its thread (or task) and socket go with it. The single-seat
+  write happens outside the state lock and has a 10 s write timeout, so a
+  peer that stopped reading cannot hold the thread either.
+- **The rotation.** A proxy's watch counts any read as the seat being alive
+  (BUG-0081's idle count resets on every successful read). A keepalive every
+  10 s is well inside its 30 s read timeout, so against this control plane
+  an idle fleet no longer rotates. That is the requirement BUG-0081 stated.
+- **Compatibility.** Every proxy's watch, back to the first, acts only on a
+  `SNAPSHOT` array and drops any other frame it decodes. So a proxy from
+  before this takes the keepalive as liveness and nothing else. A control
+  plane from before this sends none, and a new proxy against it behaves
+  exactly as before. No proxy code changes; its comments now say which
+  control planes still need `MAX_IDLE_READS`.
+
+`controlplane_drill` also gains its own `cargo build`, as every other drill
+has. Without it, a run outside the gate used whatever binaries `target/`
+held. Its first run against this fix tested a stale control plane and
+reported the unfixed behaviour.
+
+## Verification
+
+- **Unit test** `an_idle_watch_keeps_alive_and_ends_when_its_proxy_goes`. A
+  watch with nothing to push and a 100 ms interval writes two keepalives, and
+  returns within 5 s once its client closes. With the keepalive write
+  removed, it fails at the first read.
+- **`controlplane_drill`, new last section.** Twenty CPWATCH subscribers each
+  take their snapshot and ACK it. Nineteen hang up, and one stays idle for
+  25 s. Measured on the gate box, both built fresh:
+  - **Fixed:** the idle watch got 2 keepalives, and the control plane's
+    threads went 3 → 4 (the one still open).
+  - **Unfixed (origin/main's control plane):** 0 keepalives, threads 3 → 23.
+    That is one thread per departed watch, the playground's leak.
+
+## What this does not do
+
+- **Detection of a silent seat.** It is still `MAX_IDLE_READS` × 30 s, about
+  5 minutes. Against a control plane that keeps alive, the proxy could
+  abandon a silent seat much sooner. That is a separate change to BUG-0081's
+  trade.
+- **A partitioned proxy.** Its keepalive writes do not fail until TCP gives
+  up retransmitting, so its watch lasts that long, not two keepalives. That
+  is bounded, unlike before.
+
