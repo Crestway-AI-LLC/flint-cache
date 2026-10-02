@@ -138,11 +138,22 @@ impl Quant {
             Quant::Pq => "pq",
         }
     }
-}
 
-/// How many candidates a quantized search re-ranks when `VEC.SEARCH` names no
-/// `RERANK`: this many times `k`.
-pub const RERANK_DEFAULT_MULTIPLE: usize = 4;
+    /// How many candidates a search re-ranks when `VEC.SEARCH` names no
+    /// `RERANK`: this many times `k`, the depth past which the code's recall
+    /// stopped paying for itself on 999,000 real 1536-d embeddings at the
+    /// default `EF` (ADR-0049 verification 2). 1-bit gained 0.025 recall@10
+    /// from 4k to 10k and 0.007 from 10k to 20k; PQ still 0.024 from 10k to
+    /// 20k. An unquantized set re-ranks nothing.
+    pub fn rerank_multiple(self) -> usize {
+        match self {
+            Quant::None => 1,
+            Quant::Sq8 => 4,
+            Quant::Bin => 10,
+            Quant::Pq => 20,
+        }
+    }
+}
 
 /// A stored vector and its meta, owned.
 type Stored = (Vec<f32>, Option<Vec<u8>>);
@@ -1318,7 +1329,7 @@ impl Store {
                 .and_then(|s| s.parse::<usize>().ok())
         };
         let ef = opt(b"EF").unwrap_or(hnsw::EF_SEARCH_DEFAULT);
-        let rerank = opt(b"RERANK").unwrap_or(k.saturating_mul(RERANK_DEFAULT_MULTIPLE));
+        let rerank = opt(b"RERANK").unwrap_or(k.saturating_mul(vs.quant().rerank_multiple()));
         // Expired-but-unswept ids still sit in the index and can outrank live
         // ones, so over-fetch by the expired count and drop them post-hoc: with
         // at most `expired` stale hits, k+expired candidates always yield k live
