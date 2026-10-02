@@ -15,6 +15,12 @@
 #     rebuilds as sq8, not as plain hnsw; with --vec-dir its full vectors are
 #     in a local file (step 2), which a restart sweeps and the rebuild refills,
 #     and a second co-processor cannot take the same directory
+#   - ADR-0049's verifications 4-6 on quantized sets: a bin set's restart
+#     answers -LOADING and rebuilds to the same results; a burst of searches
+#     over every engine opens no channel (the proxy's connection count, with a
+#     write as its control); TTL expires and sweeps on sq8 and bin sets; and a
+#     second tenant's bin set searches and takes writes while the first tenant
+#     is at the D4 cap
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
@@ -54,8 +60,9 @@ grep -q "held by another flint-vec" "$D/vec-second.log" \
 # server's own restart durability (that is repl/warm_restart's job).
 $B --port 6676 --engine mem 2>"$D/n.log" & fleet_wait_listen 6676; fleet_wait_ping 6676
 # Four workers, pinned: the BUG-0200 section writes more than that on one
-# connection, whatever the box's core count.
-$PX --port 6677 --workers 4 --pairs 127.0.0.1:6676 --tenants "tok=ns" \
+# connection, whatever the box's core count. A second tenant (ns2) is the
+# isolation check's: it shares the co-processor and its cap.
+$PX --port 6677 --workers 4 --pairs 127.0.0.1:6676 --tenants "tok=ns,tok2=ns2" \
     --families "VEC.=127.0.0.1:6678" --edge-advertise 127.0.0.1:6677 2>"$D/px.log" & fleet_wait_listen 6677
 for _ in $(seq 1 60); do case "$(valkey-cli -p 6677 PING 2>&1)" in *NOAUTH*|PONG) break;; esac; sleep 0.1; done
 
@@ -70,6 +77,11 @@ vexec() {
   done
   echo "$out"; return 1
 }
+A2="valkey-cli -p 6677 -a tok2 --no-auth-warning"
+vexec2() { local A="$A2"; vexec "$@"; }
+# The proxy's accepted-connection count. A co-processor's PROXYCHAN dial-back is
+# a connection like any client's, so it moves this too.
+conns() { valkey-cli -p 6677 PROXYSTATS 2>/dev/null | tr -d '\r' | sed -n 's/^conns_total://p'; }
 
 echo "== VEC.* end to end"
 [ "$(vexec VEC.CREATE docs DIM 3 METRIC l2)" = "OK " ] \
@@ -181,6 +193,10 @@ kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
 sleep 0.3
 $VEC --port 6678 --vec-dir "$VD" 2>"$D/vec2.log" & COPROC_PID=$!
 fleet_wait_listen 6678
+# The first touch of the cold namespace answers -LOADING, here on the bin set
+# whose vector file the restart has just swept (ADR-0049 verification 4).
+R="$($A VEC.SEARCH docsb 0.85,0.1,0.2 2 2>&1 | tr -d '\r')"
+case "$R" in *LOADING*) : ;; *) echo "FAIL: the first command after the restart should answer -LOADING, got: $R"; exit 1 ;; esac
 POST="$(vexec VEC.SEARCH docs 0.9,0.1,0 2)"
 [ "$POST" = "$PRE" ] \
   || { echo "FAIL: rebuild did not restore the index. pre=[$PRE] post=[$POST]"; exit 1; }
@@ -216,6 +232,30 @@ case "$(vexec VEC.INFO docsb)" in *quant*bin*vectors_on*disk*) : ;; *) echo "FAI
 case "$(vexec VEC.GET docsb a)" in *"0.123,0.456,0.789"*) : ;; *) echo "FAIL: bin GET after rebuild is not the exact vector"; exit 1 ;; esac
 echo "  post-restart bin VEC.SEARCH -> $PREQ  (rebuilt as bin)"
 
+echo "== search opens no channel (ADR-0017 verification 3, ADR-0049 verification 5)"
+# Every set is warm now. A burst of searches over all four engines on ONE
+# connection moves the proxy's connection count by exactly two: the burst's
+# connection and the second count's own. A search that dialled a PROXYCHAN
+# channel would add one each.
+C0="$(conns)"
+OUT="$(for _ in $(seq 1 10); do
+  for q in "docs 0.9,0.1,0" "docsh 0.9,0.1,0" "docsq 0.85,0.1,0.2" "docsb 0.85,0.1,0.2"; do
+    echo "VEC.SEARCH $q 2"
+  done
+done | $A 2>&1 | tr -d '\r')"
+C1="$(conns)"
+case "$C0$C1" in ''|*[!0-9]*) echo "FAIL: PROXYSTATS conns_total unreadable ($C0, $C1)"; exit 1 ;; esac
+# 'b' is in every set's top two for its query, so each answer holds it once.
+NB="$(grep -cx b <<<"$OUT")"
+[ "$NB" = 40 ] || { echo "FAIL: 40 searches on one connection, $NB answered with 'b':"; sort <<<"$OUT" | uniq -c | sed 's/^/    /'; exit 1; }
+[ $(( C1 - C0 )) = 2 ] || { echo "FAIL: 40 searches moved conns_total by $(( C1 - C0 )), not 2: a search opened a channel"; exit 1; }
+# Control: one write does open a channel, so the same count moves by three.
+C0="$(conns)"
+[ "$(vexec VEC.SET docsb ctl 0,0,1)" = "OK " ] || { echo "FAIL: VEC.SET docsb ctl"; exit 1; }
+C1="$(conns)"
+[ $(( C1 - C0 )) = 3 ] || { echo "FAIL (control): a VEC.SET moved conns_total by $(( C1 - C0 )), not 3; the count does not see channels"; exit 1; }
+echo "  40 searches: +0 channels; one VEC.SET: +1 channel"
+
 echo "== VEC.DEL is durable too"
 [ "$(vexec VEC.DEL docs a)" = "1 " ] || { echo "FAIL: VEC.DEL"; exit 1; }
 case "$(vexec VEC.SEARCH docs 1,0,0 5)" in *a*) echo "FAIL: 'a' still present after DEL"; exit 1 ;; *) : ;; esac
@@ -225,22 +265,46 @@ case "$(vexec VEC.SEARCH docs 1,0,0 5)" in *a*) echo "FAIL: 'a' still present af
 DBSIZE_BEFORE_D4="$($A DBSIZE 2>&1 | tr -d '\r')"
 
 echo "== D4: a tiny per-namespace index-memory cap sheds new writes; reads unaffected"
+# The second tenant's 1-bit set, made before the cap (the isolation check below).
+[ "$(vexec2 VEC.CREATE iso DIM 3 METRIC l2 INDEX hnsw QUANT bin)" = "OK " ] || { echo "FAIL: tenant 2 VEC.CREATE iso"; exit 1; }
+[ "$(vexec2 VEC.SET iso t2a 1,0,0)" = "OK " ] || { echo "FAIL: tenant 2 VEC.SET iso t2a"; exit 1; }
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
 sleep 0.3
-# 100 bytes is far below the namespace's already-durable footprint. Rebuild
-# loads those rows regardless (they are already durable, ADR-0017 D3); the cap
-# governs only NEW writes, so this restart comes up ALREADY over budget.
-$VEC --port 6678 --index-mem-bytes 100 2>"$D/vec3.log" & COPROC_PID=$!
+# 2,000 bytes is below this namespace's already-durable footprint: twelve
+# vectors, eleven of them HNSW nodes the meter charges 320 B and more each.
+# Rebuild loads those rows regardless (they are already durable, ADR-0017 D3);
+# the cap governs only NEW writes, so this restart comes up ALREADY over
+# budget. The second tenant's one vector is well under the same cap.
+$VEC --port 6678 --vec-dir "$VD" --index-mem-bytes 2000 2>"$D/vec3.log" & COPROC_PID=$!
 fleet_wait_listen 6678
 # Reads still serve (the index rebuilt past the cap from the durable rows)...
 case "$(vexec VEC.SEARCH docs 1,0,0 3)" in *b*) : ;; *) echo "FAIL: read after cap-restart"; exit 1 ;; esac
 # ...but a fresh VEC.SET is refused with -VECFULL, BEFORE any durable write.
 R="$(vexec VEC.SET docs znew 0,0,1)"
 case "$R" in *VECFULL*) : ;; *) echo "FAIL: expected VECFULL over the cap, got: $R"; exit 1 ;; esac
-# The shed write did not persist: durable key count is unchanged.
+case "$(vexec VEC.SET docsb znew 0,0,1)" in *VECFULL*) : ;; *) echo "FAIL: the bin set took a write over the cap"; exit 1 ;; esac
+# The shed writes did not persist: durable key count is unchanged.
 [ "$($A DBSIZE 2>&1 | tr -d '\r')" = "$DBSIZE_BEFORE_D4" ] \
   || { echo "FAIL: a VECFULL-shed write still persisted (DBSIZE moved off $DBSIZE_BEFORE_D4)"; exit 1; }
 echo "  new VEC.SET -> ${R}(refused, not persisted); reads still served"
+
+echo "== isolation (ADR-0049 verification 6): tenant 1 is at its cap; tenant 2's bin set is not"
+case "$(vexec2 VEC.SEARCH iso 1,0,0 1)" in *t2a*) : ;; *) echo "FAIL: tenant 2's search beside a full tenant: $(vexec2 VEC.SEARCH iso 1,0,0 1)"; exit 1 ;; esac
+R="$(vexec2 VEC.SET iso t2b 0,1,0)"
+[ "$R" = "OK " ] || { echo "FAIL: tenant 2's write under its own cap was refused: $R"; exit 1; }
+case "$(vexec2 VEC.SEARCH iso 0,1,0 1)" in *t2b*) : ;; *) echo "FAIL: tenant 2's new vector is not searchable"; exit 1 ;; esac
+I2="$(vexec2 VEC.INFO iso)"
+case "$I2" in *"count 2 "*"quant bin vectors_on disk "*) : ;; *) echo "FAIL: tenant 2's set is not two bin vectors on disk: $I2"; exit 1 ;; esac
+# Each namespace is metered on its own: the same 2,000-byte cap, two sides of it.
+mem() { sed -n 's/.*ns_mem_bytes \([0-9]*\) ns_mem_cap \([0-9]*\) .*/\1 \2/p' <<<"$1"; }
+read -r M1 CAP <<<"$(mem "$(vexec VEC.INFO docsb)")"
+read -r M2 _ <<<"$(mem "$I2")"
+[ "$CAP" = 2000 ] && [ "${M1:-0}" -gt 2000 ] && [ "${M2:-9999}" -lt 2000 ] \
+  || { echo "FAIL: expected tenant 1 over and tenant 2 under a 2000-byte cap: $M1, $M2 of $CAP"; exit 1; }
+# Tenant 2's write did not free tenant 1, and tenant 1 cannot reach tenant 2's set.
+case "$(vexec VEC.SET docs znew 0,0,1)" in *VECFULL*) : ;; *) echo "FAIL: tenant 1 left its cap after tenant 2's write"; exit 1 ;; esac
+case "$(vexec VEC.SEARCH iso 1,0,0 1)" in *t2a*) echo "FAIL: tenant 1 searched tenant 2's set"; exit 1 ;; esac
+echo "  tenant 2 ($M2 of $CAP B): search and write served; tenant 1 ($M1 B): still -VECFULL, blind to tenant 2's set"
 
 echo "== CONTROL: the ordinary tenant data path is untouched"
 cli_ok $A SET plain value
@@ -248,15 +312,24 @@ cli_ok $A SET plain value
 
 echo "== TTL (D7): a PX vector expires from the index; a permanent one in the same set survives"
 # Restart WITHOUT the D4 cap so these writes are not shed (the prior section left
-# the namespace deliberately over a 100-byte cap).
+# the namespace deliberately over a 2,000-byte cap).
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
 sleep 0.3
-$VEC --port 6678 2>"$D/vec4.log" & COPROC_PID=$!
+$VEC --port 6678 --vec-dir "$VD" 2>"$D/vec4.log" & COPROC_PID=$!
 fleet_wait_listen 6678
 [ "$(vexec VEC.CREATE sess DIM 3 METRIC l2)" = "OK " ] || { echo "FAIL: VEC.CREATE sess"; exit 1; }
 [ "$(vexec VEC.SET sess keep 1,0,0)" = "OK " ] || { echo "FAIL: VEC.SET sess keep"; exit 1; }
 # PX 1200ms: searchable now; gone within one sweep (--sweep-ms 1000) after it lapses.
 [ "$(vexec VEC.SET sess gone 0,1,0 PX 1200)" = "OK " ] || { echo "FAIL: VEC.SET sess gone PX"; exit 1; }
+# The same on the quantized sets (ADR-0049 verification 6), whose full vectors
+# are in the local file.
+for qs in "sessq sq8" "sessb bin"; do
+  set -- $qs
+  [ "$(vexec VEC.CREATE "$1" DIM 3 METRIC l2 INDEX hnsw QUANT "$2")" = "OK " ] || { echo "FAIL: VEC.CREATE $1"; exit 1; }
+  [ "$(vexec VEC.SET "$1" keep 1,0,0)" = "OK " ] || { echo "FAIL: VEC.SET $1 keep"; exit 1; }
+  [ "$(vexec VEC.SET "$1" gone 0,1,0 PX 1200)" = "OK " ] || { echo "FAIL: VEC.SET $1 gone PX"; exit 1; }
+  case "$(vexec VEC.SEARCH "$1" 0,1,0 2)" in *gone*) : ;; *) echo "FAIL: TTL'd vector not searchable in $1 before expiry"; exit 1 ;; esac
+done
 case "$(vexec VEC.SEARCH sess 0,1,0 2)" in *gone*) : ;; *) echo "FAIL: TTL'd vector not searchable before expiry"; exit 1 ;; esac
 case "$(vexec VEC.GET sess gone)" in *"0,1,0"*) : ;; *) echo "FAIL: TTL'd VEC.GET before expiry"; exit 1 ;; esac
 # Introspection: VEC.TTL -> -1 for permanent 'keep', a positive ms for 'gone'.
@@ -281,6 +354,14 @@ case "$(vexec VEC.TTL sess gone)" in *-2*) : ;; *) echo "FAIL: VEC.TTL of an exp
 case "$(vexec VEC.INFO sess)" in *count*1*) : ;; *) echo "FAIL: sweep did not reclaim the expired id (count != 1)"; exit 1 ;; esac
 case "$(vexec VEC.INFO sess)" in *expiring*0*) : ;; *) echo "FAIL: INFO expiring should be 0 after expiry"; exit 1 ;; esac
 grep -qi "swept" "$D/vec4.log" || { echo "FAIL: no expiry sweep logged"; exit 1; }
+for qs in "sessq sq8" "sessb bin"; do
+  set -- $qs
+  case "$(vexec VEC.GET "$1" gone)" in *"0,1,0"*) echo "FAIL: expired VEC.GET in $1 still returns the vector"; exit 1 ;; esac
+  case "$(vexec VEC.SEARCH "$1" 0,1,0 5)" in *gone*) echo "FAIL: expired vector still in $1's SEARCH"; exit 1 ;; *keep*) : ;; *) echo "FAIL: 'keep' vanished from $1"; exit 1 ;; esac
+  I="$(vexec VEC.INFO "$1")"
+  case "$I" in *"count 1 expiring 0 "*) : ;; *) echo "FAIL: the sweep did not reclaim $1's expired id: $I"; exit 1 ;; esac
+  case "$I" in *"quant $2 vectors_on disk "*) : ;; *) echo "FAIL: $1 is not $2 on disk: $I"; exit 1 ;; esac
+done
 echo "  after expiry: 'gone' masked/swept, VEC.TTL -2; 'keep' still served"
 
 echo "== BUG-0200: more writes on ONE client connection than the proxy has workers"
@@ -302,9 +383,11 @@ fi
 case "$(vexec VEC.INFO pipe)" in *count*24*) : ;; *) echo "FAIL: VEC.INFO pipe should count 24"; exit 1 ;; esac
 echo "  24 VEC.SETs on one connection: all OK in ${SECS}s"
 
-echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 on a local file), writes are durable, a"
+echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 and bin on a local file), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
 echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
 echo "      per-vector TTL (D7) expires+sweeps while permanent ids stay — with VEC.TTL/"
 echo "      EXPIRE/PERSIST introspection and the INFO expiring count over the wire, and a"
-echo "      client connection takes more writes than the proxy has workers (BUG-0200)."
+echo "      client connection takes more writes than the proxy has workers (BUG-0200). Searches"
+echo "      open no channel, TTL holds on quantized sets, and a full tenant leaves another's"
+echo "      bin set serving (ADR-0049 verifications 4-6)."
