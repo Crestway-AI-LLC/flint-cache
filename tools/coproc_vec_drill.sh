@@ -158,6 +158,21 @@ NFILES=$(ls "$VD"/*.vecs 2>/dev/null | wc -l | tr -d ' ')
 [ "$NFILES" = 1 ] || { echo "FAIL: expected one vector file in $VD (the sq8 set's), found $NFILES"; ls -la "$VD"; exit 1; }
 echo "  sq8 VEC.SEARCH -> $PREQ  (full vectors in $VD)"
 
+echo "== a 1-bit set (QUANT bin: ADR-0049 item 2) serves the same way"
+[ "$(vexec VEC.CREATE docsb DIM 3 METRIC l2 INDEX hnsw QUANT bin)" = "OK " ] \
+  || { echo "FAIL: VEC.CREATE QUANT bin"; exit 1; }
+for kv in "a 0.123,0.456,0.789" "b 0.9,0.1,0.2" "c 0.5,0.5,0.5"; do
+  set -- $kv
+  [ "$(vexec VEC.SET docsb "$1" "$2")" = "OK " ] || { echo "FAIL: VEC.SET docsb $1"; exit 1; }
+done
+R="$(vexec VEC.SEARCH docsb 0.85,0.1,0.2 2)"
+[ "$R" = "$PREQ" ] || { echo "FAIL: bin SEARCH should rank as sq8 did. bin=[$R] sq8=[$PREQ]"; exit 1; }
+case "$(vexec VEC.INFO docsb)" in *quant*bin*vectors_on*disk*) : ;; *) echo "FAIL: VEC.INFO docsb: $(vexec VEC.INFO docsb)"; exit 1 ;; esac
+case "$(vexec VEC.GET docsb a)" in *"0.123,0.456,0.789"*) : ;; *) echo "FAIL: bin GET is not the exact vector"; exit 1 ;; esac
+NFILES=$(ls "$VD"/*.vecs 2>/dev/null | wc -l | tr -d ' ')
+[ "$NFILES" = 2 ] || { echo "FAIL: expected two vector files in $VD (sq8, bin), found $NFILES"; ls -la "$VD"; exit 1; }
+echo "  bin VEC.SEARCH -> $PREQ"
+
 echo "== CRASH DURABILITY: kill the co-processor, restart it EMPTY, SEARCH rebuilds"
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
 # A file the dead process might have held for a set the new one never makes:
@@ -190,11 +205,16 @@ case "$(vexec VEC.INFO docsq)" in *quant*sq8*) : ;; *) echo "FAIL: rebuilt set i
 case "$(vexec VEC.GET docsq a)" in *"0.123,0.456,0.789"*) : ;; *) echo "FAIL: sq8 GET after rebuild is not the exact vector"; exit 1 ;; esac
 # The dead process's file was swept at startup (derived, never trusted) and the
 # rebuild wrote a new one.
-grep -q "removed 2 vector file" "$D/vec2.log" \
+grep -q "removed 3 vector file" "$D/vec2.log" \
   || { echo "FAIL: the restart did not sweep the old vector files:"; sed 's/^/    /' "$D/vec2.log"; exit 1; }
 [ ! -e "$VD/99.vecs" ] || { echo "FAIL: a vector file no set owns survived the restart"; exit 1; }
 case "$(vexec VEC.INFO docsq)" in *vectors_on*disk*) : ;; *) echo "FAIL: the rebuilt sq8 set is not on disk"; exit 1 ;; esac
 echo "  post-restart sq8 VEC.SEARCH -> $POSTQ  (rebuilt as sq8)"
+R="$(vexec VEC.SEARCH docsb 0.85,0.1,0.2 2)"
+[ "$R" = "$PREQ" ] || { echo "FAIL: bin rebuild changed results. pre=[$PREQ] post=[$R]"; exit 1; }
+case "$(vexec VEC.INFO docsb)" in *quant*bin*vectors_on*disk*) : ;; *) echo "FAIL: rebuilt docsb is not bin on disk: $(vexec VEC.INFO docsb)"; exit 1 ;; esac
+case "$(vexec VEC.GET docsb a)" in *"0.123,0.456,0.789"*) : ;; *) echo "FAIL: bin GET after rebuild is not the exact vector"; exit 1 ;; esac
+echo "  post-restart bin VEC.SEARCH -> $PREQ  (rebuilt as bin)"
 
 echo "== VEC.DEL is durable too"
 [ "$(vexec VEC.DEL docs a)" = "1 " ] || { echo "FAIL: VEC.DEL"; exit 1; }

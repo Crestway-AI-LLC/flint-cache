@@ -77,6 +77,7 @@ fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
             })
             .collect();
         let ids: Vec<Vec<u8>> = (0..n).map(|i| b(&format!("id-{i:06}"))).collect();
+        let bin = &["INDEX", "hnsw", "QUANT", "bin"][..];
         for (label, extra, on_disk) in [
             ("flat", &[][..], false),
             ("hnsw", &["INDEX", "hnsw"][..], false),
@@ -86,6 +87,8 @@ fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
                 &["INDEX", "hnsw", "QUANT", "sq8"][..],
                 true,
             ),
+            ("hnsw bin", bin, false),
+            ("hnsw bin on disk", bin, true),
         ] {
             let ns = b("meter");
             let mut st = Store::new();

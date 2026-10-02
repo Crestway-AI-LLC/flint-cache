@@ -17,14 +17,33 @@
 //!        bench --memory [--sizes ...] [--dim ...] [--vec-dir D]
 //!                (heap bytes each kind of set holds per vector, counted by
 //!                 this binary's allocator, beside what the D4 meter charges)
+//!        bench --data DIR --arm plain|CODE|CODE-disk [--n N] [--queries Q]
+//!              [--k 10] [--metric cosine] [--vec-dir D]
+//!              [--efs 64,128,256] [--reranks 20,40,100,200] [--gt-only]
+//!                (ADR-0049 verifications 1 and 2 on a real corpus: one set a
+//!                 process, its RSS growth, and recall against brute force
+//!                 across EF and RERANK; DIR holds base.fbin and query.fbin.
+//!                 CODE is sq8 or bin; `-disk` keeps the full vectors in
+//!                 --vec-dir)
+//!        bench --edge HOST:PORT [--auth TOKEN] --data DIR --label L
+//!              [--set NAME] [--quant none|sq8|bin] [--n N] [--queries Q]
+//!              [--k 10] [--metric cosine] [--cold-dir D] [--window 64]
+//!              [--load-only | --search-only]
+//!                (ADR-0049 verification 3: the same corpus through a running
+//!                 proxy and co-processor, as a client sees it. Loads with
+//!                 pipelined VEC.SETs, then times one VEC.SEARCH at a time;
+//!                 with --cold-dir, also with the co-processor's vector files
+//!                 in D dropped from the page cache before each query, so the
+//!                 re-rank reads the device. Linux.)
 //! Not wired into any gate — it allocates a corpus and takes seconds; run it by
 //! hand when the index engine or its parameters change.
 
-use flint_resp::Value;
+use flint_resp::{Decoded, Value};
 use flint_vec::{Plan, Store};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicIsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Heap bytes this process holds, for `--memory`: requested sizes, so not the
 /// allocator's own rounding, and not what the OS reports, which on a host that
@@ -288,6 +307,14 @@ fn recall(oracle: &[Vec<Vec<u8>>], approx: &[Vec<Vec<u8>>], k: usize) -> f64 {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    if a.iter().any(|x| x == "--edge") {
+        edge(&a);
+        return;
+    }
+    if a.iter().any(|x| x == "--data") {
+        real_data(&a);
+        return;
+    }
     let sizes: Vec<usize> = arg(&a, "--sizes")
         .unwrap_or_else(|| "1000,10000,100000".into())
         .split(',')
@@ -410,6 +437,540 @@ fn main() {
             let (p50, p99, mean) = stats(lat);
             let r = recall(&oracle, &approx, k);
             println!("{e:>6}  {r:>9.3}  {:>16}", format!("{p50}/{p99}/{mean}"));
+        }
+    }
+}
+
+/// A float32 vector file mapped read-only: `u32` count, `u32` dim, then
+/// count x dim little-endian floats (the big-ann-benchmarks `.fbin` layout).
+/// Mapped rather than read so the arms run as separate processes share one
+/// copy in the page cache, and so it shows as file-backed memory, not in the
+/// anonymous RSS the measurement is about.
+struct Fbin {
+    map: *const u8,
+    len: usize,
+    n: usize,
+    dim: usize,
+}
+
+// SAFETY: the mapping is read-only and lives as long as the process, so any
+// thread may read it.
+unsafe impl Sync for Fbin {}
+
+impl Fbin {
+    fn open(path: &std::path::Path) -> Fbin {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let len = f.metadata().expect("metadata").len() as usize;
+        // SAFETY: a read-only private mapping of a file this process opened,
+        // kept for the life of the process and never written through.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+        assert!(map != libc::MAP_FAILED, "mmap {}", path.display());
+        let map = map as *const u8;
+        // SAFETY: the mapping is at least the 8-byte header (checked below).
+        let head = unsafe { std::slice::from_raw_parts(map, 8.min(len)) };
+        assert_eq!(
+            head.len(),
+            8,
+            "{} is shorter than its header",
+            path.display()
+        );
+        let n = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        let dim = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        assert_eq!(
+            len,
+            8 + n * dim * 4,
+            "{}: size disagrees with its header",
+            path.display()
+        );
+        Fbin { map, len, n, dim }
+    }
+
+    fn row(&self, i: usize) -> &[f32] {
+        assert!(i < self.n && 8 + (i + 1) * self.dim * 4 <= self.len);
+        // SAFETY: within the mapping (asserted at open); offset 8 + 4k is
+        // 4-byte aligned on a page-aligned mapping; the host is little-endian,
+        // as every target this repo builds for is.
+        unsafe {
+            std::slice::from_raw_parts(self.map.add(8 + i * self.dim * 4) as *const f32, self.dim)
+        }
+    }
+}
+
+/// Anonymous resident memory of this process (Linux `RssAnon`), in bytes.
+fn rss_anon() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = s.lines().find(|l| l.starts_with("RssAnon:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// Score where HIGHER is nearer, as flint-vec answers `VEC.SEARCH`.
+fn exact_score(metric: &str, q: &[f32], qn: f32, v: &[f32], vn: f32) -> f32 {
+    let dot: f32 = q.iter().zip(v).map(|(a, b)| a * b).sum();
+    match metric {
+        "l2" => -q.iter().zip(v).map(|(a, b)| (a - b) * (a - b)).sum::<f32>(),
+        "ip" => dot,
+        _ => {
+            if qn == 0.0 || vn == 0.0 {
+                0.0
+            } else {
+                dot / (qn * vn)
+            }
+        }
+    }
+}
+
+/// The exact top-`k` ids of each query over the first `n` base rows, by
+/// brute force on every core, cached in `dir` because it is the same for
+/// every arm.
+fn ground_truth(
+    dir: &std::path::Path,
+    base: &Fbin,
+    n: usize,
+    queries: &Fbin,
+    nq: usize,
+    k: usize,
+    metric: &str,
+) -> Vec<Vec<u32>> {
+    let cache = dir.join(format!("gt-n{n}-q{nq}-k{k}-{metric}.ibin"));
+    if let Ok(bytes) = std::fs::read(&cache)
+        && bytes.len() == nq * k * 4
+    {
+        let (words, _) = bytes.as_chunks::<4>();
+        let ids: Vec<u32> = words.iter().map(|w| u32::from_le_bytes(*w)).collect();
+        return ids.chunks(k).map(|c| c.to_vec()).collect();
+    }
+    let t0 = Instant::now();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norms: Vec<f32> = (0..n).map(|i| norm(base.row(i))).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
+    let qids: Vec<usize> = (0..nq).collect();
+    let mut gt = vec![Vec::new(); nq];
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = qids
+            .chunks(nq.div_ceil(threads))
+            .map(|chunk| {
+                let norms = &norms;
+                sc.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&qi| {
+                            let q = queries.row(qi);
+                            let qn = norm(q);
+                            let mut top: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+                            for (i, &vn) in norms.iter().enumerate() {
+                                let s = exact_score(metric, q, qn, base.row(i), vn);
+                                if top.len() < k || s > top[top.len() - 1].0 {
+                                    let at = top.partition_point(|&(t, _)| t >= s);
+                                    top.insert(at, (s, i as u32));
+                                    top.truncate(k);
+                                }
+                            }
+                            (qi, top.into_iter().map(|(_, i)| i).collect::<Vec<u32>>())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            for (qi, ids) in h.join().expect("ground-truth thread") {
+                gt[qi] = ids;
+            }
+        }
+    });
+    let bytes: Vec<u8> = gt.iter().flatten().flat_map(|i| i.to_le_bytes()).collect();
+    let _ = std::fs::write(&cache, bytes);
+    eprintln!(
+        "ground truth: {nq} queries over {n} in {:.0} s, {threads} threads",
+        t0.elapsed().as_secs_f64()
+    );
+    gt
+}
+
+/// `--data`: ADR-0049 verifications 1 and 2 on a real corpus. One set a run
+/// (`--arm`), so this process's RSS growth is that set's alone.
+fn real_data(a: &[String]) {
+    let dir = std::path::PathBuf::from(arg(a, "--data").expect("--data DIR"));
+    let arm = arg(a, "--arm").unwrap_or_else(|| "plain".into());
+    let k: usize = arg(a, "--k").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let metric = arg(a, "--metric").unwrap_or_else(|| "cosine".into());
+    let base = Fbin::open(&dir.join("base.fbin"));
+    let queries = Fbin::open(&dir.join("query.fbin"));
+    assert_eq!(base.dim, queries.dim, "base and queries disagree on dim");
+    let n: usize = arg(a, "--n")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(base.n)
+        .min(base.n);
+    let nq: usize = arg(a, "--queries")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200)
+        .min(queries.n);
+    let dim = base.dim;
+    let gt = ground_truth(&dir, &base, n, &queries, nq, k, &metric);
+    if a.iter().any(|x| x == "--gt-only") {
+        return;
+    }
+
+    let ns = b("real");
+    let mut st = Store::new();
+    let (code, disk) = match arm.strip_suffix("-disk") {
+        Some(c) => (c, true),
+        None => (arm.as_str(), false),
+    };
+    let quant = match code {
+        "plain" if !disk => None,
+        "sq8" | "bin" => Some(code),
+        _ => panic!("--arm plain|CODE|CODE-disk, the code sq8 or bin; not {arm}"),
+    };
+    if disk {
+        let d = std::path::PathBuf::from(arg(a, "--vec-dir").expect("a -disk arm needs --vec-dir"));
+        std::fs::create_dir_all(&d).expect("--vec-dir");
+        st.set_vec_dir(d);
+    }
+    let mut create = vec![
+        b("VEC.CREATE"),
+        b("s"),
+        b("DIM"),
+        b(&dim.to_string()),
+        b("METRIC"),
+        b(&metric),
+        b("INDEX"),
+        b("hnsw"),
+    ];
+    if let Some(q) = quant {
+        create.extend([b("QUANT"), b(q)]);
+    }
+    exec(&mut st, &ns, &create);
+    let (rss0, heap0) = (rss_anon(), HEAP.load(Ordering::Relaxed));
+    let t0 = Instant::now();
+    // The slowest single VEC.SET, and when.
+    let (mut slowest, mut slowest_at) = (0f64, 0usize);
+    for i in 0..n {
+        let t = Instant::now();
+        exec(
+            &mut st,
+            &ns,
+            &[
+                b("VEC.SET"),
+                b("s"),
+                b(&i.to_string()),
+                b(&vec_str(base.row(i))),
+            ],
+        );
+        let took = t.elapsed().as_secs_f64();
+        if took > slowest {
+            (slowest, slowest_at) = (took, i + 1);
+        }
+        if (i + 1) % (n / 10).max(1) == 0 {
+            eprintln!(
+                "{arm}: {} of {n} in {:.0} s",
+                i + 1,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    }
+    let build = t0.elapsed().as_secs_f64();
+    let heap = (HEAP.load(Ordering::Relaxed) - heap0) as f64 / n as f64;
+    let rss = match (rss0, rss_anon()) {
+        (Some(r0), Some(r1)) => format!("{:.0}", (r1 as f64 - r0 as f64) / n as f64),
+        _ => "n/a".into(),
+    };
+    println!(
+        "arm={arm} n={n} dim={dim} metric={metric} build={build:.0}s rss_B_per_vector={rss} heap_B_per_vector={heap:.0} meter_B_per_vector={:.0} slowest_set_ms={:.0} at={slowest_at}",
+        st.ns_mem_bytes(&ns) as f64 / n as f64,
+        slowest * 1e3
+    );
+
+    // Verification 2's depths, 2k to 10k, and 20k for the codes that may need
+    // more than that, unless --reranks names others; --efs likewise.
+    let list = |flag: &str| -> Option<Vec<usize>> {
+        arg(a, flag).map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+    };
+    let reranks: Vec<usize> = match quant {
+        None => vec![k],
+        Some(_) => list("--reranks").unwrap_or_else(|| vec![2 * k, 4 * k, 10 * k, 20 * k]),
+    };
+    for ef in list("--efs").unwrap_or_else(|| vec![64, 128, 256]) {
+        for &rr in &reranks {
+            let (mut hits, mut lat) = (0usize, Vec::with_capacity(nq));
+            for (qi, truth) in gt.iter().enumerate().take(nq) {
+                let args = [
+                    b("VEC.SEARCH"),
+                    b("s"),
+                    b(&vec_str(queries.row(qi))),
+                    b(&k.to_string()),
+                    b("EF"),
+                    b(&ef.to_string()),
+                    b("RERANK"),
+                    b(&rr.to_string()),
+                ];
+                let t = Instant::now();
+                let reply = st.plan(&ns, &args, 0);
+                lat.push(t.elapsed().as_micros());
+                let Plan::Reply(v) = reply else {
+                    panic!("a search is a reply")
+                };
+                hits += result_ids(&v)
+                    .iter()
+                    .filter_map(|id| std::str::from_utf8(id).ok()?.parse::<u32>().ok())
+                    .filter(|id| truth.contains(id))
+                    .count();
+            }
+            let (p50, p99, _) = stats(lat);
+            println!(
+                "arm={arm} n={n} ef={ef} rerank={rr} recall@{k}={:.4} p50_us={p50} p99_us={p99}",
+                hits as f64 / (nq * k) as f64
+            );
+        }
+    }
+}
+
+/// A client connection to the edge, for `--edge`: RESP2 over plain TCP.
+struct Conn {
+    s: std::net::TcpStream,
+    buf: Vec<u8>,
+}
+
+impl Conn {
+    fn open(addr: &str, auth: Option<&str>) -> Conn {
+        // Bounded: a blackholed edge fails the run in seconds, not after the
+        // kernel's SYN retries.
+        let to = std::net::ToSocketAddrs::to_socket_addrs(addr)
+            .expect("resolve the edge")
+            .next()
+            .expect("the edge has an address");
+        let s = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(5))
+            .expect("connect to the edge");
+        let _ = s.set_nodelay(true);
+        let mut c = Conn { s, buf: Vec::new() };
+        if let Some(t) = auth
+            && let Value::Error(e) = c.call(&[b("AUTH"), b(t)])
+        {
+            panic!("AUTH: {e}");
+        }
+        c
+    }
+
+    fn send(&mut self, parts: &[Vec<u8>]) {
+        let arr = Value::Array(Some(
+            parts.iter().map(|p| Value::Bulk(Some(p.clone()))).collect(),
+        ));
+        let mut out = Vec::new();
+        flint_resp::encode(&arr, &mut out);
+        self.s.write_all(&out).expect("write to the edge");
+    }
+
+    fn recv(&mut self) -> Value {
+        let mut chunk = vec![0u8; 1 << 16];
+        loop {
+            match flint_resp::decode(&self.buf) {
+                Ok(Decoded::Complete(v, used)) => {
+                    self.buf.drain(..used);
+                    return v;
+                }
+                Ok(Decoded::NeedMore) => {
+                    let n = self.s.read(&mut chunk).expect("read from the edge");
+                    assert!(n > 0, "the edge closed the connection");
+                    self.buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) => panic!("a reply the edge should not send: {e:?}"),
+            }
+        }
+    }
+
+    /// One command, sent again while the answer says to wait: `-LOADING`
+    /// while a cold namespace's index rebuilds (ADR-0017 D3).
+    fn call(&mut self, parts: &[Vec<u8>]) -> Value {
+        loop {
+            self.send(parts);
+            match self.recv() {
+                Value::Error(e) if transient(&e) => std::thread::sleep(Duration::from_millis(100)),
+                v => return v,
+            }
+        }
+    }
+}
+
+/// An error that says to try again rather than that the command is wrong:
+/// not `-QUOTA` or `-VECFULL`, which are caps a retry never gets past.
+fn transient(e: &str) -> bool {
+    ["LOADING", "TRYAGAIN", "BUSY"]
+        .iter()
+        .any(|w| e.contains(w))
+}
+
+/// Drop the pages of every vector file in `dir` from the page cache, so the
+/// next re-rank reads the device: write back what is dirty, then
+/// `POSIX_FADV_DONTNEED`, which only drops clean pages.
+#[cfg(target_os = "linux")]
+fn drop_vec_pages(dir: &std::path::Path) {
+    use std::os::fd::AsRawFd;
+    for e in std::fs::read_dir(dir).expect("--cold-dir").flatten() {
+        let path = e.path();
+        if path.extension().is_some_and(|x| x == "vecs")
+            && let Ok(f) = std::fs::File::open(&path)
+        {
+            let _ = f.sync_data();
+            // SAFETY: posix_fadvise reads only its integer arguments.
+            unsafe {
+                libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_vec_pages(_dir: &std::path::Path) {
+    panic!("--cold-dir drops pages with posix_fadvise: Linux only");
+}
+
+/// `--edge`: ADR-0049 verification 3. The corpus through a running proxy and
+/// co-processor, timed as a client sees it, one query in flight.
+fn edge(a: &[String]) {
+    let addr = arg(a, "--edge").expect("--edge HOST:PORT");
+    let auth = arg(a, "--auth");
+    let dir = std::path::PathBuf::from(arg(a, "--data").expect("--data DIR"));
+    let label = arg(a, "--label").expect("--label");
+    let set = arg(a, "--set").unwrap_or_else(|| "real".into());
+    let quant = arg(a, "--quant").unwrap_or_else(|| "none".into());
+    let k: usize = arg(a, "--k").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let metric = arg(a, "--metric").unwrap_or_else(|| "cosine".into());
+    let window: usize = arg(a, "--window")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    let cold_dir = arg(a, "--cold-dir").map(std::path::PathBuf::from);
+    let base = Fbin::open(&dir.join("base.fbin"));
+    let queries = Fbin::open(&dir.join("query.fbin"));
+    let n: usize = arg(a, "--n")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(base.n)
+        .min(base.n);
+    let nq: usize = arg(a, "--queries")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200)
+        .min(queries.n);
+    let mut c = Conn::open(&addr, auth.as_deref());
+
+    if !a.iter().any(|x| x == "--search-only") {
+        let mut create = vec![
+            b("VEC.CREATE"),
+            b(&set),
+            b("DIM"),
+            b(&base.dim.to_string()),
+            b("METRIC"),
+            b(&metric),
+            b("INDEX"),
+            b("hnsw"),
+        ];
+        if quant != "none" {
+            create.extend([b("QUANT"), b(&quant)]);
+        }
+        if let Value::Error(e) = c.call(&create) {
+            panic!("VEC.CREATE: {e}");
+        }
+        let t0 = Instant::now();
+        let set_cmd = |i: usize| {
+            vec![
+                b("VEC.SET"),
+                b(&set),
+                b(&i.to_string()),
+                b(&vec_str(base.row(i))),
+            ]
+        };
+        let mut retried = 0usize;
+        for start in (0..n).step_by(window) {
+            let end = (start + window).min(n);
+            for i in start..end {
+                c.send(&set_cmd(i));
+            }
+            let mut again = Vec::new();
+            for i in start..end {
+                match c.recv() {
+                    Value::Error(e) if transient(&e) => again.push(i),
+                    Value::Error(e) => panic!("VEC.SET {i}: {e}"),
+                    _ => {}
+                }
+            }
+            retried += again.len();
+            for i in again {
+                if let Value::Error(e) = c.call(&set_cmd(i)) {
+                    panic!("VEC.SET {i}: {e}");
+                }
+            }
+            if end % (n / 10).max(1) < window {
+                eprintln!(
+                    "{label}: {end} of {n} in {:.0} s",
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+        let load = t0.elapsed().as_secs_f64();
+        println!(
+            "edge={label} n={n} load={load:.0}s rate={:.0}/s retried={retried}",
+            n as f64 / load
+        );
+    }
+    if a.iter().any(|x| x == "--load-only") {
+        return;
+    }
+
+    let gt = ground_truth(&dir, &base, n, &queries, nq, k, &metric);
+    let reranks: Vec<usize> = if quant == "none" {
+        vec![k]
+    } else {
+        vec![2 * k, 4 * k, 10 * k, 20 * k]
+    };
+    let temps: &[bool] = if cold_dir.is_some() {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for ef in [64usize, 128, 256] {
+        for &rr in &reranks {
+            for &cold in temps {
+                let (mut hits, mut lat) = (0usize, Vec::with_capacity(nq));
+                for (qi, truth) in gt.iter().enumerate().take(nq) {
+                    let args = [
+                        b("VEC.SEARCH"),
+                        b(&set),
+                        b(&vec_str(queries.row(qi))),
+                        b(&k.to_string()),
+                        b("EF"),
+                        b(&ef.to_string()),
+                        b("RERANK"),
+                        b(&rr.to_string()),
+                    ];
+                    if cold && let Some(d) = &cold_dir {
+                        drop_vec_pages(d);
+                    }
+                    let t = Instant::now();
+                    let reply = c.call(&args);
+                    lat.push(t.elapsed().as_micros());
+                    if let Value::Error(e) = &reply {
+                        panic!("VEC.SEARCH: {e}");
+                    }
+                    hits += result_ids(&reply)
+                        .iter()
+                        .filter_map(|id| std::str::from_utf8(id).ok()?.parse::<u32>().ok())
+                        .filter(|id| truth.contains(id))
+                        .count();
+                }
+                let (p50, p99, _) = stats(lat);
+                println!(
+                    "edge={label} n={n} ef={ef} rerank={rr} cold={cold} recall@{k}={:.4} p50_us={p50} p99_us={p99}",
+                    hits as f64 / (nq * k) as f64
+                );
+            }
         }
     }
 }

@@ -16,11 +16,14 @@
 //!
 //! v0.1 is flat/exact — the recall oracle. v0.2 replaces [`VectorSet`]'s search
 //! with an HNSW graph behind the SAME plan. ADR-0049 adds compressed codes in
-//! that graph (`QUANT sq8`) with the best `RERANK` re-scored on full vectors;
-//! it adds options to the `VEC.*` surface and a fourth config field that the
-//! binary before it reads past, so the vector rows themselves are unchanged.
+//! that graph (`QUANT sq8|bin`) with the best `RERANK` re-scored on full
+//! vectors; it adds options to the `VEC.*` surface and a fourth config field
+//! that the binary before it reads past, so the vector rows themselves are
+//! unchanged.
 
 mod hnsw;
+mod kernel;
+mod quant;
 pub mod vecfile;
 
 use flint_resp::Value;
@@ -61,7 +64,7 @@ impl Metric {
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    kernel::dot(a, b)
 }
 
 /// A stored vector: the original vector (VEC.GET is lossless), its cached L2
@@ -109,12 +112,16 @@ pub enum Quant {
     /// Per-vector 8-bit codes in the graph; the top candidates are re-ranked
     /// against the full vectors.
     Sq8,
+    /// One bit a dimension, after a fixed random rotation (ADR-0049 item 2):
+    /// no training, a 32nd of the vector.
+    Bin,
 }
 impl Quant {
     pub fn parse(s: &[u8]) -> Option<Quant> {
         match s.to_ascii_lowercase().as_slice() {
             b"none" => Some(Quant::None),
             b"sq8" => Some(Quant::Sq8),
+            b"bin" => Some(Quant::Bin),
             _ => None,
         }
     }
@@ -122,13 +129,24 @@ impl Quant {
         match self {
             Quant::None => "none",
             Quant::Sq8 => "sq8",
+            Quant::Bin => "bin",
+        }
+    }
+
+    /// How many candidates a search re-ranks when `VEC.SEARCH` names no
+    /// `RERANK`: this many times `k`, the depth past which the code's recall
+    /// stopped paying for itself on 999,000 real 1536-d embeddings at the
+    /// default `EF` (ADR-0049 verification 2). 1-bit gained 0.025 recall@10
+    /// from 4k to 10k and 0.007 from 10k to 20k; `sq8` nothing from 2k to 4k.
+    /// An unquantized set re-ranks nothing.
+    pub fn rerank_multiple(self) -> usize {
+        match self {
+            Quant::None => 1,
+            Quant::Sq8 => 4,
+            Quant::Bin => 10,
         }
     }
 }
-
-/// How many candidates a quantized search re-ranks when `VEC.SEARCH` names no
-/// `RERANK`: this many times `k`.
-pub const RERANK_DEFAULT_MULTIPLE: usize = 4;
 
 /// A stored vector and its meta, owned.
 type Stored = (Vec<f32>, Option<Vec<u8>>);
@@ -619,16 +637,25 @@ fn entry_bytes(
         // 457 B before step 3 flattened the layout.
         IndexKind::Hnsw => 320,
     };
+    // The full vector for the re-rank, when it is in RAM: with no
+    // `--vec-dir`, a quantized set costs MORE than a plain one, and this says
+    // so. A box of its own, pointer included. In the local file (ADR-0049 D2)
+    // it costs no RAM; a vector whose write failed and stayed in RAM is
+    // charged separately (`VectorSet::spill_bytes`).
+    let full = if on_disk { 0 } else { dim * 4 + 16 };
     let vector = match quant {
         Quant::None => dim * 4,
-        // The 8-bit code and its (lo, step), plus the full vector for the
-        // re-rank when it is in RAM: with no `--vec-dir`, a quantized set costs
-        // MORE than a plain one, and this says so. In the local file (ADR-0049
-        // D2) it costs no RAM; a vector whose write failed and stayed in RAM
-        // is charged separately (`VectorSet::spill_bytes`).
-        Quant::Sq8 if on_disk => dim + 8,
-        // The full vector is a box of its own in RAM, pointer included.
-        Quant::Sq8 => dim + 8 + dim * 4 + 16,
+        // The 8-bit code and its (lo, step), and a fifth of the code again.
+        // The code is a box of its own, and at 999,000 real 1536-d vectors
+        // the process's RSS grew 280 B a vector past the heap it requested
+        // (265 B at 50,000; 15 B at 384-d): what the allocator loses around
+        // that many 1,536-byte boxes among the larger buffers each write
+        // frees. Charging it keeps the cap a bound on RSS, not just on the
+        // heap (ADR-0049 verification 1).
+        Quant::Sq8 => dim + 8 + dim / 5 + full,
+        // The 1-bit code and its factor, in arrays a fixed width a slot that
+        // grow by a quarter: up to a quarter more, spare.
+        Quant::Bin => (quant::bin_bytes(dim) + 4) * 5 / 4 + full,
     };
     vector + id_len + meta_len + structural
 }
@@ -962,7 +989,7 @@ impl Store {
             return Plan::Reply(err("ERR METRIC must be one of cosine, l2, ip"));
         };
         // Optional trailing `INDEX flat|hnsw` (default flat, exact, the oracle)
-        // and `QUANT none|sq8` (ADR-0049; HNSW only), in either order.
+        // and `QUANT none|sq8|bin` (ADR-0049; HNSW only), in either order.
         let mut index = IndexKind::Flat;
         let mut quant = Quant::None;
         let mut i = 6;
@@ -977,7 +1004,7 @@ impl Store {
                 },
                 b"QUANT" => match Quant::parse(val) {
                     Some(q) => quant = q,
-                    None => return Plan::Reply(err("ERR QUANT must be none or sq8")),
+                    None => return Plan::Reply(err("ERR QUANT must be none, sq8 or bin")),
                 },
                 _ => {
                     return Plan::Reply(err("ERR unknown VEC.CREATE option (want INDEX or QUANT)"));
@@ -1225,7 +1252,7 @@ impl Store {
                 .and_then(|s| s.parse::<usize>().ok())
         };
         let ef = opt(b"EF").unwrap_or(hnsw::EF_SEARCH_DEFAULT);
-        let rerank = opt(b"RERANK").unwrap_or(k.saturating_mul(RERANK_DEFAULT_MULTIPLE));
+        let rerank = opt(b"RERANK").unwrap_or(k.saturating_mul(vs.quant().rerank_multiple()));
         // Expired-but-unswept ids still sit in the index and can outrank live
         // ones, so over-fetch by the expired count and drop them post-hoc: with
         // at most `expired` stale hits, k+expired candidates always yield k live
@@ -1443,8 +1470,9 @@ mod tests {
     }
 
     /// ADR-0049 at the command surface: QUANT is HNSW-only, rides the config's
-    /// fourth field, reads back, shows last in INFO, and a quantized set
-    /// answers SEARCH (with RERANK in either order beside EF) like a plain one.
+    /// fourth field, reads back, shows last in INFO, and a quantized set of
+    /// each code answers SEARCH (with RERANK in either order beside EF) like a
+    /// plain one.
     #[test]
     fn a_quantized_set_round_trips_through_the_commands() {
         let mut st = Store::new();
@@ -1467,71 +1495,92 @@ mod tests {
             Value::Error("ERR QUANT needs INDEX hnsw".into()),
             "a quantized flat would be neither exact nor the oracle"
         );
-        let create = cmd(&[
-            "VEC.CREATE",
-            "q",
-            "DIM",
-            "2",
-            "METRIC",
-            "l2",
-            "QUANT",
-            "sq8",
-            "INDEX",
-            "hnsw",
-        ]);
-        match plan0(&st, ns, &create) {
-            Plan::Write { persist, .. } => {
-                let Some(Persist::Put { val, .. }) = persist.into_iter().nth(1) else {
-                    panic!("the config row is CREATE's second step")
-                };
-                assert_eq!(val, b"2|l2|hnsw|sq8".to_vec());
+        for (code, quant) in [("sq8", Quant::Sq8), ("bin", Quant::Bin)] {
+            let create = cmd(&[
+                "VEC.CREATE",
+                code,
+                "DIM",
+                "2",
+                "METRIC",
+                "l2",
+                "QUANT",
+                code,
+                "INDEX",
+                "hnsw",
+            ]);
+            match plan0(&st, ns, &create) {
+                Plan::Write { persist, .. } => {
+                    let Some(Persist::Put { val, .. }) = persist.into_iter().nth(1) else {
+                        panic!("the config row is CREATE's second step")
+                    };
+                    assert_eq!(val, format!("2|l2|hnsw|{code}").into_bytes());
+                    assert_eq!(
+                        decode_config(&val),
+                        Some((2, Metric::L2, IndexKind::Hnsw, quant))
+                    );
+                }
+                _ => panic!("create should plan a write"),
+            }
+            assert_eq!(run(&mut st, ns, &create), Value::Simple("OK".into()));
+            for (id, x) in [("a", "0,0"), ("b", "5,5"), ("c", "9,9")] {
                 assert_eq!(
-                    decode_config(&val),
-                    Some((2, Metric::L2, IndexKind::Hnsw, Quant::Sq8))
+                    run(&mut st, ns, &cmd(&["VEC.SET", code, id, x])),
+                    Value::Simple("OK".into())
                 );
             }
-            _ => panic!("create should plan a write"),
-        }
-        assert_eq!(run(&mut st, ns, &create), Value::Simple("OK".into()));
-        for (id, x) in [("a", "0,0"), ("b", "5,5"), ("c", "9,9")] {
-            assert_eq!(
-                run(&mut st, ns, &cmd(&["VEC.SET", "q", id, x])),
-                Value::Simple("OK".into())
-            );
-        }
-        for opts in [
-            vec!["RERANK", "3", "EF", "16"],
-            vec!["EF", "16", "RERANK", "3"],
-            vec![],
-        ] {
-            let mut c = vec!["VEC.SEARCH", "q", "1,1", "1"];
-            c.extend(opts.iter());
-            let Value::Array(Some(rows)) = run(&mut st, ns, &cmd(&c)) else {
-                panic!("search reply")
+            for opts in [
+                vec!["RERANK", "3", "EF", "16"],
+                vec!["EF", "16", "RERANK", "3"],
+                vec![],
+            ] {
+                let mut c = vec!["VEC.SEARCH", code, "1,1", "1"];
+                c.extend(opts.iter());
+                let Value::Array(Some(rows)) = run(&mut st, ns, &cmd(&c)) else {
+                    panic!("search reply")
+                };
+                assert_eq!(
+                    rows,
+                    vec![Value::Array(Some(vec![
+                        Value::Bulk(Some(v("a"))),
+                        Value::Double(-2.0),
+                    ]))],
+                    "{code}: nearest is a at -||(1,1)||^2, scored on the full vector (opts {opts:?})"
+                );
+            }
+            let Value::Array(Some(info)) = run(&mut st, ns, &cmd(&["VEC.INFO", code])) else {
+                panic!("info reply")
             };
+            assert_eq!(info[14], Value::Bulk(Some(v("quant"))));
+            assert_eq!(info[15], Value::Bulk(Some(v(code))));
             assert_eq!(
-                rows,
-                vec![Value::Array(Some(vec![
-                    Value::Bulk(Some(v("a"))),
-                    Value::Double(-2.0),
-                ]))],
-                "nearest is a at -||(1,1)||^2, scored on the full vector (opts {opts:?})"
+                info[16],
+                Value::Bulk(Some(v("vectors_on"))),
+                "step 2's fields come after it"
+            );
+            assert_eq!(
+                info[10],
+                Value::Bulk(Some(v("ns_mem_bytes"))),
+                "earlier fields keep their places"
             );
         }
-        let Value::Array(Some(info)) = run(&mut st, ns, &cmd(&["VEC.INFO", "q"])) else {
-            panic!("info reply")
-        };
-        assert_eq!(info[14], Value::Bulk(Some(v("quant"))));
-        assert_eq!(info[15], Value::Bulk(Some(v("sq8"))));
         assert_eq!(
-            info[16],
-            Value::Bulk(Some(v("vectors_on"))),
-            "step 2's fields come after it"
-        );
-        assert_eq!(
-            info[10],
-            Value::Bulk(Some(v("ns_mem_bytes"))),
-            "earlier fields keep their places"
+            run(
+                &mut st,
+                ns,
+                &cmd(&[
+                    "VEC.CREATE",
+                    "x",
+                    "DIM",
+                    "2",
+                    "METRIC",
+                    "l2",
+                    "INDEX",
+                    "hnsw",
+                    "QUANT",
+                    "pq8"
+                ])
+            ),
+            Value::Error("ERR QUANT must be none, sq8 or bin".into())
         );
     }
 
@@ -1672,10 +1721,16 @@ mod tests {
             Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None))
         );
         assert_eq!(
-            decode_config(b"8|cosine|hnsw|pq|96"),
+            decode_config(b"8|cosine|hnsw|later|96"),
             Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None)),
             "a later binary's code loads unquantized, its further fields read past"
         );
+        for q in [Quant::Sq8, Quant::Bin] {
+            assert_eq!(
+                decode_config(&encode_config(8, Metric::Cosine, IndexKind::Hnsw, q)),
+                Some((8, Metric::Cosine, IndexKind::Hnsw, q))
+            );
+        }
         assert_eq!(decode_config(b"8|cosine|bogus|sq8"), None);
     }
 

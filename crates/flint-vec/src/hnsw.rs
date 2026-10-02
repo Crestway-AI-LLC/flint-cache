@@ -18,11 +18,14 @@
 //! links, which every node has, are a fixed stride of one array; the few nodes
 //! on higher layers keep those in a map.
 
+use crate::kernel::{self, Sq8};
+use crate::quant::{self, BinQuery};
 use crate::vecfile::VecFile;
 use crate::{Metric, Quant};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 
 const M: usize = 16; // neighbours per node on upper layers
 const M0: usize = 32; // neighbours at layer 0 (2*M — denser base layer)
@@ -38,6 +41,28 @@ pub const EF_SEARCH_DEFAULT: usize = 64;
 /// build's, 64 lost up to 0.014 of it on clustered data, and no bound let the
 /// selection walk ~1,000 candidates for each neighbour.
 const REPAIR_POOL: usize = 4 * M0;
+
+/// Hashes a slot number for the sets a walk keeps: one multiply. The default
+/// SipHash is built to withstand keys an adversary picks, which slot numbers,
+/// handed out by this index, are not.
+#[derive(Default)]
+struct SlotHasher(u64);
+
+impl Hasher for SlotHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type SlotSet = HashSet<u32, BuildHasherDefault<SlotHasher>>;
 
 /// Who is walking the graph, which decides what a deleted node is to the walk.
 #[derive(Clone, Copy, PartialEq)]
@@ -84,7 +109,7 @@ fn put_slot<T: Copy>(v: &mut Vec<T>, slot: u32, vals: &[T]) {
 
 /// Set slot `slot` of an array of boxes, appending when it is the next one.
 /// What holds a slot's vector or code: one allocation of exactly its size.
-fn put_box<T>(v: &mut Vec<Box<[T]>>, slot: u32, b: Box<[T]>) {
+fn put_box<B>(v: &mut Vec<B>, slot: u32, b: B) {
     if slot as usize == v.len() {
         grow(v, 1);
         v.push(b);
@@ -106,6 +131,27 @@ enum Codes {
         bytes: Vec<Box<[u8]>>,
         scale: Vec<[f32; 2]>,
     },
+    /// One bit a dimension after a fixed rotation, and the factor the
+    /// estimate divides by (`quant.rs`), each a fixed width a slot in one
+    /// array: a box a slot would cost more than a 192-byte code's spare room.
+    Bin {
+        bits: Vec<u8>,
+        factor: Vec<f32>,
+        dim: usize,
+    },
+}
+
+/// A query, or a node being inserted, prepared once for the many distances a
+/// walk takes to codes: a 1-bit code's rotation and table.
+struct Query<'a> {
+    v: &'a [f32],
+    norm: f32,
+    prep: Prep,
+}
+
+enum Prep {
+    Plain,
+    Bin(BinQuery),
 }
 
 impl Codes {
@@ -116,12 +162,24 @@ impl Codes {
                 bytes: Vec::new(),
                 scale: Vec::new(),
             },
+            Quant::Bin => Codes::Bin {
+                bits: Vec::new(),
+                factor: Vec::new(),
+                dim: 0,
+            },
         }
     }
 
-    fn put(&mut self, slot: u32, v: &[f32]) {
+    fn put(&mut self, slot: u32, v: &[f32], norm: f32) {
         match self {
             Codes::F32(f) => put_box(f, slot, v.into()),
+            Codes::Bin { bits, factor, dim } => {
+                *dim = v.len();
+                let mut code = vec![0u8; quant::bin_bytes(v.len())];
+                let f = quant::bin_encode(v, norm, &mut code);
+                put_slot(bits, slot, &code);
+                put_slot(factor, slot, &[f]);
+            }
             Codes::Sq8 { bytes, scale } => {
                 let (lo, hi) = v
                     .iter()
@@ -153,35 +211,76 @@ impl Codes {
     fn f32(&self, slot: u32) -> Option<&[f32]> {
         match self {
             Codes::F32(f) => Some(&f[slot as usize]),
-            Codes::Sq8 { .. } => None,
+            Codes::Sq8 { .. } | Codes::Bin { .. } => None,
         }
     }
 
-    /// Slot `slot`'s values, decoded on the fly: no allocation per distance.
-    fn vals(&self, slot: u32) -> Vals<'_> {
+    /// `v`, of norm `norm`, prepared for distances to these codes.
+    fn query<'a>(&self, v: &'a [f32], norm: f32) -> Query<'a> {
+        let prep = match self {
+            Codes::Bin { .. } => Prep::Bin(BinQuery::new(v)),
+            _ => Prep::Plain,
+        };
+        Query { v, norm, prep }
+    }
+
+    /// The distance between slots `a` and `b` (norms `an`, `bn`).
+    fn between(&self, metric: Metric, a: u32, an: f32, b: u32, bn: f32) -> f32 {
         match self {
-            Codes::F32(f) => Vals::F(f[slot as usize].iter()),
+            Codes::F32(f) => dist(metric, &f[a as usize], an, &f[b as usize], bn),
             Codes::Sq8 { bytes, scale } => {
-                let [lo, step] = scale[slot as usize];
-                Vals::Q(bytes[slot as usize].iter(), lo, step)
+                let (x, y) = (sq8_at(bytes, scale, a), sq8_at(bytes, scale, b));
+                dist_from(
+                    metric,
+                    || kernel::sq8_l2sq_sq8(x, y),
+                    || kernel::sq8_dot_sq8(x, y),
+                    an,
+                    bn,
+                )
+            }
+            Codes::Bin { bits, dim, .. } => {
+                let w = quant::bin_bytes(*dim);
+                let dot = quant::bin_dot(at(bits, w, a), at(bits, w, b), *dim, an, bn);
+                dist_from(metric, || an * an + bn * bn - 2.0 * dot, || dot, an, bn)
             }
         }
     }
-}
 
-enum Vals<'a> {
-    F(std::slice::Iter<'a, f32>),
-    Q(std::slice::Iter<'a, u8>, f32, f32),
-}
-
-impl Iterator for Vals<'_> {
-    type Item = f32;
-    fn next(&mut self) -> Option<f32> {
-        match self {
-            Vals::F(i) => i.next().copied(),
-            Vals::Q(i, lo, step) => i.next().map(|&b| *lo + *step * b as f32),
+    /// The distance between slot `a` (norm `an`) and a prepared query.
+    fn to(&self, metric: Metric, a: u32, an: f32, q: &Query<'_>) -> f32 {
+        let qn = q.norm;
+        match (self, &q.prep) {
+            (Codes::F32(f), _) => dist(metric, &f[a as usize], an, q.v, qn),
+            (Codes::Sq8 { bytes, scale }, _) => {
+                let c = sq8_at(bytes, scale, a);
+                dist_from(
+                    metric,
+                    || kernel::sq8_l2sq(c, q.v),
+                    || kernel::sq8_dot(c, q.v),
+                    an,
+                    qn,
+                )
+            }
+            (Codes::Bin { bits, factor, dim }, Prep::Bin(bq)) => {
+                let code = at(bits, quant::bin_bytes(*dim), a);
+                let dot = bq.dot(code, an, factor[a as usize]);
+                dist_from(metric, || an * an + qn * qn - 2.0 * dot, || dot, an, qn)
+            }
+            // A 1-bit code with a query not prepared for it (none is):
+            // prepare it.
+            _ => self.to(metric, a, an, &self.query(q.v, qn)),
         }
     }
+}
+
+/// Slot `slot`'s entry in an array `width` wide a slot.
+fn at(v: &[u8], width: usize, slot: u32) -> &[u8] {
+    &v[slot as usize * width..(slot as usize + 1) * width]
+}
+
+fn sq8_at<'a>(bytes: &'a [Box<[u8]>], scale: &[[f32; 2]], slot: u32) -> Sq8<'a> {
+    let [lo, step] = scale[slot as usize];
+    (&bytes[slot as usize], lo, step)
 }
 
 pub struct Hnsw {
@@ -256,44 +355,32 @@ impl Ord for DI {
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
 fn l2norm(v: &[f32]) -> f32 {
-    dot(v, v).sqrt()
+    kernel::dot(v, v).sqrt()
 }
 
-/// Distance where SMALLER is nearer.
+/// Distance where SMALLER is nearer, from whichever of a squared L2 and a dot
+/// product the metric needs; each is computed only when asked for.
+fn dist_from(
+    metric: Metric,
+    l2sq: impl FnOnce() -> f32,
+    dot: impl FnOnce() -> f32,
+    an: f32,
+    bn: f32,
+) -> f32 {
+    match metric {
+        Metric::L2 => l2sq(),
+        Metric::Ip => -dot(),
+        Metric::Cosine => {
+            let den = an * bn;
+            if den == 0.0 { 1.0 } else { 1.0 - dot() / den }
+        }
+    }
+}
+
+/// [`dist_from`] over two full vectors.
 fn dist(metric: Metric, a: &[f32], an: f32, b: &[f32], bn: f32) -> f32 {
-    match metric {
-        Metric::L2 => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
-        Metric::Ip => -dot(a, b),
-        Metric::Cosine => {
-            let den = an * bn;
-            if den == 0.0 {
-                1.0
-            } else {
-                1.0 - dot(a, b) / den
-            }
-        }
-    }
-}
-
-/// [`dist`] over decoded values, for when either side is a code. The all-float
-/// case keeps [`dist`] itself, so an unquantized set pays nothing for this.
-fn dist_vals(metric: Metric, a: Vals<'_>, an: f32, b: Vals<'_>, bn: f32) -> f32 {
-    match metric {
-        Metric::L2 => a.zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
-        Metric::Ip => -a.zip(b).map(|(x, y)| x * y).sum::<f32>(),
-        Metric::Cosine => {
-            let den = an * bn;
-            if den == 0.0 {
-                1.0
-            } else {
-                1.0 - a.zip(b).map(|(x, y)| x * y).sum::<f32>() / den
-            }
-        }
-    }
+    dist_from(metric, || kernel::l2sq(a, b), || kernel::dot(a, b), an, bn)
 }
 
 /// Convert an internal distance back to flat's score (HIGHER is nearer), so a
@@ -533,22 +620,15 @@ impl Hnsw {
         if level > 0 {
             self.upper.insert(slot, vec![Vec::new(); level]);
         }
-        self.codes.put(slot, v);
+        self.codes.put(slot, v, norm);
     }
 
     fn dnn(&self, a: u32, b: u32) -> f32 {
         let (an, bn) = (self.norms[a as usize], self.norms[b as usize]);
-        match (self.codes.f32(a), self.codes.f32(b)) {
-            (Some(x), Some(y)) => dist(self.metric, x, an, y, bn),
-            _ => dist_vals(self.metric, self.codes.vals(a), an, self.codes.vals(b), bn),
-        }
+        self.codes.between(self.metric, a, an, b, bn)
     }
-    fn dnq(&self, a: u32, q: &[f32], qn: f32) -> f32 {
-        let an = self.norms[a as usize];
-        match self.codes.f32(a) {
-            Some(x) => dist(self.metric, x, an, q, qn),
-            None => dist_vals(self.metric, self.codes.vals(a), an, Vals::F(q.iter()), qn),
-        }
+    fn dnq(&self, a: u32, q: &Query<'_>) -> f32 {
+        self.codes.to(self.metric, a, self.norms[a as usize], q)
     }
 
     /// Insert (or upsert) a vector. An upsert deletes the old node and inserts
@@ -594,11 +674,12 @@ impl Hnsw {
             self.max_level = level;
             return;
         };
+        let q = self.codes.query(&q, norm);
 
         // Descend the layers ABOVE the new node's top with a greedy ef=1 walk.
         let mut lc = self.max_level;
         while lc > level {
-            ep = self.greedy(&q, norm, ep, lc, Walk::Insert(idx));
+            ep = self.greedy(&q, ep, lc, Walk::Insert(idx));
             lc -= 1;
         }
         // Then connect on each layer from the node's top down to 0, deleted
@@ -606,17 +687,12 @@ impl Hnsw {
         let mut ep_set = vec![ep];
         let top = level.min(self.max_level);
         for lc in (0..=top).rev() {
-            let w = self.search_layer(&q, norm, &ep_set, EF_CONSTRUCTION, lc, Walk::Insert(idx));
+            let w = self.search_layer(&q, &ep_set, EF_CONSTRUCTION, lc, Walk::Insert(idx));
             let mmax = if lc == 0 { M0 } else { M };
-            // Candidates ranked by distance to the NEW node (idx).
-            let cand: Vec<DI> = w
-                .iter()
-                .map(|di| DI {
-                    dist: self.dnn(idx, di.idx),
-                    idx: di.idx,
-                })
-                .collect();
-            let selected = self.select_heuristic(&cand, mmax);
+            // The walk ranked the candidates by distance to the NEW node, from
+            // its full vector: with codes, a better estimate than one between
+            // its code and theirs.
+            let selected = self.select_heuristic(&w, mmax);
             self.set_links(idx, lc, &selected);
             for &n in &selected {
                 let mut theirs = self.links(n, lc).to_vec();
@@ -682,7 +758,8 @@ impl Hnsw {
         self.upper.remove(&i);
         for (layer, around) in old.iter().enumerate() {
             let mmax = if layer == 0 { M0 } else { M };
-            let mut seen: HashSet<u32> = HashSet::from([i]);
+            let mut seen = SlotSet::default();
+            seen.insert(i);
             let mut pool: Vec<u32> = Vec::new();
             for &x in around {
                 if seen.insert(x) {
@@ -741,16 +818,16 @@ impl Hnsw {
 
     /// Greedy ef=1 descent at one layer: hop to the nearest neighbour until no
     /// neighbour is closer to the query.
-    fn greedy(&self, q: &[f32], qn: f32, ep: u32, layer: usize, walk: Walk) -> u32 {
+    fn greedy(&self, q: &Query<'_>, ep: u32, layer: usize, walk: Walk) -> u32 {
         let mut cur = ep;
-        let mut cur_d = self.dnq(cur, q, qn);
+        let mut cur_d = self.dnq(cur, q);
         loop {
             let mut changed = false;
             for &n in self.links(cur, layer) {
                 if !self.steps_onto(walk, n, layer) {
                     continue;
                 }
-                let d = self.dnq(n, q, qn);
+                let d = self.dnq(n, q);
                 if d < cur_d {
                     cur_d = d;
                     cur = n;
@@ -769,21 +846,20 @@ impl Hnsw {
     /// the walk is [`Walk`]'s to say.
     fn search_layer(
         &self,
-        q: &[f32],
-        qn: f32,
+        q: &Query<'_>,
         ep: &[u32],
         ef: usize,
         layer: usize,
         walk: Walk,
     ) -> Vec<DI> {
-        let mut visited: HashSet<u32> = HashSet::new();
+        let mut visited = SlotSet::default();
         let mut cands: BinaryHeap<std::cmp::Reverse<DI>> = BinaryHeap::new();
         let mut w: BinaryHeap<DI> = BinaryHeap::new(); // max-heap: worst on top
         for &e in ep {
             if !visited.insert(e) {
                 continue;
             }
-            let d = self.dnq(e, q, qn);
+            let d = self.dnq(e, q);
             cands.push(std::cmp::Reverse(DI { dist: d, idx: e }));
             if !(walk == Walk::Query && self.deleted[e as usize]) {
                 w.push(DI { dist: d, idx: e });
@@ -798,7 +874,7 @@ impl Hnsw {
                 if !self.steps_onto(walk, n, layer) || !visited.insert(n) {
                     continue;
                 }
-                let d = self.dnq(n, q, qn);
+                let d = self.dnq(n, q);
                 let worst = w.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
                 if d < worst || w.len() < ef {
                     cands.push(std::cmp::Reverse(DI { dist: d, idx: n }));
@@ -874,15 +950,16 @@ impl Hnsw {
             return Ok(Vec::new());
         };
         let qn = l2norm(q);
+        let query = self.codes.query(q, qn);
         for lc in (1..=self.max_level).rev() {
-            ep = self.greedy(q, qn, ep, lc, Walk::Query);
+            ep = self.greedy(&query, ep, lc, Walk::Query);
         }
         let depth = if self.quant == Quant::None {
             k
         } else {
             rerank.max(k)
         };
-        let mut w = self.search_layer(q, qn, &[ep], ef.max(depth), 0, Walk::Query);
+        let mut w = self.search_layer(&query, &[ep], ef.max(depth), 0, Walk::Query);
         w.sort();
         w.truncate(depth);
         if self.quant != Quant::None {
@@ -1003,7 +1080,12 @@ mod tests {
     }
 
     fn recall_on(metric: Metric, quant: Quant, rerank: usize) -> f64 {
-        let (n, dim, k, ef) = (2000usize, 32usize, 10usize, 64usize);
+        recall_at(metric, quant, 32, rerank)
+    }
+
+    /// As [`recall_on`], at `dim`.
+    fn recall_at(metric: Metric, quant: Quant, dim: usize, rerank: usize) -> f64 {
+        let (n, k, ef) = (2000usize, 10usize, 64usize);
         let mut rng = Rng(0xADC0_0049);
         let data = clustered(&mut rng, n, dim, 40);
         let mut h = Hnsw::new(metric, quant);
@@ -1157,7 +1239,13 @@ mod tests {
         }
         planted.push(x);
         h.set_links(p, 0, &planted);
-        let near_p: Vec<f32> = h.codes.vals(p).map(|v| v + 1e-3).collect();
+        let near_p: Vec<f32> = h
+            .codes
+            .f32(p)
+            .expect("an unquantized set")
+            .iter()
+            .map(|v| v + 1e-3)
+            .collect();
         h.set(b"new".to_vec(), near_p.clone(), None);
         assert_eq!(
             h.id_to_idx[b"new".as_slice()],
@@ -1268,6 +1356,22 @@ mod tests {
                 "{metric:?}: sq8+rerank recall {sq8} fell more than 0.02 below full {full}"
             );
             assert!(sq8 >= 0.85, "{metric:?}: sq8+rerank recall {sq8} < 0.85");
+        }
+    }
+
+    /// ADR-0049 item 2: the 1-bit code, re-ranked deeper than `sq8` needs,
+    /// finds what the full-vector graph finds, on every metric. At 256
+    /// dimensions a 1-bit code is 32 bytes.
+    #[test]
+    fn bin_with_rerank_keeps_the_full_vector_recall() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Ip] {
+            let full = recall_at(metric, Quant::None, 256, 10);
+            let got = recall_at(metric, Quant::Bin, 256, 100);
+            eprintln!("{metric:?} bin: {got:.3} against full {full:.3}");
+            assert!(
+                got >= full - 0.03,
+                "{metric:?}: bin+rerank recall {got} fell more than 0.03 below full {full}"
+            );
         }
     }
 
