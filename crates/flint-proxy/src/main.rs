@@ -1389,6 +1389,35 @@ struct Backends {
     whole: bool,
 }
 
+/// A CLIENT'S PRIVATE CONNECTIONS END WITH THE CLIENT (BUG-0199).
+///
+/// `private` holds connections no registry knows about -- a transaction's,
+/// and the O(keys) admin class's (`DBSIZE`, `FLUSHALL`, `SCAN`'s per-master
+/// step). `AsyncConn` is explicit that a connection must be `shutdown()`,
+/// never merely dropped: its reader task owns the read half and stays parked
+/// on the socket forever, so a dropped handle leaves the socket open on the
+/// node and `LIVE_CONNS` (exported as `pool_lanes`) counted. Every other
+/// path that discards a private connection already calls `shutdown()`
+/// (`drop_conn`, a failed `private_call`); the end of the session did not,
+/// because it was the only one with no line of code -- the struct just went
+/// out of scope.
+///
+/// Measured on the playground: `flintctl verify` (verify-watch, every five
+/// minutes) runs `DBSIZE` and `SCAN` through the proxy and disconnects, and
+/// each run left two sockets ESTABLISHED on the master. `pool_lanes` climbed
+/// 414 -> 3484 between two restarts. At the node's `--max-conns` (2048) the
+/// master accepts and drops every NEW connection while the pooled ones keep
+/// serving, so the controller's probe reads "Connection reset by peer" and
+/// promotes the replica of a master that is serving. That is the 2026-09-27
+/// failover.
+impl Drop for Backends {
+    fn drop(&mut self) {
+        for (_, c) in self.private.drain() {
+            c.shutdown();
+        }
+    }
+}
+
 impl Backends {
     fn new(
         ns: Vec<u8>,
@@ -6395,6 +6424,107 @@ mod route_tests {
             }
             other => panic!("expected the retried :1, got {other:?}"),
         }
+    }
+
+    /// BUG-0199: a client's private connection is CLOSED when the client's
+    /// session ends -- seen from the node's side, which is where the leak did
+    /// its damage. The fake backend counts connections still open; a session
+    /// runs `DBSIZE` (the admin class, so a private connection) and ends.
+    ///
+    /// Without the `Drop`, the backend saw the connection stay open for as
+    /// long as the process lived: the reader task kept the read half, so the
+    /// socket outlived every handle to it.
+    #[test]
+    fn a_sessions_private_connection_closes_when_the_session_ends() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lp = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = lp.local_addr().expect("local addr").to_string();
+        let open = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+        {
+            let (open, seen) = (Arc::clone(&open), Arc::clone(&seen));
+            std::thread::spawn(move || {
+                for c in lp.incoming() {
+                    let Ok(mut c) = c else { return };
+                    open.fetch_add(1, Ordering::SeqCst);
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let open = Arc::clone(&open);
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match c.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    let req = String::from_utf8_lossy(&buf[..n]).to_uppercase();
+                                    let reply: &[u8] = if req.contains("HELLO") {
+                                        b"%0\r\n"
+                                    } else if req.contains("FLINTNS") {
+                                        b"+OK\r\n"
+                                    } else {
+                                        b":7\r\n"
+                                    };
+                                    if c.write_all(reply).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        open.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        let (reply, during) = rt.block_on(local.run_until(async {
+            let mut backends = Backends::new(b"t".to_vec(), None, false, FANOUT_TIMEOUT_DEFAULT);
+            let mut raw = Vec::new();
+            encode(
+                &Value::Array(Some(vec![Value::Bulk(Some(b"DBSIZE".to_vec()))])),
+                &mut raw,
+            );
+            let reply = backends.call_slow(&addr, &raw).await;
+            let during = open.load(Ordering::SeqCst);
+            drop(backends);
+            // Let the aborted reader and the dropped halves actually go.
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if open.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+            }
+            (reply, during)
+        }));
+        // The thread that counts EOF can lag the runtime by a scheduling slice.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while open.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            matches!(reply, Ok(Value::Integer(7))),
+            "the DBSIZE itself: {reply:?}"
+        );
+        // CAPABILITY: the call really held a private connection open, or the
+        // assertion below is about nothing.
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "exactly one private dial");
+        assert_eq!(
+            during, 1,
+            "the private connection was open while the session lived"
+        );
+        assert_eq!(
+            open.load(Ordering::SeqCst),
+            0,
+            "the session ended and its private connection stayed open on the node \
+             -- every verify run left two of these on the playground's master"
+        );
     }
 
     /// BUG-0041's investigation ruled this OUT as that bug's cause and found
