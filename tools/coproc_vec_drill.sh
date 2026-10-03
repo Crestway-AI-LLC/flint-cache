@@ -23,6 +23,8 @@
 #     is at the D4 cap
 #   - BUG-0203: the co-processor listens where --bind says, loopback by
 #     default, not on every interface
+#   - ADR-0050 D5: rows a co-processor writes packed (--write-packed-rows)
+#     rebuild in one that writes text, to the same results, META and TTL
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
@@ -57,6 +59,7 @@ fi
 wait "$SECOND" && { echo "FAIL: a second flint-vec on a locked --vec-dir exited 0"; exit 1; }
 grep -q "held by another flint-vec" "$D/vec-second.log" \
   || { echo "FAIL: the second flint-vec did not say why it refused:"; sed 's/^/    /' "$D/vec-second.log"; exit 1; }
+
 echo "== BUG-0203: the co-processor listens only where it is told"
 # reach <port>: connect to <port> on this host's own non-loopback address.
 # "open", "refused", or "noaddr" when the host has no such address to try.
@@ -402,6 +405,91 @@ for qs in "sessq sq8" "sessb bin"; do
 done
 echo "  after expiry: 'gone' masked/swept, VEC.TTL -2; 'keep' still served"
 
+echo "== ADR-0050 D5: rows one co-processor writes packed, the next reads"
+# rows <set> [<id> <hex>]: how many of the set's durable vector rows are packed
+# and how many text, read through the proxy as the tenant; with an id, first
+# overwrite that id's row with the bytes <hex>. valkey-cli cannot pass a key
+# with a NUL in it, and every durable key has one.
+rows() {
+  python3 - "$@" <<'PY'
+import socket, sys
+want = b"\x00vec\x00v\x00" + sys.argv[1].encode() + b"\x00"
+s = socket.create_connection(("127.0.0.1", 6677), timeout=5)
+f = s.makefile("rb")
+def call(*parts):
+    s.sendall(b"*%d\r\n" % len(parts) + b"".join(b"$%d\r\n%s\r\n" % (len(p), p) for p in parts))
+    return read()
+def read():
+    line = f.readline()
+    t, body = line[:1], line[1:-2]
+    if t == b"$":
+        n = int(body)
+        return None if n < 0 else f.read(n + 2)[:-2]
+    if t == b"*":
+        return [read() for _ in range(int(body))]
+    if t == b"-":
+        raise SystemExit("ERROR " + body.decode())
+    return body
+call(b"AUTH", b"tok")
+cursor, keys = b"0", []
+while True:
+    cursor, batch = call(b"SCAN", cursor, b"COUNT", b"1000")
+    keys += [k for k in batch if want in k]
+    if cursor == b"0":
+        break
+if len(sys.argv) > 3:
+    key = want + sys.argv[2].encode()
+    assert key in keys, "no row for id " + sys.argv[2]
+    call(b"SET", key, bytes.fromhex(sys.argv[3]))
+vals = [call(b"GET", k) for k in keys]
+print("packed=%d text=%d" % (sum(v[:1] == b"\xf1" for v in vals), sum(v[:1] != b"\xf1" for v in vals)))
+PY
+}
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+sleep 0.3
+$VEC --port 6678 --vec-dir "$VD" --write-packed-rows 2>"$D/vec5.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+grep -q "packed rows" "$D/vec5.log" || { echo "FAIL: --write-packed-rows is not in the startup line:"; sed 's/^/    /' "$D/vec5.log"; exit 1; }
+[ "$(vexec VEC.CREATE pk DIM 3 METRIC l2 INDEX hnsw QUANT bin)" = "OK " ] || { echo "FAIL: VEC.CREATE pk"; exit 1; }
+for kv in "a 0.123,0.456,0.789" "b 0.9,0.1,0.2" "c 0.5,0.5,0.5"; do
+  set -- $kv
+  [ "$(vexec VEC.SET pk "$1" "$2")" = "OK " ] || { echo "FAIL: VEC.SET pk $1"; exit 1; }
+done
+# Metadata and an expiry, so both of the packed row's optional parts are read back.
+[ "$(vexec VEC.SET pk m 0.2,0.2,0.9 META hello PX 600000)" = "OK " ] || { echo "FAIL: VEC.SET pk m"; exit 1; }
+R="$(vexec VEC.SEARCH pk 0.85,0.1,0.2 2)"
+[ "$R" = "$PREQ" ] || { echo "FAIL: the packed set ranks unlike the text one. packed=[$R] text=[$PREQ]"; exit 1; }
+[ "$(rows pk)" = "packed=4 text=0" ] || { echo "FAIL: with --write-packed-rows the rows are $(rows pk)"; exit 1; }
+# Restart WITHOUT the flag: this is the binary that only reads packed rows.
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+sleep 0.3
+$VEC --port 6678 --vec-dir "$VD" 2>"$D/vec6.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+R="$(vexec VEC.SEARCH pk 0.85,0.1,0.2 2)"
+[ "$R" = "$PREQ" ] || { echo "FAIL: packed rows rebuilt to different results. post=[$R] text=[$PREQ]"; exit 1; }
+grep -qi "rebuilt ns" "$D/vec6.log" || { echo "FAIL: no rebuild logged"; exit 1; }
+case "$(vexec VEC.GET pk a)" in *"0.123,0.456,0.789"*) : ;; *) echo "FAIL: GET from a packed row is not the exact vector: $(vexec VEC.GET pk a)"; exit 1 ;; esac
+case "$(vexec VEC.GET pk m)" in *"0.2,0.2,0.9 hello"*) : ;; *) echo "FAIL: a packed row's META did not survive: $(vexec VEC.GET pk m)"; exit 1 ;; esac
+TT="$(vexec VEC.TTL pk m)"; case "$TT" in -*|"") echo "FAIL: a packed row's expiry did not survive: VEC.TTL $TT"; exit 1 ;; esac
+case "$(vexec VEC.INFO pk)" in *"count 4 expiring 1 "*) : ;; *) echo "FAIL: VEC.INFO pk after the rebuild: $(vexec VEC.INFO pk)"; exit 1 ;; esac
+# This binary writes text, beside the packed rows, in the same set.
+[ "$(vexec VEC.SET pk d 0.1,0.1,0.1)" = "OK " ] || { echo "FAIL: VEC.SET pk d"; exit 1; }
+[ "$(rows pk)" = "packed=4 text=1" ] || { echo "FAIL: without the flag a new row should be text: $(rows pk)"; exit 1; }
+echo "  4 packed rows rebuilt by a text-writing binary: same results, exact GET, META and TTL kept"
+# A row in a format this binary predates (a packed row with a flag it does not
+# know) is left out and SAID to be, not read from the wrong bytes.
+[ "$(rows pk d f18003000000cdcccc3dcdcccc3dcdcccc3d)" = "packed=5 text=0" ] || { echo "FAIL: could not plant the later-format row"; exit 1; }
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+sleep 0.3
+$VEC --port 6678 --vec-dir "$VD" 2>"$D/vec7.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+R="$(vexec VEC.SEARCH pk 0.85,0.1,0.2 2)"
+[ "$R" = "$PREQ" ] || { echo "FAIL: one unreadable row changed the set's other results: [$R]"; exit 1; }
+case "$(vexec VEC.INFO pk)" in *"count 4 "*) : ;; *) echo "FAIL: the unreadable row was indexed: $(vexec VEC.INFO pk)"; exit 1 ;; esac
+grep -q 'left out 1 vector row(s) it cannot read; first: set "pk" id "d": packed vector row has unknown flags 0x80' "$D/vec7.log" \
+  || { echo "FAIL: the rebuild did not say it left a row out:"; sed 's/^/    /' "$D/vec7.log"; exit 1; }
+echo "  a later-format row: left out of the index, and the rebuild says so"
+
 echo "== BUG-0200: more writes on ONE client connection than the proxy has workers"
 # Every write above opens a connection of its own. A family command used to
 # block its proxy worker until the co-processor replied, and the
@@ -428,5 +516,5 @@ echo "      per-vector TTL (D7) expires+sweeps while permanent ids stay — with
 echo "      EXPIRE/PERSIST introspection and the INFO expiring count over the wire, and a"
 echo "      client connection takes more writes than the proxy has workers (BUG-0200). Searches"
 echo "      open no channel, TTL holds on quantized sets, and a full tenant leaves another's"
-echo "      bin set serving (ADR-0049 verifications 4-6), and the co-processor"
-echo "      listens where it is told (BUG-0203)."
+echo "      bin set serving (ADR-0049 verifications 4-6). Packed rows written by one"
+echo "      co-processor rebuild in the next (ADR-0050 D5)."

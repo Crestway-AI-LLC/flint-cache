@@ -604,6 +604,84 @@ fn encode_vec_row(vec: &[f32], meta: Option<&[u8]>, expires_at: Option<u64>) -> 
     v
 }
 
+/// The first byte of a packed vector row (ADR-0050 D5). A text row is ASCII
+/// throughout, so none starts with it, and every row says which it is.
+const PACKED_ROW: u8 = 0xF1;
+/// A packed row's flags: an expiry follows the flags byte, and metadata ends
+/// the row. Any other bit is a later format, refused rather than misread.
+const PACKED_EXPIRES: u8 = 1;
+const PACKED_META: u8 = 2;
+
+/// Serialise a vector row packed (ADR-0050 D5): [`PACKED_ROW`], a flags byte,
+/// the expiry as a little-endian u64 when flagged, the dimension count as a
+/// little-endian u32, the floats as little-endian f32, then the metadata when
+/// flagged. A 1536-d row is 6,150 bytes, where text takes about 19,000.
+fn encode_packed_row(vec: &[f32], meta: Option<&[u8]>, expires_at: Option<u64>) -> Vec<u8> {
+    let mut flags = 0;
+    if expires_at.is_some() {
+        flags |= PACKED_EXPIRES;
+    }
+    if meta.is_some() {
+        flags |= PACKED_META;
+    }
+    let mut v = Vec::with_capacity(14 + vec.len() * 4 + meta.map_or(0, <[u8]>::len));
+    v.push(PACKED_ROW);
+    v.push(flags);
+    if let Some(ms) = expires_at {
+        v.extend_from_slice(&ms.to_le_bytes());
+    }
+    v.extend_from_slice(&(vec.len() as u32).to_le_bytes());
+    for f in vec {
+        v.extend_from_slice(&f.to_le_bytes());
+    }
+    if let Some(m) = meta {
+        v.extend_from_slice(m);
+    }
+    v
+}
+
+/// Inverse of [`encode_packed_row`]. Every length is checked: a row that is
+/// short, long or flagged with a bit this binary does not know is an error,
+/// never a vector read from the wrong bytes.
+fn decode_packed_row(val: &[u8]) -> Result<DecodedVecRow, String> {
+    let flags = *val.get(1).ok_or("truncated packed vector row")?;
+    if flags & !(PACKED_EXPIRES | PACKED_META) != 0 {
+        return Err(format!("packed vector row has unknown flags {flags:#04x}"));
+    }
+    let mut rest = &val[2..];
+    let expires_at = if flags & PACKED_EXPIRES != 0 {
+        let (ms, r) = rest
+            .split_first_chunk::<8>()
+            .ok_or("truncated packed vector expiry")?;
+        rest = r;
+        Some(u64::from_le_bytes(*ms))
+    } else {
+        None
+    };
+    let (n, rest) = rest
+        .split_first_chunk::<4>()
+        .ok_or("truncated packed vector length")?;
+    let n = u32::from_le_bytes(*n) as usize;
+    if n == 0 {
+        return Err("empty vector".into());
+    }
+    let len = n
+        .checked_mul(4)
+        .filter(|&b| b <= rest.len())
+        .ok_or("truncated packed vector")?;
+    let (floats, tail) = rest.split_at(len);
+    let (words, _) = floats.as_chunks::<4>();
+    let vec = words.iter().map(|w| f32::from_le_bytes(*w)).collect();
+    let meta = if flags & PACKED_META != 0 {
+        Some(tail.to_vec())
+    } else if tail.is_empty() {
+        None
+    } else {
+        return Err("packed vector row has bytes after its vector".into());
+    };
+    Ok((vec, meta, expires_at))
+}
+
 fn floats_to_ascii(vec: &[f32]) -> String {
     vec.iter()
         .map(|f| f.to_string())
@@ -710,10 +788,16 @@ pub fn parse_durable_key(key: &[u8]) -> Option<(u8, Vec<u8>, Vec<u8>)> {
 /// expiry in ms since epoch)`. See [`decode_vec_row`].
 pub type DecodedVecRow = (Vec<f32>, Option<Vec<u8>>, Option<u64>);
 
-/// Inverse of `encode_vec_row`: `(vector, optional meta, optional expiry-ms)`
-/// from a durable vector value. A leading `@<ms>` + 0x1e is the optional expiry
-/// header; its absence is a no-TTL v0.1 row.
+/// Inverse of `encode_vec_row` and `encode_packed_row`: `(vector, optional
+/// meta, optional expiry-ms)` from a durable vector value. A row starting with
+/// the byte `0xF1` is packed (ADR-0050 D5); any other is text, where a leading
+/// `@<ms>` + 0x1e is the optional expiry header and its absence is a no-TTL
+/// v0.1 row. Both are read whichever this binary writes, so a binary one
+/// release older than the first to write packed rows still reads them.
 pub fn decode_vec_row(val: &[u8]) -> Result<DecodedVecRow, String> {
+    if val.first() == Some(&PACKED_ROW) {
+        return decode_packed_row(val);
+    }
     let (expires_at, rest) = if val.first() == Some(&b'@') {
         let i = val
             .iter()
@@ -804,6 +888,10 @@ pub struct Store {
     vec_dir: Option<PathBuf>,
     /// Vector files made, which names the next one.
     vec_files: u64,
+    /// Write durable vector rows packed rather than as text (ADR-0050 D5, the
+    /// binary's `--write-packed-rows`). Off by default until every binary a
+    /// fleet may roll back to reads packed rows.
+    packed_rows: bool,
 }
 
 impl Store {
@@ -817,6 +905,21 @@ impl Store {
     /// stored-but-unsearchable; the tenant frees space with `VEC.DEL`.
     pub fn set_index_cap(&mut self, bytes: usize) {
         self.index_cap = bytes;
+    }
+
+    /// Write durable vector rows packed (ADR-0050 D5). Rows already written
+    /// stay as they are until rewritten; both kinds are always read.
+    pub fn set_packed_rows(&mut self, on: bool) {
+        self.packed_rows = on;
+    }
+
+    /// The durable row for a vector, in the encoding this store writes.
+    fn vec_row(&self, vec: &[f32], meta: Option<&[u8]>, expires_at: Option<u64>) -> Vec<u8> {
+        if self.packed_rows {
+            encode_packed_row(vec, meta, expires_at)
+        } else {
+            encode_vec_row(vec, meta, expires_at)
+        }
     }
 
     /// Keep each quantized set's full vectors in a file in `dir` (ADR-0049
@@ -1141,7 +1244,7 @@ impl Store {
                 },
                 Persist::Put {
                     key: durable_key(b'v', set, id),
-                    val: encode_vec_row(&vec, meta.as_deref(), expires_at),
+                    val: self.vec_row(&vec, meta.as_deref(), expires_at),
                     ttl_ms,
                 },
             ],
@@ -1379,7 +1482,7 @@ impl Store {
             // unchanged — only the row's expiry header is being rewritten.
             persist: vec![Persist::Put {
                 key: durable_key(b'v', set, id),
-                val: encode_vec_row(&vec, meta.as_deref(), Some(expires_at)),
+                val: self.vec_row(&vec, meta.as_deref(), Some(expires_at)),
                 ttl_ms: Some(ttl_ms),
             }],
             apply: Apply::Insert {
@@ -1421,7 +1524,7 @@ impl Store {
             // unchanged — only the row's expiry header is being rewritten.
             persist: vec![Persist::Put {
                 key: durable_key(b'v', set, id),
-                val: encode_vec_row(&vec, meta.as_deref(), None),
+                val: self.vec_row(&vec, meta.as_deref(), None),
                 ttl_ms: None,
             }],
             apply: Apply::Insert {
@@ -2150,6 +2253,104 @@ mod tests {
         }
         // A foreign (non-prefixed) key is not one of ours — the scan skips it.
         assert_eq!(parse_durable_key(b"regular:key"), None);
+    }
+
+    /// ADR-0050 D5: a packed row decodes to exactly what was encoded, with or
+    /// without its expiry and metadata, at a third of text's size; and no
+    /// text row can be mistaken for one.
+    #[test]
+    fn packed_rows_round_trip_and_no_text_row_looks_packed() {
+        let vecs: [&[f32]; 3] = [
+            &[1.0, -2.5, 0.0],
+            &[0.1, -0.0, f32::MIN_POSITIVE, 1e-30, -3.4e38],
+            &[0.123, 0.456, 0.789],
+        ];
+        for vec in vecs {
+            for meta in [None, Some(&b"m\x00\x1f!"[..]), Some(&b""[..])] {
+                for exp in [None, Some(0), Some(1_790_000_000_000)] {
+                    let row = encode_packed_row(vec, meta, exp);
+                    assert_eq!(row[0], PACKED_ROW);
+                    let (got, m, e) = decode_vec_row(&row).expect("decode packed");
+                    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&got), bits(vec), "packed keeps every bit");
+                    assert_eq!(m.as_deref(), meta);
+                    assert_eq!(e, exp);
+                    let text = encode_vec_row(vec, meta, exp);
+                    assert!(text[0].is_ascii() && text[0] != PACKED_ROW, "{text:?}");
+                    assert_eq!(decode_vec_row(&text).expect("decode text").0, vec);
+                }
+            }
+        }
+        let wide: Vec<f32> = (0..1536).map(|i| (i as f32 * 0.37).sin() / 39.2).collect();
+        assert_eq!(encode_packed_row(&wide, None, None).len(), 6150);
+        assert!(encode_vec_row(&wide, None, None).len() > 2 * 6150);
+    }
+
+    /// A packed row that is short, long, empty or flagged by a later format is
+    /// an error. Read from the wrong offsets, it would be a wrong vector.
+    #[test]
+    fn a_damaged_or_later_packed_row_is_refused() {
+        let row = encode_packed_row(&[1.0, 2.0], None, Some(7));
+        for cut in 1..row.len() {
+            assert!(decode_vec_row(&row[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut long = row.clone();
+        long.push(0);
+        assert!(
+            decode_vec_row(&long).is_err(),
+            "a trailing byte with no META flag"
+        );
+        let mut later = row.clone();
+        later[1] |= 4;
+        assert!(
+            decode_vec_row(&later).is_err(),
+            "a flag this binary does not know"
+        );
+        assert!(
+            decode_vec_row(&[PACKED_ROW, 0, 0, 0, 0, 0]).is_err(),
+            "no floats"
+        );
+    }
+
+    /// The store writes packed rows only when told, on every path that writes
+    /// a row (SET, EXPIRE, PERSIST), and they carry what the text rows did.
+    #[test]
+    fn a_store_writes_packed_rows_only_when_told() {
+        for packed in [false, true] {
+            let mut st = Store::new();
+            st.set_packed_rows(packed);
+            run(
+                &mut st,
+                b"n",
+                &cmd(&["VEC.CREATE", "s", "DIM", "3", "METRIC", "l2"]),
+            );
+            let row_of = |plan: Plan| match plan {
+                Plan::Write { persist, .. } => persist
+                    .into_iter()
+                    .find_map(|p| match p {
+                        Persist::Put { val, .. } => Some(val),
+                        _ => None,
+                    })
+                    .expect("a vector row"),
+                Plan::Reply(r) => panic!("expected a write, got {r:?}"),
+            };
+            let set = cmd(&["VEC.SET", "s", "a", "1,2,3", "META", "m", "PX", "5000"]);
+            let rows = [
+                row_of(plan0(&st, b"n", &set)),
+                {
+                    run(&mut st, b"n", &set);
+                    row_of(plan0(&st, b"n", &cmd(&["VEC.EXPIRE", "s", "a", "60"])))
+                },
+                row_of(plan0(&st, b"n", &cmd(&["VEC.PERSIST", "s", "a"]))),
+            ];
+            for (row, exp) in rows.iter().zip([Some(5000), Some(60_000), None]) {
+                assert_eq!(row[0] == PACKED_ROW, packed, "{row:?}");
+                let (vec, meta, e) = decode_vec_row(row).expect("decode");
+                assert_eq!(vec, vec![1.0, 2.0, 3.0]);
+                assert_eq!(meta, Some(v("m")));
+                assert_eq!(e, exp);
+            }
+        }
     }
 
     #[test]

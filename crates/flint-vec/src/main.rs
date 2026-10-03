@@ -160,6 +160,11 @@ fn main() {
         .unwrap_or(0);
     let mut initial = Store::new();
     initial.set_index_cap(index_cap);
+    // ADR-0050 D5: write durable vector rows packed, a third of text's bytes.
+    // Off by default until every binary a fleet may roll back to reads them;
+    // this binary reads both kinds either way.
+    let packed_rows = args.iter().any(|a| a == "--write-packed-rows");
+    initial.set_packed_rows(packed_rows);
     // ADR-0049 D2: where a quantized set keeps its full vectors. The files are
     // derived like the index, so every one found here is deleted before
     // serving and the rebuild writes them again. The lock is what makes that
@@ -193,8 +198,13 @@ fn main() {
         (true, true) => "mesh mTLS + edge TLS",
         (false, true) => "edge TLS only",
     };
+    let rows_note = if packed_rows {
+        "packed rows"
+    } else {
+        "text rows"
+    };
     eprintln!(
-        "flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note}, {vec_note})"
+        "flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note}, {vec_note}, {rows_note})"
     );
 
     // Background reclamation of expired vectors. Reads/searches already mask an
@@ -575,6 +585,12 @@ fn rebuild_chunk_inner(
     let mut vectors: Vec<LoadedVector> = Vec::new();
     let mut i = next;
     let mut budget_done = false;
+    // Rows this binary cannot read: a damaged row, or one a later binary wrote
+    // in a format this one predates (ADR-0050 D5 is the first). Each is left
+    // out of the index, so the count is said out loud rather than leaving a
+    // set quietly smaller than its rows.
+    let mut unreadable = 0usize;
+    let mut first_unreadable = String::new();
     while i < keys.len() {
         let Some((kind, set, id)) = parse_durable_key(&keys[i]) else {
             i += 1;
@@ -591,8 +607,18 @@ fn rebuild_chunk_inner(
             Value::Bulk(Some(val)) if kind == b'v' => {
                 // The expiry rides the durable row, so a rebuilt index restores
                 // each id's TTL for free — no separate expiry store to replay.
-                if let Ok((vec, meta, expires_at)) = decode_vec_row(&val) {
-                    vectors.push((set, id, vec, meta, expires_at));
+                match decode_vec_row(&val) {
+                    Ok((vec, meta, expires_at)) => vectors.push((set, id, vec, meta, expires_at)),
+                    Err(e) => {
+                        if unreadable == 0 {
+                            first_unreadable = format!(
+                                "set {:?} id {:?}: {e}",
+                                String::from_utf8_lossy(&set),
+                                String::from_utf8_lossy(&id)
+                            );
+                        }
+                        unreadable += 1;
+                    }
                 }
                 i += 1;
             }
@@ -607,6 +633,12 @@ fn rebuild_chunk_inner(
         }
     }
     install(store, ns, configs, vectors);
+    if unreadable > 0 {
+        eprintln!(
+            "flint-vec: rebuild of ns {:?} left out {unreadable} vector row(s) it cannot read; first: {first_unreadable}",
+            String::from_utf8_lossy(ns)
+        );
+    }
     let installed = i - next;
     if i >= keys.len() && !budget_done {
         let total = keys
