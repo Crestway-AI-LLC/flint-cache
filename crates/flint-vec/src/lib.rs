@@ -31,6 +31,7 @@ use hnsw::Hnsw;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use vecfile::VecFile;
 
 /// Distance metric, fixed per set. Scores are normalised so HIGHER is nearer,
@@ -869,6 +870,25 @@ fn err(msg: &str) -> Value {
     Value::Error(msg.to_string())
 }
 
+/// The operator's view of a [`Store`], from [`Store::stats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreStats {
+    /// Estimated index bytes over every namespace, what the overall cap meters.
+    pub index_bytes: usize,
+    /// The per-namespace cap and the overall cap; 0 = none.
+    pub index_cap: usize,
+    pub total_cap: usize,
+    /// Namespaces holding any index, their sets, and the vectors in them.
+    pub namespaces: usize,
+    pub sets: usize,
+    pub vectors: usize,
+    /// Writes refused by the per-namespace cap and by the overall cap.
+    pub refused_ns: u64,
+    pub refused_total: u64,
+    /// Whether durable rows are written packed (ADR-0050 D5).
+    pub packed_rows: bool,
+}
+
 /// The co-processor's per-tenant, per-set state. One `Store` per running
 /// co-processor; tenants are isolated by the namespace component of the key
 /// (ADR-0017 D1/D4).
@@ -883,6 +903,14 @@ pub struct Store {
     /// Per-namespace index-memory cap in bytes; 0 = unlimited (opt-in, set by
     /// the binary from `--index-mem-bytes`).
     index_cap: usize,
+    /// Cap on every namespace's index together, in bytes; 0 = unlimited
+    /// (ADR-0050 D2, `--index-mem-total-bytes`). The co-processor shares its
+    /// host with the cache's own seats, and the per-namespace cap alone lets
+    /// enough tenants take all of it.
+    total_cap: usize,
+    /// Writes refused by each cap, for the operator's `FLINTINFO`.
+    refused_ns: AtomicU64,
+    refused_total: AtomicU64,
     /// Where a quantized set keeps its full vectors (ADR-0049 D2, the binary's
     /// `--vec-dir`); `None` keeps them in RAM.
     vec_dir: Option<PathBuf>,
@@ -905,6 +933,29 @@ impl Store {
     /// stored-but-unsearchable; the tenant frees space with `VEC.DEL`.
     pub fn set_index_cap(&mut self, bytes: usize) {
         self.index_cap = bytes;
+    }
+
+    /// Cap every namespace's index together (ADR-0050 D2). 0 = unlimited. A
+    /// `VEC.SET` that would take the sum past it is refused with `-VECFULL`
+    /// before its durable write, as the per-namespace cap refuses.
+    pub fn set_index_total_cap(&mut self, bytes: usize) {
+        self.total_cap = bytes;
+    }
+
+    /// What the operator's `FLINTINFO` reports. Totals over every tenant, so
+    /// it is never answered to one.
+    pub fn stats(&self) -> StoreStats {
+        StoreStats {
+            index_bytes: self.ns_bytes.values().sum(),
+            index_cap: self.index_cap,
+            total_cap: self.total_cap,
+            namespaces: self.ns_bytes.values().filter(|&&b| b > 0).count(),
+            sets: self.sets.len(),
+            vectors: self.sets.values().map(VectorSet::len).sum(),
+            refused_ns: self.refused_ns.load(Relaxed),
+            refused_total: self.refused_total.load(Relaxed),
+            packed_rows: self.packed_rows,
+        }
     }
 
     /// Write durable vector rows packed (ADR-0050 D5). Rows already written
@@ -1221,15 +1272,29 @@ impl Store {
         // refusal here means the vector is not persisted either — a hard bound,
         // never an evict-and-desync. An UPSERT of an existing id only costs its
         // meta delta, so it is charged that, not a whole new entry.
+        let new = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
+        let old = vs.entry_cost(id).unwrap_or(0);
         if self.index_cap > 0 {
-            let new = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
-            let old = vs.entry_cost(id).unwrap_or(0);
             let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
             if used.saturating_add(new).saturating_sub(old) > self.index_cap {
+                self.refused_ns.fetch_add(1, Relaxed);
                 return Plan::Reply(err(&format!(
                     "VECFULL index memory limit reached ({used} of {} bytes for this namespace)",
                     self.index_cap
                 )));
+            }
+        }
+        // ADR-0050 D2: and every namespace together, so vector indexes cannot
+        // take the RAM this host's seats need. Summed per write rather than
+        // kept as a running total: one add per namespace, and nothing to drift.
+        // The refusal names no numbers, since they would be other tenants'.
+        if self.total_cap > 0 {
+            let total: usize = self.ns_bytes.values().sum();
+            if total.saturating_add(new).saturating_sub(old) > self.total_cap {
+                self.refused_total.fetch_add(1, Relaxed);
+                return Plan::Reply(err(
+                    "VECFULL vector index memory is full on this server; delete vectors, or retry later",
+                ));
             }
         }
         Plan::Write {
@@ -2351,6 +2416,76 @@ mod tests {
                 assert_eq!(e, exp);
             }
         }
+    }
+
+    /// ADR-0050 D2: the overall cap refuses a write that would take every
+    /// namespace together past it though each is under its own cap. It says
+    /// no numbers, leaves reads alone, frees with a delete anywhere, and is
+    /// counted apart from the per-namespace cap.
+    #[test]
+    fn the_overall_cap_bounds_every_namespace_together() {
+        let mut st = Store::new();
+        for ns in [&b"a"[..], b"b"] {
+            run(
+                &mut st,
+                ns,
+                &cmd(&["VEC.CREATE", "s", "DIM", "4", "METRIC", "l2"]),
+            );
+        }
+        let ok = Value::Simple("OK".into());
+        assert_eq!(
+            run(&mut st, b"a", &cmd(&["VEC.SET", "s", "x0", "1,0,0,0"])),
+            ok
+        );
+        let one = st.stats().index_bytes;
+        assert!(one > 0);
+        st.set_index_cap(3 * one);
+        st.set_index_total_cap(4 * one);
+        for id in ["x1", "x2"] {
+            assert_eq!(
+                run(&mut st, b"a", &cmd(&["VEC.SET", "s", id, "0,1,0,0"])),
+                ok
+            );
+        }
+        assert_eq!(
+            run(&mut st, b"b", &cmd(&["VEC.SET", "s", "y0", "0,0,1,0"])),
+            ok
+        );
+        // Four of four: b is at a third of its own cap, and still refused.
+        match run(&mut st, b"b", &cmd(&["VEC.SET", "s", "y1", "0,0,0,1"])) {
+            Value::Error(e) => {
+                assert!(e.starts_with("VECFULL"), "{e}");
+                assert!(
+                    !e.chars().any(|c| c.is_ascii_digit()),
+                    "names a number: {e}"
+                );
+            }
+            r => panic!("expected the overall cap to refuse, got {r:?}"),
+        }
+        // a, past its own cap, is refused by that one, which says its numbers.
+        match run(&mut st, b"a", &cmd(&["VEC.SET", "s", "x3", "1,1,0,0"])) {
+            Value::Error(e) => assert!(e.contains("for this namespace"), "{e}"),
+            r => panic!("expected the namespace cap to refuse, got {r:?}"),
+        }
+        // Reads are untouched by either.
+        assert!(matches!(
+            run(&mut st, b"b", &cmd(&["VEC.SEARCH", "s", "0,0,1,0", "1"])),
+            Value::Array(Some(ref r)) if !r.is_empty()
+        ));
+        let full = st.stats();
+        assert_eq!((full.refused_total, full.refused_ns), (1, 1));
+        assert_eq!(full.index_bytes, 4 * one);
+        assert_eq!((full.namespaces, full.sets, full.vectors), (2, 2, 4));
+        // A delete in a frees room for b.
+        assert_eq!(
+            run(&mut st, b"a", &cmd(&["VEC.DEL", "s", "x0"])),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            run(&mut st, b"b", &cmd(&["VEC.SET", "s", "y1", "0,0,0,1"])),
+            ok
+        );
+        assert_eq!(st.stats().index_bytes, 4 * one);
     }
 
     #[test]

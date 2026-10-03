@@ -128,6 +128,27 @@ struct Tls {
     edge: Option<Arc<flint_tls::ClientConfig>>,
 }
 
+/// `FLINTINFO`'s body: `field:value` lines, as a node's, so flint-exporter
+/// turns each number into a gauge and `build` into `build_info`.
+fn flintinfo(s: &flint_vec::StoreStats, loading: usize) -> String {
+    format!(
+        "build:{}\r\nrole:coproc\r\nindex_bytes:{}\r\nindex_cap_ns_bytes:{}\r\n\
+         index_cap_total_bytes:{}\r\nnamespaces:{}\r\nnamespaces_loading:{loading}\r\n\
+         sets:{}\r\nvectors:{}\r\nvecfull_ns_total:{}\r\nvecfull_server_total:{}\r\n\
+         packed_rows:{}\r\n",
+        build_version(),
+        s.index_bytes,
+        s.index_cap,
+        s.total_cap,
+        s.namespaces,
+        s.sets,
+        s.vectors,
+        s.refused_ns,
+        s.refused_total,
+        u8::from(s.packed_rows),
+    )
+}
+
 fn build_version() -> String {
     flint_build::version(env!("CARGO_PKG_VERSION"))
 }
@@ -158,8 +179,15 @@ fn main() {
     let index_cap: usize = arg(&args, "--index-mem-bytes")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // ADR-0050 D2: a cap over every namespace's index together; 0 (default) =
+    // none. Set it below what the host's seats need, so vector indexes can never
+    // take the cache's RAM however many tenants hold their per-namespace cap.
+    let total_cap: usize = arg(&args, "--index-mem-total-bytes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let mut initial = Store::new();
     initial.set_index_cap(index_cap);
+    initial.set_index_total_cap(total_cap);
     // ADR-0050 D5: write durable vector rows packed, a third of text's bytes.
     // Off by default until every binary a fleet may roll back to reads them;
     // this binary reads both kinds either way.
@@ -183,10 +211,11 @@ fn main() {
     let bind = format!("{bind_host}:{port}");
     let listener = TcpListener::bind((bind_host.as_str(), port))
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
-    let cap_note = if index_cap == 0 {
-        "index mem unlimited".to_string()
-    } else {
-        format!("index mem cap {index_cap} B/ns")
+    let cap_note = match (index_cap, total_cap) {
+        (0, 0) => "index mem unlimited".to_string(),
+        (ns, 0) => format!("index mem cap {ns} B/ns"),
+        (0, all) => format!("index mem cap {all} B in all"),
+        (ns, all) => format!("index mem cap {ns} B/ns, {all} B in all"),
     };
     let vec_note = match &vec_dir {
         Some(d) => format!("quantized vectors in {}", d.display()),
@@ -354,6 +383,20 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
     let Some(bulks) = bulks else {
         return err("ERR FLINTFAM parts must be bulk strings");
     };
+    // The operator's view (ADR-0050 D2), read by flint-exporter. It is totals
+    // over every tenant, so it is not a family command: tenants' commands
+    // arrive inside FLINTFAM, and only the mesh reaches this listener (mutual
+    // TLS, or loopback since BUG-0203).
+    if bulks.len() == 1 && bulks[0].eq_ignore_ascii_case(b"FLINTINFO") {
+        let stats = store.lock().expect("store lock").stats();
+        let loading = loads
+            .lock()
+            .expect("loads lock")
+            .values()
+            .filter(|l| !matches!(l, LoadState::Loaded))
+            .count();
+        return Value::Bulk(Some(flintinfo(&stats, loading).into_bytes()));
+    }
     if bulks.len() < 5 || !bulks[0].eq_ignore_ascii_case(b"FLINTFAM") {
         return err("ERR FLINTFAM <token> <callback> <ns> <cmd...>");
     }

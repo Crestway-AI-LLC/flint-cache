@@ -21,6 +21,8 @@
 #     write as its control); TTL expires and sweeps on sq8 and bin sets; and a
 #     second tenant's bin set searches and takes writes while the first tenant
 #     is at the D4 cap
+#   - ADR-0050 D2: an overall cap refuses every tenant's writes together,
+#     reported in the co-processor's FLINTINFO and by flint-exporter
 #   - BUG-0203: the co-processor listens where --bind says, loopback by
 #     default, not on every interface
 #   - ADR-0050 D5: rows a co-processor writes packed (--write-packed-rows)
@@ -36,14 +38,16 @@ PX=./target/release/flint-proxy
 VEC=./target/release/flint-vec
 D=$FLINT_DRILL_ROOT/flint-vecd; rm -rf "$D"; mkdir -p "$D"
 COPROC_PID=""
+EXP_PID=""
 fleet_kill server; fleet_kill proxy; sleep 0.4
 cleanup() {
   [ -n "$COPROC_PID" ] && kill -9 "$COPROC_PID" 2>/dev/null
+  [ -n "$EXP_PID" ] && kill -9 "$EXP_PID" 2>/dev/null
   fleet_kill server; fleet_kill proxy; rm -rf "$D"
 }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-proxy -p flint-vec --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
+cargo build --release -q -p flint-server -p flint-proxy -p flint-vec -p flint-exporter --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 echo "== cluster: master + proxy (static --families) + the real flint-vec co-processor"
 VD="$D/vecs"
@@ -347,6 +351,49 @@ case "$(vexec VEC.SET docs znew 0,0,1)" in *VECFULL*) : ;; *) echo "FAIL: tenant
 case "$(vexec VEC.SEARCH iso 1,0,0 1)" in *t2a*) echo "FAIL: tenant 1 searched tenant 2's set"; exit 1 ;; esac
 echo "  tenant 2 ($M2 of $CAP B): search and write served; tenant 1 ($M1 B): still -VECFULL, blind to tenant 2's set"
 
+echo "== ADR-0050 D2: an overall cap bounds every tenant's index together"
+# info <field>: one field of the co-processor's operator FLINTINFO, asked on
+# its own listener as the exporter asks (loopback here; the mesh in a fleet).
+info() { valkey-cli -p 6678 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n "s/^$1://p"; }
+[ "$(info role)" = coproc ] || { echo "FAIL: FLINTINFO: $(valkey-cli -p 6678 FLINTINFO 2>&1 | tr -d '\r' | tr '\n' ' ')"; exit 1; }
+[ "$(info index_cap_ns_bytes)" = 2000 ] && [ "$(info index_cap_total_bytes)" = 0 ] \
+  || { echo "FAIL: FLINTINFO caps: ns $(info index_cap_ns_bytes), total $(info index_cap_total_bytes)"; exit 1; }
+[ "$(info vecfull_ns_total)" = 3 ] && [ "$(info vecfull_server_total)" = 0 ] \
+  || { echo "FAIL: FLINTINFO refusals: ns $(info vecfull_ns_total), server $(info vecfull_server_total)"; exit 1; }
+# Both tenants' indexes together, which the restart sets as the overall cap.
+S="$(info index_bytes)"
+[ "$S" -gt "$M1" ] 2>/dev/null || { echo "FAIL: FLINTINFO index_bytes [$S] is not past tenant 1's $M1"; exit 1; }
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+sleep 0.3
+$VEC --port 6678 --vec-dir "$VD" --index-mem-bytes 100000 --index-mem-total-bytes "$S" 2>"$D/vec-total.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+grep -q "index mem cap 100000 B/ns, $S B in all" "$D/vec-total.log" || { echo "FAIL: the startup line does not name both caps:"; sed 's/^/    /' "$D/vec-total.log"; exit 1; }
+# The first touch of each namespace rebuilds it, to the same total.
+case "$(vexec VEC.SEARCH docs 1,0,0 3)" in *b*) : ;; *) echo "FAIL: tenant 1 read under the overall cap: $(vexec VEC.SEARCH docs 1,0,0 3)"; exit 1 ;; esac
+case "$(vexec2 VEC.SEARCH iso 1,0,0 1)" in *t2a*) : ;; *) echo "FAIL: tenant 2 read under the overall cap"; exit 1 ;; esac
+[ "$(info index_bytes)" = "$S" ] || { echo "FAIL: the rebuilt total $(info index_bytes) is not the $S it was"; exit 1; }
+# Both tenants are far under their own 100,000 B, and both are refused.
+for t in "vexec VEC.SET docs znew 0,0,1" "vexec2 VEC.SET iso t2c 0,0,1"; do
+  R="$($t)"
+  case "$R" in *"VECFULL vector index memory is full on this server"*) : ;; *) echo "FAIL: $t over the overall cap: $R"; exit 1 ;; esac
+  case "$R" in *[0-9]*) echo "FAIL: the overall refusal names a number: $R"; exit 1 ;; esac
+done
+[ "$(info vecfull_server_total)" = 2 ] || { echo "FAIL: FLINTINFO vecfull_server_total $(info vecfull_server_total), expected 2"; exit 1; }
+# A delete by either tenant frees room for a write of the same size.
+[ "$(vexec2 VEC.DEL iso t2b)" = "1 " ] || { echo "FAIL: tenant 2 VEC.DEL iso t2b"; exit 1; }
+[ "$(vexec2 VEC.SET iso t2b 0,1,0)" = "OK " ] || { echo "FAIL: tenant 2 could not write back into the room its delete freed"; exit 1; }
+# The exporter carries it to an operator's dashboard.
+./target/release/flint-exporter --port 6679 --coproc 127.0.0.1:6678 2>"$D/exp.log" & EXP_PID=$!
+fleet_wait_listen 6679
+M="$(curl -s --max-time 5 http://127.0.0.1:6679/metrics)"
+for want in 'flint_coproc_up{instance="127.0.0.1:6678",role="coproc"} 1' \
+            "flint_coproc_index_cap_total_bytes{instance=\"127.0.0.1:6678\"} $S" \
+            'flint_coproc_vecfull_server_total{instance="127.0.0.1:6678"} 2'; do
+  grep -qF "$want" <<<"$M" || { echo "FAIL: the exporter does not say: $want"; sed 's/^/    /' <<<"$M"; exit 1; }
+done
+kill -9 "$EXP_PID" 2>/dev/null; wait "$EXP_PID" 2>/dev/null; EXP_PID=""
+echo "  cap $S B in all: both tenants refused far under their own caps, with no numbers; a delete frees room; exported"
+
 echo "== CONTROL: the ordinary tenant data path is untouched"
 cli_ok $A SET plain value
 [ "$($A GET plain)" = "value" ] || { echo "FAIL (control): tenant SET/GET broke"; exit 1; }
@@ -517,4 +564,5 @@ echo "      EXPIRE/PERSIST introspection and the INFO expiring count over the wi
 echo "      client connection takes more writes than the proxy has workers (BUG-0200). Searches"
 echo "      open no channel, TTL holds on quantized sets, and a full tenant leaves another's"
 echo "      bin set serving (ADR-0049 verifications 4-6). Packed rows written by one"
-echo "      co-processor rebuild in the next (ADR-0050 D5)."
+echo "      co-processor rebuild in the next (ADR-0050 D5), an overall cap bounds every"
+echo "      tenant's index together and is exported (D2), and the seat listens where told (BUG-0203)."

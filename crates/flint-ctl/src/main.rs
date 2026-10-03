@@ -109,6 +109,10 @@ struct Inventory {
     /// coproc: per-namespace index RAM budget before the seat sheds
     /// (`--index-mem-bytes`). Absent = [`DEFAULT_COPROC_INDEX_BYTES`].
     coproc_index_bytes: Option<u64>,
+    /// coproc: index RAM budget over every namespace together
+    /// (`--index-mem-total-bytes`, ops ADR-0050 D2), so vector indexes cannot
+    /// take the RAM the host's seats need. Absent = no overall cap.
+    coproc_index_total_bytes: Option<u64>,
     /// Billing journal path (agent --billing): the append-only per-tenant
     /// usage record a metering reporter aggregates from. Absent = the
     /// agent keeps no billing journal (self-hosters who do not bill).
@@ -361,6 +365,7 @@ fn parse_inventory(path: &str) -> Inventory {
             // ("VEC" vs "VEC.") until a command silently took the keyed
             // path instead of the family path.
             "coproc-index-bytes" => inv.coproc_index_bytes = val.parse().ok(),
+            "coproc-index-total-bytes" => inv.coproc_index_total_bytes = val.parse().ok(),
             "coproc" => {
                 let mut it = val.split_whitespace();
                 match (it.next(), it.next(), it.next()) {
@@ -1703,6 +1708,9 @@ fn coproc_args(inv: &Inventory, i: usize) -> Vec<String> {
         "--vec-dir".to_string(),
         format!("{d}/{}", coproc_seat_name(inv, i)),
     ];
+    if let Some(total) = inv.coproc_index_total_bytes {
+        args.extend(["--index-mem-total-bytes".to_string(), total.to_string()]);
+    }
     if inv.tls {
         args.extend([
             "--internal-ca".to_string(),
@@ -10215,6 +10223,33 @@ mod cert_manifest_tests {
         };
         assert_eq!(dir(0), "/var/lib/flint/vec-7411");
         assert_eq!(dir(1), "/var/lib/flint/vec-7412");
+    }
+
+    /// ops ADR-0050 D2 and BUG-0203: the overall cap reaches the seat only
+    /// when the inventory sets it, and every seat is told where to listen.
+    #[test]
+    fn a_coproc_seat_gets_its_bind_and_the_overall_cap_only_when_set() {
+        let base = "statedir /var/lib/flint\n\
+                    bins /opt/flint/bin\n\
+                    cp 10.0.0.1:7500\n\
+                    pair 10.0.0.2:7001,10.0.0.3:7002\n\
+                    proxy 0.0.0.0:7379\n\
+                    coproc VEC. 127.0.0.1:7411\n";
+        let flag = |a: &[String], f: &str| a.iter().position(|x| x == f).map(|i| a[i + 1].clone());
+        let off = coproc_args(&inv_from(base, "capoff"), 0);
+        assert_eq!(flag(&off, "--bind").as_deref(), Some("127.0.0.1"));
+        assert_eq!(flag(&off, "--index-mem-total-bytes"), None);
+        let on = coproc_args(
+            &inv_from(
+                &format!("{base}coproc-index-total-bytes 8589934592\n"),
+                "capon",
+            ),
+            0,
+        );
+        assert_eq!(
+            flag(&on, "--index-mem-total-bytes").as_deref(),
+            Some("8589934592")
+        );
     }
 
     /// ...and ONLY a co-processor host. The leaf is server-auth only by design

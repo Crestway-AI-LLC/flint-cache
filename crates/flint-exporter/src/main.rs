@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 //! flint-exporter — the reference Prometheus exporter for a self-hosted
-//! open Flint fleet. It polls `FLINTINFO` on each node and `PROXYSTATS` on
-//! each proxy over the internal mesh (mutual TLS), and re-emits every
+//! open Flint fleet. It polls `FLINTINFO` on each node and co-processor and
+//! `PROXYSTATS` on each proxy over the internal mesh (mutual TLS), and re-emits every
 //! numeric field as a Prometheus gauge on `/metrics`. Point Prometheus at
 //! it; point Grafana at Prometheus (see docs/self-hosting.md §3).
 //!
@@ -13,6 +13,7 @@
 //!   flint-exporter --port 9100 \
 //!     --node 127.0.0.1:7001 --node 127.0.0.1:7002 \
 //!     --proxy 127.0.0.1:7379 \
+//!     [--coproc 127.0.0.1:7411] \
 //!     [--ca certs/ca.crt --cert certs/int.crt --key certs/int.key] \
 //!     `[--admin-token <tok>]`      # if the proxy admin surface is gated
 //!
@@ -173,6 +174,7 @@ fn emit(prefix: &str, instance: &str, body: Option<&str>, out: &mut String) {
 fn render(
     nodes: &[String],
     proxies: &[String],
+    coprocs: &[String],
     tls: &Option<Arc<ClientConfig>>,
     admin: &Option<String>,
 ) -> String {
@@ -194,6 +196,16 @@ fn render(
             &mut out,
         );
     }
+    // A co-processor answers FLINTINFO on its mesh listener with totals over
+    // every tenant: index memory against the overall cap (ops ADR-0050 D2).
+    for c in coprocs {
+        emit(
+            "flint_coproc_",
+            c,
+            scrape(c, tls, b"FLINTINFO", &None, false).as_deref(),
+            &mut out,
+        );
+    }
     out
 }
 
@@ -201,10 +213,11 @@ fn main() {
     let port: u16 = one("--port").and_then(|v| v.parse().ok()).unwrap_or(9100);
     let nodes = multi("--node");
     let proxies = multi("--proxy");
+    let coprocs = multi("--coproc");
     let admin = one("--admin-token");
-    if nodes.is_empty() && proxies.is_empty() {
+    if nodes.is_empty() && proxies.is_empty() && coprocs.is_empty() {
         eprintln!(
-            "usage: flint-exporter --port N --node H:P... --proxy H:P... [--ca --cert --key] [--admin-token T]"
+            "usage: flint-exporter --port N --node H:P... --proxy H:P... [--coproc H:P...] [--ca --cert --key] [--admin-token T]"
         );
         std::process::exit(2);
     }
@@ -217,16 +230,17 @@ fn main() {
     };
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind metrics port");
     eprintln!(
-        "flint-exporter on :{port} ({} node(s), {} proxy(ies), tls={})",
+        "flint-exporter on :{port} ({} node(s), {} proxy(ies), {} co-processor(s), tls={})",
         nodes.len(),
         proxies.len(),
+        coprocs.len(),
         tls.is_some()
     );
     for stream in listener.incoming() {
         let Ok(mut s) = stream else { continue };
         let mut buf = [0u8; 1024];
         let _ = s.read(&mut buf); // consume the request line (any path -> metrics)
-        let body = render(&nodes, &proxies, &tls, &admin);
+        let body = render(&nodes, &proxies, &coprocs, &tls, &admin);
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
