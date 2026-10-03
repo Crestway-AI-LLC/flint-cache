@@ -21,6 +21,8 @@
 #     write as its control); TTL expires and sweeps on sq8 and bin sets; and a
 #     second tenant's bin set searches and takes writes while the first tenant
 #     is at the D4 cap
+#   - BUG-0203: the co-processor listens where --bind says, loopback by
+#     default, not on every interface
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
@@ -55,6 +57,42 @@ fi
 wait "$SECOND" && { echo "FAIL: a second flint-vec on a locked --vec-dir exited 0"; exit 1; }
 grep -q "held by another flint-vec" "$D/vec-second.log" \
   || { echo "FAIL: the second flint-vec did not say why it refused:"; sed 's/^/    /' "$D/vec-second.log"; exit 1; }
+echo "== BUG-0203: the co-processor listens only where it is told"
+# reach <port>: connect to <port> on this host's own non-loopback address.
+# "open", "refused", or "noaddr" when the host has no such address to try.
+reach() {
+  python3 - "$1" <<'PY'
+import socket, sys
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    u.connect(("10.255.255.255", 1))   # picks the outbound interface; sends nothing
+    ip = u.getsockname()[0]
+except OSError:
+    ip = ""
+u.close()
+if not ip or ip.startswith("127."):
+    print("noaddr"); sys.exit()
+s = socket.socket()
+s.settimeout(2)
+try:
+    s.connect((ip, int(sys.argv[1]))); print("open")
+except OSError:
+    print("refused")
+PY
+}
+# bound <want> <flint-vec args...>: start one on 6679, probe it, stop it.
+bound() {
+  local want="$1"; shift
+  $VEC --port 6679 "$@" 2>"$D/vec-bind.log" & local pid=$!
+  fleet_wait_listen 6679
+  local got; got="$(reach 6679)"
+  kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  [ "$got" = "$want" ] || { echo "FAIL (BUG-0203): flint-vec $* -> $got from this host's own address, expected $want"; sed 's/^/    /' "$D/vec-bind.log"; exit 1; }
+}
+bound open --bind 0.0.0.0          # the control: the probe reaches a listener on every interface
+bound refused --bind 127.0.0.1     # flintctl's loopback seat answers on loopback only
+bound refused                      # and so does a seat started with no --bind
+echo "  --bind 0.0.0.0 reachable; --bind 127.0.0.1 and the default are loopback only"
 # --engine mem: the server stays up across the co-processor restart and holds
 # the durable rows, so this drill isolates the CO-PROCESSOR's rebuild, not the
 # server's own restart durability (that is repl/warm_restart's job).
@@ -390,4 +428,5 @@ echo "      per-vector TTL (D7) expires+sweeps while permanent ids stay — with
 echo "      EXPIRE/PERSIST introspection and the INFO expiring count over the wire, and a"
 echo "      client connection takes more writes than the proxy has workers (BUG-0200). Searches"
 echo "      open no channel, TTL holds on quantized sets, and a full tenant leaves another's"
-echo "      bin set serving (ADR-0049 verifications 4-6)."
+echo "      bin set serving (ADR-0049 verifications 4-6), and the co-processor"
+echo "      listens where it is told (BUG-0203)."

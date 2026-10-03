@@ -147,7 +147,11 @@ fn main() {
     let port: u16 = arg(&args, "--port")
         .and_then(|s| s.parse().ok())
         .unwrap_or(6700);
-    let bind = format!("0.0.0.0:{port}");
+    // BUG-0203: listen where `flintctl` says (`--bind`, the host of the
+    // inventory's `coproc` address), on loopback by default as flint-server
+    // and the control plane do. This built `0.0.0.0` whatever it was told, so
+    // a seat asked for loopback answered FLINTFAM on every interface.
+    let bind_host = arg(&args, "--bind").unwrap_or_else(|| "127.0.0.1".into());
     // D4: per-namespace index-memory cap in bytes; 0 (default) = unlimited. On
     // a co-processor shared by many tenants, set this so one tenant's set cannot
     // exhaust the process RAM and starve every other tenant's search.
@@ -171,7 +175,9 @@ fn main() {
     let store: Arc<Mutex<Store>> = Arc::new(Mutex::new(initial));
     let loads: Loads = Arc::new(Mutex::new(HashMap::new()));
     let tls = build_tls(&args);
-    let listener = TcpListener::bind(&bind).unwrap_or_else(|e| panic!("bind {bind}: {e}"));
+    let bind = format!("{bind_host}:{port}");
+    let listener = TcpListener::bind((bind_host.as_str(), port))
+        .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     let cap_note = if index_cap == 0 {
         "index mem unlimited".to_string()
     } else {
