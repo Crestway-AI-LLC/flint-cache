@@ -8516,7 +8516,7 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
 }
 
 /// Roll everything that is not a pair node: controller, agent, control
-/// plane, proxies.
+/// plane, co-processors, proxies.
 ///
 /// These have no role to hand over, so each is a stop-and-respawn rather than
 /// a failover. Order is chosen so the client-facing hop moves last, over a
@@ -8683,6 +8683,64 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
                 envs,
             );
         }
+    }
+
+    // Co-processors (ops ADR-0050 D4), after the control plane and BEFORE the
+    // proxies that route to them, the order `start` uses. This loop did not
+    // exist: an upgrade rolled every other seat and left each co-processor on
+    // whatever binary first started it, and a `coproc` line added to the
+    // inventory waited for a `start` nobody runs on a live fleet. A seat that
+    // is not running is started here, so the next roll brings it up, and the
+    // proxies rolled below are given the family that routes to it.
+    //
+    // Its index is derived (ADR-0017 D3): the new process rebuilds each
+    // namespace from its durable rows on first touch, answering -LOADING
+    // meanwhile, so the swap costs vector reads a rebuild and loses nothing.
+    for i in 0..inv.coprocs.len() {
+        let bin =
+            coproc_bin(coproc_family(inv, i)).expect("inventory parse rejected unknown families");
+        let seat = coproc_seat_name(inv, i);
+        let addr = inv.coprocs[i].1.clone();
+        eprintln!("== co-processor {seat}");
+        if let Err(e) = stop_seat(
+            inv,
+            &coproc_runner(inv, i),
+            &seat,
+            bin,
+            &format!("{d}/{seat}"),
+            Some(port_of(&addr)),
+        ) {
+            die_on(&seat, e);
+        }
+        spawn_env(
+            inv,
+            &coproc_runner(inv, i),
+            &seat,
+            bin,
+            &coproc_args(inv, i),
+            envs,
+        );
+        // Its FLINTINFO is the build it reports, so one question proves both
+        // that it serves and what it is.
+        let ask = || match call(&addr, &tls, &["FLINTINFO"]) {
+            Ok(Value::Bulk(Some(raw))) => Ok(String::from_utf8_lossy(&raw)
+                .split(['\r', '\n'])
+                .find_map(|l| l.strip_prefix("build:"))
+                .map(|b| b.trim().to_string())),
+            Ok(other) => Err(format!("FLINTINFO answered {other:?}")),
+            Err(e) => Err(e.to_string()),
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut got = ask();
+        while got.is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(150));
+            got = ask();
+        }
+        if let Err(e) = &got {
+            die_on(&seat, format!("did not answer after the binary swap: {e}"));
+        }
+        assert_build(&seat, got);
+        eprintln!("  {seat} rolled and serving");
     }
 
     eprintln!("== proxies last (clients see one blip, over an already-new fleet)");

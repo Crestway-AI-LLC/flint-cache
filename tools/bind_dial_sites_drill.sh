@@ -56,17 +56,21 @@ FIELDS = {
     # BUG-0140, the third field. Unlike cp and proxies this one has no dial
     # helper and deliberately never will: a wildcard `coproc` address is
     # REFUSED at parse time, because no generator writes the key and the only
-    # writer resolves the host itself. So the six exempt readers are, each for
-    # its own reason: parse_inventory, because reading the raw literal IS the
-    # refusal; coproc_args, which BINDS; families_arg, which dials an address
-    # the refusal has already guaranteed names a machine; coproc_runner, which
-    # resolves placement from it the way cp_runner and proxy_runner do; and
+    # writer resolves the host itself. So the seven exempt readers are, each
+    # for its own reason: parse_inventory, because reading the raw literal IS
+    # the refusal; coproc_args, which BINDS; families_arg, which dials an
+    # address the refusal has already guaranteed names a machine; coproc_runner,
+    # which resolves placement from it the way cp_runner and proxy_runner do;
     # coproc_seat_name and coproc_family, which exist so that launch never
     # destructures the element itself -- the rule cp and proxies already
-    # follow. A SEVENTH reader is the signal that the refusal is no longer
-    # enough and the key is wanted after all.
+    # follow; and roll_edge (ops ADR-0050 D4), which stops the seat on that
+    # address's port and asks it FLINTINFO there: the same literal
+    # families_arg dials, under the same guarantee, so the refusal is still
+    # enough. An EIGHTH reader is the signal to ask that again, and whether
+    # the key is wanted after all.
     "coprocs": {"coproc_args", "families_arg", "coproc_runner",
-                "parse_inventory", "coproc_seat_name", "coproc_family"},
+                "parse_inventory", "coproc_seat_name", "coproc_family",
+                "roll_edge"},
 }
 FN = re.compile(r"^(?:pub )?(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)")
 

@@ -26,6 +26,9 @@
 #   - `status` reports the proxy's build, not `-`, when the edge is TLS
 #   - the pair nodes and cp report it too, so a green result is not one
 #     surface accidentally agreeing with itself
+#   - ops ADR-0050 D4: a `coproc` line added after bootstrap is started by
+#     the next upgrade, the rolled proxy routes VEC. to it, and a second
+#     upgrade replaces the running co-processor with the new build
 #
 # The edge cert is minted by `bootstrap` and signed by the fleet's own
 # internal CA, and flintctl's edge trust defaults to that CA — so this needs
@@ -33,7 +36,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-edgeroll-state 7970 7971 7972 7973
+fleet_init $FLINT_DRILL_ROOT/flint-edgeroll-state 7970 7971 7972 7973 7974
 fleet_guard
 D=$FLINT_DRILL_ROOT/flint-edgeroll; STATE=$FLINT_DRILL_ROOT/flint-edgeroll-state
 INV=$D/cluster.flint
@@ -41,18 +44,18 @@ TAG=edge-roll-9
 rm -rf "$D" "$STATE"; mkdir -p "$D"
 
 fleet_kill controller; fleet_kill server
-fleet_kill proxy; fleet_kill controlplane
+fleet_kill proxy; fleet_kill controlplane; fleet_kill vec
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop >/dev/null 2>&1
   fleet_kill controller; fleet_kill server
-  fleet_kill proxy; fleet_kill controlplane
+  fleet_kill proxy; fleet_kill controlplane; fleet_kill vec
   [ -n "${KEEP:-}" ] || rm -rf "$D" "$STATE"
 }
 trap cleanup EXIT
 
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
-  -p flint-controller -p flint-ctl --features flint-server/rocks \
+  -p flint-controller -p flint-ctl -p flint-vec --features flint-server/rocks \
   || { echo "FAIL: build"; exit 1; }
 
 # client-tls on is the whole point. 127.0.0.1 as an edge-san so the edge
@@ -80,6 +83,21 @@ $CTL bootstrap >"$D/boot.log" 2>&1 || { echo "FAIL: bootstrap"; tail -8 "$D/boot
 BEFORE=$($CTL status 2>/dev/null | grep -c "build $TAG" || true)
 [ "${BEFORE:-0}" -eq 0 ] \
   || { echo "FAIL: $BEFORE seat(s) already on '$TAG' before the roll — vacuous"; exit 1; }
+
+# ops ADR-0050 D4: a `coproc` line added to a running fleet is started by the
+# next upgrade, and the proxies rolled after it route to it. Nothing has
+# started this seat: bootstrap ran before the line existed.
+echo "coproc VEC. 127.0.0.1:7974" >> "$INV"
+if (exec 3<>/dev/tcp/127.0.0.1/7974) 2>/dev/null; then
+  echo "FAIL: something already listens on 7974 before the upgrade — starting the co-processor would be vacuous"; exit 1
+fi
+# coproc_info <field>: the co-processor's FLINTINFO over the mesh, as the
+# roll and the exporter ask it.
+coproc_info() {
+  valkey-cli --tls --cacert "$STATE/certs/ca.crt" --cert "$STATE/certs/int.crt" \
+    --key "$STATE/certs/int.key" --sni flint-internal -p 7974 FLINTINFO 2>/dev/null \
+    | tr -d '\r' | sed -n "s/^$1://p"
+}
 
 echo "== upgrade --version-tag $TAG"
 # Exit status IS an assertion here. The bug this drill exists for did not
@@ -111,6 +129,23 @@ CPS=$(echo "$ST"  | grep -c "^cp .*build $TAG" || true)
 [ "${PAIRS:-0}" -eq 2 ] && [ "${CPS:-0}" -ge 1 ] || {
   echo "FAIL: pair $PAIRS/2, cp $CPS on $TAG — the roll itself is wrong, not just the report"; exit 1; }
 echo "  proxy $PXS, pair $PAIRS/2, cp $CPS — all on $TAG over a TLS edge"
+
+echo "== the upgrade started the co-processor the inventory gained, and the proxy routes to it"
+grep -q "vec-7974 reports $TAG" "$D/upgrade.log" || { echo "FAIL: the upgrade log does not show vec-7974 on $TAG:"; grep -n "co-processor\|vec-" "$D/upgrade.log" | sed 's/^/  | /'; exit 1; }
+[ "$(coproc_info build)" = "$TAG" ] || { echo "FAIL: vec-7974 answers FLINTINFO build '$(coproc_info build)', expected $TAG"; exit 1; }
+PXARGS="$(ps -o args= -p "$(cat "$STATE/pids/proxy-7972.pid")" 2>/dev/null)"
+case "$PXARGS" in *"VEC.=127.0.0.1:7974"*) : ;; *) echo "FAIL: the rolled proxy was not given the VEC. family: $PXARGS"; exit 1 ;; esac
+echo "  vec-7974 started on $TAG; the proxy routes VEC. to it"
+
+echo "== a second upgrade rolls the running co-processor onto the new build"
+TAG2=edge-roll-10
+VPID="$(cat "$STATE/pids/vec-7974.pid" 2>/dev/null)"
+kill -0 "$VPID" 2>/dev/null || { echo "FAIL: no live pid for vec-7974 ($VPID)"; exit 1; }
+$CTL upgrade --version-tag "$TAG2" --soak-ms 1500 >"$D/upgrade2.log" 2>&1 \
+  || { tail -12 "$D/upgrade2.log" | sed 's/^/  | /'; echo "FAIL: the second upgrade exited $?"; exit 1; }
+kill -0 "$VPID" 2>/dev/null && { echo "FAIL: vec-7974's old process $VPID survived the roll"; exit 1; }
+[ "$(coproc_info build)" = "$TAG2" ] || { echo "FAIL: after the roll vec-7974 reports '$(coproc_info build)', expected $TAG2"; exit 1; }
+echo "  vec-7974: old process gone, new one reports $TAG2"
 
 echo "== a bare TCP listener must NOT read as a serving proxy"
 # THE POSITIVE CONTROL for proxy_up. Until today a client-TLS fleet's
@@ -154,4 +189,4 @@ case "$ROW" in
           exit 1 ;;
 esac
 
-echo "PASS: a client-TLS fleet rolls to completion and every seat REPORTS the build, and liveness means ANSWERING rather than merely holding the port — the branch no other drill executes"
+echo "PASS: a client-TLS fleet rolls to completion and every seat REPORTS the build, liveness means ANSWERING rather than merely holding the port — the branch no other drill executes — and an upgrade starts and rolls the fleet's co-processor"
