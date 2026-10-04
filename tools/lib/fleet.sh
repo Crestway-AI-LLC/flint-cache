@@ -1319,6 +1319,9 @@ fleet_kill() {
     case "$(basename "${args%% *}")" in
       flint-server|flint-proxy|flint-controlplane|flint-controller|flint-agent) ;;
       flint-console|flint-ops|flint-register|flint-exporter|flint-meter|flint-backup) ;;
+      # BUG-0204: _fleet_ours selects flint-vec for `fleet_kill vec`, and this
+      # check then skipped every one, so the call killed nothing.
+      flint-vec) ;;
       *) continue ;;               # exited, or the pid now belongs elsewhere
     esac
     kill -9 "$pid" 2>/dev/null

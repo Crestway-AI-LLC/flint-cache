@@ -555,7 +555,25 @@ echo "  an orphaned seat under a live lock is reported as owned, by name"
 # walked out of the arm that exists to stop leaked processes being misread.
 reap_j; cleanup; PIDS=""; sleep 0.5
 
-echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, proceeds past an ORPHANED one while still refusing a parented one, does not misread our own binaries, honours FORCE, disowns prefix scopes, tells a live peer drill from a foreign fleet, and attributes an out-of-scope seat to its live owner rather than to its ppid"
+echo "== K) fleet_kill vec kills this drill's co-processor (BUG-0204)"
+# _fleet_ours selected flint-vec for `fleet_kill vec`, and the re-verify
+# before the signal listed every fleet binary but this one, so the call
+# killed nothing and coproc_family_drill's cleanup left its seat behind.
+spawn_argv "flint-vec --port 6999 --vec-dir $FLEET_SCOPE/vec-6999"
+VECPID="${PIDS##* }"
+sleep 1
+# POSITIVE CONTROL: selected first, or a dead fake would pass the kill check.
+case " $(_fleet_ours vec | tr '\n' ' ') " in *" $VECPID "*) : ;;
+  *) echo "FAIL: _fleet_ours vec did not select the fake co-processor $VECPID — this case would pass vacuously"; exit 1 ;; esac
+fleet_kill vec
+sleep 0.3
+if kill -0 "$VECPID" 2>/dev/null; then
+  echo "FAIL (BUG-0204): fleet_kill vec left this drill's co-processor $VECPID running"; exit 1
+fi
+echo "  selected, then killed"
+cleanup; PIDS=""; sleep 0.5
+
+echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, proceeds past an ORPHANED one while still refusing a parented one, does not misread our own binaries, honours FORCE, disowns prefix scopes, tells a live peer drill from a foreign fleet, attributes an out-of-scope seat to its live owner rather than to its ppid, and kills a co-processor when asked"
 
 # `[ test ] && echo` as the LAST command makes the script's exit status the
 # TEST's: when case A did run, the test is false, the echo is skipped, and the
