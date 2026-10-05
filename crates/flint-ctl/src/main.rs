@@ -1057,6 +1057,59 @@ fn fail(what: &str, reply: &std::io::Result<Value>) -> ! {
 }
 
 /// Run an admin call for its effect; any refusal ends the command.
+/// Make the control plane's co-processor family table (ADR-0010 D1) match
+/// the inventory's `coproc` lines: `CPFAMILY` each declared family whose
+/// endpoints differ or are missing, `CPFAMILYCLEAR` each the inventory no
+/// longer declares. Returns what changed, or "unchanged". BUG-0205: bootstrap
+/// was the only writer, so a family added or removed later never reached the
+/// proxies, which take the table from the CP's snapshot over `--families`.
+fn sync_families(
+    inv: &Inventory,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+) -> Result<String, String> {
+    let want: Vec<(String, String)> = families_arg(inv)
+        .map(|f| {
+            f.split(';')
+                .filter_map(|e| e.split_once('='))
+                .map(|(p, a)| (p.to_string(), a.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let have: Vec<(String, String)> = match call_cp(inv, tls, &["CPFAMILIES"]) {
+        Ok(Value::Bulk(Some(raw))) => String::from_utf8_lossy(&raw)
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .map(|(p, a)| (p.to_string(), a.trim().to_string()))
+            .collect(),
+        Ok(Value::Bulk(None)) => Vec::new(),
+        Ok(other) => return Err(format!("CPFAMILIES answered {other:?}")),
+        Err(e) => return Err(format!("CPFAMILIES: {e}")),
+    };
+    let ask = |args: &[&str]| match call_cp(inv, tls, args) {
+        Ok(Value::Error(e)) => Err(format!("{}: {e}", args.join(" "))),
+        Err(e) => Err(format!("{}: {e}", args.join(" "))),
+        Ok(_) => Ok(()),
+    };
+    let mut changed = Vec::new();
+    for (p, a) in &want {
+        if !have.iter().any(|(hp, ha)| hp == p && ha == a) {
+            ask(&["CPFAMILY", p, a])?;
+            changed.push(format!("{p}={a}"));
+        }
+    }
+    for (p, _) in &have {
+        if !want.iter().any(|(wp, _)| wp == p) {
+            ask(&["CPFAMILYCLEAR", p])?;
+            changed.push(format!("{p} cleared"));
+        }
+    }
+    Ok(if changed.is_empty() {
+        "unchanged".into()
+    } else {
+        changed.join(", ")
+    })
+}
+
 fn must(what: &str, reply: std::io::Result<Value>) -> Value {
     match reply {
         Ok(v) if !matches!(v, Value::Error(_)) => v,
@@ -8741,6 +8794,18 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
         }
         assert_build(&seat, got);
         eprintln!("  {seat} rolled and serving");
+    }
+
+    // BUG-0205: the control plane's family table is what every proxy routes
+    // by. Its CPSNAPSHOT replaces a proxy's `--families` the moment one lands,
+    // and families reached the CP only at bootstrap. So a co-processor the
+    // inventory gained was started above and given to the proxies below, and
+    // `VEC.*` still answered "unknown command". Make the CP say what the
+    // inventory says, before the proxies roll: register what is declared,
+    // clear what no longer is.
+    match sync_families(inv, &tls) {
+        Ok(summary) => eprintln!("== co-processor families on the control plane: {summary}"),
+        Err(e) => die_on("the control plane's family table", e),
     }
 
     eprintln!("== proxies last (clients see one blip, over an already-new fleet)");

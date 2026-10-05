@@ -29,6 +29,9 @@
 #   - ops ADR-0050 D4: a `coproc` line added after bootstrap is started by
 #     the next upgrade, the rolled proxy routes VEC. to it, and a second
 #     upgrade replaces the running co-processor with the new build
+#   - BUG-0205: "routes" means a tenant's VEC.* answers through the edge,
+#     not that the proxy's argv names the family (the control plane's table
+#     replaces it); removing the line and rolling clears the family
 #
 # The edge cert is minted by `bootstrap` and signed by the fleet's own
 # internal CA, and flintctl's edge trust defaults to that CA — so this needs
@@ -135,7 +138,27 @@ grep -q "vec-7974 reports $TAG" "$D/upgrade.log" || { echo "FAIL: the upgrade lo
 [ "$(coproc_info build)" = "$TAG" ] || { echo "FAIL: vec-7974 answers FLINTINFO build '$(coproc_info build)', expected $TAG"; exit 1; }
 PXARGS="$(ps -o args= -p "$(cat "$STATE/pids/proxy-7972.pid")" 2>/dev/null)"
 case "$PXARGS" in *"VEC.=127.0.0.1:7974"*) : ;; *) echo "FAIL: the rolled proxy was not given the VEC. family: $PXARGS"; exit 1 ;; esac
-echo "  vec-7974 started on $TAG; the proxy routes VEC. to it"
+# BUG-0205: the argv is not the route table. The control plane's snapshot
+# replaces a proxy's --families, and only bootstrap registered families with
+# it, so the argv above was right while VEC.* answered "unknown command".
+# Ask the edge itself, as a tenant.
+grep -q "co-processor families on the control plane: VEC.=127.0.0.1:7974" "$D/upgrade.log" \
+  || { echo "FAIL: the upgrade did not register VEC. with the control plane:"; grep -n "famil" "$D/upgrade.log" | sed 's/^/  | /'; exit 1; }
+$CTL tenant add er tok-er er 1 >/dev/null 2>&1 || { echo "FAIL: tenant add"; exit 1; }
+# vec <args>: one command through the TLS edge as tenant er, retrying the
+# -LOADING a namespace answers while the co-processor rebuilds it.
+vec() {
+  local out i
+  for i in $(seq 1 40); do
+    out=$(valkey-cli -p 7972 --tls --cacert "$STATE/certs/ca.crt" -a tok-er --no-auth-warning "$@" 2>&1)
+    case "$out" in *LOADING*) sleep 0.25 ;; *) break ;; esac
+  done
+  printf '%s' "$out"
+}
+[ "$(vec VEC.CREATE er DIM 3 METRIC l2)" = "OK" ] || { echo "FAIL: VEC.CREATE through the edge after the upgrade: $(vec VEC.CREATE er2 DIM 3 METRIC l2)"; exit 1; }
+[ "$(vec VEC.SET er a 1,0,0)" = "OK" ] || { echo "FAIL: VEC.SET through the edge"; exit 1; }
+[ "$(vec VEC.SEARCH er 1,0,0 1 | head -1)" = "a" ] || { echo "FAIL: VEC.SEARCH through the edge: $(vec VEC.SEARCH er 1,0,0 1)"; exit 1; }
+echo "  vec-7974 started on $TAG; the proxy routes VEC. to it: a tenant's VEC.CREATE, SET and SEARCH answer through the edge"
 
 echo "== a second upgrade rolls the running co-processor onto the new build"
 TAG2=edge-roll-10
@@ -146,6 +169,23 @@ $CTL upgrade --version-tag "$TAG2" --soak-ms 1500 >"$D/upgrade2.log" 2>&1 \
 kill -0 "$VPID" 2>/dev/null && { echo "FAIL: vec-7974's old process $VPID survived the roll"; exit 1; }
 [ "$(coproc_info build)" = "$TAG2" ] || { echo "FAIL: after the roll vec-7974 reports '$(coproc_info build)', expected $TAG2"; exit 1; }
 echo "  vec-7974: old process gone, new one reports $TAG2"
+[ "$(vec VEC.SEARCH er 1,0,0 1 | head -1)" = "a" ] || { echo "FAIL: after the second roll VEC.SEARCH answers: $(vec VEC.SEARCH er 1,0,0 1)"; exit 1; }
+echo "  the set survives the roll: rebuilt from durable rows, still routed"
+
+echo "== BUG-0205: a coproc line removed and rolled clears the family"
+grep -v '^coproc VEC\. 127\.0\.0\.1:7974$' "$INV" > "$INV.new" && mv "$INV.new" "$INV"
+TAG3=edge-roll-11
+$CTL upgrade --version-tag "$TAG3" --soak-ms 1500 >"$D/upgrade3.log" 2>&1 \
+  || { tail -12 "$D/upgrade3.log" | sed 's/^/  | /'; echo "FAIL: the third upgrade exited $?"; exit 1; }
+grep -q "co-processor families on the control plane: VEC. cleared" "$D/upgrade3.log" \
+  || { echo "FAIL: removing the coproc line did not clear VEC. on the control plane:"; grep -n "famil" "$D/upgrade3.log" | sed 's/^/  | /'; exit 1; }
+# The undeclared seat is not the upgrade's to stop (it no longer knows it);
+# stop it as an operator does, so nothing could answer if a route remained.
+fleet_kill vec
+case "$(vec VEC.CREATE gone DIM 3 METRIC l2)" in
+  *"unknown command"*) echo "  VEC.* is unknown again: no proxy routes to a co-processor that is gone" ;;
+  *) echo "FAIL: after removing the line VEC.CREATE answered: $(vec VEC.CREATE gone DIM 3 METRIC l2)"; exit 1 ;;
+esac
 
 echo "== a bare TCP listener must NOT read as a serving proxy"
 # THE POSITIVE CONTROL for proxy_up. Until today a client-TLS fleet's
@@ -189,4 +229,4 @@ case "$ROW" in
           exit 1 ;;
 esac
 
-echo "PASS: a client-TLS fleet rolls to completion and every seat REPORTS the build, liveness means ANSWERING rather than merely holding the port — the branch no other drill executes — and an upgrade starts and rolls the fleet's co-processor"
+echo "PASS: a client-TLS fleet rolls to completion and every seat REPORTS the build, liveness means ANSWERING rather than merely holding the port — the branch no other drill executes — and an upgrade starts, routes, rolls and (with its line removed) unroutes the fleet's co-processor"
