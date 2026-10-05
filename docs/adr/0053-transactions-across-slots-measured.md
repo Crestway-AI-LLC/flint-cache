@@ -4,7 +4,8 @@ Status: **ACCEPTED 2026-09-27** (Jeff: "go with your recommendation on
 ADR-0053"): option D. Built for transactions and scripts; see "As built" at
 the end, which also measures a need the Context missed (rq's worker). The
 amendment it proposed for that need was **accepted 2026-09-30** (Jeff: "go
-with your recommendations"), to be built with ADR-0052's stage 4.
+with your recommendations"), to be built with ADR-0052's stage 4, which
+is held (2026-10-03) until a tenant asks for rq or BullMQ.
 
 ## Context
 

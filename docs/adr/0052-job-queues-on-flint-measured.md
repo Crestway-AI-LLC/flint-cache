@@ -5,7 +5,10 @@ ADR-0052"): Flint serves job queues, in the four stages below. Stages 1 (D1
 and D2) and 2 (D4) are built; see "As built" at the end. **Stage 3, pub/sub
 (D5), is STOPPED 2026-09-30** (Jeff: "stop pub/sub as out of scope"): the
 roadmap lists pub/sub as out of v0 scope, and no user has asked for it.
-Stage 4 is accepted and not started. The three plain commands the
+**Stage 4, streams (D6) then `cjson` and `cmsgpack` (D3), is HELD
+2026-10-03** (Jeff: "Hold stage 4 until a tenant asks for rq or BullMQ
+till I revisit the situation"); see "Stage 4" at the end. The three plain
+commands the
 measurement found missing (`LMOVE`, `RPOPLPUSH`, `HINCRBYFLOAT`) were
 ordinary gaps and are fixed as BUG-0187.
 
@@ -405,3 +408,14 @@ The design this record chose held up against them: a channel hashed like a
 key keeps Celery's result transaction on one pair. The build had reached a
 seat-side broker and a RESP3 push frame; it is not in the repository.
 
+### Stage 4: D6 then D3, held (2026-10-03)
+
+Not started. Jeff held it until a tenant asks for rq or BullMQ, or he
+revisits it. Those are the two libraries it serves: rq keeps results on a
+stream, and BullMQ's scripts need `cmsgpack`. ADR-0053's amendment (`LMOVE`
+and its relatives across slots, for rq's worker) is held with it, since rq
+needs both.
+
+**What it means today:** rq and BullMQ are not served; each stops where the
+stage 2 table above records. Sidekiq and asynq (stages 1 and 2) are
+unaffected.

@@ -17,8 +17,12 @@ defence in depth, not data. Vector search is not offered to tenants yet.
 flint-server (`--engine mem`), flint-proxy and flint-vec, the last built
 from ADR-0049's item-2 branch, on a laptop with a LAN address `10.0.0.206`.
 
-- `flint-vec --port 6792 --bind 127.0.0.1` printed `co-processor on
-  0.0.0.0:6792`, and `lsof` showed `TCP *:6792 (LISTEN)`.
+Two runs, each started with `--bind 127.0.0.1`:
+
+- On port 6799, `flint-vec` printed `co-processor on 0.0.0.0:6799`, and
+  `lsof` showed `TCP *:6799 (LISTEN)`.
+- On port 6792, it printed `co-processor on 0.0.0.0:6792`, and the rest of
+  this list was measured.
 - Through the proxy, tenant `ns` created set `docs` and stored id `secret`.
 - A client connected to `10.0.0.206:6792`, not loopback, and sent
   `FLINTFAM not-a-token 127.0.0.1:1 ns VEC.SEARCH docs 1,0,0 2`. The reply was
