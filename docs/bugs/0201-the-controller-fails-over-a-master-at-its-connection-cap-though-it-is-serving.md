@@ -115,12 +115,12 @@ Measured on the gate box:
 
 ## What this does not do
 
-- **A replica cannot re-attach to a full master.** Its replication handshake
-  is not a probe, so it gets the max-clients error until the master has room.
-  A link that drops while the master is full stays down until then, and
-  `min-replicas-to-write` may shed writes meanwhile. The ops agent's early
-  warning (OPS-0361, at 50% of the cap) is the defence. A reserve for
-  replication, by first command or by identity, would be the next step.
+- **A replica could not re-attach to a full master. FIXED as BUG-0206
+  (2026-10-05).** Its replication handshake was not a probe, so it got the
+  max-clients error until the master had room, and `min-replicas-to-write`
+  could shed writes meanwhile. Now the first 4 connections past the cap are
+  served when their first command is `FLINTSYNC` or `FLINTFULLSYNC`. The ops
+  agent's early warning (OPS-0361, at 50% of the cap) still comes first.
 - **A node still loading** (the `-LOADING` acceptor) drops over-cap
   connections as before. A loading node is never a master.
 - **Direction 3**, a second liveness signal before promoting, is not built.

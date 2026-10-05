@@ -18,7 +18,10 @@
 #   - anything else answers Redis's "-ERR max number of clients reached";
 #   - for well past the controller's confirm ticks and its slow-promote
 #     window, the master stays master;
-#   - the edge keeps serving on the proxy's pooled connections.
+#   - the edge keeps serving on the proxy's pooled connections;
+#   - BUG-0206: a replica restarted while its master is full re-attaches,
+#     through the connections held past the cap for a replica's handshake
+#     (FLINTSYNC/FLINTFULLSYNC), and the master stays full.
 # Unfixed, the first PING is a reset and the controller promotes the replica.
 set -u
 cd "$(dirname "$0")/.."
@@ -213,6 +216,30 @@ done
 [ "$(masters)" = "$BEFORE" ] || { echo "FAIL: flintctl status: [$(masters)] against [$BEFORE] before"; exit 1; }
 echo "  10 s: $REP still the replica, $M still master at epoch $EPOCH, edge writable throughout"
 
+echo "== BUG-0206: a replica restarted while the master is full re-attaches"
+# Its link is a connection like any other, and it opens one with FLINTSYNC or
+# FLINTFULLSYNC. Over the cap that got the max-clients error, so a link that
+# dropped while the master was full stayed down until it had room.
+field_of() { probe "$1" FLINTINFO | sed -n "s/^$2:\([0-9]*\).*/\1/p"; }
+RA0="$(field_of $M conns_reserve_admitted)"
+[ -n "$RA0" ] || { echo "FAIL: FLINTINFO has no conns_reserve_admitted"; exit 1; }
+$CTL -f "$INV" restart-node "127.0.0.1:$REP" >"$D/restart.log" 2>&1 \
+  || { tail -8 "$D/restart.log" | sed 's/^/  | /'; echo "FAIL (BUG-0206): the replica could not rejoin its master while the master was full"; exit 1; }
+LIVE=""
+for _ in $(seq 1 75); do
+  [ "$(field_of $M live_replicas)" = 1 ] && { LIVE=1; break; }
+  sleep 0.2
+done
+[ -n "$LIVE" ] || { echo "FAIL (BUG-0206): after the restart the master reports live_replicas $(field_of $M live_replicas)"; exit 1; }
+RA1="$(field_of $M conns_reserve_admitted)"
+[ "${RA1:-0}" -gt "$RA0" ] \
+  || { echo "FAIL: the replica re-attached without the reserve ($RA0 -> $RA1): the master was not full, so this proved nothing"; exit 1; }
+A=$(field_of $M active_conns); X=$(field_of $M max_conns)
+[ "$A" -ge "$X" ] || { echo "FAIL: the master is no longer full ($A of $X); the holder let go"; exit 1; }
+R="$(probe $M SET cap:direct2 v)"
+case "$R" in "-ERR max number of clients reached") : ;; *) echo "FAIL: a data command in the reserve answered [$R], not the max-clients error"; exit 1 ;; esac
+echo "  $REP restarted and re-attached through the reserve ($RA0 -> $RA1 admitted); the master stayed full ($A of $X) and still refuses data commands"
+
 echo "== release the held connections: the master takes new ones again"
 kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null; HOLD_PID=""
 OK=""
@@ -226,4 +253,5 @@ probe $M FLINTCONFIG max-conns 2048 >/dev/null
 
 echo "PASS: a master at its connection cap answers PING and FLINTINFO on a new connection,"
 echo "      refuses everything else with Redis's max-clients error, and the controller"
-echo "      keeps it as master while the edge serves on (BUG-0201)."
+echo "      keeps it as master while the edge serves on (BUG-0201); a replica restarted"
+echo "      meanwhile re-attaches through the reserve held for its handshake (BUG-0206)."

@@ -1114,6 +1114,18 @@ static OVER_CAP_ANSWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// How long an over-cap connection has for its handshake and its one command,
 /// each: the controller's own read timeout is 800 ms.
 const OVER_CAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Connections a node takes past `--max-conns` for a REPLICA'S HANDSHAKE
+/// only (BUG-0206). A replica opens its link with `FLINTSYNC` or
+/// `FLINTFULLSYNC`; over the cap that got [`MAX_CLIENTS_ERR`], so a link that
+/// dropped while the master was full stayed down until it had room, and
+/// `min-replicas-to-write` could shed writes meanwhile. A connection in this
+/// band must name one of those two as its first command within
+/// [`OVER_CAP_DEADLINE`]; anything else is answered as over the cap
+/// ([`admit_to_reserve`]) and closed, so tenants cannot use it.
+const REPL_RESERVE: usize = 4;
+/// Replica handshakes admitted through [`REPL_RESERVE`] (FLINTINFO
+/// `conns_reserve_admitted:`).
+static CONNS_RESERVE_ADMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Startup state (#176). Set from process start until the real accept loop
 /// takes the listener over; while it holds, the port is OPEN and answers, but
@@ -3584,7 +3596,12 @@ fn main() -> std::io::Result<()> {
         // dropped: dropped, every new-connection probe read a FULL node as a
         // dead one, and the controller failed over a master that was serving
         // every client it had (BUG-0201).
-        if ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS.load(Ordering::Relaxed) {
+        // BUG-0206: the first REPL_RESERVE past the cap are held for a
+        // replica's handshake; past those, as BUG-0201 answers.
+        let held = ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed);
+        let max_conns = MAX_CONNS.load(Ordering::Relaxed);
+        let in_reserve = held >= max_conns;
+        if held >= max_conns.saturating_add(REPL_RESERVE) {
             ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
             CONNS_SHED.fetch_add(1, Ordering::Relaxed);
             let read_only = Arc::clone(&read_only);
@@ -3626,15 +3643,36 @@ fn main() -> std::io::Result<()> {
             let _conn_guard = ConnGuard;
             // TLS handshake (incl. mutual client-cert verification) runs lazily
             // on serve's first read; a peer that fails it errors out there.
-            let conn = match flint_tls::accept(stream, &internal_tls) {
+            let mut conn = match flint_tls::accept(stream, &internal_tls) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("internal tls accept: {e}");
                     return;
                 }
             };
+            // BUG-0206: a connection in the reserve is served only if its
+            // first command is a replica's handshake, and that command is
+            // handed to serve() unread.
+            let prefix = if in_reserve {
+                match admit_to_reserve(&mut conn, || {
+                    let (ro, role_epoch) = role_snapshot(&read_only, &rocks);
+                    flintinfo(
+                        ro,
+                        role_epoch,
+                        &rocks,
+                        &hub,
+                        write_queue.as_ref().map(|q| q.depth()),
+                    )
+                }) {
+                    Some(bytes) => bytes,
+                    None => return,
+                }
+            } else {
+                Vec::new()
+            };
             let _ = serve(
                 conn,
+                prefix,
                 store.as_ref(),
                 &read_only,
                 &tailer_stop,
@@ -3710,16 +3748,60 @@ fn answer_over_cap(
     });
 }
 
+/// A connection in [`REPL_RESERVE`]: read its first command within
+/// [`OVER_CAP_DEADLINE`]. A replica's handshake (`FLINTSYNC`,
+/// `FLINTFULLSYNC`) is admitted: the deadline is lifted and the bytes read so
+/// far are returned for serve() to parse. Anything else is answered as a
+/// connection over the cap would be, and `None` closes it.
+fn admit_to_reserve(
+    conn: &mut flint_tls::Stream,
+    flintinfo: impl FnOnce() -> Value,
+) -> Option<Vec<u8>> {
+    if conn.set_read_timeout(Some(OVER_CAP_DEADLINE)).is_err()
+        || conn.set_write_timeout(Some(OVER_CAP_DEADLINE)).is_err()
+    {
+        return None;
+    }
+    let (args, raw) = read_first_command(conn)?;
+    let name = args[0].to_ascii_uppercase();
+    if name == b"FLINTSYNC" || name == b"FLINTFULLSYNC" {
+        if conn.set_read_timeout(None).is_err() || conn.set_write_timeout(None).is_err() {
+            return None;
+        }
+        CONNS_RESERVE_ADMITTED.fetch_add(1, Ordering::Relaxed);
+        return Some(raw);
+    }
+    CONNS_SHED.fetch_add(1, Ordering::Relaxed);
+    let reply = match name.as_slice() {
+        b"PING" => Value::Simple("PONG".into()),
+        b"FLINTINFO" => flintinfo(),
+        _ => Value::Error(MAX_CLIENTS_ERR.into()),
+    };
+    let mut out = Vec::new();
+    encode(&reply, &mut out);
+    let _ = conn.write_all(&out);
+    None
+}
+
 /// The first command on `conn`, RESP or inline, or `None` when the peer sends
 /// none (in time), closes, or sends something that is not one.
 fn read_one_command(conn: &mut flint_tls::Stream) -> Option<Vec<Vec<u8>>> {
+    read_first_command(conn).map(|(args, _)| args)
+}
+
+/// [`read_one_command`], also returning every byte read, so a caller that
+/// admits the connection can hand them on unparsed.
+fn read_first_command(conn: &mut flint_tls::Stream) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4 * 1024];
     loop {
         if buf.first() == Some(&b'*') {
             match decode(&buf) {
                 Ok(Decoded::Complete(frame, _)) => {
-                    return frame_to_args(frame).filter(|a| !a.is_empty());
+                    let raw = buf.clone();
+                    return frame_to_args(frame)
+                        .filter(|a| !a.is_empty())
+                        .map(|a| (a, raw));
                 }
                 Ok(Decoded::NeedMore) => {}
                 Err(_) => return None,
@@ -3731,7 +3813,7 @@ fn read_one_command(conn: &mut flint_tls::Stream) -> Option<Vec<Vec<u8>>> {
                 .filter(|p| !p.is_empty())
                 .map(<[u8]>::to_vec)
                 .collect();
-            return (!args.is_empty()).then_some(args);
+            return (!args.is_empty()).then(|| (args, buf.clone()));
         }
         if buf.len() > MAX_INLINE_LEN {
             return None;
@@ -4141,6 +4223,9 @@ fn commit_pending(
 #[allow(clippy::too_many_arguments)]
 fn serve(
     mut stream: flint_tls::Stream,
+    // Bytes already read off `stream` that serve() must parse before reading
+    // more: a reserve connection's first command (BUG-0206). Empty otherwise.
+    prefix: Vec<u8>,
     store: &dyn Kv,
     read_only: &Arc<AtomicBool>,
     tailer_stop: &Arc<AtomicBool>,
@@ -4152,7 +4237,8 @@ fn serve(
     write_queue: Option<&Arc<write_queue::WriteQueue>>,
     watch: &Arc<flint_storage::watch::WatchTable>,
 ) -> std::io::Result<()> {
-    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut buf: Vec<u8> = prefix;
+    buf.reserve(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
     // Connection-scoped namespace (FLINTNS): the tenant boundary.
@@ -6594,7 +6680,7 @@ fn flintinfo(
     // One read of the pair, so the two describe the same moment.
     let ews_ewb = engine_write_samples();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nengine_write_busy_samples:{ewb}\r\nengine_write_samples:{ews}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\nuptime_ms:{upms}\r\n{lrs}",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nconns_reserve_admitted:{cra}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nengine_write_busy_samples:{ewb}\r\nengine_write_samples:{ews}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\nuptime_ms:{upms}\r\n{lrs}",
         if read_only { "replica" } else { "master" },
         hub.live_replica_count(now),
         soft = hub.lag_soft_ms(),
@@ -6688,6 +6774,7 @@ fn flintinfo(
         ac = ACTIVE_CONNS.load(Ordering::Relaxed),
         mc = MAX_CONNS.load(Ordering::Relaxed),
         cs = CONNS_SHED.load(Ordering::Relaxed),
+        cra = CONNS_RESERVE_ADMITTED.load(Ordering::Relaxed),
         // ONE read, not two: the pair has to describe one moment, and
         // write_stall() is now fallible, so calling it twice could also
         // report readable=1 beside a value from a read that failed.
@@ -8617,6 +8704,7 @@ mod serve_tests {
                     let store = MemKv::new();
                     let _ = serve(
                         flint_tls::Stream::Plain(stream),
+                        Vec::new(),
                         &store,
                         &Arc::new(AtomicBool::new(false)),
                         &Arc::new(AtomicBool::new(false)),
@@ -8978,6 +9066,7 @@ mod serve_tests {
                     let store: &dyn Kv = &*kv;
                     let _ = serve(
                         flint_tls::Stream::Plain(stream),
+                        Vec::new(),
                         store,
                         &Arc::new(AtomicBool::new(false)),
                         &Arc::new(AtomicBool::new(false)),
@@ -9025,6 +9114,7 @@ mod serve_tests {
                 std::thread::spawn(move || {
                     let _ = serve(
                         flint_tls::Stream::Plain(stream),
+                        Vec::new(),
                         &*store,
                         &Arc::new(AtomicBool::new(false)),
                         &Arc::new(AtomicBool::new(false)),
