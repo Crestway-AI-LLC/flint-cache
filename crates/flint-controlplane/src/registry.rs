@@ -228,6 +228,13 @@ pub struct RegistryState {
     /// overwriting it, reproducing the bug in the surface built to find it.
     #[serde(skip)]
     pub controllers: std::collections::BTreeMap<String, (String, u64)>,
+    /// Planned-handover holds (BUG-0207, `crate::state::handover`): a pair's
+    /// sorted members -> the unix ms its hold ends. NEVER RAFTED or persisted,
+    /// for the reason `controllers` is not: a seconds-long advisory from a
+    /// running `flintctl`, whose loss only returns the controller to what it
+    /// did before holds existed.
+    #[serde(skip)]
+    pub handovers: std::collections::BTreeMap<String, u64>,
     /// Where the SINGLE-NODE control plane persists this state, and `None`
     /// everywhere else.
     ///

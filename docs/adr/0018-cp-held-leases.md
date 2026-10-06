@@ -167,3 +167,38 @@ fence the old master within a renewal interval).
   `flintctl failover` gains the CPFENCE step. Inventory syntax is unchanged.
 - Runbook: "controller down" stops being a fleet emergency. "CP quorum lost"
   gains a hard deadline (TTL) and pages accordingly.
+
+## Amendment 2026-10-05: a planned handover holds the controller off its gap (BUG-0207)
+
+The controlled failover this ADR orders (fence, demote, drain, CPFENCE,
+promote) leaves the pair with no master for the length of the drain. The
+controller was never told, and on every playground roll from rc.76 to rc.79
+it promoted the just-demoted old master into that gap. The roll then
+promoted the new master at the same role epoch. Jeff chose option A of
+BUG-0207 on 2026-10-05.
+
+- **`CPHANDOVER <addr> [ttl_ms]`** on the control plane. It sets (`ttl_ms` >
+  0, capped at 60 s), clears (`0`), or queries (no `ttl_ms`; an integer of
+  milliseconds left) a hold for the pair holding `addr`. Membership is the
+  guard, as for CPFENCE. The hold is **node-local and never Rafted**, like
+  `CPCONTROLLER`. In Raft mode it is served only by the leader, the seat both
+  callers reach by following `-LEADER`. Losing it to a restart or a leader
+  change returns the controller to its earlier behaviour.
+- **`flintctl`** takes a 5 s hold before the demote and refreshes it once a
+  second while the old master answers the drain. It releases the hold after
+  the promote, and on every failure path before it exits, because those
+  paths promise the controller will finish the handoff.
+- **The controller** asks for the hold after `confirm` empty ticks and
+  before announcing an outage. While a hold is live it stands down, keeping
+  its streak, and asks again at most once a second. It **fails open**: an old
+  CP (unknown verb), an unreachable CP, or no `--commit-cp` all read as no
+  hold, because a CP that cannot be asked must never stop a failover.
+- **Compatibility.** An old controller ignores holds. A new controller
+  facing an old CP sees none. A new `flintctl` facing an old CP prints a
+  note and proceeds as before. Holds protect a roll only from the release
+  AFTER the one that ships them: `upgrade` rolls the controller after the
+  pairs, so the roll that ships this still has the old controller watching.
+- **Held by `handover_hold_drill`.** One arm checks that a planned handover
+  with its gap held open makes the controller hold rather than promote. The
+  other checks that a `flintctl` killed mid-handover lets the hold lapse and
+  the controller recover the pair within seconds.

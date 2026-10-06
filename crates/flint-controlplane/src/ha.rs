@@ -294,6 +294,9 @@ pub struct Ha {
     /// unions the rows across every CP in the inventory, so the fleet-wide
     /// answer is assembled by the reader rather than by consensus.
     pub controllers: std::sync::Mutex<crate::state::Controllers>,
+    /// Planned-handover holds (BUG-0207): node-local and never Rafted, like
+    /// `controllers`, and served only by the leader (see the CPHANDOVER arm).
+    pub handovers: std::sync::Mutex<crate::state::Handovers>,
     /// CPLEASE telemetry (ADR-0018) — node-local like `usage`: the leader
     /// serves renewals, so its numbers are the fleet's. (total, 128-ring of
     /// latencies in us, ring index.)
@@ -365,6 +368,7 @@ pub async fn start(
         journal_path,
         usage: std::sync::Mutex::new(std::collections::HashMap::new()),
         controllers: std::sync::Mutex::new(crate::state::Controllers::new()),
+        handovers: std::sync::Mutex::new(crate::state::Handovers::new()),
         lease_meter: std::sync::Mutex::new((0, Vec::new(), 0)),
     })
 }
@@ -1506,6 +1510,37 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                     Value::Simple(format!("OK {id} {build}"))
                 }
                 Err(_) => Value::Error("ERR controller registry lock".into()),
+            }
+        }
+        b"CPHANDOVER" => {
+            // The HA counterpart of main.rs's handler (BUG-0207). LEADER-ONLY,
+            // like CPLEASE: the hold is node-local and never Rafted, so it has
+            // to live on the one seat that both `flintctl` (call_cp follows
+            // -LEADER) and the controller (it follows one LEADER hop) reach. A
+            // leader change loses it, which returns the controller to what it
+            // did before holds existed -- the failure this fix is not allowed
+            // to make worse.
+            let Some(addr) = text(1) else {
+                return Value::Error("ERR CPHANDOVER <addr> [ttl_ms]".into());
+            };
+            let leader = ha.raft.current_leader().await;
+            if leader != Some(ha.node_id) {
+                return redirect(leader.and_then(|id| ha.client_addrs.get(&id).cloned()));
+            }
+            let reg = ha.store.registry().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match ha.handovers.lock() {
+                Ok(mut h) => crate::handover_value(crate::state::handover(
+                    &mut h,
+                    &reg.pairs,
+                    &addr,
+                    text(2).as_deref(),
+                    now,
+                )),
+                Err(_) => Value::Error("ERR handover lock".into()),
             }
         }
         b"CPSNAPSHOT" => {

@@ -7499,22 +7499,41 @@ fn controlled_failover(
         .max()
         .unwrap_or(1)
         + 1;
+    // TELL THE CONTROLLER THE GAP IS PLANNED (BUG-0207), before the demote
+    // opens it. Without this the controller sees two replicas for `confirm`
+    // ticks and promotes the old master into the gap, and the promotion below
+    // lands at the same role epoch. Best effort: an older CP refuses the verb,
+    // and then the handover proceeds exactly as it did before the fix.
+    let hold = HandoverHold::take(inv, tls, old_master);
     match call(old_master, tls, &["FLINTDEMOTE", "0", &next.to_string()]) {
         Ok(Value::Simple(_)) => {}
         Ok(Value::Error(e)) if e.starts_with("FENCED") => {}
-        other => fail(&format!("demotion of {old_master} failed"), &other),
+        other => {
+            hold.release();
+            fail(&format!("demotion of {old_master} failed"), &other)
+        }
     }
-    let drain_deadline = Instant::now() + Duration::from_secs(30);
+    let drain_start = Instant::now();
+    let drain_deadline = drain_start + Duration::from_secs(30);
+    let floor = handover_drain_floor();
     loop {
-        if info_field(old_master, tls, "seq_lag:").as_deref() == Some("0") {
+        let lag = info_field(old_master, tls, "seq_lag:");
+        if lag.as_deref() == Some("0") && drain_start.elapsed() >= floor {
             break;
         }
-        assert!(
-            Instant::now() < drain_deadline,
-            "replica never drained the demoted master {old_master}'s tail"
-        );
+        // Refreshed only while the old master ANSWERS: a master that died
+        // mid-handover is a real outage, and the controller should have it
+        // within one hold, not at this loop's deadline.
+        if lag.is_some() {
+            hold.refresh();
+        }
+        if Instant::now() >= drain_deadline {
+            hold.release();
+            panic!("replica never drained the demoted master {old_master}'s tail");
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
+    hold.refresh();
     // ADR-0018: the fencing record commits BEFORE the promotion, exactly as
     // the controller does. This is NOT the best-effort hint CPPROMOTED was —
     // it is what makes the promotion stick: the new master's own lease
@@ -7533,14 +7552,19 @@ fn controlled_failover(
     // completes the handoff once the CP is reachable again.
     match call_cp(inv, tls, &["CPFENCE", new_master]) {
         Ok(Value::Simple(_)) => {}
-        other => fail(
-            &format!(
-                "CPFENCE {new_master} did not commit — refusing to promote without \
-                 a fencing record (the pair is demoted and drained; re-run once \
-                 the CP is reachable, or the controller will finish the handoff)"
-            ),
-            &other,
-        ),
+        other => {
+            // The message promises the controller will finish the handoff, so
+            // it must not be left standing down behind our hold.
+            hold.release();
+            fail(
+                &format!(
+                    "CPFENCE {new_master} did not commit — refusing to promote without \
+                     a fencing record (the pair is demoted and drained; re-run once \
+                     the CP is reachable, or the controller will finish the handoff)"
+                ),
+                &other,
+            )
+        }
     }
     match call(
         new_master,
@@ -7548,12 +7572,100 @@ fn controlled_failover(
         &["FLINTPROMOTE", "0", &(next + 1).to_string()],
     ) {
         Ok(Value::Simple(_)) => {}
-        other => fail(
-            &format!("promotion of {new_master} at (0,{}) failed", next + 1),
-            &other,
-        ),
+        other => {
+            hold.release();
+            fail(
+                &format!("promotion of {new_master} at (0,{}) failed", next + 1),
+                &other,
+            )
+        }
     }
+    hold.release();
     next + 1
+}
+
+/// The shortest the drain may take, 0 unless `FLINT_HANDOVER_DRAIN_FLOOR_MS`
+/// says otherwise (BUG-0207). A drill knob, like FLINT_ROLL_GRACE_MS: on a
+/// laptop the drain finishes in milliseconds, inside the controller's
+/// `confirm` window, so the race the hold exists for cannot be reproduced on
+/// demand without holding the gap open. `handover_hold_drill` sets it.
+fn handover_drain_floor() -> Duration {
+    Duration::from_millis(
+        std::env::var("FLINT_HANDOVER_DRAIN_FLOOR_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+/// How long one handover hold lasts (BUG-0207). Short on purpose and
+/// refreshed while the drain makes progress, so a `flintctl` that dies holding
+/// one keeps the controller off the pair for seconds, not for the drain's
+/// 30-second deadline.
+const HANDOVER_HOLD_MS: u64 = 5_000;
+
+/// A planned handover's hold on the control plane (`CPHANDOVER`, BUG-0207):
+/// while it is live the controller does not promote into the gap between the
+/// demote and the promote. Every method is best effort. If the CP would not
+/// take the hold (an older CP refuses the verb), the handover goes ahead as
+/// it did before the fix, and refresh and release cost nothing.
+struct HandoverHold<'a> {
+    inv: &'a Inventory,
+    tls: &'a Option<Arc<flint_tls::ClientConfig>>,
+    member: &'a str,
+    held: bool,
+    refreshed: std::cell::Cell<Instant>,
+}
+
+impl<'a> HandoverHold<'a> {
+    fn take(
+        inv: &'a Inventory,
+        tls: &'a Option<Arc<flint_tls::ClientConfig>>,
+        member: &'a str,
+    ) -> Self {
+        let held = Self::send(inv, tls, member, HANDOVER_HOLD_MS);
+        if !held {
+            eprintln!(
+                "  note: the control plane took no handover hold for {member} (an older CP?), \
+                 so the controller may fail this pair over during the handover (BUG-0207)"
+            );
+        }
+        HandoverHold {
+            inv,
+            tls,
+            member,
+            held,
+            refreshed: std::cell::Cell::new(Instant::now()),
+        }
+    }
+
+    /// Extend the hold, at most once a second.
+    fn refresh(&self) {
+        if self.held && self.refreshed.get().elapsed() >= Duration::from_secs(1) {
+            Self::send(self.inv, self.tls, self.member, HANDOVER_HOLD_MS);
+            self.refreshed.set(Instant::now());
+        }
+    }
+
+    /// End the hold: the handover is done, or failed and the controller is
+    /// the one to finish it.
+    fn release(&self) {
+        if self.held {
+            Self::send(self.inv, self.tls, self.member, 0);
+        }
+    }
+
+    fn send(
+        inv: &Inventory,
+        tls: &Option<Arc<flint_tls::ClientConfig>>,
+        member: &str,
+        ms: u64,
+    ) -> bool {
+        matches!(
+            call_cp(inv, tls, &["CPHANDOVER", member, &ms.to_string()]),
+            Ok(Value::Simple(_))
+        )
+    }
 }
 
 /// `flintctl failover <node>`: a graceful, epoch-fenced handoff of a LIVE

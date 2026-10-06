@@ -1,9 +1,13 @@
-# BUG-0207: during a roll the controller fails the pair over mid-handover, and two nodes are master at one role epoch (OPEN)
+# BUG-0207: during a roll the controller fails the pair over mid-handover, and two nodes are master at one role epoch (FIXED)
 
-**Status:** **OPEN.** Filed 2026-10-05 by the ops session while reviewing the
-playground's runs after the rc.79 roll. The fix is a coordination choice
-between `flintctl upgrade` and the controller, so this records the evidence
-and the options and does not pick one.
+**Status:** **FIXED 2026-10-05**, option A below (Jeff: "go with option A,
+you build it"). Filed the same day by the ops session while reviewing the
+playground's runs after the rc.79 roll. Held by the new CORE drill
+`handover_hold_drill`. **It protects a roll only from the release after the
+one that ships it**: `flintctl upgrade` rolls the controller after the pairs,
+so during the roll that ships the fix the old controller is still watching.
+`flintctl failover` is protected as soon as the controller is on the fixed
+build.
 **Severity:** medium, latent so far. On all four playground rolls checked
 (rc.76, rc.77, rc.78, rc.79) the controller promoted the old master in the
 middle of the roll's handover, and the roll then gave the new master the same
@@ -105,7 +109,47 @@ which.
   gives: a promote-first window is exactly the lossy window this bug opens by
   accident.
 
-## A test that would hold it
+## Fixed (option A)
+
+ADR-0018's amendment of 2026-10-05 records the design. In short:
+
+- **`CPHANDOVER <addr> [ttl_ms]`** (`crates/flint-controlplane`: the shared
+  `state::handover`, dispatched by both `main.rs` and `ha.rs`). It sets, clears
+  or queries a hold for the pair holding `addr`. The hold is node-local, never
+  Rafted or persisted, served by the leader in Raft mode, and capped at 60 s.
+- **`flintctl`'s `controlled_failover`** takes a 5 s hold before the demote
+  and refreshes it once a second while the old master still answers the
+  drain. It releases the hold after the promote and on every failure path. An
+  older CP refuses the verb, and `flintctl` then prints a note and proceeds as
+  before.
+- **The controller** asks after `confirm` empty ticks, before announcing an
+  outage. While a hold is live it stands down, logging "holding: a planned
+  handover is in progress" once and asking again at most once a second. An
+  old CP, an unreachable CP or no `--commit-cp` reads as no hold, so this
+  fails open to the old behaviour.
+
+**`handover_hold_drill`** runs one pair with a controller at the
+playground's `poll-ms 100 confirm 3`. `FLINT_HANDOVER_DRAIN_FLOOR_MS`, a drill
+knob like `FLINT_ROLL_GRACE_MS`, holds the drain open 2 s, which a laptop's
+millisecond drain never does on its own.
+
+- **Arm 1, a planned handover.** The controller logs that it is holding,
+  which it does only after `confirm` empty ticks, so the line is the proof
+  the gap was long enough to race. It does not promote the old master, and
+  the pair ends with one master and the old one as its replica.
+- **Arm 2, `flintctl` killed mid-handover.** The hold lapses and the
+  controller promotes within 5 s on the gate box.
+
+Both mutants reproduce the playground's failure, with the controller logging
+`PROMOTED 127.0.0.1:7568 at (0,3)` into the planned gap:
+- `flintctl` taking no hold;
+- the controller ignoring holds.
+
+The CP rules are unit-tested in `state.rs`, covering set, query by either
+member, refresh, clear, expiry, the cap, the membership guard and a bad ttl.
+The registry round-trip test asserts a hold does not survive a reload.
+
+## The test, as first proposed
 
 A CORE drill: a pair under constant writes with an oracle, a controller at
 `--poll-ms 100 --confirm 3`, and `flintctl upgrade` with the drain slowed past

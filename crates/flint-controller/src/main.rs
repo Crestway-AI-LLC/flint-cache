@@ -203,6 +203,25 @@ fn journal_event(
     );
 }
 
+/// Milliseconds left on a planned handover's hold for the pair holding `addr`
+/// (BUG-0207), or `None` when the CP cannot say. An old CP answers an error for
+/// the unknown verb and an unreachable one answers nothing; both are `None`,
+/// which the caller reads as "no hold". The answer to a known verb is an
+/// INTEGER, so its type is what tells the two apart. Follows one `-LEADER` hop,
+/// as the CPFENCE call does: an HA control plane keeps holds on its leader.
+fn handover_hold_ms(cp: &str, addr: &str) -> Option<u64> {
+    let mut reply = call(cp, &[b"CPHANDOVER", addr.as_bytes()]);
+    if let Ok(Value::Error(e)) = &reply
+        && let Some(leader) = e.strip_prefix("LEADER ")
+    {
+        reply = call(leader.trim(), &[b"CPHANDOVER", addr.as_bytes()]);
+    }
+    match reply {
+        Ok(Value::Integer(n)) => u64::try_from(n).ok(),
+        _ => None,
+    }
+}
+
 fn call(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
     let mut stream = internal_connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_millis(800)))?;
@@ -692,6 +711,11 @@ struct Pair {
     slow_since: Option<Instant>,
     /// One "detected" journal per outage, not one per tick.
     outage_announced: bool,
+    /// A planned handover's hold (BUG-0207): ask the CP again no sooner than
+    /// this, so a held pair costs one CP round trip a second, not one a tick.
+    hold_recheck_at: Option<Instant>,
+    /// One "holding" log line per hold, not one per tick.
+    hold_announced: bool,
     slot_miss: Vec<u32>,
     slot_cooldown: Vec<Instant>,
     slot_child: Vec<Option<std::process::Child>>,
@@ -729,6 +753,8 @@ impl Pair {
             no_master_ticks: Vec::new(),
             slow_since: None,
             outage_announced: false,
+            hold_recheck_at: None,
+            hold_announced: false,
             slot_miss: vec![0; n],
             slot_cooldown: vec![Instant::now(); n],
             slot_child: (0..n).map(|_| None).collect(),
@@ -876,6 +902,8 @@ impl Pair {
             self.no_master_ticks.clear();
             self.slow_since = None;
             self.outage_announced = false;
+            self.hold_recheck_at = None;
+            self.hold_announced = false;
             // Snapshot schedule (Tier-0, design.md §2.9): a periodic durable
             // checkpoint of each managed master into <root>/<pair-label>/.
             // This is what makes whole-pair loss survivable (spare restore
@@ -1082,6 +1110,48 @@ impl Pair {
             cfg.slow_promote,
         ) {
             return;
+        }
+        // A PLANNED HANDOVER IS NOT AN OUTAGE (BUG-0207). `flintctl`'s
+        // controlled failover demotes the old master, drains and only then
+        // promotes, so its no-master gap is longer than `confirm` ticks; on
+        // every roll from rc.76 to rc.79 this controller promoted the
+        // just-demoted master into that gap and the roll then promoted the new
+        // one at the SAME role epoch. The handover now takes a hold on the CP
+        // before it demotes, and this asks for it before announcing an outage.
+        //
+        // FAILS OPEN: an old CP (unknown verb), an unreachable one, or no
+        // `--commit-cp` at all reads as "no hold" -- a CP that cannot be asked
+        // must never stop a failover. The streak is kept, so when the hold ends
+        // with still no master this promotes on the next tick, as before.
+        if let Some(cp) = &cfg.commit_cp {
+            if self.hold_recheck_at.is_some_and(|t| Instant::now() < t) {
+                return;
+            }
+            let member = self.nodes.first().cloned().unwrap_or_default();
+            match handover_hold_ms(cp, &member) {
+                Some(ms) if ms > 0 => {
+                    if !self.hold_announced {
+                        self.hold_announced = true;
+                        eprintln!(
+                            "[{}][{}] holding: a planned handover is in progress on this pair (CP hold, {ms} ms left) -- not promoting into its gap",
+                            cfg.id, self.label
+                        );
+                    }
+                    self.hold_recheck_at =
+                        Some(Instant::now() + Duration::from_millis(ms.min(1_000)));
+                    return;
+                }
+                _ => {
+                    if self.hold_announced {
+                        eprintln!(
+                            "[{}][{}] the handover's hold ended with no master on the pair -- resuming failover",
+                            cfg.id, self.label
+                        );
+                    }
+                    self.hold_announced = false;
+                    self.hold_recheck_at = None;
+                }
+            }
         }
         if !self.outage_announced {
             self.outage_announced = true;

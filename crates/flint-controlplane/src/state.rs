@@ -68,6 +68,77 @@ pub fn record_controller(map: &mut Controllers, id: &str, build: &str, now: u64)
     map.retain(|_, (_, at)| *at >= cutoff);
 }
 
+/// Planned-handover holds (BUG-0207): a pair's key -> the unix ms its hold ends.
+///
+/// `flintctl`'s controlled failover demotes the old master, drains, commits
+/// CPFENCE and only then promotes, so for the length of the drain the pair has
+/// no master. The controller promotes after `confirm` empty ticks -- 300 ms on
+/// the playground -- and on every roll from rc.76 to rc.79 it did exactly
+/// that: it promoted the just-demoted old master, and the roll then promoted
+/// the new one at the SAME role epoch. A hold is how the handover tells the
+/// controller "this gap is planned": the controller asks before promoting and
+/// stands down while one is live.
+///
+/// Node-local in BOTH control planes and never Rafted, like [`Controllers`]:
+/// it is a seconds-long advisory from a running process, and losing it (a CP
+/// restart, a leader change) only puts the controller back to what it did
+/// before this existed. In Raft mode it lives on the LEADER, the seat both
+/// `flintctl` and the controller reach by following `-LEADER`.
+pub type Handovers = BTreeMap<String, u64>;
+
+/// The longest hold a handover may ask for. `flintctl` asks for seconds and
+/// refreshes while it drains; this bound is what stops a caller that dies
+/// holding one from keeping a pair unsupervised for longer than this.
+pub const HANDOVER_MAX_MS: u64 = 60_000;
+
+/// What `CPHANDOVER` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HandoverReply {
+    /// The query form: milliseconds left on the pair's hold, 0 for none.
+    Remaining(u64),
+    /// A hold was set (or refreshed) for this many milliseconds.
+    Set(u64),
+    /// The hold was cleared.
+    Cleared,
+}
+
+/// `CPHANDOVER <addr> [ttl_ms]`, shared by the single-node and HA control
+/// planes for the reason `record_controller` is: two copies drift.
+///
+/// `addr` names the pair by any member, and MEMBERSHIP IS THE GUARD, as for
+/// CPFENCE: an address no registered pair holds is refused. With no `ttl` it
+/// is a query. A `ttl` of 0 clears; anything else sets, capped at
+/// [`HANDOVER_MAX_MS`]. Expired holds are dropped on every call.
+pub fn handover(
+    map: &mut Handovers,
+    pairs: &[Vec<String>],
+    addr: &str,
+    ttl: Option<&str>,
+    now: u64,
+) -> Result<HandoverReply, String> {
+    map.retain(|_, until| *until > now);
+    let Some(pair) = pairs.iter().find(|p| p.iter().any(|m| m == addr)) else {
+        return Err("NOPAIR address is not a member of any registered pair".into());
+    };
+    let mut members = pair.clone();
+    members.sort();
+    let key = members.join(",");
+    let Some(ttl) = ttl else {
+        let left = map.get(&key).map_or(0, |until| until.saturating_sub(now));
+        return Ok(HandoverReply::Remaining(left));
+    };
+    let Ok(ms) = ttl.parse::<u64>() else {
+        return Err("ERR CPHANDOVER <addr> [ttl_ms]: ttl_ms is not a whole number".into());
+    };
+    if ms == 0 {
+        map.remove(&key);
+        return Ok(HandoverReply::Cleared);
+    }
+    let ms = ms.min(HANDOVER_MAX_MS);
+    map.insert(key, now + ms);
+    Ok(HandoverReply::Set(ms))
+}
+
 /// Render one `controller:` line per registered controller.
 ///
 /// Renders STALE rather than dropping the row. A controller that stopped
@@ -849,6 +920,13 @@ mod tests {
                 );
                 c
             },
+            // A live advisory, like `controllers`: set so its absence below
+            // is a finding.
+            handovers: {
+                let mut h = std::collections::BTreeMap::new();
+                h.insert("a:7001,b:7001".to_string(), 1_700_000_005_000_u64);
+                h
+            },
             // Deliberately None: the fixture is what a FILE holds, and a file
             // cannot know where it lives. `load_or_new` restores it from its
             // own argument, which the test below asserts.
@@ -887,6 +965,13 @@ mod tests {
              outlived the process reporting it is a claim about a controller \
              that may not be running, so a cold control plane must start \
              knowing nothing and relearn within one heartbeat"
+        );
+        assert!(
+            got.handovers.is_empty(),
+            "handovers is #[serde(skip)] on purpose (BUG-0207): a hold is a \
+             seconds-long advisory from a running flintctl, and one that \
+             outlived a CP restart would stand the controller down for a \
+             handover nobody is doing"
         );
         // AND THE PATH MUST COME BACK, which is the one field whose absence is
         // silent and expensive. It is #[serde(skip)], so a state parsed from
@@ -1197,5 +1282,86 @@ mod controller_registry_tests {
         // is running" — a CP restarted a moment ago knows nothing yet.
         // Saying nothing is honest; a "controller: none" line would not be.
         assert_eq!(State::default().controller_line(), "");
+    }
+
+    fn pairs() -> Vec<Vec<String>> {
+        vec![
+            vec!["a:7001".into(), "b:7001".into()],
+            vec!["c:7001".into(), "d:7001".into()],
+        ]
+    }
+
+    #[test]
+    fn a_handover_hold_is_set_queried_by_either_member_and_cleared() {
+        let mut m = Handovers::new();
+        let p = pairs();
+        assert_eq!(
+            handover(&mut m, &p, "a:7001", None, 1_000),
+            Ok(HandoverReply::Remaining(0)),
+            "no hold yet"
+        );
+        assert_eq!(
+            handover(&mut m, &p, "a:7001", Some("5000"), 1_000),
+            Ok(HandoverReply::Set(5_000))
+        );
+        // Either member names the pair: flintctl sets it on the old master and
+        // the controller may ask about any member.
+        assert_eq!(
+            handover(&mut m, &p, "b:7001", None, 2_000),
+            Ok(HandoverReply::Remaining(4_000))
+        );
+        assert_eq!(
+            handover(&mut m, &p, "c:7001", None, 2_000),
+            Ok(HandoverReply::Remaining(0)),
+            "a hold is one pair's, not the fleet's"
+        );
+        // A refresh moves the deadline, which is how flintctl keeps a short
+        // hold alive only while it is alive.
+        assert_eq!(
+            handover(&mut m, &p, "a:7001", Some("5000"), 3_000),
+            Ok(HandoverReply::Set(5_000))
+        );
+        assert_eq!(
+            handover(&mut m, &p, "b:7001", None, 7_000),
+            Ok(HandoverReply::Remaining(1_000))
+        );
+        assert_eq!(
+            handover(&mut m, &p, "b:7001", Some("0"), 7_500),
+            Ok(HandoverReply::Cleared)
+        );
+        assert_eq!(
+            handover(&mut m, &p, "a:7001", None, 7_500),
+            Ok(HandoverReply::Remaining(0))
+        );
+    }
+
+    #[test]
+    fn a_handover_hold_expires_and_is_capped() {
+        let mut m = Handovers::new();
+        let p = pairs();
+        handover(&mut m, &p, "a:7001", Some("2000"), 10_000).expect("set");
+        assert_eq!(
+            handover(&mut m, &p, "a:7001", None, 12_000),
+            Ok(HandoverReply::Remaining(0)),
+            "a caller that died holding a hold must not hold the pair past its ttl"
+        );
+        assert!(m.is_empty(), "an expired hold is dropped, not kept at zero");
+        assert_eq!(
+            handover(&mut m, &p, "a:7001", Some("999999999"), 0),
+            Ok(HandoverReply::Set(HANDOVER_MAX_MS)),
+            "no caller holds a pair unsupervised for longer than the cap"
+        );
+    }
+
+    #[test]
+    fn a_handover_hold_refuses_a_non_member_and_a_bad_ttl() {
+        let mut m = Handovers::new();
+        let p = pairs();
+        assert!(
+            handover(&mut m, &p, "z:9", Some("5000"), 0).is_err_and(|e| e.starts_with("NOPAIR")),
+            "membership is the guard, as for CPFENCE"
+        );
+        assert!(handover(&mut m, &p, "a:7001", Some("soon"), 0).is_err());
+        assert!(m.is_empty());
     }
 }

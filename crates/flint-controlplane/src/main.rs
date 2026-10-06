@@ -215,6 +215,20 @@ fn err(msg: &str) -> Value {
     Value::Error(format!("ERR {msg}"))
 }
 
+/// `CPHANDOVER`'s answer (BUG-0207), shared by both control planes: the query
+/// is an integer (milliseconds left, 0 for none), so a caller tells "no hold"
+/// from "this CP does not know the verb" by the reply's TYPE.
+pub(crate) fn handover_value(r: Result<state::HandoverReply, String>) -> Value {
+    match r {
+        Ok(state::HandoverReply::Remaining(ms)) => {
+            Value::Integer(i64::try_from(ms).unwrap_or(i64::MAX))
+        }
+        Ok(state::HandoverReply::Set(ms)) => Value::Simple(format!("OK hold {ms}")),
+        Ok(state::HandoverReply::Cleared) => Value::Simple("OK cleared".into()),
+        Err(e) => Value::Error(e),
+    }
+}
+
 fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
     let cmd = args
         .first()
@@ -1389,6 +1403,30 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .unwrap_or(0);
             state::record_controller(&mut st.controllers, &id, &build, now);
             Value::Simple(format!("OK {id} {build}"))
+        }
+        b"CPHANDOVER" => {
+            // `CPHANDOVER <addr> [ttl_ms]` (BUG-0207) — a planned handover
+            // telling the controller its no-master gap is not an outage. Like
+            // CPCONTROLLER: no commit, no version bump, nothing a proxy
+            // watches. `state::handover` holds the rules; see it.
+            let Some(addr) = text(1) else {
+                return err("CPHANDOVER <addr> [ttl_ms]");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let st = &mut *st;
+            handover_value(state::handover(
+                &mut st.handovers,
+                &st.pairs,
+                &addr,
+                text(2).as_deref(),
+                now,
+            ))
         }
         b"CPSNAPSHOT" => {
             let Some(proxy) = text(1) else {
