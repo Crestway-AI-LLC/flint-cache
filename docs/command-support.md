@@ -548,9 +548,14 @@ Smaller ones, which the corpus does not list:
   and `FLINTINFO` throughout, and refuses everything else with `-LOADING`
   until it is serving. `FLINTINFO` reports `role:loading`, `loading:1` and
   `loading_ms` — how long it has been at it — and `loading:0` once it
-  serves. **Tenants do not see this error**: the proxy pins each backend
-  connection to a namespace before any command travels on it, and a loading
-  node refuses that pin, so it stays out of the routing path entirely.
+  serves. **Tenants do not see a node's LOADING**: the proxy pins each
+  backend connection to a namespace before any command travels on it, and a
+  loading node refuses that pin, so it stays out of the routing path
+  entirely. The one LOADING a tenant can see comes from a proxy itself, in
+  the moment after it starts and before its first control-plane snapshot
+  arrives (BUG-0211). It holds no tenant tokens yet, and LOADING says to
+  retry. The WRONGPASS it used to answer told a client holding a valid token
+  that the token was wrong.
 
 ## Lua scripts (ADR-0051)
 

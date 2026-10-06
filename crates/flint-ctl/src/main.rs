@@ -1447,10 +1447,16 @@ fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Result<Option<Str
     // next one -- can say which transient it hit.
     //
     // So the first fix is to make the failure SAYABLE. Retrying is not done
-    // here on purpose: which transient fires is still unknown, and choosing a
+    // here on purpose: which transient fires was unknown, and choosing a
     // remedy before the evidence exists is how the three prior instances
     // (rc.29, #102, rc.47) each removed one way to fail while leaving the
     // single attempt in place.
+    //
+    // BUG-0211 is the evidence: `WRONGPASS invalid token` from a proxy
+    // restarted just after its control plane, before its first snapshot gave
+    // it the admin digest. The remedy is at the source, not a retry here: such
+    // a proxy answers LOADING, which `proxy_up` reads as not up, so the roll
+    // waits for the snapshot before it asks.
     match call_seq_on(
         &proxy_dial(inv, i),
         &tls,
@@ -4061,6 +4067,22 @@ fn proxy_up(inv: &Inventory, i: usize) -> bool {
         // without a live proxy.
         Err(e) if is_noauth_error(&e.to_string()) => true,
         _ => false,
+    }
+}
+
+/// What a proxy answers PROXYSTATS, for a message that must say why it is
+/// not up. A CP-fed proxy without its first snapshot answers LOADING
+/// (BUG-0211), which `proxy_up` rightly reads as not up.
+fn proxy_probe_error(inv: &Inventory, i: usize) -> String {
+    match call_seq_on(
+        &proxy_dial(inv, i),
+        &edge_tls_client(inv),
+        &[&["PROXYSTATS"]],
+        Duration::from_millis(1500),
+        inv.client_tls,
+    ) {
+        Ok(_) => "PROXYSTATS, now".into(),
+        Err(e) => e.to_string(),
     }
 }
 
@@ -8946,10 +8968,19 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
             &proxy_args(inv, i),
             envs,
         );
+        // A CP-fed proxy is up once it has its first control-plane
+        // snapshot: before that it answers LOADING (BUG-0211), and the
+        // build read below would have nothing to authenticate against.
         let deadline = Instant::now() + Duration::from_secs(15);
         while !proxy_up(inv, i) {
             if Instant::now() > deadline {
-                die_on(&seat, "did not serve after the binary swap".into());
+                die_on(
+                    &seat,
+                    format!(
+                        "did not serve after the binary swap (it answers: {})",
+                        proxy_probe_error(inv, i)
+                    ),
+                );
             }
             std::thread::sleep(Duration::from_millis(150));
         }

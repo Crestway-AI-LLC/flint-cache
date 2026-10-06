@@ -527,6 +527,12 @@ struct Topology {
     /// auth, default namespace. A control-plane-fed proxy is never open —
     /// before its first snapshot it simply has no tenants yet.
     open_mode: bool,
+    /// Whether this proxy has the tenants and admin digest it serves with
+    /// (BUG-0211): from the start for a proxy configured statically, and
+    /// from the first applied snapshot for one fed by a control plane. Until
+    /// then every command but QUIT answers `-LOADING`, which clients retry,
+    /// where an AUTH used to fall through to `WRONGPASS` for a valid token.
+    ready: std::sync::atomic::AtomicBool,
     /// Client-side mutual-TLS for dialing backends (the internal hop),
     /// hot-reloading its leaf (ADR-0006 D4) — each dial snapshots the
     /// current config. `None` = plaintext backends (default). Set by
@@ -1568,6 +1574,11 @@ impl Backends {
         self.private_call(addr, frame, budget).await
     }
 }
+
+/// What a control-plane-fed proxy answers before its first snapshot
+/// (BUG-0211).
+const PROXY_LOADING: &str =
+    "LOADING the proxy has not yet received its tenants from the control plane";
 
 /// The key a command routes by (mirrors the server's command_key): `args[1]`
 /// unless the command addresses no key. Multi-key commands route by their
@@ -2752,7 +2763,18 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
             // any code that could forward them. Checked pre-auth
             // deliberately: an unauthenticated connection has no more
             // business naming a namespace than an authenticated one.
-            let reply = if args.first().is_some_and(|n| is_internal_only(n)) {
+            let reply = if !topo.ready.load(Ordering::Acquire)
+                && !args
+                    .first()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(b"QUIT"))
+            {
+                // BUG-0211: no snapshot yet, so no tenant token or admin
+                // digest to check one against. LOADING, as a Redis node
+                // answers while it loads, is the reply clients retry;
+                // WRONGPASS told a client holding a valid token that it was
+                // wrong.
+                Value::Error(PROXY_LOADING.into())
+            } else if args.first().is_some_and(|n| is_internal_only(n)) {
                 Value::Error("ERR admin commands are not available through the proxy".into())
             } else {
                 match auth_step(
@@ -5090,6 +5112,10 @@ fn watch_control_plane(
                     if let Some(f) = &families {
                         topo.apply_families(f);
                     }
+                    // BUG-0211: set only once every part of the snapshot is
+                    // applied, so no connection is admitted against half of
+                    // it. See `ready`.
+                    topo.ready.store(true, Ordering::Release);
                     *last_version = *version as u64;
                     eprintln!("control-plane snapshot v{version} applied");
                     out.clear();
@@ -5383,6 +5409,7 @@ fn main() -> std::io::Result<()> {
                 .unwrap_or(cache::DEFAULT_TTL_MAX_MS),
         ),
         open_mode,
+        ready: std::sync::atomic::AtomicBool::new(control_plane.is_none()),
         backend_tls,
         // Sized to the KEYSPACE, not to taste: DBSIZE walks every metadata
         // row on the node it asks. Default 60s (~20M keys of headroom on
@@ -6044,6 +6071,7 @@ mod route_tests {
             stat_quota_write_shed_total: std::sync::atomic::AtomicU64::new(0),
             cache: cache::ProxyCache::new(0, 0),
             open_mode: true,
+            ready: std::sync::atomic::AtomicBool::new(true),
             backend_tls: None,
             fanout_timeout: FANOUT_TIMEOUT_DEFAULT,
             cert_path: None,
@@ -6931,6 +6959,49 @@ mod route_tests {
             Some("c:1"),
             "disagreeing (newer) bridge must survive the push"
         );
+    }
+
+    /// BUG-0211: a control-plane-fed proxy answers LOADING until its first
+    /// snapshot is applied, not WRONGPASS to a token it cannot yet check;
+    /// once it is applied, the same token authenticates. On the code before
+    /// the fix the first AUTH answered `WRONGPASS invalid token`.
+    #[test]
+    fn a_proxy_without_its_first_snapshot_answers_loading_not_wrongpass() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut t = two_pair_topo();
+        t.open_mode = false;
+        t.ready = std::sync::atomic::AtomicBool::new(false);
+        let t = Arc::new(t);
+        let auth = b"*2\r\n$4\r\nAUTH\r\n$5\r\ntok-a\r\n";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        let replies = rt.block_on(local.run_until(async {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let topo = Arc::clone(&t);
+            tokio::task::spawn_local(async move {
+                let _ = serve_client(server, topo).await;
+            });
+            let mut buf = [0u8; 256];
+            client.write_all(auth).await.expect("write");
+            let n = client.read(&mut buf).await.expect("read");
+            let before = String::from_utf8_lossy(&buf[..n]).to_string();
+            let digest = flint_tls::sha256_hex(b"tok-a");
+            t.apply_snapshot("a:1;b:1", &format!("{digest}=acme"), "", "");
+            t.ready.store(true, Ordering::Release);
+            client.write_all(auth).await.expect("write");
+            let n = client.read(&mut buf).await.expect("read");
+            let after = String::from_utf8_lossy(&buf[..n]).to_string();
+            (before, after)
+        }));
+        assert!(
+            replies.0.starts_with("-LOADING"),
+            "before the snapshot: {:?}",
+            replies.0
+        );
+        assert!(replies.1.starts_with("+OK"), "after it: {:?}", replies.1);
     }
 
     /// ADR-0053: `P<n>` in a tenant's flags places it. Every slot of its
