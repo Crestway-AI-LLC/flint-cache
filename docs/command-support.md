@@ -28,8 +28,8 @@ reporting a failure that would say nothing about either side.
 
 They are checked against the real thing separately. `tools/redisjson_compare.sh`
 loads a RedisJSON module built from source and runs this same corpus against
-it; the gate is that exactly three cases differ, and that those three are the
-ones listed under "Where we differ from RedisJSON" below. So the JSON
+it; the gate is that exactly the cases listed under "Where we differ from
+RedisJSON" below differ, and every one of them still does. So the JSON
 contract is a verified match, not a reading of the docs — but the check is
 on-demand rather than in CI, because it needs a module you have to compile.
 
@@ -392,18 +392,41 @@ honest.
   JSON.DEL counts what it removed in both dialects, and a rejected NX/XX is
   nil in both — neither is a set of matches. One exception, RedisJSON's and
   ours: JSON.TYPE answers nil, not an error, for a missing legacy path.
-- **The path subset is single-match.** `$`, object members, and array
-  indexes in any mix — `$.user.tags[0]`, `$["odd key"].n`, negative indexes
-  counting from the end. Wildcards (`$.a[*]`, `$.*`), recursive descent
-  (`$..a`), slices, and filters are rejected as UNSUPPORTED — a distinct
-  error from a malformed path. Adopting the container reply shape now is
-  what keeps that door open: when multi-match lands, `$..a` will return two
-  elements where it returns one today, and no reply type changes.
+- **`$` paths can match many locations** (ADR-0054). Besides `$`, object
+  members and array indexes (`$.user.tags[0]`, `$["odd key"].n`, negative
+  indexes counting from the end), a `$` path takes wildcards (`$.*`,
+  `$.a[*]`), recursive descent (`$..a`, `$..*`), unions (`$['a','b']`,
+  `$[0,-1]`), slices (`$.a[1:3]`, `$.a[::2]`) and filters
+  (`$.a[?(@.price < 10 && @.tag == "x")]`, with `==`, `!=`, `<`, `<=`, `>`,
+  `>=`, `&&`, `||`, `!`, parentheses, `@` and `$` paths, and string, number,
+  `true`, `false` and `null` literals). Matches come back in document order,
+  a location a union names twice answering twice.
+  - Reads (GET, TYPE, ARRLEN) answer one element per match.
+  - NUMINCRBY and ARRAPPEND act on each match, a null for one of the wrong
+    type; a location a union names twice is acted on twice, as in
+    RedisJSON. A refusal at any match (an overflow, a non-finite result)
+    fails the whole command and stores nothing.
+  - DEL removes each matched location once, a location inside another
+    matched one going with it uncounted, and answers how many it removed.
+  - SET replaces every match and adds nothing: only a path naming one
+    location can add a value, as in RedisJSON. So an indefinite SET that
+    matches nothing is an error, NX with one is always an error, and XX
+    with one that matches nothing is nil.
+
+  A filter treats an absent operand as equal to nothing, another absent one
+  included (RedisJSON's rule; RFC 9535 calls two absent operands equal), and
+  orders only two numbers or two strings. The legacy dialect stays
+  single-match, and a regex (`=~`) or multi-match operand in a filter is
+  refused: each is UNSUPPORTED, an error distinct from a malformed path.
 - **JSON writes create the leaf, never intermediate levels**, so a typo
   cannot silently grow a document a shape you did not ask for.
   **JSON.SET will not overwrite a non-JSON key** (WRONGTYPE) — unlike a
   plain SET, a document write is never a silent way to destroy a string or a
-  hash. JSON.NUMINCRBY keeps integers integral. Documents are stored as one
+  hash. JSON.NUMINCRBY adds an integer to an integer exactly, in 64-bit
+  integer arithmetic, and refuses an overflow; an increment written as a
+  float (`2.0`, `1e3`) makes a float. A JSON.DEL that leaves the document
+  an empty object or array deletes the key, as in RedisJSON. Documents are
+  stored as one
   row, so they live beyond RAM like any value; sub-document writes rewrite
   that row.
 - **A document write preserves the key's TTL — root replacement included.**
@@ -415,9 +438,9 @@ honest.
 
 ### Where we differ from RedisJSON
 
-Everything above matches the RedisJSON module reply-for-reply, verified by
-running the conformance corpus against it (`tools/redisjson_compare.sh`).
-Three cases differ, each on purpose:
+Everything above matches the RedisJSON module (v8.2.8, the one Redis 8.2
+loads) reply-for-reply, verified by running the conformance corpus against
+it (`tools/redisjson_compare.sh`). These cases differ, each on purpose:
 
 1. **`TYPE key` answers `json`**, where RedisJSON answers its module type
    name `ReJSON-RL`. Ours fits the rest of our TYPE vocabulary. Tools that
@@ -425,12 +448,21 @@ Three cases differ, each on purpose:
 2. **Writing at index == length appends.** `JSON.SET d $.a[3] 40` on a
    3-element array grows it; RedisJSON refuses. Past the end is refused
    either way, so no write can punch a hole.
-3. **Multi-match paths are refused, not evaluated** — see the subset note
-   above. RedisJSON evaluates them.
+3. **An integer overflow in JSON.NUMINCRBY is refused.** RedisJSON wraps
+   `9223372036854775807` + 1 to `-9223372036854775808` and stores it; we
+   answer an error and store nothing, as Redis's INCRBY does.
+4. **Multi-match in the legacy dialect is refused.** RedisJSON answers the
+   first match of `..a` or `.a[*]`; the `$` spelling answers all of them,
+   here and there.
+5. **A regex filter (`=~`) is refused.** RedisJSON evaluates it.
+6. **A multi-match operand inside a filter (`@..a`, `@.*`) is refused.**
+   RedisJSON evaluates it.
 
-A fourth, smaller one: a write to a missing intermediate (`$.x.y` where `x`
-does not exist) is an error here and a silent nil in RedisJSON. Both refuse
-the write; ours says why.
+Smaller ones, which the corpus does not list: a write to a missing
+intermediate (`$.x.y` where `x` does not exist) is an error here and a
+silent nil in RedisJSON; both refuse the write, and ours says why. Filters
+here also take `!` and exponent literals (`1e3`), which RedisJSON refuses as
+syntax errors.
 - **Keys are capped at 4 KiB**, where stock Redis treats a key as just
   another string and accepts up to 512 MB. The cap matches what ElastiCache
   Serverless enforces, so a key that works on the managed service people

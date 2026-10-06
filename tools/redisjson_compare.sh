@@ -37,12 +37,16 @@ fi
 
 # The cases we KNOWINGLY answer differently. Each is a decision recorded in
 # docs/command-support.md, not an accident — so the gate is "exactly these
-# three fail", in both directions: a NEW failure is a regression, and a
-# disappearing one means the divergence was quietly dropped.
+# fail", in both directions: a NEW failure is a regression, and a
+# disappearing one means the divergence was quietly dropped. Each sits in a
+# case of its own (or last in one), since a failing step ends its case.
 EXPECTED_DIVERGENCES=(
-  "TYPE doc"            # we answer "json"; RedisJSON answers "ReJSON-RL"
-  "JSON.SET d \$.a[3]"  # index == len appends here, RedisJSON refuses
-  "JSON.GET d \$..b"    # multi-match paths are UNSUPPORTED in our v1
+  "TYPE doc"                         # we answer "json"; RedisJSON "ReJSON-RL"
+  "JSON.SET d \$.a[3]"               # index == len appends here, RedisJSON refuses
+  'JSON.NUMINCRBY d $.m 1'           # overflow refused; RedisJSON wraps (BUG-0208)
+  'JSON.GET d ..b'                   # legacy-dialect multi-match refused (ADR-0054)
+  'JSON.GET d $.a[?(@ =~ "x")]'      # regex filter refused (ADR-0054)
+  'JSON.GET d $.a[?(@..c)]'          # multi-match filter operand refused (ADR-0054)
 )
 
 cleanup() { [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null; }

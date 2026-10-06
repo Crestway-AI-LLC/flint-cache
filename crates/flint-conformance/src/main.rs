@@ -177,6 +177,16 @@ fn flint_only(family: &str) -> bool {
     matches!(family, "json" | "bloom" | "sandbox")
 }
 
+/// Flint-only families a `--foreign` target (a real Redis with the RedisJSON
+/// or RedisBloom module loaded) has nothing to say about. The sandbox family
+/// asserts what Flint does around a script that Valkey does not, and against
+/// a stock server its runaway-script case never returns: the server answers
+/// BUSY to everything after it. That hung both compare scripts from ADR-0051
+/// (2026-09-26) until ADR-0054 ran one.
+fn foreign_skips(family: &str) -> bool {
+    matches!(family, "sandbox")
+}
+
 /// Families only a Flint SEAT can answer, which is a different question from
 /// whether an oracle exists. `FLINT*` is the admin surface: the proxy refuses
 /// the whole prefix by design (`ERR admin commands are not available through
@@ -3301,8 +3311,9 @@ fn corpus() -> Vec<Case> {
         // The expectations below were checked reply-by-reply against the
         // real RedisJSON module (built from source, loaded into Redis 8.2),
         // so "the contract we chose" is a verified match rather than a
-        // reading of the docs. The four places we knowingly differ are
-        // called out inline and in docs/command-support.md.
+        // reading of the docs. The places we knowingly differ are called
+        // out inline, listed in tools/redisjson_compare.sh and in
+        // docs/command-support.md.
         Case {
             family: "json",
             name: "document roundtrip: root set, path get, TYPE vocabulary",
@@ -3610,20 +3621,234 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             family: "json",
-            name: "unsupported paths and invalid JSON are refused, not guessed",
+            name: "malformed paths and invalid JSON are refused, not guessed",
             steps: vec![
                 s(&[b"JSON.SET", b"d", b"$", br#"{"a":{"b":1}}"#], Expect::Ok),
-                // Multi-match constructs are out of the v1 subset.
-                s(&[b"JSON.GET", b"d", b"$..b"], Expect::AnyError),
-                s(&[b"JSON.GET", b"d", b"$.a[*]"], Expect::AnyError),
-                s(&[b"JSON.GET", b"d", b"$.*"], Expect::AnyError),
-                s(&[b"JSON.GET", b"d", b"$.a[0:2]"], Expect::AnyError),
                 // Malformed paths and payloads.
                 s(&[b"JSON.GET", b"d", b"$.a["], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$...b"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$.a[0:2:0]"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$.a[?(@.b = 1)]"], Expect::AnyError),
                 s(&[b"JSON.SET", b"bad", b"$", b"{not json"], Expect::AnyError),
                 s(&[b"EXISTS", b"bad"], Expect::Int(0)),
                 // The document survived every refusal.
                 s(&[b"JSON.GET", b"d", b"$.a.b"], Expect::Str(b"[1]")),
+            ],
+        },
+        // ADR-0054: multi-match paths under `$`. Every reply below is
+        // RedisJSON v8.2.8's to the same command; the deliberate
+        // differences each have a case of their own after these, so one
+        // cannot hide the steps that follow it in an oracle run.
+        Case {
+            family: "json",
+            name: "multi-match reads: descent, wildcard, union, slice, filter, in document order",
+            steps: vec![
+                s(
+                    &[
+                        b"JSON.SET",
+                        b"d",
+                        b"$",
+                        br#"{"a":{"n":1,"m":"x"},"b":{"n":2,"m":null},"c":[{"n":3,"s":"abc"},{"k":4,"s":"abd"}],"l":[1,2,3,4,5]}"#,
+                    ],
+                    Expect::Ok,
+                ),
+                s(&[b"JSON.GET", b"d", b"$..n"], Expect::Str(b"[1,2,3]")),
+                s(&[b"JSON.GET", b"d", b"$..m"], Expect::Str(br#"["x",null]"#)),
+                s(&[b"JSON.GET", b"d", b"$.c[*].s"], Expect::Str(br#"["abc","abd"]"#)),
+                s(&[b"JSON.GET", b"d", b"$['a','b'].n"], Expect::Str(b"[1,2]")),
+                s(&[b"JSON.GET", b"d", b"$.l[-1,0]"], Expect::Str(b"[5,1]")),
+                s(&[b"JSON.GET", b"d", b"$.l[0,9]"], Expect::Str(b"[1]")),
+                s(&[b"JSON.GET", b"d", b"$.l[1:3]"], Expect::Str(b"[2,3]")),
+                s(&[b"JSON.GET", b"d", b"$.l[::2]"], Expect::Str(b"[1,3,5]")),
+                s(&[b"JSON.GET", b"d", b"$.l[-2:]"], Expect::Str(b"[4,5]")),
+                s(&[b"JSON.GET", b"d", b"$.l[5:1]"], Expect::Str(b"[]")),
+                s(
+                    &[b"JSON.GET", b"d", b"$.c[?(@.n)]"],
+                    Expect::Str(br#"[{"n":3,"s":"abc"}]"#),
+                ),
+                s(
+                    &[b"JSON.GET", b"d", br#"$.c[?(@.s > "abc")]"#],
+                    Expect::Str(br#"[{"k":4,"s":"abd"}]"#),
+                ),
+                s(
+                    &[b"JSON.GET", b"d", b"$.c[?(@.n >= 3 && @.s)]"],
+                    Expect::Str(br#"[{"n":3,"s":"abc"}]"#),
+                ),
+                s(
+                    &[b"JSON.GET", b"d", b"$.c[?(@.n < 3 || @.k > 3)]"],
+                    Expect::Str(br#"[{"k":4,"s":"abd"}]"#),
+                ),
+                s(
+                    &[b"JSON.GET", b"d", b"$.l[?(@ > $.a.n)]"],
+                    Expect::Str(b"[2,3,4,5]"),
+                ),
+                // An absent operand equals nothing, another absent one
+                // included (RedisJSON's rule, not RFC 9535's).
+                s(
+                    &[b"JSON.GET", b"d", b"$.c[?(@.zz == @.yy)]"],
+                    Expect::Str(b"[]"),
+                ),
+                s(&[b"JSON.GET", b"d", b"$.nothing[*]"], Expect::Str(b"[]")),
+                s(
+                    &[b"JSON.TYPE", b"d", b"$..n"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"integer"),
+                        Expect::Str(b"integer"),
+                        Expect::Str(b"integer"),
+                    ]),
+                ),
+                s(
+                    &[b"JSON.ARRLEN", b"d", b"$.*"],
+                    Expect::Arr(vec![Expect::Nil, Expect::Nil, Expect::Int(2), Expect::Int(5)]),
+                ),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "multi-match writes reach every match; SET replaces and adds none",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":{"n":1,"m":"x"},"b":{"n":2},"l":[1,2]}"#],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$..n", b"10"],
+                    Expect::Str(b"[11,12]"),
+                ),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.a.*", b"1"],
+                    Expect::Str(b"[12,null]"),
+                ),
+                // A location a union names twice is written twice.
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.l[0,0]", b"1"],
+                    Expect::Str(b"[2,3]"),
+                ),
+                s(
+                    &[b"JSON.ARRAPPEND", b"d", br#"$["b","l"]"#, b"9"],
+                    Expect::Arr(vec![Expect::Nil, Expect::Int(3)]),
+                ),
+                s(&[b"JSON.GET", b"d", b"$.l"], Expect::Str(b"[[3,2,9]]")),
+                s(&[b"JSON.SET", b"d", b"$..n", b"0"], Expect::Ok),
+                s(&[b"JSON.GET", b"d", b"$..n"], Expect::Str(b"[0,0]")),
+                // Only a path naming one location adds a value: an
+                // indefinite one matching nothing is refused, NX on one is
+                // always refused, and XX matching nothing is nil.
+                s(&[b"JSON.SET", b"d", b"$.*.z", b"true"], Expect::AnyError),
+                s(&[b"JSON.SET", b"d", b"$..n", b"1", b"NX"], Expect::AnyError),
+                s(&[b"JSON.SET", b"d", b"$.*.z", b"true", b"XX"], Expect::Nil),
+                s(&[b"JSON.SET", b"d", b"$..n", b"5", b"XX"], Expect::Ok),
+                s(
+                    &[b"JSON.GET", b"d", b"$"],
+                    Expect::Str(br#"[{"a":{"n":5,"m":"x"},"b":{"n":5},"l":[3,2,9]}]"#),
+                ),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "DEL counts each location once, and emptying the document deletes the key",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":{"n":1},"b":{"n":2,"k":3},"l":[1,2,3]}"#],
+                    Expect::Ok,
+                ),
+                // Last index first, so no removal shifts one still to come.
+                s(&[b"JSON.DEL", b"d", b"$.l[0,2]"], Expect::Int(2)),
+                s(&[b"JSON.GET", b"d", b"$.l"], Expect::Str(b"[[2]]")),
+                s(&[b"JSON.DEL", b"d", b"$.l[0,0]"], Expect::Int(1)),
+                s(&[b"JSON.GET", b"d", b"$.l"], Expect::Str(b"[[]]")),
+                s(&[b"JSON.DEL", b"d", b"$..n"], Expect::Int(2)),
+                // A location inside another removed one goes with it,
+                // uncounted: a, b and l, not b.k.
+                s(&[b"JSON.DEL", b"d", b"$..*"], Expect::Int(3)),
+                // BUG-0209: the document is now empty, so the key is gone.
+                s(&[b"EXISTS", b"d"], Expect::Int(0)),
+                s(&[b"JSON.SET", b"e", b"$", br#"{"a":1}"#], Expect::Ok),
+                s(&[b"JSON.DEL", b"e", b"$.a"], Expect::Int(1)),
+                s(&[b"EXISTS", b"e"], Expect::Int(0)),
+                // An emptied member is not an emptied document.
+                s(&[b"JSON.SET", b"g", b"$", br#"{"a":[1]}"#], Expect::Ok),
+                s(&[b"JSON.DEL", b"g", b"$.a[0]"], Expect::Int(1)),
+                s(&[b"JSON.GET", b"g", b"$"], Expect::Str(br#"[{"a":[]}]"#)),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "NUMINCRBY on integers stays exact past 2^53 (BUG-0208)",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"i":9007199254740993,"j":1}"#],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.i", b"0"],
+                    Expect::Str(b"[9007199254740993]"),
+                ),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.i", b"1"],
+                    Expect::Str(b"[9007199254740994]"),
+                ),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b".i", b"-2"],
+                    Expect::Str(b"9007199254740992"),
+                ),
+                // An increment written as a float makes a float, whole or
+                // not. Asserted through JSON.GET: RESP3's double cannot
+                // carry the `.0` (see the NUMINCRBY case above).
+                s(&[b"JSON.NUMINCRBY", b"d", b"$.j", b"2.0"], Expect::AnyBulk),
+                s(&[b"JSON.GET", b"d", b"$.j"], Expect::Str(b"[3.0]")),
+            ],
+        },
+        // The deliberate differences from RedisJSON in the multi-match
+        // work, each alone and each listed in tools/redisjson_compare.sh.
+        Case {
+            family: "json",
+            name: "NUMINCRBY refuses an integer overflow (RedisJSON wraps)",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"m":9223372036854775807}"#],
+                    Expect::Ok,
+                ),
+                // DIVERGENCE (deliberate): RedisJSON answers
+                // [-9223372036854775808] and stores it. Redis's INCRBY
+                // refuses an overflow, and so do we.
+                s(&[b"JSON.NUMINCRBY", b"d", b"$.m", b"1"], Expect::AnyError),
+                s(
+                    &[b"JSON.GET", b"d", b"$.m"],
+                    Expect::Str(b"[9223372036854775807]"),
+                ),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "multi-match in the legacy dialect is refused",
+            steps: vec![
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":{"b":1}}"#], Expect::Ok),
+                // DIVERGENCE (deliberate): RedisJSON answers the first
+                // match, 1. The `$` spelling answers every match.
+                s(&[b"JSON.GET", b"d", b"..b"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$..b"], Expect::Str(b"[1]")),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "a regex filter is refused",
+            steps: vec![
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":["x","y"]}"#], Expect::Ok),
+                // DIVERGENCE (deliberate, for now): RedisJSON matches `=~`.
+                s(
+                    &[b"JSON.GET", b"d", br#"$.a[?(@ =~ "x")]"#],
+                    Expect::AnyError,
+                ),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "a multi-match operand inside a filter is refused",
+            steps: vec![
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":[{"b":{"c":1}}]}"#], Expect::Ok),
+                // DIVERGENCE (deliberate): RedisJSON evaluates `@..c`.
+                s(&[b"JSON.GET", b"d", b"$.a[?(@..c)]"], Expect::AnyError),
             ],
         },
         Case {
@@ -4371,7 +4596,7 @@ fn main() -> ExitCode {
     let not_a_seat = reference || foreign || endpoint.auth.is_some();
 
     for case in corpus() {
-        if reference && flint_only(case.family) {
+        if (reference && flint_only(case.family)) || (foreign && foreign_skips(case.family)) {
             skipped += 1;
             continue;
         }
@@ -4417,7 +4642,7 @@ fn main() -> ExitCode {
         100.0 * pass as f64 / total as f64
     );
     if skipped > 0 {
-        println!("  ({skipped} flint-only case(s) skipped: no reference oracle)");
+        println!("  ({skipped} flint-only case(s) skipped: no oracle on this target)");
     }
     if skipped_seat > 0 {
         println!(

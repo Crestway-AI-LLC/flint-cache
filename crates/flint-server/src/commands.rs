@@ -2245,8 +2245,9 @@ impl<'a> Dispatcher<'a> {
             Ok(p) => p,
             Err(crate::json_path::PathError::Unsupported) => {
                 return Err(err(
-                    "ERR path contains an unsupported construct (wildcards, \
-                     recursive descent, slices, and filters are not supported)",
+                    "ERR path contains an unsupported construct (multi-match \
+                     outside the $ dialect, a regex or multi-match operand in a \
+                     filter, a negative slice step, or a slice in a union)",
                 ));
             }
             Err(crate::json_path::PathError::Malformed) => {
@@ -2284,7 +2285,7 @@ impl<'a> Dispatcher<'a> {
     /// a RESP array instead; `json_resp_matches` below is that variant.
     /// Both are RedisJSON's shapes, verified against the module.
     ///
-    /// `found` is the single match (v1 is single-match), `Some(None)` means
+    /// `found` is a definite path's one match, `Some(None)` means
     /// "the path matched, but the value is not what this command operates
     /// on" — a non-array for ARRLEN, a non-number for NUMINCRBY. Legacy
     /// callers get an error there; JSONPath callers get a null element,
@@ -2317,6 +2318,28 @@ impl<'a> Dispatcher<'a> {
             (false, Some(Some(v))) => v,
             (false, _) => err(legacy_err),
         }
+    }
+
+    /// ADR-0054: the values an indefinite path selects, in document order,
+    /// duplicates kept (a read of `$[0,0]` answers the element twice).
+    fn json_selected<'d>(
+        doc: &'d serde_json::Value,
+        path: &crate::json_path::Path,
+    ) -> Vec<&'d serde_json::Value> {
+        crate::json_path::select(doc, path)
+            .into_iter()
+            .filter_map(|loc| crate::json_path::get(doc, &crate::json_path::Path::internal(loc)))
+            .collect()
+    }
+
+    /// ADR-0054: the distinct locations JSON.SET and JSON.DEL act on, first
+    /// occurrence first: `$[0,0]` deletes element 0 once, as RedisJSON
+    /// does. (NUMINCRBY and ARRAPPEND act once per occurrence, as it does.)
+    fn json_targets(locs: Vec<Vec<crate::json_path::Step>>) -> Vec<Vec<crate::json_path::Step>> {
+        let mut seen = std::collections::HashSet::new();
+        locs.into_iter()
+            .filter(|l| seen.insert(l.clone()))
+            .collect()
     }
 
     /// Persist a mutated document, preserving any TTL (a sub-document write
@@ -2373,6 +2396,38 @@ impl<'a> Dispatcher<'a> {
         let Some(mut doc) = doc else {
             return err("ERR new objects must be created at the root");
         };
+        // ADR-0054, an indefinite path: each location it selects is
+        // replaced, and nothing is created. RedisJSON adds a value only on
+        // a path that names one location, so an indefinite path matching
+        // nothing is refused there, and so is NX, which only ever adds; XX
+        // matching nothing is nil. Verified against RedisJSON v8.2.8.
+        if path.selectors().is_some() {
+            const NOT_ADDED: &str = "ERR a multi-match path replaces existing values and adds none";
+            if nx {
+                return err(NOT_ADDED);
+            }
+            let locs = Self::json_targets(crate::json_path::select(&doc, &path));
+            if locs.is_empty() {
+                return if xx {
+                    Value::Bulk(None)
+                } else {
+                    err(NOT_ADDED)
+                };
+            }
+            // Innermost first: a replaced ancestor would otherwise leave a
+            // descendant's location pointing into the new value. The final
+            // document is the same either way.
+            for loc in locs.into_iter().rev() {
+                let at = crate::json_path::Path::internal(loc);
+                if let Some(slot) = crate::json_path::get_mut(&mut doc, &at) {
+                    *slot = value.clone();
+                }
+            }
+            return match self.json_save(key, &doc) {
+                Some(e) => e,
+                None => Value::Simple("OK".into()),
+            };
+        }
         // NX/XX on a sub-path test the PATH's existence.
         let exists = crate::json_path::get(&doc, &path).is_some();
         if (nx && exists) || (xx && !exists) {
@@ -2408,12 +2463,20 @@ impl<'a> Dispatcher<'a> {
         let Some(doc) = doc else {
             return Value::Bulk(None);
         };
+        if path.selectors().is_some() {
+            let vals: Vec<serde_json::Value> = Self::json_selected(&doc, &path)
+                .into_iter()
+                .cloned()
+                .collect();
+            return Self::json_bulk(&serde_json::Value::Array(vals));
+        }
         let found = crate::json_path::get(&doc, &path).map(|v| Some(v.clone()));
         Self::json_doc_matches(&path, found, PATH_MISSING)
     }
 
     /// JSON.DEL key `[path]` — root path deletes the key; a sub-path removes
-    /// that member/element. Returns the number of paths deleted (0 or 1).
+    /// that member/element, and every location a multi-match path selects.
+    /// Returns the number of locations deleted.
     fn cmd_json_del(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 2 || args.len() > 3 {
             return arity_err("json.del");
@@ -2433,13 +2496,56 @@ impl<'a> Dispatcher<'a> {
                 Err(e) => store_err(e),
             };
         }
+        // ADR-0054: every selected location, counted. A location beneath
+        // another selected one goes with it and is not counted twice, and
+        // removal runs last-first so no removal shifts an index still to
+        // come. The root is never a member's removal (`$` deletes the key).
+        if path.selectors().is_some() {
+            let mut locs = Self::json_targets(crate::json_path::select(&doc, &path));
+            locs.retain(|l| !l.is_empty());
+            let all = locs.clone();
+            locs.retain(|l| !all.iter().any(|a| a.len() < l.len() && l.starts_with(a)));
+            locs.sort();
+            let mut removed = 0i64;
+            for loc in locs.into_iter().rev() {
+                if crate::json_path::remove(&mut doc, &crate::json_path::Path::internal(loc)) {
+                    removed += 1;
+                }
+            }
+            if removed == 0 {
+                return Value::Integer(0);
+            }
+            return match self.json_save_or_drop(key, &doc) {
+                Some(e) => e,
+                None => Value::Integer(removed),
+            };
+        }
         if !crate::json_path::remove(&mut doc, &path) {
             return Value::Integer(0);
         }
-        match self.json_save(key, &doc) {
+        match self.json_save_or_drop(key, &doc) {
             Some(e) => e,
             None => Value::Integer(1),
         }
+    }
+
+    /// Persist a document a JSON.DEL removed from, or delete the key when
+    /// the removal left it an empty object or array. BUG-0209: RedisJSON
+    /// deletes the key there (its testDelCommand asserts it), and Flint
+    /// kept `{}`, so EXISTS and a later sub-path JSON.SET disagreed.
+    fn json_save_or_drop(&self, key: &[u8], doc: &serde_json::Value) -> Option<Value> {
+        let emptied = match doc {
+            serde_json::Value::Object(m) => m.is_empty(),
+            serde_json::Value::Array(a) => a.is_empty(),
+            _ => false,
+        };
+        if !emptied {
+            return self.json_save(key, doc);
+        }
+        self.json
+            .delete(slot_for_key(key), key)
+            .err()
+            .map(store_err)
     }
 
     /// JSON.TYPE key `[path]` — Redis's type vocabulary for the value at the
@@ -2460,6 +2566,13 @@ impl<'a> Dispatcher<'a> {
         // the RESP2 spelling stays exactly as it was. See
         // `flint_resp::resp3_nests_reply`.
         let nest = |v: Value| Value::Resp3Nested(Box::new(v));
+        if path.selectors().is_some() {
+            let names = Self::json_selected(&doc, &path)
+                .into_iter()
+                .map(|v| Value::Bulk(Some(crate::json_path::type_name(v).into())))
+                .collect();
+            return nest(Value::Array(Some(names)));
+        }
         let Some(v) = crate::json_path::get(&doc, &path) else {
             // JSON.TYPE is the one command whose legacy dialect answers NIL
             // rather than an error for a path that matches nothing — asking
@@ -2702,6 +2815,15 @@ impl<'a> Dispatcher<'a> {
         else {
             return err("ERR value is not a number");
         };
+        // The increment as an exact integer, when it is written as one.
+        // `2.0` is a float, so an integer incremented by it becomes one,
+        // as in RedisJSON.
+        let by = (
+            by,
+            std::str::from_utf8(&args[3])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok()),
+        );
         let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
             Ok(v) => v,
             Err(reply) => return reply,
@@ -2724,30 +2846,51 @@ impl<'a> Dispatcher<'a> {
             resp2: Box::new(resp2),
             resp3: Box::new(Value::Array(Some(matches))),
         };
+        // ADR-0054: each selected number incremented, a null for each
+        // selected non-number. A location a union names twice is
+        // incremented twice, as RedisJSON does. A refused result fails the
+        // whole command, and nothing is saved.
+        if path.selectors().is_some() {
+            let mut as_json = Vec::new();
+            let mut as_resp = Vec::new();
+            for loc in crate::json_path::select(&doc, &path) {
+                let at = crate::json_path::Path::internal(loc);
+                let Some(slot) = crate::json_path::get_mut(&mut doc, &at) else {
+                    continue;
+                };
+                if !slot.is_number() {
+                    as_json.push(serde_json::Value::Null);
+                    as_resp.push(Value::Null);
+                    continue;
+                }
+                if let Err(e) = Self::json_add(slot, by) {
+                    return e;
+                }
+                as_resp.push(numeric(Some(slot)));
+                as_json.push(slot.clone());
+            }
+            if as_json.iter().any(|v| !v.is_null())
+                && let Some(e) = self.json_save(&args[1], &doc)
+            {
+                return e;
+            }
+            return paired(Self::json_bulk(&serde_json::Value::Array(as_json)), as_resp);
+        }
         let Some(slot) = crate::json_path::get_mut(&mut doc, &path) else {
             return paired(
                 Self::json_doc_matches(&path, None, PATH_MISSING),
                 Vec::new(),
             );
         };
-        let Some(cur) = slot.as_f64() else {
+        if !slot.is_number() {
             return paired(
                 Self::json_doc_matches(&path, Some(None), "ERR path does not hold a number"),
                 vec![Value::Null],
             );
-        };
-        let next = cur + by;
-        if !next.is_finite() {
-            return err("ERR result is not a finite number");
         }
-        // Integer in, integer out (Redis's JSON keeps ints as ints).
-        *slot = match (slot.is_i64() || slot.is_u64()) && by.fract() == 0.0 {
-            true => serde_json::json!(next as i64),
-            false => match serde_json::Number::from_f64(next) {
-                Some(n) => serde_json::Value::Number(n),
-                None => return err("ERR result is not representable"),
-            },
-        };
+        if let Err(e) = Self::json_add(slot, by) {
+            return e;
+        }
         let out = slot.clone();
         match self.json_save(&args[1], &doc) {
             Some(e) => e,
@@ -2756,6 +2899,31 @@ impl<'a> Dispatcher<'a> {
                 vec![numeric(Some(&out))],
             ),
         }
+    }
+
+    /// Add `by` (as f64, and as an exact integer when written as one) to
+    /// the number in `slot`. An integer plus an integer is an integer, in
+    /// i64 arithmetic: BUG-0208 added in f64 and cast back, so `+0` changed
+    /// an integer above 2^53 and overflow saturated. Overflow is refused,
+    /// as Redis's INCRBY refuses it (RedisJSON wraps); so is a result that
+    /// is not finite. A refusal leaves `slot` as it was.
+    fn json_add(slot: &mut serde_json::Value, by: (f64, Option<i64>)) -> Result<(), Value> {
+        if let (Some(cur), Some(inc)) = (slot.as_i64(), by.1) {
+            let Some(next) = cur.checked_add(inc) else {
+                return Err(err("ERR increment or decrement would overflow"));
+            };
+            *slot = serde_json::Value::from(next);
+            return Ok(());
+        }
+        let next = slot.as_f64().unwrap_or(0.0) + by.0;
+        if !next.is_finite() {
+            return Err(err("ERR result is not a finite number"));
+        }
+        *slot = match serde_json::Number::from_f64(next) {
+            Some(n) => serde_json::Value::Number(n),
+            None => return Err(err("ERR result is not representable")),
+        };
+        Ok(())
     }
 
     /// JSON.ARRAPPEND key path value [value ...] — append to an array,
@@ -2778,6 +2946,28 @@ impl<'a> Dispatcher<'a> {
         let Some(mut doc) = doc else {
             return err(NO_SUCH_KEY);
         };
+        // ADR-0054: each selected array extended, its new length answered;
+        // nil for each selected non-array. As with NUMINCRBY, a location a
+        // union names twice is extended twice, as RedisJSON does.
+        if path.selectors().is_some() {
+            let mut out = Vec::new();
+            let mut changed = false;
+            for loc in crate::json_path::select(&doc, &path) {
+                let at = crate::json_path::Path::internal(loc);
+                match crate::json_path::get_mut(&mut doc, &at) {
+                    Some(serde_json::Value::Array(arr)) => {
+                        arr.extend(values.iter().cloned());
+                        out.push(Value::Integer(arr.len() as i64));
+                        changed = true;
+                    }
+                    _ => out.push(Value::Bulk(None)),
+                }
+            }
+            if changed && let Some(e) = self.json_save(&args[1], &doc) {
+                return e;
+            }
+            return Value::Array(Some(out));
+        }
         let Some(target) = crate::json_path::get_mut(&mut doc, &path) else {
             return Self::json_resp_matches(&path, None, PATH_MISSING);
         };
@@ -2804,6 +2994,16 @@ impl<'a> Dispatcher<'a> {
         let Some(doc) = doc else {
             return Value::Bulk(None);
         };
+        if path.selectors().is_some() {
+            let lens = Self::json_selected(&doc, &path)
+                .into_iter()
+                .map(|v| match v {
+                    serde_json::Value::Array(a) => Value::Integer(a.len() as i64),
+                    _ => Value::Bulk(None),
+                })
+                .collect();
+            return Value::Array(Some(lens));
+        }
         // The two failure shapes carry different legacy messages, so they
         // are separate calls rather than one folded expression.
         let Some(v) = crate::json_path::get(&doc, &path) else {
@@ -4112,13 +4312,15 @@ mod tests {
             &s,
             &[b"JSON.SET", b"d", b"$", br#"{"o":{"n":1},"s":"str"}"#],
         );
-        // Unsupported path constructs name themselves.
-        assert!(
-            matches!(call(&s, &[b"JSON.GET", b"d", b"$..n"]), Value::Error(e) if e.contains("unsupported"))
-        );
-        assert!(
-            matches!(call(&s, &[b"JSON.GET", b"d", b"$.o[*]"]), Value::Error(e) if e.contains("unsupported"))
-        );
+        // Unsupported path constructs name themselves: multi-match in the
+        // legacy dialect (ADR-0054), and a regex filter in either.
+        for path in [&b"..n"[..], b".o[*]", br#"$.o[?(@.n =~ "1")]"#] {
+            assert!(
+                matches!(call(&s, &[b"JSON.GET", b"d", path]), Value::Error(e) if e.contains("unsupported")),
+                "{}",
+                String::from_utf8_lossy(path)
+            );
+        }
         // Intermediates are never created silently.
         assert!(matches!(
             call(&s, &[b"JSON.SET", b"d", b"$.x.y", b"1"]),
@@ -4181,6 +4383,206 @@ mod tests {
             matches!(call(&s, &[b"JSON.GET", b"str"]), Value::Error(e) if e.starts_with("WRONGTYPE"))
         );
         assert!(matches!(call(&s, &[b"GET", b"d"]), Value::Error(e) if e.starts_with("WRONGTYPE")));
+    }
+
+    /// ADR-0054: an indefinite `$` path reads every match and writes every
+    /// match, in document order. Each expectation is RedisJSON v8.2.8's
+    /// answer to the same command.
+    #[test]
+    fn json_multimatch_reads_and_writes_every_match() {
+        let s = MemKv::new();
+        let get = |path: &[u8]| call(&s, &[b"JSON.GET", b"d", path]);
+        let json = |text: &str| Value::Bulk(Some(text.as_bytes().to_vec()));
+        call(
+            &s,
+            &[
+                b"JSON.SET",
+                b"d",
+                b"$",
+                br#"{"a":{"n":1,"m":"x"},"b":{"n":2},"c":[{"n":3},{"k":4}],"l":[1,2]}"#,
+            ],
+        );
+        // Reads: recursive descent, wildcard, union, slice, filter.
+        assert_eq!(get(b"$..n"), json("[1,2,3]"));
+        assert_eq!(get(b"$.c[*].n"), json("[3]"));
+        assert_eq!(get(b"$.l[1,0,1]"), json("[2,1,2]"));
+        assert_eq!(get(b"$.l[0:1]"), json("[1]"));
+        assert_eq!(get(br#"$.c[?(@.n > 2)]"#), json(r#"[{"n":3}]"#));
+        assert_eq!(get(b"$.nothing[*]"), json("[]"));
+        assert_eq!(
+            call(&s, &[b"JSON.TYPE", b"d", b"$.*"]),
+            Value::Resp3Nested(Box::new(Value::Array(Some(
+                ["object", "object", "array", "array"]
+                    .iter()
+                    .map(|t| Value::Bulk(Some(t.as_bytes().to_vec())))
+                    .collect()
+            ))))
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.ARRLEN", b"d", b"$.*"]),
+            Value::Array(Some(vec![
+                Value::Bulk(None),
+                Value::Bulk(None),
+                Value::Integer(2),
+                Value::Integer(2),
+            ]))
+        );
+        // Writes reach every match; a non-number or non-array answers nil.
+        assert_eq!(
+            call(&s, &[b"JSON.ARRAPPEND", b"d", b"$[\"b\",\"l\"]", b"9"]),
+            Value::Array(Some(vec![Value::Bulk(None), Value::Integer(3)]))
+        );
+        assert_eq!(
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b"$..n", b"10"]),
+                Proto::Resp2
+            ),
+            b"$10\r\n[11,12,13]\r\n"
+        );
+        assert_eq!(
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.a.*", b"1"]),
+                Proto::Resp3
+            ),
+            b"*2\r\n:12\r\n_\r\n"
+        );
+        // A location a union names twice is incremented twice.
+        assert_eq!(
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.l[0,0]", b"1"]),
+                Proto::Resp2
+            ),
+            b"$5\r\n[2,3]\r\n"
+        );
+        assert_eq!(get(b"$.l"), json("[[3,2,9]]"));
+        // A refusal at any match refuses the whole command, and nothing is
+        // saved: the matches before it stay as they were.
+        call(
+            &s,
+            &[b"JSON.SET", b"d", b"$.c[0].n", b"9223372036854775807"],
+        );
+        assert!(matches!(
+            call(&s, &[b"JSON.NUMINCRBY", b"d", b"$..n", b"1"]),
+            Value::Error(e) if e.contains("overflow")
+        ));
+        assert_eq!(get(b"$..n"), json("[12,12,9223372036854775807]"));
+        // SET replaces every match, nested ones included, and adds none:
+        // matching nothing is refused, NX always is, XX answers nil.
+        call(&s, &[b"JSON.SET", b"d", b"$.a.in", br#"{"n":5}"#]);
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$..n", b"7"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(get(b"$..n"), json("[7,7,7,7]"));
+        for set in [
+            &[&b"JSON.SET"[..], b"d", b"$.*.z", b"true"][..],
+            &[b"JSON.SET", b"d", b"$.*.z", b"true", b"NX"],
+            &[b"JSON.SET", b"d", b"$..n", b"0", b"NX"],
+        ] {
+            assert!(
+                matches!(call(&s, set), Value::Error(e) if e.contains("adds none")),
+                "{set:?}"
+            );
+        }
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$.*.z", b"true", b"XX"]),
+            Value::Bulk(None)
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$..n", b"8", b"XX"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(get(b"$..z"), json("[]"));
+        // DEL counts each removed location once; one inside another removed
+        // one goes with it, uncounted. Index order cannot shift a later
+        // removal.
+        assert_eq!(
+            call(&s, &[b"JSON.DEL", b"d", b"$.l[0,2]"]),
+            Value::Integer(2)
+        );
+        assert_eq!(get(b"$.l"), json("[[2]]"));
+        assert_eq!(
+            call(&s, &[b"JSON.DEL", b"d", b"$.l[0,0]"]),
+            Value::Integer(1)
+        );
+        assert_eq!(get(b"$.l"), json("[[]]"));
+        assert_eq!(call(&s, &[b"JSON.DEL", b"d", b"$..n"]), Value::Integer(4));
+        assert_eq!(get(b"$..n"), json("[]"));
+        // Emptying the document deletes the key (BUG-0209).
+        assert_eq!(call(&s, &[b"JSON.DEL", b"d", b"$..*"]), Value::Integer(4));
+        assert_eq!(call(&s, &[b"EXISTS", b"d"]), Value::Integer(0));
+    }
+
+    /// BUG-0208: an integer is incremented in integer arithmetic. The old
+    /// f64 round trip stored each of these wrong, without an error.
+    #[test]
+    fn json_numincrby_keeps_integers_exact() {
+        let s = MemKv::new();
+        let incr = |start: &str, by: &str| {
+            call(
+                &s,
+                &[
+                    b"JSON.SET",
+                    b"p",
+                    b"$",
+                    format!(r#"{{"a":{start}}}"#).as_bytes(),
+                ],
+            );
+            let reply = call(&s, &[b"JSON.NUMINCRBY", b"p", b".a", by.as_bytes()]);
+            let stored = call(&s, &[b"JSON.GET", b"p", b".a"]);
+            (reply, stored)
+        };
+        let json = |text: &str| Value::Bulk(Some(text.as_bytes().to_vec()));
+        // Above 2^53, +0 and +1 are exact.
+        assert_eq!(incr("9007199254740993", "0").1, json("9007199254740993"));
+        assert_eq!(incr("9007199254740993", "1").1, json("9007199254740994"));
+        assert_eq!(incr("-9007199254740993", "-1").1, json("-9007199254740994"));
+        // Overflow is refused and the integer is kept.
+        let (reply, stored) = incr("9223372036854775807", "1");
+        assert!(matches!(reply, Value::Error(e) if e.contains("overflow")));
+        assert_eq!(stored, json("9223372036854775807"));
+        // A whole increment beyond i64 is a float, not i64::MAX.
+        assert_eq!(incr("1", "1e19").1, json("1e+19"));
+        // An increment written as a float makes the integer a float, as in
+        // RedisJSON, whether or not it is whole.
+        assert_eq!(incr("1", "2.0").1, json("3.0"));
+        assert_eq!(incr("-5", "2.5").1, json("-2.5"));
+        // The `$` dialect takes the same path.
+        call(&s, &[b"JSON.SET", b"p", b"$", br#"{"a":9007199254740993}"#]);
+        assert_eq!(
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"p", b"$.a", b"0"]),
+                Proto::Resp2
+            ),
+            b"$18\r\n[9007199254740993]\r\n"
+        );
+    }
+
+    /// BUG-0209: a JSON.DEL that leaves an empty object or array deletes
+    /// the key, as RedisJSON does; one that leaves anything else keeps it.
+    #[test]
+    fn json_del_that_empties_the_document_deletes_the_key() {
+        let s = MemKv::new();
+        for (doc, path, removed, left) in [
+            (&br#"{"a":1}"#[..], &b"$.a"[..], 1, 0),
+            (br#"{"a":1}"#, b".a", 1, 0),
+            (b"[1]", b"$[0]", 1, 0),
+            (br#"{"a":1,"b":2}"#, b"$.*", 2, 0),
+            // An emptied member is not an emptied document.
+            (br#"{"a":[1]}"#, b"$.a[0]", 1, 1),
+            (br#"{"a":1,"b":2}"#, b"$.a", 1, 1),
+            // Nothing removed, nothing deleted.
+            (b"{}", b"$.a", 0, 1),
+        ] {
+            call(&s, &[b"JSON.SET", b"d", b"$", doc]);
+            let what = String::from_utf8_lossy(path);
+            assert_eq!(
+                call(&s, &[b"JSON.DEL", b"d", path]),
+                Value::Integer(removed),
+                "{what}"
+            );
+            assert_eq!(call(&s, &[b"EXISTS", b"d"]), Value::Integer(left), "{what}");
+        }
     }
 
     #[test]
