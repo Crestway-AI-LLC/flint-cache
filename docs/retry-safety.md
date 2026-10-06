@@ -63,13 +63,13 @@ Three corollaries, each measured rather than assumed:
 (`ZUNIONSTORE`, `ZINTERSTORE`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`),
 which overwrite their destination
 
-**Documents and filters**: `JSON.SET` · `JSON.DEL` · `JSON.FORGET` ·
-`BF.ADD` · `BF.MADD` · `BF.INSERT`
+**Documents and filters**: `JSON.SET` · `JSON.MSET` · `JSON.MERGE` ·
+`JSON.DEL` · `JSON.FORGET` · `JSON.CLEAR` · `BF.ADD` · `BF.MADD` · `BF.INSERT`
 
 Re-applying reaches the same end state. **The reply may not match the
 first one**, and that is the trap inside this list rather than a footnote to
-it: `DEL`/`HDEL`/`SREM`/`ZREM` return a smaller count, and `BF.ADD` returns
-0 where the first returned 1. If your code reads that reply as "was this new"
+it: `DEL`/`HDEL`/`SREM`/`ZREM` return a smaller count, `JSON.CLEAR` counts 0
+the second time, and `BF.ADD` returns 0 where the first returned 1. If your code reads that reply as "was this new"
 — a dedupe check, a first-writer-wins election — the STATE is right and your
 CONCLUSION is wrong, which is the hazard in the next table, not this one.
 
@@ -77,14 +77,15 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 
 | Command | Hazard on retry |
 |---|---|
-| `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `HINCRBY` `HINCRBYFLOAT` `ZINCRBY` `JSON.NUMINCRBY` | Double-counts. |
+| `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `HINCRBY` `HINCRBYFLOAT` `ZINCRBY` `JSON.NUMINCRBY` `JSON.NUMMULTBY` | Double-counts, or multiplies twice. |
 | `BITFIELD` with `INCRBY` | Double-counts, as `INCRBY` does; Sidekiq's metrics flush is this shape. A `BITFIELD` of only `GET` and `SET` converges, but a retried `SET` answers the value the first attempt wrote, not the one before it. |
-| `APPEND` `JSON.ARRAPPEND` | Double-appends. |
+| `APPEND` `JSON.ARRAPPEND` `JSON.STRAPPEND` | Double-appends. |
 | `LPUSH` `RPUSH` | Double-pushes. |
-| `LINSERT` | Double-inserts: `a b` becomes `a x x b`. |
-| `LPOP` `RPOP` `SPOP` `ZPOPMIN` `ZPOPMAX` `BLPOP` `BRPOP` `BZPOPMIN` `BZPOPMAX` | Destroys an EXTRA element — silent data loss. `SPOP` on `{a,b,c}` returns `c`, then the retry returns `b` and two members are gone. |
+| `LINSERT` `JSON.ARRINSERT` | Double-inserts: `a b` becomes `a x x b`. |
+| `LPOP` `RPOP` `SPOP` `ZPOPMIN` `ZPOPMAX` `BLPOP` `BRPOP` `BZPOPMIN` `BZPOPMAX` `JSON.ARRPOP` | Destroys an EXTRA element — silent data loss. `SPOP` on `{a,b,c}` returns `c`, then the retry returns `b` and two members are gone. |
 | `LMOVE` `RPOPLPUSH` `BLMOVE` `BRPOPLPUSH` | Moves an EXTRA element. A worker taking one job from a queue takes two, and the reply names only the second, so the first sits in the destination list unclaimed. On one list (a rotation) it rotates twice. |
-| `LTRIM` `ZREMRANGEBYRANK` `LREM key <n≠0> m` | Position- or count-addressed, so the retry cuts a DIFFERENT set. `LTRIM 1 2` twice on `a b c d` leaves `c`. Also silent data loss. |
+| `LTRIM` `ZREMRANGEBYRANK` `LREM key <n≠0> m` `JSON.ARRTRIM` | Position- or count-addressed, so the retry cuts a DIFFERENT set. `LTRIM 1 2` twice on `a b c d` leaves `c`. Also silent data loss. |
+| `JSON.TOGGLE` | The retry flips the value back. The toggle the caller was told about is undone, and the second reply names the value it started from. |
 | `SET … NX` `SETNX` `HSETNX` | If the first succeeded but the ack was lost, the retry sees the key present and returns 0/nil, so the caller wrongly believes it failed. The classic lock hazard. |
 | `GETDEL` | The first returns the value and the retry returns nil, so a retrying reader loses the only copy it was handed. |
 | `COPY` (without `REPLACE`) | Returns 0 on the retry: the copy exists, and the caller is told it does not. |

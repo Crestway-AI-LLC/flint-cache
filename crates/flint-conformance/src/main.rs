@@ -78,6 +78,10 @@ enum Expect {
     /// numbers differ per host and per second, but whose FIELDS are the
     /// promise. Asserting a whole reply there would be a test of the clock.
     StrContains(&'static [u8]),
+    /// A bulk reply holding JSON equal to this, object members in any
+    /// order. JSON.GET with several paths answers one object keyed by path,
+    /// and RedisJSON orders its members by its hash map (ADR-0055).
+    Json(&'static [u8]),
 }
 
 struct Case {
@@ -3851,6 +3855,430 @@ fn corpus() -> Vec<Case> {
                 s(&[b"JSON.GET", b"d", b"$.a[?(@..c)]"], Expect::AnyError),
             ],
         },
+        // ADR-0055: the rest of RedisJSON's command family. Every reply is
+        // RedisJSON v8.2.8's to the same command; the one deliberate
+        // difference has a case of its own at the end.
+        Case {
+            family: "json",
+            name: "STRLEN and STRAPPEND: lengths in bytes, an append per match",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":{"s":"ab","n":2},"b":{"s":"c"}}"#],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"JSON.STRLEN", b"d", b"$..s"],
+                    Expect::Arr(vec![Expect::Int(2), Expect::Int(1)]),
+                ),
+                s(&[b"JSON.STRLEN", b"d", b".a.s"], Expect::Int(2)),
+                s(&[b"JSON.STRLEN", b"d", b"$.a.n"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.STRLEN", b"d", b".a.n"], Expect::AnyError),
+                s(&[b"JSON.STRLEN", b"d", b"$.zz"], Expect::Arr(vec![])),
+                s(&[b"JSON.STRLEN", b"gone"], Expect::Nil),
+                s(&[b"JSON.STRLEN", b"gone", b"$.a"], Expect::AnyError),
+                s(
+                    &[b"JSON.STRAPPEND", b"d", b"$..s", br#""xy""#],
+                    Expect::Arr(vec![Expect::Int(4), Expect::Int(3)]),
+                ),
+                s(&[b"JSON.STRAPPEND", b"d", b".a.s", br#""z""#], Expect::Int(5)),
+                s(
+                    &[b"JSON.STRAPPEND", b"d", b"$.a.n", br#""z""#],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                // A value that is not a JSON string fails at a string, and
+                // text that is not JSON at all fails before anything.
+                s(&[b"JSON.STRAPPEND", b"d", b"$.a.s", b"5"], Expect::AnyError),
+                s(&[b"JSON.STRAPPEND", b"d", b"$.a.s", b"z"], Expect::AnyError),
+                s(&[b"JSON.STRAPPEND", b"gone", b"$", br#""z""#], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$..s"], Expect::Str(br#"["abxyz","cxy"]"#)),
+                // With no path the legacy root is the target.
+                s(&[b"JSON.SET", b"q", b"$", br#""str""#], Expect::Ok),
+                s(&[b"JSON.STRAPPEND", b"q", br#""!""#], Expect::Int(4)),
+                s(&[b"JSON.STRLEN", b"q"], Expect::Int(4)),
+                // A location a union names twice is appended to twice.
+                s(&[b"JSON.SET", b"u", b"$", br#"{"a":"x"}"#], Expect::Ok),
+                s(
+                    &[b"JSON.STRAPPEND", b"u", br#"$["a","a"]"#, br#""?""#],
+                    Expect::Arr(vec![Expect::Int(2), Expect::Int(3)]),
+                ),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "OBJLEN and OBJKEYS: an object's size and member names, in order",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":{"o":{"x":1,"y":[1]}},"b":{"o":{}},"s":"t"}"#],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"JSON.OBJLEN", b"d", b"$..o"],
+                    Expect::Arr(vec![Expect::Int(2), Expect::Int(0)]),
+                ),
+                s(&[b"JSON.OBJLEN", b"d", b".a.o"], Expect::Int(2)),
+                s(&[b"JSON.OBJLEN", b"d"], Expect::Int(3)),
+                s(&[b"JSON.OBJLEN", b"d", b"$.s"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.OBJLEN", b"d", b".s"], Expect::AnyError),
+                // A missing legacy path is nil here, not an error.
+                s(&[b"JSON.OBJLEN", b"d", b".zz"], Expect::Nil),
+                s(&[b"JSON.OBJLEN", b"gone"], Expect::Nil),
+                s(&[b"JSON.OBJLEN", b"gone", b"$"], Expect::AnyError),
+                s(
+                    &[b"JSON.OBJKEYS", b"d", b"$..o"],
+                    Expect::Arr(vec![
+                        Expect::Arr(vec![Expect::Str(b"x"), Expect::Str(b"y")]),
+                        Expect::Arr(vec![]),
+                    ]),
+                ),
+                s(
+                    &[b"JSON.OBJKEYS", b"d", b".a.o"],
+                    Expect::Arr(vec![Expect::Str(b"x"), Expect::Str(b"y")]),
+                ),
+                s(
+                    &[b"JSON.OBJKEYS", b"d"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"b"), Expect::Str(b"s")]),
+                ),
+                s(&[b"JSON.OBJKEYS", b"d", b"$.s"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.OBJKEYS", b"d", b".s"], Expect::AnyError),
+                s(&[b"JSON.OBJKEYS", b"d", b".zz"], Expect::Nil),
+                s(&[b"JSON.OBJKEYS", b"gone"], Expect::Nil),
+                s(&[b"JSON.OBJKEYS", b"gone", b"$"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "TOGGLE flips each boolean: 1 or 0 under $, true or false under legacy",
+            steps: vec![
+                s(&[b"JSON.SET", b"b", b"$", br#"{"t":true,"l":[true,false],"n":1}"#], Expect::Ok),
+                // A location a union names twice is flipped twice.
+                s(
+                    &[b"JSON.TOGGLE", b"b", b"$.l[0,0,1]"],
+                    Expect::Arr(vec![Expect::Int(0), Expect::Int(1), Expect::Int(1)]),
+                ),
+                s(&[b"JSON.GET", b"b", b"$.l"], Expect::Str(b"[[true,true]]")),
+                s(&[b"JSON.TOGGLE", b"b", b".t"], Expect::Str(b"false")),
+                s(&[b"JSON.TOGGLE", b"b", b"$.n"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.TOGGLE", b"b", b".n"], Expect::AnyError),
+                s(&[b"JSON.TOGGLE", b"b", b"$.zz"], Expect::Arr(vec![])),
+                s(&[b"JSON.TOGGLE", b"b", b".zz"], Expect::AnyError),
+                s(&[b"JSON.TOGGLE", b"gone", b"$"], Expect::AnyError),
+                s(&[b"JSON.TOGGLE", b"b"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "ARRINDEX: first index of a value, type-strict, in a clamped range",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"l":[1,{"k":[2]},2.5,"2",[1],null,2],"e":[],"s":"x"}"#],
+                    Expect::Ok,
+                ),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", br#"{"k":[2]}"#], Expect::Arr(vec![Expect::Int(1)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"[1]"], Expect::Arr(vec![Expect::Int(4)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"null"], Expect::Arr(vec![Expect::Int(5)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", br#""2""#], Expect::Arr(vec![Expect::Int(3)])),
+                // The integer 2 is not the float 2.0.
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"2"], Expect::Arr(vec![Expect::Int(6)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"2.0"], Expect::Arr(vec![Expect::Int(-1)])),
+                s(&[b"JSON.ARRINDEX", b"d", b".l", b"2.5"], Expect::Int(2)),
+                // stop is exclusive, 0 means the end, negatives count back.
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"2.5", b"0", b"2"], Expect::Arr(vec![Expect::Int(-1)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"2.5", b"0", b"3"], Expect::Arr(vec![Expect::Int(2)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"1", b"1"], Expect::Arr(vec![Expect::Int(-1)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"1", b"-99"], Expect::Arr(vec![Expect::Int(0)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"2", b"0", b"0"], Expect::Arr(vec![Expect::Int(6)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"2", b"0", b"-1"], Expect::Arr(vec![Expect::Int(-1)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.e", b"1"], Expect::Arr(vec![Expect::Int(-1)])),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.s", b"1"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.ARRINDEX", b"d", b".s", b"1"], Expect::AnyError),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"notjson"], Expect::AnyError),
+                s(&[b"JSON.ARRINDEX", b"d", b"$.l", b"1", b"x"], Expect::AnyError),
+                s(&[b"JSON.ARRINDEX", b"gone", b"$.l", b"1"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "ARRINSERT, ARRPOP and ARRTRIM: positions, clamping and new lengths",
+            steps: vec![
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":[1,2,3,4,5],"e":[],"s":"x"}"#], Expect::Ok),
+                // The length appends; past it, or before the start, refuses.
+                s(&[b"JSON.ARRINSERT", b"d", b"$.a", b"5", b"6"], Expect::Arr(vec![Expect::Int(6)])),
+                s(&[b"JSON.ARRINSERT", b"d", b"$.a", b"-6", b"0"], Expect::Arr(vec![Expect::Int(7)])),
+                s(&[b"JSON.ARRINSERT", b"d", b".a", b"1", br#""x""#, br#""y""#], Expect::Int(9)),
+                s(&[b"JSON.ARRINSERT", b"d", b"$.a", b"99", b"7"], Expect::AnyError),
+                s(&[b"JSON.ARRINSERT", b"d", b"$.a", b"-99", b"7"], Expect::AnyError),
+                s(&[b"JSON.ARRINSERT", b"d", b"$.s", b"0", b"7"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.ARRINSERT", b"d", b".s", b"0", b"7"], Expect::AnyError),
+                s(&[b"JSON.ARRINSERT", b"d", b"$.a", b"0"], Expect::AnyError),
+                s(
+                    &[b"JSON.GET", b"d", b"$.a"],
+                    Expect::Str(br#"[[0,"x","y",1,2,3,4,5,6]]"#),
+                ),
+                // ARRPOP answers JSON text; the last by default, an index
+                // clamped; an empty array answers nil.
+                s(&[b"JSON.ARRPOP", b"d", b"$.a"], Expect::Arr(vec![Expect::Str(b"6")])),
+                s(&[b"JSON.ARRPOP", b"d", b"$.a", b"1"], Expect::Arr(vec![Expect::Str(br#""x""#)])),
+                s(&[b"JSON.ARRPOP", b"d", b"$.a", b"99"], Expect::Arr(vec![Expect::Str(b"5")])),
+                s(&[b"JSON.ARRPOP", b"d", b".a", b"-99"], Expect::Str(b"0")),
+                s(&[b"JSON.ARRPOP", b"d", b"$.e"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.ARRPOP", b"d", b".e"], Expect::Nil),
+                s(&[b"JSON.ARRPOP", b"d", b"$.s"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.ARRPOP", b"d", b".s"], Expect::AnyError),
+                s(&[b"JSON.ARRPOP", b"d"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(br#"[["y",1,2,3,4]]"#)),
+                // ARRTRIM keeps the inclusive range, clamped to the array.
+                s(&[b"JSON.ARRTRIM", b"d", b"$.a", b"1", b"-2"], Expect::Arr(vec![Expect::Int(3)])),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[[1,2,3]]")),
+                s(&[b"JSON.ARRTRIM", b"d", b".a", b"-2", b"99"], Expect::Int(2)),
+                s(&[b"JSON.ARRTRIM", b"d", b"$.a", b"-99", b"-99"], Expect::Arr(vec![Expect::Int(1)])),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[[2]]")),
+                s(&[b"JSON.ARRTRIM", b"d", b"$.a", b"99", b"100"], Expect::Arr(vec![Expect::Int(0)])),
+                s(&[b"JSON.ARRTRIM", b"d", b"$.s", b"0", b"1"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.ARRTRIM", b"d", b".s", b"0", b"1"], Expect::AnyError),
+                s(&[b"JSON.ARRTRIM", b"d", b"$.a", b"0"], Expect::AnyError),
+                s(&[b"JSON.ARRTRIM", b"gone", b"$.a", b"0", b"1"], Expect::AnyError),
+                // Legacy root defaults: ARRPOP with no path pops the root.
+                s(&[b"JSON.SET", b"r", b"$", b"[1,2,3]"], Expect::Ok),
+                s(&[b"JSON.ARRPOP", b"r"], Expect::Str(b"3")),
+                s(&[b"JSON.ARRPOP", b"r", b"$"], Expect::Arr(vec![Expect::Str(b"2")])),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "NUMMULTBY multiplies each number; integers stay exact",
+            steps: vec![
+                s(&[b"JSON.SET", b"v", b"$", br#"{"n":10,"f":1.5,"neg":-3,"s":"x"}"#], Expect::Ok),
+                s(&[b"JSON.NUMMULTBY", b"v", b"$.n", b"-2"], Expect::Str(b"[-20]")),
+                s(&[b"JSON.NUMMULTBY", b"v", b".neg", b"2"], Expect::Str(b"-6")),
+                s(&[b"JSON.NUMMULTBY", b"v", b"$.f", b"3"], Expect::Str(b"[4.5]")),
+                s(&[b"JSON.NUMMULTBY", b"v", b"$.s", b"2"], Expect::Str(b"[null]")),
+                s(&[b"JSON.NUMMULTBY", b"v", b".s", b"2"], Expect::AnyError),
+                s(&[b"JSON.NUMMULTBY", b"v", b"$.zz", b"2"], Expect::Str(b"[]")),
+                s(&[b"JSON.NUMMULTBY", b"v", b"$.n", b"x"], Expect::AnyError),
+                s(&[b"JSON.NUMMULTBY", b"gone", b"$.n", b"2"], Expect::AnyError),
+                // A multiplier written as a float makes a float.
+                s(&[b"JSON.NUMMULTBY", b"v", b"$.n", b"0.5"], Expect::AnyBulk),
+                s(&[b"JSON.GET", b"v", b"$.n"], Expect::Str(b"[-10.0]")),
+                s(&[b"JSON.SET", b"w", b"$", br#"{"i":9007199254740993}"#], Expect::Ok),
+                s(&[b"JSON.NUMMULTBY", b"w", b"$.i", b"1"], Expect::Str(b"[9007199254740993]")),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "CLEAR empties containers and zeroes numbers, counting what changed",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":{"o":{"x":1},"e":{},"n":2,"z":0,"s":"x","b":true,"l":[1]}}"#],
+                    Expect::Ok,
+                ),
+                // Already empty, already zero, and non-containers count 0.
+                s(&[b"JSON.CLEAR", b"d", b"$.a.e"], Expect::Int(0)),
+                s(&[b"JSON.CLEAR", b"d", b"$.a.z"], Expect::Int(0)),
+                s(&[b"JSON.CLEAR", b"d", b"$.a.s"], Expect::Int(0)),
+                s(&[b"JSON.CLEAR", b"d", b"$.a.b"], Expect::Int(0)),
+                s(&[b"JSON.CLEAR", b"d", b".a.o"], Expect::Int(1)),
+                s(&[b"JSON.CLEAR", b"d", b"$.a.*"], Expect::Int(2)),
+                s(&[b"JSON.CLEAR", b"d", b"$.zz"], Expect::Int(0)),
+                s(&[b"JSON.CLEAR", b"d", b".zz"], Expect::Int(0)),
+                s(
+                    &[b"JSON.GET", b"d"],
+                    Expect::Str(br#"{"a":{"o":{},"e":{},"n":0,"z":0,"s":"x","b":true,"l":[]}}"#),
+                ),
+                s(&[b"JSON.CLEAR", b"d"], Expect::Int(1)),
+                s(&[b"JSON.GET", b"d"], Expect::Str(b"{}")),
+                s(&[b"JSON.CLEAR", b"gone"], Expect::AnyError),
+                s(&[b"JSON.SET", b"n", b"$", b"5"], Expect::Ok),
+                s(&[b"JSON.CLEAR", b"n"], Expect::Int(1)),
+                s(&[b"JSON.GET", b"n"], Expect::Str(b"0")),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "MERGE applies an RFC 7396 patch at each match",
+            steps: vec![
+                s(&[b"JSON.SET", b"g", b"$", br#"{"a":{"b":1},"l":[1,2]}"#], Expect::Ok),
+                // A null member deletes; nulls inside a new object go too;
+                // an array replaces.
+                s(
+                    &[b"JSON.MERGE", b"g", b"$", br#"{"a":{"c":{"d":null,"e":1}},"l":[3],"x":null}"#],
+                    Expect::Ok,
+                ),
+                s(&[b"JSON.GET", b"g"], Expect::Str(br#"{"a":{"b":1,"c":{"e":1}},"l":[3]}"#)),
+                // A non-object patch replaces; an object patch over a
+                // non-object starts from an empty object.
+                s(&[b"JSON.MERGE", b"g", b"$.a", b"5"], Expect::Ok),
+                s(&[b"JSON.MERGE", b"g", b"$.l", br#"{"k":null,"j":1}"#], Expect::Ok),
+                s(&[b"JSON.GET", b"g"], Expect::Str(br#"{"a":5,"l":{"j":1}}"#)),
+                // A null patch at a path sets null there.
+                s(&[b"JSON.MERGE", b"g", b"$.a", b"null"], Expect::Ok),
+                // A missing last member is added as given.
+                s(&[b"JSON.MERGE", b"g", b"$.new", br#"{"x":null}"#], Expect::Ok),
+                s(&[b"JSON.GET", b"g"], Expect::Str(br#"{"a":null,"l":{"j":1},"new":{"x":null}}"#)),
+                s(&[b"JSON.SET", b"h", b"$", br#"{"a":{"a":{"z":1}}}"#], Expect::Ok),
+                s(&[b"JSON.MERGE", b"h", b"$..a", br#"{"b":2}"#], Expect::Ok),
+                s(&[b"JSON.GET", b"h"], Expect::Str(br#"{"a":{"a":{"z":1,"b":2},"b":2}}"#)),
+                s(&[b"JSON.MERGE", b"h", b"$.*.x", b"1"], Expect::AnyError),
+                // A missing key takes the patch as its document, nulls and
+                // all, as JSON.SET would.
+                s(&[b"JSON.MERGE", b"k", b"$", br#"{"a":1,"b":null}"#], Expect::Ok),
+                s(&[b"JSON.GET", b"k"], Expect::Str(br#"{"a":1,"b":null}"#)),
+                s(&[b"JSON.MERGE", b"k2", b"$.a", b"1"], Expect::AnyError),
+                s(&[b"JSON.MERGE", b"k", b"$", b"notjson"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "MGET reads one path from many keys; MSET writes all triples or none",
+            steps: vec![
+                s(&[b"JSON.SET", b"{j}a", b"$", br#"{"x":1,"y":{"x":2}}"#], Expect::Ok),
+                s(&[b"JSON.SET", b"{j}b", b"$", br#"{"x":3}"#], Expect::Ok),
+                s(&[b"SET", b"{j}s", b"plain"], Expect::Ok),
+                // A missing key, or one that is not a document, is nil.
+                s(
+                    &[b"JSON.MGET", b"{j}a", b"{j}b", b"{j}gone", b"{j}s", b"$..x"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"[1,2]"),
+                        Expect::Str(b"[3]"),
+                        Expect::Nil,
+                        Expect::Nil,
+                    ]),
+                ),
+                s(
+                    &[b"JSON.MGET", b"{j}a", b"{j}b", b".x"],
+                    Expect::Arr(vec![Expect::Str(b"1"), Expect::Str(b"3")]),
+                ),
+                s(&[b"JSON.MGET", b"{j}a", b".zz"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.MGET", b"{j}a", b"$.zz"], Expect::Arr(vec![Expect::Str(b"[]")])),
+                s(&[b"JSON.MGET", b"$.x"], Expect::AnyError),
+                s(
+                    &[b"JSON.MSET", b"{j}a", b"$.x", b"10", b"{j}b", b"$", br#"{"y":1}"#],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"JSON.MGET", b"{j}a", b"{j}b", b"$"],
+                    Expect::Arr(vec![
+                        Expect::Str(br#"[{"x":10,"y":{"x":2}}]"#),
+                        Expect::Str(br#"[{"y":1}]"#),
+                    ]),
+                ),
+                // Each triple is checked against the documents as they
+                // were: a key the command itself creates is still missing to
+                // a later sub-path triple, and nothing is written.
+                s(
+                    &[b"JSON.MSET", b"{j}c", b"$", b"{}", b"{j}c", b"$.y", b"1"],
+                    Expect::AnyError,
+                ),
+                s(&[b"EXISTS", b"{j}c"], Expect::Int(0)),
+                s(
+                    &[b"JSON.MSET", b"{j}a", b"$.x", b"11", b"{j}s", b"$", b"1"],
+                    Expect::AnyError,
+                ),
+                s(
+                    &[b"JSON.MSET", b"{j}a", b"$.x", b"11", b"{j}b", b"$.q", b"notjson"],
+                    Expect::AnyError,
+                ),
+                // A multi-match path adds nothing, so one matching nothing
+                // refuses the command.
+                s(&[b"JSON.MSET", b"{j}a", b"$.*.q", b"1"], Expect::AnyError),
+                s(&[b"JSON.MSET", b"{j}a", b"$.x", b"1", b"{j}b"], Expect::AnyError),
+                s(&[b"JSON.GET", b"{j}a", b"$.x"], Expect::Str(b"[10]")),
+                // The same key twice applies in order.
+                s(&[b"JSON.MSET", b"{j}a", b"$.x", b"8", b"{j}a", b"$.x", b"9"], Expect::Ok),
+                s(&[b"JSON.MSET", b"{j}a", b"$..x", b"7"], Expect::Ok),
+                s(&[b"JSON.GET", b"{j}a"], Expect::Str(br#"{"x":7,"y":{"x":7}}"#)),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "RESP renders a value in RESP terms; DEBUG reports sizes and help",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"r", b"$", br#"{"a":{"s":"x","n":1,"f":1.5,"t":true,"z":null,"l":[1,"a"]}}"#],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"JSON.RESP", b"r", b".a.l"],
+                    Expect::Arr(vec![Expect::Simple("["), Expect::Int(1), Expect::Str(b"a")]),
+                ),
+                s(
+                    &[b"JSON.RESP", b"r", b"$..n"],
+                    Expect::Arr(vec![Expect::Int(1)]),
+                ),
+                s(
+                    &[b"JSON.RESP", b"r", b"$.a.t"],
+                    Expect::Arr(vec![Expect::Simple("true")]),
+                ),
+                s(&[b"JSON.RESP", b"r", b"$.a.z"], Expect::Arr(vec![Expect::Nil])),
+                s(&[b"JSON.RESP", b"r", b"$.zz"], Expect::Arr(vec![])),
+                s(&[b"JSON.RESP", b"r", b".zz"], Expect::AnyError),
+                s(&[b"JSON.RESP", b"gone"], Expect::Nil),
+                s(&[b"JSON.RESP", b"gone", b"$"], Expect::Nil),
+                // DEBUG MEMORY's number is each server's own accounting.
+                s(&[b"JSON.DEBUG", b"MEMORY", b"r"], Expect::IntRange(1, 1 << 20)),
+                s(&[b"JSON.DEBUG", b"MEMORY", b"gone"], Expect::Int(0)),
+                s(&[b"JSON.DEBUG", b"MEMORY", b"gone", b"$.a"], Expect::Arr(vec![])),
+                s(&[b"JSON.DEBUG", b"MEMORY", b"r", b".zz"], Expect::AnyError),
+                s(
+                    &[b"JSON.DEBUG", b"HELP"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"MEMORY <key> [path] - reports memory usage"),
+                        Expect::Str(b"HELP                - this message"),
+                    ]),
+                ),
+                s(&[b"JSON.DEBUG", b"FOO"], Expect::AnyError),
+                s(&[b"JSON.DEBUG", b"MEMORY"], Expect::AnyError),
+                s(&[b"JSON.DEBUG"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "GET takes several paths and RedisJSON's formatting arguments",
+            steps: vec![
+                s(&[b"JSON.SET", b"w", b"$", br#"{"a":{"b":1,"c":[]},"d":"\u00e9\""}"#], Expect::Ok),
+                s(&[b"JSON.GET", b"w", b"$.a.b", b"$.zz"], Expect::Json(br#"{"$.a.b":[1],"$.zz":[]}"#)),
+                // A legacy path among `$` ones answers under `$`.
+                s(&[b"JSON.GET", b"w", b"$.a.b", b".d"], Expect::Json(br#"{"$.a.b":[1],".d":["\u00e9\""]}"#)),
+                s(&[b"JSON.GET", b"w", b".a.b", b".d"], Expect::Json(br#"{".a.b":1,".d":"\u00e9\""}"#)),
+                // Two path arguments answer the object form even when equal.
+                s(&[b"JSON.GET", b"w", b".a.b", b".a.b"], Expect::Json(br#"{".a.b":1}"#)),
+                s(&[b"JSON.GET", b"w", b".a.b", b".zz"], Expect::AnyError),
+                s(
+                    &[b"JSON.GET", b"w", b"INDENT", b"  ", b"NEWLINE", b"\n", b"SPACE", b" ", b".a"],
+                    Expect::Str(b"{\n  \"b\": 1,\n  \"c\": []\n}"),
+                ),
+                // The options may follow the path, and the last one wins.
+                s(
+                    &[b"JSON.GET", b"w", b"$.a", b"newline", b"|", b"indent", b"<", b"indent", b">"],
+                    Expect::Str(b"[|>{|>>\"b\":1,|>>\"c\":[]|>}|]"),
+                ),
+                s(&[b"JSON.GET", b"w", b"NOESCAPE", b".a.b"], Expect::Str(b"1")),
+                s(&[b"JSON.GET", b"w", b"INDENT"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "ARRLEN and TYPE answer a missing key as RedisJSON does (BUG-0210)",
+            steps: vec![
+                s(&[b"JSON.ARRLEN", b"gone"], Expect::Nil),
+                s(&[b"JSON.ARRLEN", b"gone", b".a"], Expect::Nil),
+                s(&[b"JSON.ARRLEN", b"gone", b"$"], Expect::AnyError),
+                s(&[b"JSON.ARRLEN", b"gone", b"$.a"], Expect::AnyError),
+                s(&[b"JSON.TYPE", b"gone"], Expect::Nil),
+                s(&[b"JSON.TYPE", b"gone", b"$.a"], Expect::Nil),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "NUMMULTBY refuses an integer overflow (RedisJSON wraps)",
+            steps: vec![
+                s(&[b"JSON.SET", b"m", b"$", br#"{"i":3037000500}"#], Expect::Ok),
+                // DIVERGENCE (deliberate): RedisJSON answers
+                // [-9223372036709301616] and stores it, as BUG-0208 records
+                // for NUMINCRBY.
+                s(&[b"JSON.NUMMULTBY", b"m", b"$.i", b"3037000500"], Expect::AnyError),
+                s(&[b"JSON.GET", b"m", b"$.i"], Expect::Str(b"[3037000500]")),
+            ],
+        },
         Case {
             family: "json",
             name: "type gate: WRONGTYPE in both directions",
@@ -4408,6 +4836,18 @@ fn matches(expect: &Expect, got: &Value, proto: Proto) -> bool {
         Expect::AnyError => matches!(got, Value::Error(_)),
         Expect::Err(t) => matches!(got, Value::Error(e) if e == t),
         Expect::AnyBulk => matches!(got, Value::Bulk(Some(_))),
+        Expect::Json(want) => match got {
+            Value::Bulk(Some(b)) => {
+                match (
+                    serde_json::from_slice::<serde_json::Value>(b),
+                    serde_json::from_slice::<serde_json::Value>(want),
+                ) {
+                    (Ok(g), Ok(w)) => g == w,
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
         Expect::AnyArray => matches!(got, Value::Array(Some(_))),
         Expect::StrContains(s) => matches!(
             got,

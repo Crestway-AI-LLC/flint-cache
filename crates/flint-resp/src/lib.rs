@@ -98,7 +98,8 @@ pub enum Value {
     /// for when the protocols disagree about the reply's KIND, not merely
     /// its shape, and no amount of re-rendering can bridge them.
     ///
-    /// Exactly one command needs it: `JSON.NUMINCRBY`. RESP2 answers a
+    /// Two commands need it: `JSON.NUMINCRBY` and its twin
+    /// `JSON.NUMMULTBY` (ADR-0055). RESP2 answers a
     /// JSON string (`[6]`), RESP3 answers a typed RESP array (`*1 :6`), and
     /// for a legacy path that matches nothing RESP2 answers an ERROR where
     /// RESP3 answers an empty array. An encoder cannot turn a string into
@@ -143,13 +144,17 @@ pub fn resp3_nests_reply(command: &[u8]) -> bool {
     command.eq_ignore_ascii_case(b"JSON.TYPE")
 }
 
-/// True for the command whose two dialects disagree in reply KIND, so the
-/// proxy knows to rebuild the RESP2 spelling from the RESP3 one it read.
+/// True for the commands whose two dialects disagree in reply KIND, so the
+/// proxy knows to rebuild the RESP2 spelling from the RESP3 one it read:
+/// `JSON.NUMINCRBY`, and `JSON.NUMMULTBY`, which RedisJSON answers the same
+/// way (ADR-0055).
 pub fn resp3_differs_in_kind(command: &[u8]) -> bool {
     command.eq_ignore_ascii_case(b"JSON.NUMINCRBY")
+        || command.eq_ignore_ascii_case(b"JSON.NUMMULTBY")
 }
 
-/// Rebuild `JSON.NUMINCRBY`'s RESP2 reply from its RESP3 array.
+/// Rebuild `JSON.NUMINCRBY`'s (or `JSON.NUMMULTBY`'s) RESP2 reply from its
+/// RESP3 array.
 ///
 /// The proxy reads backends in RESP3, so this is the direction it needs:
 /// `*1 :6` becomes the JSON text `[6]` for a `$` caller, or the bare `6`

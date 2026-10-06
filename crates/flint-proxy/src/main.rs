@@ -1603,6 +1603,10 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
             .and_then(|k| k.first())
             .map(|k| k.as_slice());
     }
+    // JSON.DEBUG MEMORY's key follows its subcommand (ADR-0055).
+    if let Some(key) = flint_commands::json_debug_key(args) {
+        return key;
+    }
     args.get(1).map(|k| k.as_slice())
 }
 
@@ -3508,6 +3512,9 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
     if upper.as_slice() == b"MGET" && spans_slots(&args[1..]) {
         return false;
     }
+    if upper.as_slice() == b"JSON.MGET" && args.len() > 3 && spans_slots(&args[1..args.len() - 1]) {
+        return false;
+    }
     // A D7 replica read resolves its target differently and falls back to the
     // master when a replica errors. Left on the ordinary path: the fallback
     // is worth more than the batching.
@@ -3975,6 +3982,14 @@ fn cache_invalidate_written(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) {
         // through this proxy — the read-your-own-writes contract.
         b"MSET" => {
             for k in args[1..].iter().step_by(2) {
+                topo.cache.invalidate(ns, k);
+            }
+        }
+        // JSON.MSET k1 path v1 k2 path v2 ...: every key leading a triple
+        // (ADR-0055). The cache holds only GET replies, so this is the
+        // same read-your-own-writes hygiene as MSET's.
+        b"JSON.MSET" => {
+            for k in args[1..].iter().step_by(3) {
                 topo.cache.invalidate(ns, k);
             }
         }
@@ -4595,6 +4610,10 @@ fn assemble_mget(n: usize, groups: &[(u16, Vec<usize>)], replies: Vec<Value>) ->
 /// client splitting the same call. MSET itself is NOT split: its atomicity is
 /// its contract. A transaction never reaches here (`transaction_step` runs
 /// first), so a queued MGET is still refused across slots.
+///
+/// `JSON.MGET key [key ...] path` splits the same way (ADR-0055): its last
+/// argument is the path, which every per-slot command repeats. JSON.MSET,
+/// like MSET, is not split.
 async fn split_mget(
     topo: &Arc<Topology>,
     backends: &mut Backends,
@@ -4603,7 +4622,8 @@ async fn split_mget(
     raw: &[u8],
     read_replica: bool,
 ) -> Value {
-    let keys = &args[1..];
+    let trail = usize::from(args[0].eq_ignore_ascii_case(b"JSON.MGET"));
+    let (keys, tail) = args[1..].split_at(args.len() - 1 - trail);
     let groups = group_by_slot(keys);
     if groups.len() <= 1 {
         return forward(topo, backends, ns, args, raw, read_replica).await;
@@ -4611,9 +4631,10 @@ async fn split_mget(
     let subs: Vec<(Vec<Vec<u8>>, Vec<u8>)> = groups
         .iter()
         .map(|(_, positions)| {
-            let mut sub = Vec::with_capacity(positions.len() + 1);
+            let mut sub = Vec::with_capacity(positions.len() + 1 + trail);
             sub.push(args[0].clone());
             sub.extend(positions.iter().map(|&p| keys[p].clone()));
+            sub.extend(tail.iter().cloned());
             let parts: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
             let frame = encode_cmd(&parts);
             (sub, frame)
@@ -4855,8 +4876,12 @@ async fn handle(
             split_by_owner(topo, backends, ns, args, raw, read_replica).await
         }
         // An MGET across slots: one MGET per slot, reassembled in the
-        // caller's order (ADR-0048). See `split_mget`.
+        // caller's order (ADR-0048). See `split_mget`. JSON.MGET, whose last
+        // argument is its path, the same way (ADR-0055).
         b"MGET" if args.len() > 2 => split_mget(topo, backends, ns, args, raw, read_replica).await,
+        b"JSON.MGET" if args.len() > 3 => {
+            split_mget(topo, backends, ns, args, raw, read_replica).await
+        }
         // The blocking pops wait here, not on a seat (ADR-0052 D4). See
         // `blocking_pop`.
         _ if flint_commands::is_blocking_command(&upper) => {
@@ -5612,6 +5637,8 @@ mod prefetch_tests {
             vec!["EXISTS", "a", "b"],
             vec!["UNLINK", "a", "b"],
             vec!["MGET", "a", "b"],
+            // ADR-0055: split per slot, as MGET is; its path is not a key.
+            vec!["JSON.MGET", "a", "b", "$"],
             vec!["PING"],
             vec!["ECHO", "x"],
             vec!["QUIT"],

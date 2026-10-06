@@ -115,6 +115,26 @@ $A JSON.ARRLEN shape .o 2>&1 | grep -qi 'array' || { echo "FAIL: legacy wrong-sh
 [ "$($A JSON.ARRLEN shape '$.a')" = "2" ] || { echo "FAIL: \$ ARRLEN value"; exit 1; }
 echo "  \$ -> containers (incl. empty and nil-element), legacy -> bare/errors"
 
+# ADR-0055. JSON.NUMMULTBY answers RESP2 and RESP3 in different KINDS, as
+# JSON.NUMINCRBY does: the proxy reads RESP3 from the seat and must rebuild
+# this RESP2 client's JSON text, and the legacy form's bare number.
+echo "== the rest of the family through the proxy (ADR-0055)"
+[ "$($A JSON.NUMMULTBY shape '$.n' 3)" = "[3]" ] || { echo "FAIL: \$ NUMMULTBY not rebuilt for RESP2: $($A JSON.NUMMULTBY shape '$.n' 3)"; exit 1; }
+[ "$($A JSON.NUMMULTBY shape .n 2)" = "6" ] || { echo "FAIL: legacy NUMMULTBY"; exit 1; }
+# One JSON.MGET over documents on BOTH pairs: the proxy splits it by slot,
+# each part carrying the path, and puts the answers back in order.
+KEYS=""; WANT=""
+for i in $(seq 0 39); do KEYS="$KEYS doc:$i"; WANT="$WANT$i
+"; done
+GOT=$($A JSON.MGET $KEYS .n)
+[ "$GOT" = "$(printf '%s' "$WANT")" ] || { echo "FAIL: JSON.MGET across pairs: $GOT"; exit 1; }
+# A tagged JSON.MSET writes both documents at once, and MERGE patches one.
+[ "$($A JSON.MSET '{u1}:profile' .name '"b"' '{u1}:prefs' .dark false)" = "OK" ] || { echo "FAIL: tagged JSON.MSET"; exit 1; }
+[ "$($A JSON.MERGE '{u1}:profile' '$' '{"age":3}')" = "OK" ] || { echo "FAIL: JSON.MERGE"; exit 1; }
+[ "$($A JSON.GET '{u1}:profile')" = '{"name":"b","age":3}' ] || { echo "FAIL: MSET/MERGE result: $($A JSON.GET '{u1}:profile')"; exit 1; }
+[ "$($A JSON.GET '{u1}:prefs' .dark)" = "false" ] || { echo "FAIL: MSET second key"; exit 1; }
+echo "  NUMMULTBY rebuilt for RESP2; JSON.MGET over 40 documents on 2 pairs in order; tagged MSET and MERGE"
+
 echo "== TTL rides along with the document, and survives a WARM RESTART"
 $A JSON.SET tdoc '$' '{"v":1}' >/dev/null
 $A EXPIRE tdoc 600 >/dev/null

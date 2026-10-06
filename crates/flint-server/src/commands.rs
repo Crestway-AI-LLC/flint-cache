@@ -22,6 +22,9 @@ use flint_storage::strings::{
 };
 use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore};
 
+/// The JSON commands ADR-0055 added.
+mod json;
+
 /// True for commands that mutate the keyspace (rejected on replicas).
 /// Delegates to the SHARED classifier (flint-commands, ADR-0005 D1): the
 /// server's -READONLY gate and slot gate must classify identically to the
@@ -65,6 +68,9 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         return flint_commands::eval_keys(args)
             .and_then(|k| k.first())
             .map(|k| k.as_slice());
+    }
+    if let Some(key) = flint_commands::json_debug_key(args) {
+        return key;
     }
     args.get(1).map(|k| k.as_slice())
 }
@@ -309,6 +315,16 @@ impl<'a> Dispatcher<'a> {
             | b"INFO" | b"SELECT" | b"QUIT" | b"HELLO" | b"SCAN" => false,
             b"DEL" | b"EXISTS" => args[1..].iter().any(|k| k.len() > max),
             b"MSET" => args[1..].iter().step_by(2).any(|k| k.len() > max),
+            // ADR-0055: JSON.MGET's last argument is its path, JSON.MSET's
+            // keys lead each triple, and JSON.DEBUG's key follows its
+            // subcommand.
+            b"JSON.MGET" => args[1..args.len().saturating_sub(1).max(1)]
+                .iter()
+                .any(|k| k.len() > max),
+            b"JSON.MSET" => args[1..].iter().step_by(3).any(|k| k.len() > max),
+            b"JSON.DEBUG" => flint_commands::json_debug_key(args)
+                .flatten()
+                .is_some_and(|k| k.len() > max),
             // BUG-0189: `args[1]` is the script's text (or its SHA1), not a
             // key, and a text past the cap was refused as one: BullMQ's
             // scripts are larger than 4 KiB. The declared keys are checked
@@ -1041,9 +1057,26 @@ impl<'a> Dispatcher<'a> {
             b"JSON.GET" => self.cmd_json_get(args),
             b"JSON.DEL" | b"JSON.FORGET" => self.cmd_json_del(args),
             b"JSON.TYPE" => self.cmd_json_type(args),
-            b"JSON.NUMINCRBY" => self.cmd_json_numincrby(args),
+            b"JSON.NUMINCRBY" => self.cmd_json_numop(args, false),
+            b"JSON.NUMMULTBY" => self.cmd_json_numop(args, true),
             b"JSON.ARRAPPEND" => self.cmd_json_arrappend(args),
             b"JSON.ARRLEN" => self.cmd_json_arrlen(args),
+            // ADR-0055, in commands/json.rs.
+            b"JSON.MGET" => self.cmd_json_mget(args),
+            b"JSON.MSET" => self.cmd_json_mset(args),
+            b"JSON.MERGE" => self.cmd_json_merge(args),
+            b"JSON.STRLEN" => self.cmd_json_strlen(args),
+            b"JSON.STRAPPEND" => self.cmd_json_strappend(args),
+            b"JSON.OBJLEN" => self.cmd_json_objlen(args),
+            b"JSON.OBJKEYS" => self.cmd_json_objkeys(args),
+            b"JSON.TOGGLE" => self.cmd_json_toggle(args),
+            b"JSON.ARRINDEX" => self.cmd_json_arrindex(args),
+            b"JSON.ARRINSERT" => self.cmd_json_arrinsert(args),
+            b"JSON.ARRPOP" => self.cmd_json_arrpop(args),
+            b"JSON.ARRTRIM" => self.cmd_json_arrtrim(args),
+            b"JSON.CLEAR" => self.cmd_json_clear(args),
+            b"JSON.RESP" => self.cmd_json_resp(args),
+            b"JSON.DEBUG" => self.cmd_json_debug(args),
             b"BF.RESERVE" => self.cmd_bf_reserve(args),
             b"BF.ADD" => exact(args, 3, "bf.add", |a| {
                 reply(self.bloom.add(slot_for_key(&a[1]), &a[1], &a[2]), |b| {
@@ -2244,11 +2277,7 @@ impl<'a> Dispatcher<'a> {
         let path = match crate::json_path::parse(raw.as_deref().unwrap_or(".")) {
             Ok(p) => p,
             Err(crate::json_path::PathError::Unsupported) => {
-                return Err(err(
-                    "ERR path contains an unsupported construct (multi-match \
-                     outside the $ dialect, a regex or multi-match operand in a \
-                     filter, a negative slice step, or a slice in a union)",
-                ));
+                return Err(err(UNSUPPORTED_PATH));
             }
             Err(crate::json_path::PathError::Malformed) => {
                 return Err(err("ERR malformed JSON path"));
@@ -2371,30 +2400,48 @@ impl<'a> Dispatcher<'a> {
         let Ok(value): Result<serde_json::Value, _> = serde_json::from_slice(&args[3]) else {
             return err("ERR value is not valid JSON");
         };
-        let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
+        let (path, mut doc) = match self.json_open(&args[1], Some(&args[2])) {
             Ok(v) => v,
             Err(reply) => return reply,
         };
-        let key = &args[1];
+        match Self::json_set_in(&mut doc, &path, value, nx, xx) {
+            Err(reply) => reply,
+            Ok(false) => Value::Bulk(None),
+            Ok(true) => {
+                let doc = doc.as_ref().expect("a write leaves a document");
+                // Every document write, the root's included, is an in-place
+                // mutation of the key, so the TTL survives: RedisJSON's
+                // behavior, and the safe direction for a cache, where
+                // clearing it would quietly make an expiring document
+                // immortal.
+                match self.json_save(&args[1], doc) {
+                    Some(e) => e,
+                    None => Value::Simple("OK".into()),
+                }
+            }
+        }
+    }
+
+    /// JSON.SET's rules applied to a document in hand (`None` for a missing
+    /// key), shared with JSON.MSET. `Ok(true)` when it wrote, `Ok(false)`
+    /// when NX or XX declined (nil), or the error to answer.
+    pub(super) fn json_set_in(
+        doc: &mut Option<serde_json::Value>,
+        path: &crate::json_path::Path,
+        value: serde_json::Value,
+        nx: bool,
+        xx: bool,
+    ) -> Result<bool, Value> {
         // Whole-document write: the key itself is the NX/XX subject.
         if path.is_root() {
             if (nx && doc.is_some()) || (xx && doc.is_none()) {
-                return Value::Bulk(None);
+                return Ok(false);
             }
-            let Ok(bytes) = serde_json::to_vec(&value) else {
-                return err("ERR could not serialize document");
-            };
-            // Replacing the document is an in-place mutation of an existing
-            // key, not a fresh key, so the TTL survives — RedisJSON's
-            // behavior, and the safe direction for a cache: clearing it
-            // would quietly turn an expiring document into an immortal one.
-            return match self.json.set(slot_for_key(key), key, &bytes) {
-                Ok(()) => Value::Simple("OK".into()),
-                Err(e) => store_err(e),
-            };
+            *doc = Some(value);
+            return Ok(true);
         }
-        let Some(mut doc) = doc else {
-            return err("ERR new objects must be created at the root");
+        let Some(doc) = doc else {
+            return Err(err("ERR new objects must be created at the root"));
         };
         // ADR-0054, an indefinite path: each location it selects is
         // replaced, and nothing is created. RedisJSON adds a value only on
@@ -2404,74 +2451,37 @@ impl<'a> Dispatcher<'a> {
         if path.selectors().is_some() {
             const NOT_ADDED: &str = "ERR a multi-match path replaces existing values and adds none";
             if nx {
-                return err(NOT_ADDED);
+                return Err(err(NOT_ADDED));
             }
-            let locs = Self::json_targets(crate::json_path::select(&doc, &path));
+            let locs = Self::json_targets(crate::json_path::select(doc, path));
             if locs.is_empty() {
-                return if xx {
-                    Value::Bulk(None)
-                } else {
-                    err(NOT_ADDED)
-                };
+                return if xx { Ok(false) } else { Err(err(NOT_ADDED)) };
             }
             // Innermost first: a replaced ancestor would otherwise leave a
             // descendant's location pointing into the new value. The final
             // document is the same either way.
             for loc in locs.into_iter().rev() {
                 let at = crate::json_path::Path::internal(loc);
-                if let Some(slot) = crate::json_path::get_mut(&mut doc, &at) {
+                if let Some(slot) = crate::json_path::get_mut(doc, &at) {
                     *slot = value.clone();
                 }
             }
-            return match self.json_save(key, &doc) {
-                Some(e) => e,
-                None => Value::Simple("OK".into()),
-            };
+            return Ok(true);
         }
         // NX/XX on a sub-path test the PATH's existence.
-        let exists = crate::json_path::get(&doc, &path).is_some();
+        let exists = crate::json_path::get(doc, path).is_some();
         if (nx && exists) || (xx && !exists) {
-            return Value::Bulk(None);
+            return Ok(false);
         }
-        match crate::json_path::set(&mut doc, &path, value) {
-            crate::json_path::SetOutcome::Set | crate::json_path::SetOutcome::Created => {
-                match self.json_save(key, &doc) {
-                    Some(e) => e,
-                    None => Value::Simple("OK".into()),
-                }
-            }
-            crate::json_path::SetOutcome::MissingParent => {
-                err("ERR path parent does not exist (intermediate levels are not created)")
-            }
-            crate::json_path::SetOutcome::ShapeMismatch => {
-                err("ERR path does not fit the document's shape at that position")
-            }
+        match crate::json_path::set(doc, path, value) {
+            crate::json_path::SetOutcome::Set | crate::json_path::SetOutcome::Created => Ok(true),
+            crate::json_path::SetOutcome::MissingParent => Err(err(
+                "ERR path parent does not exist (intermediate levels are not created)",
+            )),
+            crate::json_path::SetOutcome::ShapeMismatch => Err(err(
+                "ERR path does not fit the document's shape at that position",
+            )),
         }
-    }
-
-    /// JSON.GET key `[path]` — the value at the path, serialized. A missing
-    /// KEY is nil in either dialect; a missing PATH is `[]` under JSONPath
-    /// and an error under the legacy dialect.
-    fn cmd_json_get(&self, args: &[Vec<u8>]) -> Value {
-        if args.len() < 2 || args.len() > 3 {
-            return arity_err("json.get");
-        }
-        let (path, doc) = match self.json_open(&args[1], args.get(2)) {
-            Ok(v) => v,
-            Err(reply) => return reply,
-        };
-        let Some(doc) = doc else {
-            return Value::Bulk(None);
-        };
-        if path.selectors().is_some() {
-            let vals: Vec<serde_json::Value> = Self::json_selected(&doc, &path)
-                .into_iter()
-                .cloned()
-                .collect();
-            return Self::json_bulk(&serde_json::Value::Array(vals));
-        }
-        let found = crate::json_path::get(&doc, &path).map(|v| Some(v.clone()));
-        Self::json_doc_matches(&path, found, PATH_MISSING)
     }
 
     /// JSON.DEL key `[path]` — root path deletes the key; a sub-path removes
@@ -2558,8 +2568,10 @@ impl<'a> Dispatcher<'a> {
             Ok(v) => v,
             Err(reply) => return reply,
         };
+        // A missing key's nil takes the RESP3 nesting too (BUG-0210):
+        // RedisJSON answers `[null]` there.
         let Some(doc) = doc else {
-            return Value::Bulk(None);
+            return Value::Resp3Nested(Box::new(Value::Bulk(None)));
         };
         // RedisJSON nests this reply one level deeper under RESP3 and
         // redis-py unwraps to match; `Resp3Nested` carries that intent so
@@ -2805,9 +2817,13 @@ impl<'a> Dispatcher<'a> {
 
     /// JSON.NUMINCRBY key path number — atomically add to a number at the
     /// path, replying with the new value.
-    fn cmd_json_numincrby(&self, args: &[Vec<u8>]) -> Value {
+    fn cmd_json_numop(&self, args: &[Vec<u8>], mult: bool) -> Value {
         if args.len() != 4 {
-            return arity_err("json.numincrby");
+            return arity_err(if mult {
+                "json.nummultby"
+            } else {
+                "json.numincrby"
+            });
         }
         let Some(by) = std::str::from_utf8(&args[3])
             .ok()
@@ -2863,7 +2879,7 @@ impl<'a> Dispatcher<'a> {
                     as_resp.push(Value::Null);
                     continue;
                 }
-                if let Err(e) = Self::json_add(slot, by) {
+                if let Err(e) = Self::json_numop(slot, by, mult) {
                     return e;
                 }
                 as_resp.push(numeric(Some(slot)));
@@ -2888,7 +2904,7 @@ impl<'a> Dispatcher<'a> {
                 vec![Value::Null],
             );
         }
-        if let Err(e) = Self::json_add(slot, by) {
+        if let Err(e) = Self::json_numop(slot, by, mult) {
             return e;
         }
         let out = slot.clone();
@@ -2901,21 +2917,36 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// Add `by` (as f64, and as an exact integer when written as one) to
-    /// the number in `slot`. An integer plus an integer is an integer, in
-    /// i64 arithmetic: BUG-0208 added in f64 and cast back, so `+0` changed
-    /// an integer above 2^53 and overflow saturated. Overflow is refused,
-    /// as Redis's INCRBY refuses it (RedisJSON wraps); so is a result that
-    /// is not finite. A refusal leaves `slot` as it was.
-    fn json_add(slot: &mut serde_json::Value, by: (f64, Option<i64>)) -> Result<(), Value> {
-        if let (Some(cur), Some(inc)) = (slot.as_i64(), by.1) {
-            let Some(next) = cur.checked_add(inc) else {
-                return Err(err("ERR increment or decrement would overflow"));
+    /// Add `by` to the number in `slot`, or multiply by it (ADR-0055's
+    /// NUMMULTBY), with `by` as f64 and as an exact integer when written as
+    /// one. An integer and an integer make an integer, in i64 arithmetic:
+    /// BUG-0208 worked in f64 and cast back, so `+0` changed an integer
+    /// above 2^53 and overflow saturated. Overflow is refused, as Redis's
+    /// INCRBY refuses it (RedisJSON wraps); so is a result that is not
+    /// finite. A refusal leaves `slot` as it was.
+    fn json_numop(
+        slot: &mut serde_json::Value,
+        by: (f64, Option<i64>),
+        mult: bool,
+    ) -> Result<(), Value> {
+        if let (Some(cur), Some(n)) = (slot.as_i64(), by.1) {
+            let next = if mult {
+                cur.checked_mul(n)
+            } else {
+                cur.checked_add(n)
+            };
+            let Some(next) = next else {
+                return Err(err(if mult {
+                    "ERR multiplication would overflow"
+                } else {
+                    "ERR increment or decrement would overflow"
+                }));
             };
             *slot = serde_json::Value::from(next);
             return Ok(());
         }
-        let next = slot.as_f64().unwrap_or(0.0) + by.0;
+        let cur = slot.as_f64().unwrap_or(0.0);
+        let next = if mult { cur * by.0 } else { cur + by.0 };
         if !next.is_finite() {
             return Err(err("ERR result is not a finite number"));
         }
@@ -2991,8 +3022,14 @@ impl<'a> Dispatcher<'a> {
             Ok(v) => v,
             Err(reply) => return reply,
         };
+        // A missing key is nil under the legacy dialect and an error under
+        // `$`, as RedisJSON answers (BUG-0210).
         let Some(doc) = doc else {
-            return Value::Bulk(None);
+            return if path.is_jsonpath() {
+                err(NO_SUCH_KEY)
+            } else {
+                Value::Bulk(None)
+            };
         };
         if path.selectors().is_some() {
             let lens = Self::json_selected(&doc, &path)
@@ -3702,6 +3739,9 @@ fn parse_u64(raw: &[u8]) -> Option<u64> {
 /// a JSONPath caller gets an empty or null-holding container instead, which
 /// is the whole point of the two dialects.
 const PATH_MISSING: &str = "ERR Path does not exist";
+const UNSUPPORTED_PATH: &str = "ERR path contains an unsupported construct (multi-match \
+     outside the $ dialect, a regex or multi-match operand in a filter, a \
+     negative slice step, or a slice in a union)";
 const NOT_AN_ARRAY: &str = "ERR path does not hold an array";
 const NO_SUCH_KEY: &str = "ERR could not perform this operation on a key that doesn't exist";
 
@@ -3801,6 +3841,8 @@ mod tests {
         for c in [
             &["MSET", "a", "1", "b", "2"][..],
             &["MGET", "a", "b"],
+            &["JSON.MGET", "a", "b", "$"],
+            &["JSON.MSET", "a", "$", "1", "b", "$", "2"],
             &["SINTER", "a", "b"],
             &["SUNIONSTORE", "a", "b"],
             &["ZUNIONSTORE", "a", "1", "b"],
@@ -3816,6 +3858,11 @@ mod tests {
         // Colocated, the same commands queue.
         assert_eq!(q(&["MSET", "{u}a", "1", "{u}b", "2"]), None);
         assert_eq!(q(&["MGET", "{u}a", "{u}b"]), None);
+        assert_eq!(q(&["JSON.MGET", "{u}a", "{u}b", "$"]), None);
+        assert_eq!(q(&["JSON.MSET", "{u}a", "$", "1", "{u}b", "$", "2"]), None);
+        // JSON.MGET's path is not a key: `$` alone must not read as a
+        // second slot.
+        assert_eq!(q(&["JSON.MGET", "a", "$"]), None);
         assert_eq!(q(&["RENAME", "{u}a", "{u}b"]), None);
         // DEL, UNLINK and EXISTS check no slot of their own: the queue step
         // walks their keys (BUG-0179), not this probe.
@@ -4511,6 +4558,119 @@ mod tests {
         // Emptying the document deletes the key (BUG-0209).
         assert_eq!(call(&s, &[b"JSON.DEL", b"d", b"$..*"]), Value::Integer(4));
         assert_eq!(call(&s, &[b"EXISTS", b"d"]), Value::Integer(0));
+    }
+
+    /// ADR-0055: a multi-match edit that moves array elements applies at the
+    /// last location first, so nested matches all land where they were
+    /// named; a location a union names twice is edited twice, in order.
+    #[test]
+    fn json_multimatch_edits_land_on_nested_and_repeated_locations() {
+        let s = MemKv::new();
+        let get = |k: &[u8]| call(&s, &[b"JSON.GET", k]);
+        let json = |text: &str| Value::Bulk(Some(text.as_bytes().to_vec()));
+        let nested = br#"{"a":[{"a":[1]},{"a":[2,3]}]}"#;
+        call(&s, &[b"JSON.SET", b"n", b"$", nested]);
+        // Edited in document order, the insert into the outer array would
+        // move the inner ones before they were reached.
+        assert_eq!(
+            call(&s, &[b"JSON.ARRINSERT", b"n", b"$..a", b"0", br#""x""#]),
+            Value::Array(Some(vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(3)
+            ]))
+        );
+        assert_eq!(
+            get(b"n"),
+            json(r#"{"a":["x",{"a":["x",1]},{"a":["x",2,3]}]}"#)
+        );
+        call(&s, &[b"JSON.SET", b"n", b"$", nested]);
+        assert_eq!(
+            call(&s, &[b"JSON.ARRPOP", b"n", b"$..a", b"0"]),
+            Value::Array(Some(vec![
+                Value::Bulk(Some(br#"{"a":[]}"#.to_vec())),
+                Value::Bulk(Some(b"1".to_vec())),
+                Value::Bulk(Some(b"2".to_vec())),
+            ]))
+        );
+        assert_eq!(get(b"n"), json(r#"{"a":[{"a":[3]}]}"#));
+        // CLEAR counts a match inside another cleared one once.
+        call(&s, &[b"JSON.SET", b"n", b"$", nested]);
+        assert_eq!(call(&s, &[b"JSON.CLEAR", b"n", b"$..a"]), Value::Integer(1));
+        assert_eq!(get(b"n"), json(r#"{"a":[]}"#));
+        // A union naming one location twice toggles it twice.
+        call(&s, &[b"JSON.SET", b"b", b"$", b"[true,false]"]);
+        assert_eq!(
+            call(&s, &[b"JSON.TOGGLE", b"b", b"$[0,0,1]"]),
+            Value::Array(Some(vec![
+                Value::Integer(0),
+                Value::Integer(1),
+                Value::Integer(1)
+            ]))
+        );
+        assert_eq!(get(b"b"), json("[true,true]"));
+    }
+
+    /// ADR-0055: JSON.MSET checks every triple against the documents as they
+    /// were, then applies them in order, storing nothing unless all apply.
+    #[test]
+    fn json_mset_is_all_or_nothing() {
+        let s = MemKv::new();
+        let get = |k: &[u8]| call(&s, &[b"JSON.GET", k]);
+        let json = |text: &str| Value::Bulk(Some(text.as_bytes().to_vec()));
+        call(&s, &[b"JSON.SET", b"{t}a", b"$", br#"{"x":1}"#]);
+        // A key the command creates is still missing to a later triple.
+        assert!(matches!(
+            call(
+                &s,
+                &[b"JSON.MSET", b"{t}c", b"$", b"{}", b"{t}c", b"$.y", b"1"]
+            ),
+            Value::Error(_)
+        ));
+        assert_eq!(call(&s, &[b"EXISTS", b"{t}c"]), Value::Integer(0));
+        // A triple that cannot apply to what an earlier one wrote refuses
+        // the command, and the earlier triple is not stored either.
+        assert!(matches!(
+            call(
+                &s,
+                &[b"JSON.MSET", b"{t}a", b"$", b"5", b"{t}a", b"$.x", b"2"]
+            ),
+            Value::Error(_)
+        ));
+        assert_eq!(get(b"{t}a"), json(r#"{"x":1}"#));
+        // So does a missing intermediate, where RedisJSON writes the rest.
+        assert!(matches!(
+            call(
+                &s,
+                &[b"JSON.MSET", b"{t}a", b"$.x", b"3", b"{t}a", b"$.q.r", b"1"]
+            ),
+            Value::Error(_)
+        ));
+        assert_eq!(get(b"{t}a"), json(r#"{"x":1}"#));
+        assert_eq!(
+            call(
+                &s,
+                &[
+                    b"JSON.MSET",
+                    b"{t}a",
+                    b"$.x",
+                    b"8",
+                    b"{t}b",
+                    b"$",
+                    b"[]",
+                    b"{t}a",
+                    b"$.x",
+                    b"9"
+                ]
+            ),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(get(b"{t}a"), json(r#"{"x":9}"#));
+        assert_eq!(get(b"{t}b"), json("[]"));
+        assert!(matches!(
+            call(&s, &[b"JSON.MSET", b"a", b"$", b"1", b"b", b"$", b"2"]),
+            Value::Error(e) if e.starts_with("CROSSSLOT")
+        ));
     }
 
     /// BUG-0208: an integer is incremented in integer arithmetic. The old

@@ -174,8 +174,13 @@ single-slot, all or nothing. See "Lua scripts" below (ADR-0051).
 > miss one that did. A needless abort costs a retry; a missed modification
 > would cost an update.
 
-**JSON documents**: JSON.SET (NX, XX), JSON.GET, JSON.DEL / JSON.FORGET,
-JSON.TYPE, JSON.NUMINCRBY, JSON.ARRAPPEND, JSON.ARRLEN.
+**JSON documents**: JSON.SET (NX, XX), JSON.GET (several paths; INDENT,
+NEWLINE, SPACE, NOESCAPE), JSON.MGET, JSON.MSET, JSON.MERGE, JSON.DEL /
+JSON.FORGET, JSON.CLEAR, JSON.TYPE, JSON.NUMINCRBY, JSON.NUMMULTBY,
+JSON.STRAPPEND, JSON.STRLEN, JSON.TOGGLE, JSON.ARRAPPEND, JSON.ARRINSERT,
+JSON.ARRINDEX, JSON.ARRLEN, JSON.ARRPOP, JSON.ARRTRIM, JSON.OBJKEYS,
+JSON.OBJLEN, JSON.RESP, JSON.DEBUG (MEMORY, HELP): every command RedisJSON
+v8.2.8 has (ADR-0055).
 
 **Keyspace iteration**: SCAN (MATCH, COUNT, TYPE) — incremental, works
 through the proxy across all shard pairs as one cursor stream (redis-cli
@@ -418,6 +423,36 @@ honest.
   orders only two numbers or two strings. The legacy dialect stays
   single-match, and a regex (`=~`) or multi-match operand in a filter is
   refused: each is UNSUPPORTED, an error distinct from a malformed path.
+- **The rest of the family follows RedisJSON command by command**
+  (ADR-0055), including where its answers for a missing key, a missing path
+  and a value of the wrong type differ between commands and dialects. A few
+  rules are worth knowing:
+  - STRAPPEND, STRLEN, ARRPOP, OBJKEYS, OBJLEN, CLEAR, RESP and DEBUG MEMORY
+    take the legacy root when no path is given. A string's length is in
+    bytes.
+  - ARRINDEX compares type-strictly (the integer `2` is not the float
+    `2.0`), its `stop` is exclusive, and `0` means the end. ARRPOP's index
+    and ARRTRIM's range clamp to the array; ARRINSERT's index may equal the
+    length, and anything outside refuses the command.
+  - TOGGLE answers 1 or 0 under `$`, `true` or `false` under the legacy
+    dialect.
+  - CLEAR empties non-empty objects and arrays and zeroes non-zero numbers,
+    counting only what changed.
+  - MERGE applies an RFC 7396 merge patch at each match. A null member of
+    an object patch deletes that member, and a null patch at a path sets
+    null there. A path that matches nothing adds the value where JSON.SET
+    would, and a missing key takes the patch as its document, nulls and
+    all.
+  - MSET applies JSON.SET's rules to each `key path value` triple, all or
+    nothing, each triple checked against the documents as they were before
+    the command.
+  - MGET answers nil for a key that is missing or not a document.
+  - NUMMULTBY multiplies as NUMINCRBY adds: integers exactly, overflow
+    refused, a multiplier written as a float making a float.
+  - JSON.GET with several path arguments answers one object keyed by path,
+    in the order given, under `$` if any of them is a `$` path. Its
+    INDENT, NEWLINE and SPACE format the text as RedisJSON's do, and may
+    appear anywhere among the paths.
 - **JSON writes create the leaf, never intermediate levels**, so a typo
   cannot silently grow a document a shape you did not ask for.
   **JSON.SET will not overwrite a non-JSON key** (WRONGTYPE) — unlike a
@@ -458,11 +493,32 @@ it (`tools/redisjson_compare.sh`). These cases differ, each on purpose:
 6. **A multi-match operand inside a filter (`@..a`, `@.*`) is refused.**
    RedisJSON evaluates it.
 
-Smaller ones, which the corpus does not list: a write to a missing
-intermediate (`$.x.y` where `x` does not exist) is an error here and a
-silent nil in RedisJSON; both refuse the write, and ours says why. Filters
-here also take `!` and exponent literals (`1e3`), which RedisJSON refuses as
-syntax errors.
+7. **An integer overflow in JSON.NUMMULTBY is refused**, as in
+   JSON.NUMINCRBY (3). RedisJSON wraps.
+
+Smaller ones, which the corpus does not list:
+- A write to a missing intermediate (`$.x.y` where `x` does not exist) is an
+  error here, from JSON.SET, JSON.MERGE and JSON.MSET alike. RedisJSON
+  answers nil from SET and MERGE, and from MSET answers OK without writing
+  that triple; both refuse the write, and ours says why. JSON.MSET is all or
+  nothing here: a triple that cannot apply to the document an earlier triple
+  of the same command wrote refuses the whole command, where RedisJSON
+  answers OK and drops that triple.
+- A multi-match ARRINSERT, ARRPOP, ARRTRIM or CLEAR whose matches nest (an
+  array inside another matched array) applies to every match here, and
+  CLEAR counts a match inside another cleared one once. RedisJSON applies
+  the first and then answers `Path does not exist`, keeping the first edit.
+- Arguments RedisJSON ignores are refused here: one past the last that
+  STRAPPEND, ARRPOP or CLEAR takes, and an ARRPOP index that is not an
+  integer (RedisJSON pops the last element).
+- JSON.DEBUG MEMORY answers the bytes a value occupies as stored, its JSON
+  text. RedisJSON answers the size of its in-memory tree. Both are each
+  server's own accounting, not a common unit.
+- Numbers are spelled by serde_json: `1e+20` where RedisJSON writes `1e20`,
+  and JSON.RESP renders a double as Redis's sorted sets do
+  (`100000000000000000000`, `0` for `-0.0`). The values are equal.
+- Filters here also take `!` and exponent literals (`1e3`), which RedisJSON
+  refuses as syntax errors.
 - **Keys are capped at 4 KiB**, where stock Redis treats a key as just
   another string and accepts up to 512 MB. The cap matches what ElastiCache
   Serverless enforces, so a key that works on the managed service people
@@ -615,8 +671,10 @@ two-second write.
   in any slots, the proxy sends one `MGET` per slot, and the values come back
   in the order asked. What it gives up is the single snapshot: a reader racing
   an `MSET` can see some slots before it and some after. A pair that cannot be
-  read fails the whole call; it is never answered as nil. **`MSET` is not
-  split**, because its atomicity is its contract, and nothing inside a
+  read fails the whole call; it is never answered as nil. `JSON.MGET` splits
+  the same way, each per-slot command carrying the path (ADR-0055).
+  **`MSET` and `JSON.MSET` are not split**, because their atomicity is their
+  contract, and nothing inside a
   transaction is split. So a framework cache store whose multi-write is a
   transaction (Django's `set_many`: `MULTI`, `MSET`, `EXPIRE`s, `EXEC`) is
   still refused across slots. Either write those keys one at a time, or give

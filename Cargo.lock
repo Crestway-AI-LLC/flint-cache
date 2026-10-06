@@ -564,6 +564,7 @@ version = "0.0.1"
 dependencies = [
  "flint-resp",
  "flint-tls",
+ "serde_json",
 ]
 
 [[package]]

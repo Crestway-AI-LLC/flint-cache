@@ -5293,6 +5293,7 @@ fn apply_inline(store: &dyn Kv, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
 /// (BUG-0188). `name` is upper-cased.
 ///
 /// - MSET of more than one pair; DEL / UNLINK of more than one key;
+/// - JSON.MSET naming more than one key (ADR-0055);
 /// - RENAME, RENAMENX, COPY, LMOVE, RPOPLPUSH, BLMOVE, BRPOPLPUSH, when
 ///   source and destination differ (the same key is one key);
 /// - BLPOP, BRPOP, BZPOPMIN, BZPOPMAX of more than one key;
@@ -5301,6 +5302,7 @@ fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
     let two_keys = || args.len() > 2 && args[1] != args[2];
     match name {
         b"MSET" => args.len() > 3,
+        b"JSON.MSET" => args.len() > 4 && args[1..].chunks(3).any(|t| t[0] != args[1]),
         b"DEL" | b"UNLINK" => args.len() > 2,
         b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH" => {
             two_keys()
@@ -9681,6 +9683,7 @@ mod accepted_flags {
         // and the reason to write the scan now rather than after one appears.
         for (name, whole) in [
             ("commands.rs", include_str!("commands.rs")),
+            ("commands/json.rs", include_str!("commands/json.rs")),
             ("diskguard.rs", include_str!("diskguard.rs")),
             ("heat.rs", include_str!("heat.rs")),
             ("json_path.rs", include_str!("json_path.rs")),
@@ -10976,6 +10979,7 @@ mod every_writer_predicate {
             &["BLPOP", "{t}a", "{t}b", "0"],
             &["BZPOPMAX", "{t}a", "{t}b", "0"],
             &["MSET", "a", "1", "b", "2"],
+            &["JSON.MSET", "{t}a", "$", "1", "{t}b", "$", "2"],
             &["DEL", "a", "b"],
             &["UNLINK", "a", "b"],
             &["EVAL", "return 1", "2", "{t}a", "{t}b"],
@@ -10994,6 +10998,8 @@ mod every_writer_predicate {
             &["BLPOP", "q", "0"],
             &["BZPOPMIN", "q", "0"],
             &["MSET", "a", "1"],
+            &["JSON.MSET", "a", "$", "1"],
+            &["JSON.MSET", "a", "$.x", "1", "a", "$.y", "2"],
             &["DEL", "a"],
             &["SET", "a", "1"],
             &["HSET", "h", "f", "v"],

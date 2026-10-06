@@ -49,6 +49,20 @@ pub fn is_blocking_command(name: &[u8]) -> bool {
     )
 }
 
+/// `JSON.DEBUG`'s key (ADR-0055). It follows the subcommand, in
+/// `JSON.DEBUG MEMORY key [path]`, so the server's `command_key` and the
+/// proxy's `route_key` cannot take `args[1]`; `JSON.DEBUG HELP` has none.
+/// `None` when `args` is not a JSON.DEBUG.
+pub fn json_debug_key(args: &[Vec<u8>]) -> Option<Option<&[u8]>> {
+    if !args.first()?.eq_ignore_ascii_case(b"JSON.DEBUG") {
+        return None;
+    }
+    Some(match args.get(1) {
+        Some(sub) if sub.eq_ignore_ascii_case(b"MEMORY") => args.get(2).map(|k| k.as_slice()),
+        _ => None,
+    })
+}
+
 /// True when `name` mutates the keyspace.
 pub fn is_write_command(name: &[u8]) -> bool {
     matches!(
@@ -133,6 +147,19 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"JSON.FORGET"
             | b"JSON.NUMINCRBY"
             | b"JSON.ARRAPPEND"
+            // ADR-0055. JSON.ARRPOP, JSON.ARRTRIM and JSON.CLEAR shrink a
+            // document but are not `reduces_space`, like a JSON.DEL of a
+            // path: each rewrites the whole document row, which takes room
+            // before compaction gives any back.
+            | b"JSON.MSET"
+            | b"JSON.MERGE"
+            | b"JSON.NUMMULTBY"
+            | b"JSON.STRAPPEND"
+            | b"JSON.ARRINSERT"
+            | b"JSON.ARRPOP"
+            | b"JSON.ARRTRIM"
+            | b"JSON.TOGGLE"
+            | b"JSON.CLEAR"
             // Bloom filters (ADR-0016). BF.RESERVE creates the key and
             // BF.ADD sets bits, so both mutate. None of them is
             // `reduces_space`: a Bloom filter never shrinks — the only way
@@ -216,6 +243,14 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"JSON.GET"
             | b"JSON.TYPE"
             | b"JSON.ARRLEN"
+            // ADR-0055.
+            | b"JSON.MGET"
+            | b"JSON.STRLEN"
+            | b"JSON.ARRINDEX"
+            | b"JSON.OBJKEYS"
+            | b"JSON.OBJLEN"
+            | b"JSON.RESP"
+            | b"JSON.DEBUG"
             | b"BF.EXISTS"
             | b"BF.MEXISTS"
             | b"BF.CARD"
@@ -235,6 +270,67 @@ mod tests {
         assert!(is_read_command(b"get"));
         assert!(is_read_command(b"ZRANGE"));
         assert!(!is_read_command(b"SET"));
+    }
+
+    #[test]
+    fn json_debug_routes_by_the_key_after_its_subcommand() {
+        let a = |v: &[&str]| v.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert_eq!(
+            json_debug_key(&a(&["JSON.DEBUG", "MEMORY", "k", "$"])),
+            Some(Some(&b"k"[..]))
+        );
+        assert_eq!(
+            json_debug_key(&a(&["json.debug", "memory", "k"])),
+            Some(Some(&b"k"[..]))
+        );
+        assert_eq!(json_debug_key(&a(&["JSON.DEBUG", "HELP"])), Some(None));
+        assert_eq!(json_debug_key(&a(&["JSON.DEBUG"])), Some(None));
+        assert_eq!(json_debug_key(&a(&["JSON.GET", "k"])), None);
+    }
+
+    #[test]
+    fn every_json_command_is_classified() {
+        // ADR-0055: an unclassified command skips the -READONLY gate and the
+        // write lock on a seat, and on a replica its writes reach a store
+        // that drops them, answering OK.
+        for w in [
+            "JSON.SET",
+            "JSON.DEL",
+            "JSON.FORGET",
+            "JSON.NUMINCRBY",
+            "JSON.NUMMULTBY",
+            "JSON.ARRAPPEND",
+            "JSON.MSET",
+            "JSON.MERGE",
+            "JSON.STRAPPEND",
+            "JSON.ARRINSERT",
+            "JSON.ARRPOP",
+            "JSON.ARRTRIM",
+            "JSON.TOGGLE",
+            "JSON.CLEAR",
+        ] {
+            assert!(
+                is_write_command(w.as_bytes()) && !is_read_command(w.as_bytes()),
+                "{w}"
+            );
+        }
+        for r in [
+            "JSON.GET",
+            "JSON.MGET",
+            "JSON.TYPE",
+            "JSON.ARRLEN",
+            "JSON.STRLEN",
+            "JSON.ARRINDEX",
+            "JSON.OBJKEYS",
+            "JSON.OBJLEN",
+            "JSON.RESP",
+            "JSON.DEBUG",
+        ] {
+            assert!(
+                is_read_command(r.as_bytes()) && !is_write_command(r.as_bytes()),
+                "{r}"
+            );
+        }
     }
 
     #[test]
