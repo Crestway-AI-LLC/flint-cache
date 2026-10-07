@@ -3897,42 +3897,8 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
          -out {stage}/edge.crt -days 365 -extfile {stage}/edge-ext.cnf 2>/dev/null",
         sans = edge_san_list(edge_sans),
     ));
-    // The co-processor leaf (ADR-0010 step 1). SAN flint-internal like the mesh
-    // leaf — the proxy verifies it on an internal dial at INTERNAL_SNI — but
-    // `serverAuth` ONLY, no `clientAuth`. That absence IS the isolation
-    // guarantee: a node's mutual-TLS verifier refuses a serverAuth-only leaf as
-    // a client certificate, so a co-processor holding this leaf cannot dial the
-    // mesh as a member. Nothing consumes it yet (the PROXYCHAN arm is step 2);
-    // it is minted now because "a certificate and a test" is the whole of step
-    // 1, and the mint is where the security property is either created or lost.
-    sh(&format!(
-        "openssl req -newkey rsa:2048 -nodes -keyout {stage}/coproc.key -out {stage}/coproc.csr \
-         -subj /CN=flint-coproc 2>/dev/null"
-    ));
-    sh(&format!(
-        "printf 'subjectAltName=DNS:flint-internal\\nextendedKeyUsage=serverAuth\\nbasicConstraints=CA:FALSE' > {stage}/coproc-ext.cnf && \
-         openssl x509 -req -in {stage}/coproc.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
-         -CAcreateserial -CAserial {d}/ca.srl \
-         -out {stage}/coproc.crt -days 365 -extfile {stage}/coproc-ext.cnf 2>/dev/null"
-    ));
+    mint_coproc_leaf(d, &stage, sh);
 
-    // Assert the EKU the mint PRODUCED, not the recipe it was asked to run
-    // (ADR-0010 D2: "the mint recipe becomes security-critical"). A co-processor
-    // leaf accidentally minted by copying the mesh line above would serve
-    // correctly and every server-side handshake would still pass, silently
-    // keeping the clientAuth that must never be here. Fail the mint instead —
-    // on bootstrap AND on every rotate-certs, since both route through here.
-    let coproc = flint_tls::cert_eku(&format!("{stage}/coproc.crt"))
-        .expect("co-processor leaf unreadable/unparseable immediately after minting it");
-    assert!(
-        coproc.server_auth && !coproc.client_auth,
-        "co-processor leaf minted with the WRONG EKU (server_auth={}, client_auth={}); \
-         it must be serverAuth-ONLY. A clientAuth bit here is exactly the hole \
-         ADR-0010 D2 exists to close — it would let a co-processor dial the mesh as a \
-         member. Fix the coproc-ext.cnf line above; do not relax this assert.",
-        coproc.server_auth,
-        coproc.client_auth
-    );
     // The mirror: the mesh leaf must KEEP clientAuth, or every internal dial
     // stops working. Same helper, opposite verdict — the pair is the point.
     let mesh = flint_tls::cert_eku(&format!("{stage}/int.crt"))
@@ -3960,6 +3926,123 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
     // Both callers land here: mint_certs (ca.key is already on disk by now)
     // and rotate_certs, which rewrites int.key under live traffic.
     harden_key_modes(d);
+}
+
+/// Mint the co-processor leaf into `stage`, signed by the CA in `d`, and
+/// assert the EKU the mint produced. Shared by `resign_leaves` (bootstrap and
+/// rotate-certs) and `ensure_coproc_leaf` (BUG-0217), so the security property
+/// below is created in one place.
+fn mint_coproc_leaf(d: &str, stage: &str, sh: &dyn Fn(&str)) {
+    // The co-processor leaf (ADR-0010 step 1). SAN flint-internal like the mesh
+    // leaf — the proxy verifies it on an internal dial at INTERNAL_SNI — but
+    // `serverAuth` ONLY, no `clientAuth`. That absence IS the isolation
+    // guarantee: a node's mutual-TLS verifier refuses a serverAuth-only leaf as
+    // a client certificate, so a co-processor holding this leaf cannot dial the
+    // mesh as a member. Nothing consumes it yet (the PROXYCHAN arm is step 2);
+    // it is minted now because "a certificate and a test" is the whole of step
+    // 1, and the mint is where the security property is either created or lost.
+    sh(&format!(
+        "openssl req -newkey rsa:2048 -nodes -keyout {stage}/coproc.key -out {stage}/coproc.csr \
+         -subj /CN=flint-coproc 2>/dev/null"
+    ));
+    sh(&format!(
+        "printf 'subjectAltName=DNS:flint-internal\\nextendedKeyUsage=serverAuth\\nbasicConstraints=CA:FALSE' > {stage}/coproc-ext.cnf && \
+         openssl x509 -req -in {stage}/coproc.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
+         -CAcreateserial -CAserial {d}/ca.srl \
+         -out {stage}/coproc.crt -days 365 -extfile {stage}/coproc-ext.cnf 2>/dev/null"
+    ));
+
+    // Assert the EKU the mint PRODUCED, not the recipe it was asked to run
+    // (ADR-0010 D2: "the mint recipe becomes security-critical"). A co-processor
+    // leaf accidentally minted by copying the mesh line above would serve
+    // correctly and every server-side handshake would still pass, silently
+    // keeping the clientAuth that must never be here. Fail the mint instead —
+    // on bootstrap, on every rotate-certs, and on a leaf minted alone for a
+    // fleet that lacked one (BUG-0217), since all three route through here.
+    let coproc = flint_tls::cert_eku(&format!("{stage}/coproc.crt"))
+        .expect("co-processor leaf unreadable/unparseable immediately after minting it");
+    assert!(
+        coproc.server_auth && !coproc.client_auth,
+        "co-processor leaf minted with the WRONG EKU (server_auth={}, client_auth={}); \
+         it must be serverAuth-ONLY. A clientAuth bit here is exactly the hole \
+         ADR-0010 D2 exists to close — it would let a co-processor dial the mesh as a \
+         member. Fix the coproc-ext.cnf line above; do not relax this assert.",
+        coproc.server_auth,
+        coproc.client_auth
+    );
+}
+
+/// BUG-0217: give a fleet that declares a co-processor the leaf it is spawned
+/// with, when the fleet has none.
+///
+/// A fleet bootstrapped before the leaf existed (public `2973016`, 2026-08-11)
+/// has no `coproc.crt`, and `flintctl` spawns a co-processor with
+/// `--internal-cert <statedir>/certs/coproc.crt` on a TLS fleet, so the seat
+/// panics on the missing file and every `VEC.` command answers
+/// -COPROCUNAVAIL. The playground was such a fleet: ADR-0050 step 4's three
+/// inventory lines and `upgrade` would have started a seat that could not
+/// run. The only other way to the leaf, `rotate-certs`, re-signs EVERY leaf,
+/// the edge one included, and the playground's edge certificate was not
+/// issued by the fleet's CA.
+///
+/// So this mints that one leaf, where the CA key is, and copies it to the
+/// remote co-processor hosts only. The mesh and edge leaves are not touched.
+/// Without a CA key here nothing is minted. `upgrade` (`refuse`) then stops
+/// before a seat is touched if a co-processor would run on this host, which
+/// could not start; `start`, which the supervisor runs to restart any dead
+/// seat, only warns, so the other seats still come back.
+fn ensure_coproc_leaf(inv: &Inventory, refuse: bool) {
+    if !inv.tls || inv.coprocs.is_empty() {
+        return;
+    }
+    let d = format!("{}/certs", inv.statedir);
+    let have = |f: &str| std::path::Path::new(&format!("{d}/{f}")).exists();
+    if have("coproc.crt") && have("coproc.key") {
+        return;
+    }
+    if !have("ca.key") {
+        let here = (0..inv.coprocs.len()).any(|i| !coproc_runner(inv, i).is_remote());
+        let why = format!(
+            "the inventory declares a co-processor and {d} has no co-processor leaf \
+             (coproc.crt), nor the CA key to mint one, so a co-processor started here \
+             cannot run. Run this from the host that bootstrapped the fleet, which holds \
+             ca.key (BUG-0217)."
+        );
+        if refuse && here {
+            die(&format!("{why} Nothing was changed."));
+        }
+        eprintln!("  WARNING: {why}");
+        return;
+    }
+    let sh = |cmd: &str| {
+        let ok = Command::new("sh")
+            .args(["-c", cmd])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "cert step failed: {cmd}");
+    };
+    let stage = format!("{d}/.coproc-mint");
+    sh(&format!("rm -rf {stage} && mkdir -p {stage}"));
+    mint_coproc_leaf(&d, &stage, &sh);
+    sh(&format!(
+        "mv {stage}/coproc.key {d}/coproc.key && mv {stage}/coproc.crt {d}/coproc.crt && rm -rf {stage}"
+    ));
+    harden_key_modes(&d);
+    for i in 0..inv.coprocs.len() {
+        let r = coproc_runner(inv, i);
+        if !r.is_remote() {
+            continue;
+        }
+        for (f, mode) in [("coproc.crt", "644"), ("coproc.key", "600")] {
+            if let Err(e) = r.send_file(&format!("{d}/{f}"), &format!("{d}/{f}"), mode) {
+                die(&format!("distributing {f} to {}: {e}", r.label()));
+            }
+        }
+    }
+    eprintln!(
+        "  minted the co-processor leaf, which this fleet lacked (BUG-0217); no other leaf changed"
+    );
 }
 
 /// The edge cert's SAN list: loopback always, plus every `edge-san` entry —
@@ -4829,6 +4912,8 @@ fn launch(inv: &Inventory, register: bool) {
     if register && inv.tls {
         mint_certs(inv);
         push_certs(inv);
+    } else {
+        ensure_coproc_leaf(inv, false);
     }
     let tls = tls_client(inv);
 
@@ -8356,6 +8441,9 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
     // FIRST, before a seat is touched and before the roll record exists: a
     // refusal here must leave the fleet and the journal exactly as they were.
     assert_cp_can_read_its_state(inv);
+    // Also before a seat is touched: a co-processor line on a fleet with no
+    // co-processor leaf would start a seat that cannot run (BUG-0217).
+    ensure_coproc_leaf(inv, true);
     let tls = tls_client(inv);
     // Kept for binaries built before the tag was compiled in: release builds
     // now bake FLINT_RELEASE_TAG, which OUTRANKS this variable, so on a

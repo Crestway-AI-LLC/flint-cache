@@ -26,6 +26,8 @@
 #   - `status` reports the proxy's build, not `-`, when the edge is TLS
 #   - the pair nodes and cp report it too, so a green result is not one
 #     surface accidentally agreeing with itself
+#   - BUG-0217: on a fleet with no co-processor leaf, the upgrade that adds
+#     a co-processor mints the leaf alone and changes no other cert file.
 #   - ops ADR-0050 D4: a `coproc` line added after bootstrap is started by
 #     the next upgrade, the rolled proxy routes VEC. to it, and a second
 #     upgrade replaces the running co-processor with the new build
@@ -90,6 +92,17 @@ BEFORE=$($CTL status 2>/dev/null | grep -c "build $TAG" || true)
 # ops ADR-0050 D4: a `coproc` line added to a running fleet is started by the
 # next upgrade, and the proxies rolled after it route to it. Nothing has
 # started this seat: bootstrap ran before the line existed.
+#
+# BUG-0217: and this fleet stands in for one bootstrapped before the
+# co-processor leaf existed (public 2973016, 2026-08-11), which has no
+# coproc.crt. The upgrade must mint that leaf alone: the CA, mesh and edge
+# files come through it byte for byte. Copies, compared with cmp, because
+# shasum is not on the gate box.
+rm -f "$STATE/certs/coproc.crt" "$STATE/certs/coproc.key"
+mkdir -p "$D/certs-before"
+for f in ca.crt ca.key int.crt int.key edge.crt edge.key; do
+  cp -p "$STATE/certs/$f" "$D/certs-before/$f" || { echo "FAIL: no $f to compare after the roll"; exit 1; }
+done
 echo "coproc VEC. 127.0.0.1:7974" >> "$INV"
 if (exec 3<>/dev/tcp/127.0.0.1/7974) 2>/dev/null; then
   echo "FAIL: something already listens on 7974 before the upgrade — starting the co-processor would be vacuous"; exit 1
@@ -138,6 +151,23 @@ grep -q "vec-7974 reports $TAG" "$D/upgrade.log" || { echo "FAIL: the upgrade lo
 [ "$(coproc_info build)" = "$TAG" ] || { echo "FAIL: vec-7974 answers FLINTINFO build '$(coproc_info build)', expected $TAG"; exit 1; }
 PXARGS="$(ps -o args= -p "$(cat "$STATE/pids/proxy-7972.pid")" 2>/dev/null)"
 case "$PXARGS" in *"VEC.=127.0.0.1:7974"*) : ;; *) echo "FAIL: the rolled proxy was not given the VEC. family: $PXARGS"; exit 1 ;; esac
+
+echo "== BUG-0217: the upgrade minted the missing co-processor leaf, and only it"
+[ -s "$STATE/certs/coproc.crt" ] && [ -s "$STATE/certs/coproc.key" ] \
+  || { echo "FAIL: no co-processor leaf after the upgrade"; exit 1; }
+grep -q 'minted the co-processor leaf' "$D/upgrade.log" \
+  || { echo "FAIL: the upgrade log does not say it minted the leaf:"; grep -n 'leaf\|cert' "$D/upgrade.log" | sed 's/^/  | /'; exit 1; }
+for f in ca.crt ca.key int.crt int.key edge.crt edge.key; do
+  cmp -s "$D/certs-before/$f" "$STATE/certs/$f" || { echo "FAIL: the upgrade changed $f; it may mint the co-processor leaf only"; exit 1; }
+done
+# -text, not -ext: macOS's LibreSSL has no -ext, and printed nothing.
+EKU=$(openssl x509 -in "$STATE/certs/coproc.crt" -noout -text 2>/dev/null | grep -A1 'Extended Key Usage' | tail -1)
+case "$EKU" in
+  *"Client Authentication"*) echo "FAIL: the minted co-processor leaf carries clientAuth: $EKU"; exit 1 ;;
+  *"Server Authentication"*) : ;;
+  *) echo "FAIL: the minted co-processor leaf has no serverAuth EKU: $EKU"; exit 1 ;;
+esac
+echo "  coproc.crt minted serverAuth-only; ca, int and edge files unchanged"
 # BUG-0205: the argv is not the route table. The control plane's snapshot
 # replaces a proxy's --families, and only bootstrap registered families with
 # it, so the argv above was right while VEC.* answered "unknown command".

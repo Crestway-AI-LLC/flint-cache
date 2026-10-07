@@ -33,6 +33,12 @@ dialed address, so one leaf certificate serves the whole mesh and
 distribution is a file copy rather than a per-host PKI. Certificates
 **hot-reload**: `flintctl rotate-certs` replaces them under live traffic, and
 `cert_reload_fleet_drill.sh` proves the fleet keeps serving through it.
+`rotate-certs` re-signs every leaf from the fleet's CA, the edge one
+included, so a fleet whose edge certificate was issued elsewhere must not
+run it. A co-processor's leaf is the one minted on its own: `upgrade` and
+`start` mint it from the CA when the inventory declares a co-processor and
+the fleet has none, as a fleet bootstrapped before 2026-08-11 does, and
+change no other certificate (BUG-0217).
 
 **The client edge is TLS when you ask for it** — `client-tls on` in the
 inventory, terminated at the proxy with a certificate carrying real SANs
