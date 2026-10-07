@@ -4923,7 +4923,12 @@ async fn handle(
             })
             .await
         }
-        // FLUSHDB is FLUSHALL: one database per tenant (BUG-0178).
+        // FLUSHDB is FLUSHALL: one database per tenant (BUG-0178). One
+        // with an argument Redis refuses is refused here, before any pair
+        // sees it (BUG-0213).
+        b"FLUSHALL" | b"FLUSHDB" if !flint_commands::flush_args_ok(args) => {
+            Value::Error("ERR syntax error".into())
+        }
         b"FLUSHALL" | b"FLUSHDB" => {
             fan_out(topo, backends, raw, |replies| {
                 for r in replies {

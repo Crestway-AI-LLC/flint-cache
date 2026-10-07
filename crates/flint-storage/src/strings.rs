@@ -45,6 +45,23 @@ pub struct SetOptions {
     pub expiry: SetExpiry,
 }
 
+/// An integer as Redis reads one, in an argument or a stored value: an
+/// optional `-`, then digits with no leading zero, or `0` alone (Redis's
+/// `string2ll`). Rust's `parse` also takes `+1` and `01`, which Redis
+/// refuses (BUG-0213): `INCR` on a value of `01` is an error there.
+pub fn parse_redis_i64(raw: &[u8]) -> Option<i64> {
+    let digits = raw.strip_prefix(b"-").unwrap_or(raw);
+    let canonical = match digits {
+        [b'0'] => raw.len() == 1,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    if !canonical {
+        return None;
+    }
+    std::str::from_utf8(raw).ok()?.parse().ok()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
     NotInteger,
@@ -53,6 +70,9 @@ pub enum StoreError {
     /// A float op's result left the representable range (Redis refuses to
     /// store NaN/Infinity from INCRBYFLOAT).
     NanOrInfinity,
+    /// A sorted-set score would be NaN: `ZINCRBY` adding `-inf` to `+inf`
+    /// (BUG-0212). Redis refuses it and changes nothing.
+    NanScore,
     WrongType,
     /// The write would grow the value past the max-value-bytes policy
     /// (Valkey's `checkStringLength` analog, extended to collections).
@@ -255,8 +275,7 @@ impl<'a> StringStore<'a> {
         let (current, expire_ms) = match &existing {
             None => (0i64, 0u64),
             Some(m) => {
-                let s = std::str::from_utf8(&m.payload).map_err(|_| StoreError::NotInteger)?;
-                let n: i64 = s.parse().map_err(|_| StoreError::NotInteger)?;
+                let n = parse_redis_i64(&m.payload).ok_or(StoreError::NotInteger)?;
                 (n, m.expire_ms)
             }
         };
@@ -324,10 +343,17 @@ impl<'a> StringStore<'a> {
         let Some(m) = self.read_live(slot, key)? else {
             return Ok(Vec::new());
         };
+        // Redis's rules (BUG-0214), which are not LRANGE's: two negative
+        // indexes in the wrong order answer empty, and an end before the
+        // start of the string is clamped to its first byte, not dropped.
+        // `GETRANGE k 0 -100` answers the first byte.
+        if start < 0 && end < 0 && start > end {
+            return Ok(Vec::new());
+        }
         let len = m.payload.len() as i64;
         let norm = |i: i64| if i < 0 { len + i } else { i };
         let from = norm(start).max(0);
-        let to = norm(end).min(len - 1);
+        let to = norm(end).max(0).min(len - 1);
         if len == 0 || from > to {
             return Ok(Vec::new());
         }
@@ -751,6 +777,38 @@ mod tests {
         )
         .expect("set");
         assert_eq!(s.incr_by(1, b"max", 1), Err(StoreError::Overflow));
+        // BUG-0213: Redis reads only a canonical integer. A leading zero, a
+        // plus sign or "-0" is a string to it, and so the value is unchanged.
+        for odd in [b"01".as_slice(), b"+1", b"-0", b" 1", b"1 ", b"-", b""] {
+            s.set(1, b"odd", odd, SetOptions::default()).expect("set");
+            assert_eq!(
+                s.incr_by(1, b"odd", 1),
+                Err(StoreError::NotInteger),
+                "{odd:?}"
+            );
+            assert_eq!(s.get(1, b"odd"), Ok(Some(odd.to_vec())));
+        }
+    }
+
+    #[test]
+    fn redis_integers_are_canonical() {
+        assert_eq!(parse_redis_i64(b"0"), Some(0));
+        assert_eq!(parse_redis_i64(b"-7"), Some(-7));
+        assert_eq!(parse_redis_i64(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse_redis_i64(b"-9223372036854775808"), Some(i64::MIN));
+        for odd in [
+            b"01".as_slice(),
+            b"+1",
+            b"-0",
+            b"00",
+            b"1.0",
+            b"9223372036854775808",
+            b"-9223372036854775809",
+            b"",
+            b"-",
+        ] {
+            assert_eq!(parse_redis_i64(odd), None, "{odd:?}");
+        }
     }
 
     #[test]

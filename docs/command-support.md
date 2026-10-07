@@ -245,6 +245,9 @@ AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands").
 > removes the destination rather than leaving an empty sorted set behind.
 > Where a computed score would be NaN — a zero weight against an infinite
 > score, or SUM over both infinities — the score is 0, matching upstream.
+> `ZINCRBY` to a NaN (`-inf` added to `+inf`) is refused with upstream's
+> `ERR resulting score is not a number (NaN)`, and the member keeps its
+> score (BUG-0212).
 
 > The lex forms are meaningful only when every member shares one score —
 > the same condition Redis states — because the index is ordered by
@@ -514,11 +517,20 @@ Smaller ones, which the corpus does not list:
 - JSON.DEBUG MEMORY answers the bytes a value occupies as stored, its JSON
   text. RedisJSON answers the size of its in-memory tree. Both are each
   server's own accounting, not a common unit.
-- Numbers are spelled by serde_json: `1e+20` where RedisJSON writes `1e20`,
-  and JSON.RESP renders a double as Redis's sorted sets do
-  (`100000000000000000000`, `0` for `-0.0`). The values are equal.
+- Numbers are spelled by serde_json: `1e+20` where RedisJSON writes `1e20`.
+  JSON.RESP renders a double as Redis does (`1e+20`, BUG-0214), except
+  `-0.0`, which is `0` here and `-0` there. The values are equal.
 - Filters here also take `!` and exponent literals (`1e3`), which RedisJSON
   refuses as syntax errors.
+- **Where Redis 8.2 and Valkey 9.1 disagree, Flint answers as Valkey
+  does**, Valkey being the conformance oracle. `GETEX nokey EX 0` is an
+  invalid-expire error here and in Valkey, which judge the time first;
+  Redis reads the key first and answers nil (BUG-0213).
+- **`SET k v PX 9223372036854775807` is refused**, an instant whose sum
+  with now overflows. Upstream tests that sum after a signed addition C
+  leaves undefined, so its answer depends on the build: a Linux build of
+  Valkey 9.1 refuses it, and macOS builds of Redis 8.2 and Valkey 9.1
+  answer OK (BUG-0213).
 - **Keys are capped at 4 KiB**, where stock Redis treats a key as just
   another string and accepts up to 512 MB. The cap matches what ElastiCache
   Serverless enforces, so a key that works on the managed service people

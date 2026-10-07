@@ -18,7 +18,7 @@ use flint_storage::lists::{ListStore, LsetOutcome};
 use flint_storage::sets::SetStore;
 use flint_storage::strings::{
     BitfieldKind, BitfieldOp, BitfieldOverflow, Clock, SetExpiry, SetOptions, SetOutcome,
-    StoreError, StringStore,
+    StoreError, StringStore, parse_redis_i64,
 };
 use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore};
 
@@ -415,20 +415,20 @@ impl<'a> Dispatcher<'a> {
                     Err(e) => store_err(e),
                 }
             }),
-            b"SETEX" => exact(args, 4, "setex", |a| match parse_i64(&a[2]) {
-                Ok(secs) if secs > 0 => {
-                    let at = ((self.clock)()).saturating_add(secs as u64 * 1000);
-                    let opts = SetOptions {
-                        expiry: SetExpiry::AtMs(at),
-                        ..Default::default()
-                    };
-                    match self.strings.set(slot_for_key(&a[1]), &a[1], &a[3], opts) {
-                        Ok(_) => Value::Simple("OK".into()),
-                        Err(e) => store_err(e),
+            b"SETEX" => exact(args, 4, "setex", |a| {
+                match string_expiry(b"EX", &a[2], (self.clock)(), "setex") {
+                    Ok(at) => {
+                        let opts = SetOptions {
+                            expiry: SetExpiry::AtMs(at),
+                            ..Default::default()
+                        };
+                        match self.strings.set(slot_for_key(&a[1]), &a[1], &a[3], opts) {
+                            Ok(_) => Value::Simple("OK".into()),
+                            Err(e) => store_err(e),
+                        }
                     }
+                    Err(e) => e,
                 }
-                Ok(_) => err("ERR invalid expire time in 'setex' command"),
-                Err(_) => err("ERR value is not an integer or out of range"),
             }),
             b"GET" => exact(args, 2, "get", |a| {
                 reply(self.strings.get(slot_for_key(&a[1]), &a[1]), Value::Bulk)
@@ -606,11 +606,15 @@ impl<'a> Dispatcher<'a> {
                 )
             }
             b"HINCRBY" => exact(args, 4, "hincrby", |a| match parse_i64(&a[3]) {
-                Ok(delta) => reply(
-                    self.hashes
-                        .hincr_by(slot_for_key(&a[1]), &a[1], &a[2], delta),
-                    Value::Integer,
-                ),
+                Ok(delta) => match self
+                    .hashes
+                    .hincr_by(slot_for_key(&a[1]), &a[1], &a[2], delta)
+                {
+                    Ok(n) => Value::Integer(n),
+                    // Valkey names the hash value here, as HINCRBYFLOAT does.
+                    Err(StoreError::NotInteger) => err("ERR hash value is not an integer"),
+                    Err(e) => store_err(e),
+                },
                 Err(_) => err("ERR value is not an integer or out of range"),
             }),
             b"HINCRBYFLOAT" => exact(args, 4, "hincrbyfloat", |a| match parse_f64(&a[3]) {
@@ -1138,6 +1142,11 @@ impl<'a> Dispatcher<'a> {
             // made Django's cache.clear() raise and Rails' RedisCacheStore
             // #clear silently do nothing (its error handler swallows it).
             b"FLUSHALL" | b"FLUSHDB" => {
+                // ASYNC or SYNC, or nothing. Anything else flushed too until
+                // BUG-0213, where Redis refuses it and flushes nothing.
+                if !flint_commands::flush_args_ok(args) {
+                    return err("ERR syntax error");
+                }
                 // Namespace-scoped: a tenant flushing its cache must never
                 // touch another tenant's rows (kv.clear() would). Chunked
                 // collect-then-delete keeps memory bounded on huge tenants.
@@ -1178,46 +1187,39 @@ impl<'a> Dispatcher<'a> {
         if args.len() < 2 {
             return arity_err("getex");
         }
-        let mut expiry = SetExpiry::Keep;
-        let mut set_once = false;
+        // Redis takes one kind of expiry option at most. Repeating one is
+        // allowed and the last wins; a second kind is a syntax error, so a
+        // client cannot half-apply a contradiction like "EX 60 PERSIST".
+        let mut persist = false;
+        let mut timed: Option<(Vec<u8>, &[u8])> = None;
         let mut i = 2;
         while i < args.len() {
-            // Redis takes at most one expiry option; a second is a syntax
-            // error rather than last-one-wins, so a client cannot half-apply
-            // a contradiction like "EX 60 PERSIST".
-            if set_once {
-                return err("ERR syntax error");
-            }
-            match args[i].to_ascii_uppercase().as_slice() {
-                b"PERSIST" => {
-                    expiry = SetExpiry::Clear;
-                    set_once = true;
-                }
-                opt @ (b"EX" | b"PX" | b"EXAT" | b"PXAT") => {
-                    let unit_ms = matches!(opt, b"EX" | b"EXAT");
-                    let absolute = matches!(opt, b"EXAT" | b"PXAT");
-                    let Some(raw) = args.get(i + 1) else {
-                        return err("ERR syntax error");
-                    };
-                    let Ok(n) = parse_i64(raw) else {
-                        return err("ERR value is not an integer or out of range");
-                    };
-                    if n <= 0 && !absolute {
-                        return err("ERR invalid expire time in 'getex' command");
-                    }
-                    let ms = if unit_ms { n.saturating_mul(1000) } else { n } as u64;
-                    expiry = SetExpiry::AtMs(if absolute {
-                        ms
-                    } else {
-                        ((self.clock)()).saturating_add(ms)
-                    });
-                    set_once = true;
+            let opt = args[i].to_ascii_uppercase();
+            match opt.as_slice() {
+                b"PERSIST" if timed.is_none() => persist = true,
+                b"EX" | b"PX" | b"EXAT" | b"PXAT"
+                    if !persist
+                        && i + 1 < args.len()
+                        && timed.as_ref().is_none_or(|(o, _)| *o == opt) =>
+                {
+                    timed = Some((opt, &args[i + 1]));
                     i += 1;
                 }
                 _ => return err("ERR syntax error"),
             }
             i += 1;
         }
+        // The time is judged before the key is read, as Valkey judges it.
+        // Redis 8.2 reads the key first, so a missing key answers nil there
+        // whatever the time says.
+        let expiry = match timed {
+            None if persist => SetExpiry::Clear,
+            None => SetExpiry::Keep,
+            Some((opt, raw)) => match string_expiry(&opt, raw, (self.clock)(), "getex") {
+                Ok(at) => SetExpiry::AtMs(at),
+                Err(e) => return e,
+            },
+        };
         reply(
             self.strings.getex(slot_for_key(&args[1]), &args[1], expiry),
             Value::Bulk,
@@ -1233,42 +1235,40 @@ impl<'a> Dispatcher<'a> {
         // SET ... GET: return the OLD value (nil if absent; WRONGTYPE if the
         // key held a non-string). NX+GET/XX+GET are valid in modern Redis.
         let mut want_get = false;
+        // One kind of expiry option at most, as GETEX (BUG-0213): EX, PX,
+        // EXAT, PXAT or KEEPTTL, repeated or not. A second kind, or NX with
+        // XX, is a syntax error where this kept the last. The time is judged
+        // after every option parses, as Redis judges it.
+        let mut keep_ttl = false;
+        let mut timed: Option<(Vec<u8>, &[u8])> = None;
         let mut i = 3;
         while i < args.len() {
-            match args[i].to_ascii_uppercase().as_slice() {
-                b"NX" => opts.nx = true,
-                b"XX" => opts.xx = true,
-                b"KEEPTTL" => opts.expiry = SetExpiry::Keep,
+            let opt = args[i].to_ascii_uppercase();
+            match opt.as_slice() {
+                b"NX" if !opts.xx => opts.nx = true,
+                b"XX" if !opts.nx => opts.xx = true,
                 b"GET" => want_get = true,
-                b"EX" | b"PX" | b"EXAT" | b"PXAT" => {
-                    let unit_ms =
-                        matches!(args[i].to_ascii_uppercase().as_slice(), b"EX" | b"EXAT");
-                    let absolute =
-                        matches!(args[i].to_ascii_uppercase().as_slice(), b"EXAT" | b"PXAT");
-                    let Some(raw) = args.get(i + 1) else {
-                        return err("ERR syntax error");
-                    };
-                    let Ok(n) = parse_i64(raw) else {
-                        return err("ERR value is not an integer or out of range");
-                    };
-                    if n <= 0 && !absolute {
-                        return err("ERR invalid expire time in 'set' command");
-                    }
-                    let ms = if unit_ms { n.saturating_mul(1000) } else { n } as u64;
-                    let at = if absolute {
-                        ms
-                    } else {
-                        ((self.clock)()).saturating_add(ms)
-                    };
-                    opts.expiry = SetExpiry::AtMs(at);
+                b"KEEPTTL" if timed.is_none() => keep_ttl = true,
+                b"EX" | b"PX" | b"EXAT" | b"PXAT"
+                    if !keep_ttl
+                        && i + 1 < args.len()
+                        && timed.as_ref().is_none_or(|(o, _)| *o == opt) =>
+                {
+                    timed = Some((opt, &args[i + 1]));
                     i += 1;
                 }
                 _ => return err("ERR syntax error"),
             }
             i += 1;
         }
-        if opts.nx && opts.xx {
-            return err("ERR syntax error");
+        if keep_ttl {
+            opts.expiry = SetExpiry::Keep;
+        }
+        if let Some((opt, raw)) = timed {
+            match string_expiry(&opt, raw, (self.clock)(), "set") {
+                Ok(at) => opts.expiry = SetExpiry::AtMs(at),
+                Err(e) => return e,
+            }
         }
         let slot = slot_for_key(key);
         // With GET we must read the old value first (and surface WRONGTYPE).
@@ -3295,7 +3295,10 @@ impl<'a> Dispatcher<'a> {
                     .into_iter()
                     .filter(|(m, _)| keep(m))
                     .flat_map(|(m, sc)| {
-                        vec![Value::Bulk(Some(m)), Value::Bulk(Some(fmt_score(sc)))]
+                        vec![
+                            Value::Bulk(Some(m)),
+                            Value::Bulk(Some(flint_resp::fmt_double(sc))),
+                        ]
                     })
                     .collect(),
                 Err(e) => return store_err(e),
@@ -3364,9 +3367,15 @@ impl<'a> Dispatcher<'a> {
                 b"RANK" => match parse_i64(val) {
                     Ok(0) => {
                         return err(
-                            "ERR RANK can't be zero, use 1 to start searching from the first \
-                             matching element in the head of the list or -1 for the tail",
+                            "ERR RANK can't be zero: use 1 to start from the first match, 2 \
+                             from the second ... or use negative to start from the end of the \
+                             list",
                         );
+                    }
+                    // Redis's bound is symmetric, so i64::MIN is out of it.
+                    Ok(i64::MIN) => {
+                        return err("ERR value is out of range, value must between \
+                             -9223372036854775807 and 9223372036854775807");
                     }
                     Ok(r) => rank = r,
                     Err(_) => return err("ERR value is not an integer or out of range"),
@@ -3417,14 +3426,18 @@ impl<'a> Dispatcher<'a> {
         };
         match parse_i64(&args[2]) {
             Ok(n) => {
-                let delta = n.saturating_mul(unit_ms as i64);
-                let now = (self.clock)();
-                let when = (now as i64).saturating_add(delta);
-                let at = if delta <= 0 {
-                    1 // already in the past → delete-on-touch semantics
-                } else {
-                    now.saturating_add(delta as u64)
+                let now = (self.clock)() as i64;
+                // An instant Redis cannot represent is refused (BUG-0213).
+                // It was clamped here, so `EXPIRE k -9223372036854775808`
+                // deleted the key where Redis answers an error.
+                let Some(when) = n
+                    .checked_mul(unit_ms as i64)
+                    .and_then(|ms| ms.checked_add(now))
+                else {
+                    return err(&format!("ERR invalid expire time in '{name}' command"));
                 };
+                // Already in the past: delete-on-touch semantics.
+                let at = if when <= now { 1 } else { when as u64 };
                 self.expire_if(&args[1], cond, when, at)
             }
             Err(_) => err("ERR value is not an integer or out of range"),
@@ -3441,10 +3454,10 @@ impl<'a> Dispatcher<'a> {
             Err(e) => return e,
         };
         match parse_i64(&args[2]) {
-            Ok(n) => {
-                let when = n.saturating_mul(unit_ms as i64);
-                self.expire_if(&args[1], cond, when, when.max(1) as u64)
-            }
+            Ok(n) => match n.checked_mul(unit_ms as i64) {
+                Some(when) => self.expire_if(&args[1], cond, when, when.max(1) as u64),
+                None => err(&format!("ERR invalid expire time in '{name}' command")),
+            },
             Err(_) => err("ERR value is not an integer or out of range"),
         }
     }
@@ -3484,18 +3497,24 @@ impl<'a> Dispatcher<'a> {
             match self.keyspace.ttl(slot_for_key(&a[1]), &a[1]) {
                 Ttl::Missing => Value::Integer(-2),
                 Ttl::NoExpiry => Value::Integer(-1),
-                Ttl::Ms(ms) => Value::Integer(ms.div_ceil(unit_ms) as i64),
+                // Redis rounds to the nearest second; this rounded up
+                // (BUG-0214). PTTL's unit of 1 leaves milliseconds exact.
+                Ttl::Ms(ms) => Value::Integer((ms.saturating_add(unit_ms / 2) / unit_ms) as i64),
             }
         })
     }
 
     fn cmd_incr_delta(&self, args: &[Vec<u8>], name: &str, sign: i64) -> Value {
         exact(args, 3, name, |a| match parse_i64(&a[2]) {
-            Ok(delta) => reply(
-                self.strings
-                    .incr_by(slot_for_key(&a[1]), &a[1], delta.saturating_mul(sign)),
-                Value::Integer,
-            ),
+            // DECRBY negates its argument, and i64::MIN has no negation. It
+            // saturated to i64::MAX here, one short (BUG-0213).
+            Ok(delta) => match delta.checked_mul(sign) {
+                Some(delta) => reply(
+                    self.strings.incr_by(slot_for_key(&a[1]), &a[1], delta),
+                    Value::Integer,
+                ),
+                None => err("ERR decrement would overflow"),
+            },
             Err(_) => err("ERR value is not an integer or out of range"),
         })
     }
@@ -3645,9 +3664,9 @@ fn class_match(pat: &[u8], open: usize, c: u8) -> Option<(bool, usize)> {
 
 fn store_err(e: StoreError) -> Value {
     match e {
-        StoreError::NotInteger | StoreError::Overflow => {
-            err("ERR value is not an integer or out of range")
-        }
+        StoreError::NotInteger => err("ERR value is not an integer or out of range"),
+        StoreError::Overflow => err("ERR increment or decrement would overflow"),
+        StoreError::NanScore => err("ERR resulting score is not a number (NaN)"),
         StoreError::NotFloat => err("ERR value is not a valid float"),
         StoreError::NanOrInfinity => err("ERR increment would produce NaN or Infinity"),
         StoreError::WrongType => {
@@ -3677,16 +3696,6 @@ fn multi_key(args: &[Vec<u8>], name: &str, mut f: impl FnMut(&[u8]) -> bool) -> 
     Value::Integer(args[1..].iter().filter(|k| f(k)).count() as i64)
 }
 
-/// Redis-compatible score formatting: integers print without a decimal
-/// point; everything else uses shortest-roundtrip.
-fn fmt_score(s: f64) -> Vec<u8> {
-    if s.fract() == 0.0 && s.is_finite() && s.abs() < 1e17 {
-        format!("{}", s as i64).into_bytes()
-    } else {
-        format!("{s}").into_bytes()
-    }
-}
-
 fn parse_f64(raw: &[u8]) -> Result<f64, ()> {
     let s = std::str::from_utf8(raw).map_err(|_| ())?;
     let v: f64 = s.parse().map_err(|_| ())?;
@@ -3706,6 +3715,42 @@ fn parse_f64(raw: &[u8]) -> Result<f64, ()> {
     }
 }
 
+/// The instant an `EX`, `PX`, `EXAT` or `PXAT` argument of SET, SETEX or
+/// GETEX names, in unix ms, or Redis's refusal (BUG-0213): a count of zero
+/// or less, absolute or not, or one whose milliseconds, or whose sum with
+/// now, overflows a signed 64-bit count. Seconds were clamped here, and
+/// SETEX's multiplication wrapped in a release build.
+///
+/// Redis tests the sum after a signed addition, which C leaves undefined
+/// on overflow, so the answer depends on the compiler: Valkey 9.1.0 built
+/// on the gate box (Linux) refuses `PX 9223372036854775807`, and macOS
+/// builds of Redis 8.2.8 and Valkey 9.1.0 answer OK. This refuses, as the
+/// source means to.
+fn string_expiry(opt: &[u8], raw: &[u8], now: u64, cmd: &str) -> Result<u64, Value> {
+    let Ok(n) = parse_i64(raw) else {
+        return Err(err("ERR value is not an integer or out of range"));
+    };
+    let invalid = || err(&format!("ERR invalid expire time in '{cmd}' command"));
+    let unit = if matches!(opt, b"EX" | b"EXAT") {
+        1000
+    } else {
+        1
+    };
+    let ms = (n > 0)
+        .then(|| n.checked_mul(unit))
+        .flatten()
+        .ok_or_else(invalid)?;
+    let at = if matches!(opt, b"EX" | b"PX") {
+        i64::try_from(now)
+            .ok()
+            .and_then(|now| ms.checked_add(now))
+            .ok_or_else(invalid)?
+    } else {
+        ms
+    };
+    Ok(at as u64)
+}
+
 /// A blocking command's timeout, in seconds, checked as Valkey checks it:
 /// not a float (NaN, or a spelling past a double's range), negative, or so
 /// large that its milliseconds overflow a signed 64-bit count.
@@ -3722,11 +3767,10 @@ fn parse_block_timeout(raw: &[u8]) -> Result<f64, Value> {
     Ok(secs)
 }
 
+/// An integer argument, read as Redis reads one (BUG-0213): `01` and `+1`
+/// are not integers.
 fn parse_i64(raw: &[u8]) -> Result<i64, ()> {
-    std::str::from_utf8(raw)
-        .map_err(|_| ())?
-        .parse()
-        .map_err(|_| ())
+    parse_redis_i64(raw).ok_or(())
 }
 
 /// A non-negative count argument. `Option` rather than `Result<_, ()>`
@@ -5165,6 +5209,35 @@ mod tests {
     /// Redis 7's EXPIRE conditions (BUG-0185), on all four commands: a key
     /// with no expiry counts as never expiring, a missing key answers 0, and
     /// the options are checked before the number, with upstream's errors.
+    /// BUG-0213. Not a corpus case: the reference's answer depends on how
+    /// it was compiled (`string_expiry`), so only Flint's is pinned here.
+    #[test]
+    fn a_relative_expiry_whose_sum_with_now_overflows_is_refused() {
+        let s = MemKv::new();
+        ev(&s, &["SET", "k", "v"]);
+        for set in [
+            ["SET", "k", "w", "PX", "9223372036854775807"],
+            ["SET", "k", "w", "EX", "9223372036854775"],
+        ] {
+            assert_eq!(
+                ev(&s, &set),
+                Value::Error("ERR invalid expire time in 'set' command".into()),
+                "{set:?}"
+            );
+        }
+        assert_eq!(
+            ev(&s, &["GETEX", "k", "PX", "9223372036854775807"]),
+            Value::Error("ERR invalid expire time in 'getex' command".into())
+        );
+        assert_eq!(ev(&s, &["GET", "k"]), Value::Bulk(Some(b"v".to_vec())));
+        assert_eq!(ev(&s, &["TTL", "k"]), Value::Integer(-1));
+        // Absolute instants are not summed: PXAT takes the largest there is.
+        assert_eq!(
+            ev(&s, &["SET", "k", "w", "PXAT", "9223372036854775807"]),
+            Value::Simple("OK".into())
+        );
+    }
+
     #[test]
     fn expire_conditions_do_what_redis_7_does() {
         let s = MemKv::new();

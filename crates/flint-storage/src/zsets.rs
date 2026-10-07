@@ -293,6 +293,11 @@ impl<'a> ZSetStore<'a> {
     ) -> Result<f64, StoreError> {
         let current = self.zscore(slot, key, member)?.unwrap_or(0.0);
         let next = current + delta;
+        // `+inf` plus `-inf` (BUG-0212). Stored, a NaN score has no place
+        // in (score, member) order and prints as `NaN`.
+        if next.is_nan() {
+            return Err(StoreError::NanScore);
+        }
         self.zadd(slot, key, &[(next, member.to_vec())])?;
         Ok(next)
     }
@@ -679,6 +684,19 @@ mod tests {
             Ok(Some(40 * (25 + 8))),
             "a zset's accounted size is member_cost summed: length PLUS 8 for the score"
         );
+    }
+
+    #[test]
+    fn zincr_by_refuses_a_nan_score_and_changes_nothing() {
+        // BUG-0212: +inf plus -inf.
+        let kv = MemKv::new();
+        let z = ZSetStore::new(&kv, b"t", now);
+        assert_eq!(z.zincr_by(1, b"z", f64::INFINITY, b"m"), Ok(f64::INFINITY));
+        assert_eq!(
+            z.zincr_by(1, b"z", f64::NEG_INFINITY, b"m"),
+            Err(StoreError::NanScore)
+        );
+        assert_eq!(z.zscore(1, b"z", b"m"), Ok(Some(f64::INFINITY)));
     }
 
     #[test]

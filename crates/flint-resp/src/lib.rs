@@ -121,17 +121,73 @@ pub enum Value {
     ScorePairs(Vec<(Vec<u8>, f64)>),
 }
 
-/// Redis-compatible score formatting: integral values print without a
-/// decimal point, everything else uses shortest-roundtrip. This is the
-/// RESP2 spelling of [`Value::Double`], and matches what the sorted-set
-/// commands emitted before RESP3 existed here — the conformance corpus
-/// pins it against a real Valkey.
+/// A double as Redis spells one (`d2string`): the RESP2 spelling of
+/// [`Value::Double`] and the text of a RESP3 `,` frame. The conformance
+/// corpus pins it against a real Valkey.
+///
+/// An integral value within ±2^62 prints as an integer. Anything else is the
+/// shortest digits that round-trip, laid out as Redis's `fpconv_dtoa` lays
+/// them out: in full while the exponent is small, and as `1.5e+300` or
+/// `1e-7` past that. This spelled every value out in full until BUG-0214,
+/// so `1e20` was 21 digits and `5e-324` was 326 characters. Redis's digits
+/// come from Grisu2, which does not always pick the shortest or the nearest
+/// last digit: 13 of 4,999 random doubles, all with 16 or 17 significant
+/// digits, read back differently here, and each spelling named the same
+/// double.
 pub fn fmt_double(s: f64) -> Vec<u8> {
-    if s.fract() == 0.0 && s.is_finite() && s.abs() < 1e17 {
-        format!("{}", s as i64).into_bytes()
-    } else {
-        format!("{s}").into_bytes()
+    if s.is_nan() {
+        return b"nan".to_vec();
     }
+    if s.is_infinite() {
+        return if s > 0.0 {
+            b"inf".to_vec()
+        } else {
+            b"-inf".to_vec()
+        };
+    }
+    const HALF: f64 = (i64::MAX / 2) as f64;
+    if s.fract() == 0.0 && (-HALF..=HALF).contains(&s) {
+        return (s as i64).to_string().into_bytes();
+    }
+    // `{:e}` gives the shortest round-trip digits: "-1.23456789e-4".
+    let sci = format!("{s:e}");
+    let (mantissa, exp10) = sci.split_once('e').expect("{:e} has an exponent");
+    let exp10: i32 = exp10.parse().expect("{:e} exponent is an integer");
+    let digits: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
+    let n = digits.len() as i32;
+    // The value is `digits * 10^k`, and `exp` is the scientific exponent's
+    // magnitude: fpconv's `emit_digits`, case for case.
+    let k = exp10 - (n - 1);
+    let exp = exp10.abs();
+    let mut out = Vec::with_capacity(32);
+    if s < 0.0 {
+        out.push(b'-');
+    }
+    if k >= 0 && exp < n + 7 {
+        out.extend_from_slice(&digits);
+        out.resize(out.len() + k as usize, b'0');
+    } else if k < 0 && (k > -7 || exp < 4) {
+        let point = n + k;
+        if point <= 0 {
+            out.extend_from_slice(b"0.");
+            out.resize(out.len() + (-point) as usize, b'0');
+            out.extend_from_slice(&digits);
+        } else {
+            out.extend_from_slice(&digits[..point as usize]);
+            out.push(b'.');
+            out.extend_from_slice(&digits[point as usize..]);
+        }
+    } else {
+        out.push(digits[0]);
+        if n > 1 {
+            out.push(b'.');
+            out.extend_from_slice(&digits[1..]);
+        }
+        out.push(b'e');
+        out.push(if exp10 < 0 { b'-' } else { b'+' });
+        out.extend_from_slice(exp.to_string().as_bytes());
+    }
+    out
 }
 
 /// True for commands whose RESP3 reply carries [`Value::Resp3Nested`]'s
@@ -351,13 +407,8 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
         Value::Double(d) => {
             if resp3_sel {
                 out.push(b',');
-                // RESP3 spells the infinities out; finite values use the
-                // same shortest-roundtrip text as the RESP2 bulk.
-                if d.is_infinite() {
-                    out.extend_from_slice(if *d > 0.0 { b"inf" } else { b"-inf" });
-                } else {
-                    out.extend_from_slice(&fmt_double(*d));
-                }
+                // The same text as the RESP2 bulk, the infinities included.
+                out.extend_from_slice(&fmt_double(*d));
                 out.extend_from_slice(b"\r\n");
             } else {
                 encode_proto(&Value::Bulk(Some(fmt_double(*d))), proto, out);
@@ -854,6 +905,9 @@ mod tests {
             enc(&Value::Double(f64::INFINITY), Proto::Resp3),
             b",inf\r\n"
         );
+        // BUG-0214: past a small exponent, Redis switches to `1e+20`.
+        assert_eq!(enc(&Value::Double(1e20), Proto::Resp2), b"$5\r\n1e+20\r\n");
+        assert_eq!(enc(&Value::Double(1e-7), Proto::Resp3), b",1e-7\r\n");
         // HGETALL
         let m = Value::Map(vec![(
             Value::Bulk(Some(b"f1".to_vec())),
@@ -1195,5 +1249,40 @@ mod flushing_encoder_tests {
         let (got, flushes, _) = transcript(&v, Proto::Resp2, 8 * 1024);
         assert_eq!(got, want);
         assert!(flushes > 1, "nested elements did not drain: {flushes}");
+    }
+
+    #[test]
+    fn doubles_are_spelled_as_redis_spells_them() {
+        // BUG-0214. Each pair is what Redis 8.2.8 and Valkey 9.1.0 answered
+        // to ZSCORE, measured 2026-10-07.
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0"),
+            (3.0, "3"),
+            (-17.0, "-17"),
+            (0.1, "0.1"),
+            (2.5, "2.5"),
+            (1234567.125, "1234567.125"),
+            (0.0001, "0.0001"),
+            (1e-5, "0.00001"),
+            (1e-6, "0.000001"),
+            (1e-7, "1e-7"),
+            (0.000123456789, "1.23456789e-4"),
+            (-2.5e-9, "-2.5e-9"),
+            (5e-324, "5e-324"),
+            (1e15, "1000000000000000"),
+            (123456789012345678.0, "123456789012345680"),
+            (4611686018427387904.0, "4611686018427387904"),
+            (9.3e18, "9.3e+18"),
+            (1e20, "1e+20"),
+            (1e22, "1e+22"),
+            (1234567890123456789012.0, "1234567890123456800000"),
+            (1.5e300, "1.5e+300"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ];
+        for &(d, want) in cases {
+            assert_eq!(fmt_double(d), want.as_bytes(), "{d:e}");
+        }
     }
 }

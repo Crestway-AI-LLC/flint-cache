@@ -316,6 +316,82 @@ fn corpus() -> Vec<Case> {
                 s(&[b"GETRANGE", b"nosuchg", b"0", b"-1"], Expect::Str(b"")),
             ],
         },
+        // BUG-0214, from a three-way differential against Redis 8.2 and
+        // Valkey: GETRANGE is not LRANGE. An end before the string clamps
+        // to its first byte; two negatives in the wrong order are empty.
+        Case {
+            family: "strings",
+            name: "getrange clamps an end before the string",
+            steps: vec![
+                s(&[b"SET", b"gr2", b"Hello"], Expect::Ok),
+                s(&[b"GETRANGE", b"gr2", b"0", b"-100"], Expect::Str(b"H")),
+                s(&[b"GETRANGE", b"gr2", b"-100", b"-100"], Expect::Str(b"H")),
+                s(&[b"GETRANGE", b"gr2", b"-3", b"-100"], Expect::Str(b"")),
+                s(&[b"GETRANGE", b"gr2", b"-10", b"-20"], Expect::Str(b"")),
+            ],
+        },
+        // BUG-0213: one kind of expiry option, and an instant that fits.
+        Case {
+            family: "strings",
+            name: "set takes one kind of expiry and refuses one out of range",
+            steps: vec![
+                s(&[b"SET", b"se", b"v", b"EX", b"10", b"PX", b"10"], Expect::Err("ERR syntax error")),
+                s(&[b"SET", b"se", b"v", b"KEEPTTL", b"EX", b"10"], Expect::Err("ERR syntax error")),
+                s(&[b"SET", b"se", b"v", b"PX", b"10", b"KEEPTTL"], Expect::Err("ERR syntax error")),
+                s(&[b"SET", b"se", b"v", b"EXAT", b"1", b"PXAT", b"1"], Expect::Err("ERR syntax error")),
+                s(&[b"SET", b"se", b"v", b"NX", b"XX"], Expect::Err("ERR syntax error")),
+                // Every option parses before the time is read.
+                s(&[b"SET", b"se", b"v", b"EX", b"abc", b"NX", b"XX"], Expect::Err("ERR syntax error")),
+                s(&[b"EXISTS", b"se"], Expect::Int(0)),
+                // The same option twice is allowed, and the last wins.
+                s(&[b"SET", b"se", b"v", b"EX", b"10", b"EX", b"100"], Expect::Ok),
+                s(&[b"TTL", b"se"], Expect::IntRange(95, 100)),
+                s(
+                    &[b"SET", b"se", b"w", b"EX", b"9223372036854775807"],
+                    Expect::Err("ERR invalid expire time in 'set' command"),
+                ),
+                s(&[b"SET", b"se", b"w", b"EXAT", b"0"], Expect::Err("ERR invalid expire time in 'set' command")),
+                s(&[b"SET", b"se", b"w", b"PXAT", b"-1"], Expect::Err("ERR invalid expire time in 'set' command")),
+                s(
+                    &[b"SETEX", b"se", b"9223372036854775807", b"w"],
+                    Expect::Err("ERR invalid expire time in 'setex' command"),
+                ),
+                s(
+                    &[b"GETEX", b"se", b"EX", b"9223372036854775807"],
+                    Expect::Err("ERR invalid expire time in 'getex' command"),
+                ),
+                s(&[b"GET", b"se"], Expect::Str(b"v")),
+                s(&[b"TTL", b"se"], Expect::IntRange(95, 100)),
+                s(&[b"GETEX", b"se", b"PERSIST", b"EX", b"10"], Expect::Err("ERR syntax error")),
+                s(&[b"GETEX", b"se", b"EX", b"10", b"EX", b"20"], Expect::Str(b"v")),
+                s(&[b"TTL", b"se"], Expect::IntRange(15, 20)),
+            ],
+        },
+        // BUG-0213: Redis reads a canonical integer only, and names the
+        // overflow.
+        Case {
+            family: "strings",
+            name: "integers are canonical and overflow is named",
+            steps: vec![
+                s(&[b"SET", b"ci", b"01"], Expect::Ok),
+                s(&[b"INCR", b"ci"], Expect::Err("ERR value is not an integer or out of range")),
+                s(&[b"SET", b"ci", b"+1"], Expect::Ok),
+                s(&[b"INCRBY", b"ci", b"1"], Expect::Err("ERR value is not an integer or out of range")),
+                s(&[b"GET", b"ci"], Expect::Str(b"+1")),
+                s(&[b"INCRBY", b"ci2", b"01"], Expect::Err("ERR value is not an integer or out of range")),
+                s(&[b"SET", b"ci3", b"9223372036854775807"], Expect::Ok),
+                s(&[b"INCR", b"ci3"], Expect::Err("ERR increment or decrement would overflow")),
+                s(&[b"SET", b"ci4", b"5"], Expect::Ok),
+                s(
+                    &[b"DECRBY", b"ci4", b"-9223372036854775808"],
+                    Expect::Err("ERR decrement would overflow"),
+                ),
+                s(&[b"GET", b"ci4"], Expect::Str(b"5")),
+                s(&[b"HSET", b"ch", b"f", b"01", b"g", b"9223372036854775807"], Expect::Int(2)),
+                s(&[b"HINCRBY", b"ch", b"f", b"1"], Expect::Err("ERR hash value is not an integer")),
+                s(&[b"HINCRBY", b"ch", b"g", b"1"], Expect::Err("ERR increment or decrement would overflow")),
+            ],
+        },
         Case {
             family: "strings",
             name: "setrange pad overwrite ttl",
@@ -528,6 +604,47 @@ fn corpus() -> Vec<Case> {
                 s(&[b"PERSIST", b"t1"], Expect::Int(1)),
                 s(&[b"TTL", b"t1"], Expect::Int(-1)),
                 s(&[b"PERSIST", b"t1"], Expect::Int(0)),
+            ],
+        },
+        // BUG-0214: TTL rounds to the nearest second. It rounded up here,
+        // so a key with 1.4 s left answered 2.
+        Case {
+            family: "ttl",
+            name: "ttl rounds to the nearest second",
+            steps: vec![
+                s(&[b"SET", b"tr1", b"v", b"PX", b"1400"], Expect::Ok),
+                s(&[b"TTL", b"tr1"], Expect::Int(1)),
+                s(&[b"SET", b"tr2", b"v", b"PX", b"1700"], Expect::Ok),
+                s(&[b"TTL", b"tr2"], Expect::Int(2)),
+            ],
+        },
+        // BUG-0213: an instant past the 64-bit range is refused, and leaves
+        // the key alone. EXPIRE with i64::MIN deleted it here.
+        Case {
+            family: "ttl",
+            name: "expire refuses an instant out of range",
+            steps: vec![
+                s(&[b"SET", b"eo", b"v"], Expect::Ok),
+                s(
+                    &[b"EXPIRE", b"eo", b"9223372036854775807"],
+                    Expect::Err("ERR invalid expire time in 'expire' command"),
+                ),
+                s(
+                    &[b"EXPIRE", b"eo", b"-9223372036854775808"],
+                    Expect::Err("ERR invalid expire time in 'expire' command"),
+                ),
+                s(
+                    &[b"PEXPIRE", b"eo", b"9223372036854775807"],
+                    Expect::Err("ERR invalid expire time in 'pexpire' command"),
+                ),
+                s(
+                    &[b"EXPIREAT", b"eo", b"9223372036854775807"],
+                    Expect::Err("ERR invalid expire time in 'expireat' command"),
+                ),
+                s(&[b"TTL", b"eo"], Expect::Int(-1)),
+                s(&[b"PEXPIREAT", b"eo", b"9223372036854775807"], Expect::Int(1)),
+                s(&[b"EXPIRE", b"eo", b"-100"], Expect::Int(1)),
+                s(&[b"EXISTS", b"eo"], Expect::Int(0)),
             ],
         },
         Case {
@@ -1802,6 +1919,54 @@ fn corpus() -> Vec<Case> {
                 ),
             ],
         },
+        // BUG-0212: +inf plus -inf is NaN, which Redis refuses to store.
+        Case {
+            family: "zsets",
+            name: "zincrby refuses a nan score",
+            steps: vec![
+                s(&[b"ZADD", b"zn", b"inf", b"m"], Expect::Int(1)),
+                s(
+                    &[b"ZINCRBY", b"zn", b"-inf", b"m"],
+                    Expect::Err("ERR resulting score is not a number (NaN)"),
+                ),
+                s(&[b"ZSCORE", b"zn", b"m"], Expect::Str(b"inf")),
+            ],
+        },
+        // BUG-0214: a score is spelled as Redis's d2string spells it. Large
+        // and small values were written out in full here.
+        Case {
+            family: "zsets",
+            name: "scores are spelled as redis spells them",
+            steps: vec![
+                s(
+                    &[
+                        b"ZADD", b"zf", b"1e20", b"a", b"1e-7", b"b", b"0.000123456789", b"c",
+                        b"1.5e300", b"d", b"5e-324", b"e", b"4611686018427387904", b"f",
+                        b"9.3e18", b"g", b"1234567.125", b"h", b"0.0001", b"i", b"-2.5e-9", b"j",
+                    ],
+                    Expect::Int(10),
+                ),
+                s(&[b"ZSCORE", b"zf", b"a"], Expect::Str(b"1e+20")),
+                s(&[b"ZSCORE", b"zf", b"b"], Expect::Str(b"1e-7")),
+                s(&[b"ZSCORE", b"zf", b"c"], Expect::Str(b"1.23456789e-4")),
+                s(&[b"ZSCORE", b"zf", b"d"], Expect::Str(b"1.5e+300")),
+                s(&[b"ZSCORE", b"zf", b"e"], Expect::Str(b"5e-324")),
+                s(&[b"ZSCORE", b"zf", b"f"], Expect::Str(b"4611686018427387904")),
+                s(&[b"ZSCORE", b"zf", b"g"], Expect::Str(b"9.3e+18")),
+                s(&[b"ZSCORE", b"zf", b"h"], Expect::Str(b"1234567.125")),
+                s(&[b"ZSCORE", b"zf", b"i"], Expect::Str(b"0.0001")),
+                s(&[b"ZSCORE", b"zf", b"j"], Expect::Str(b"-2.5e-9")),
+                s(
+                    &[b"ZRANGE", b"zf", b"0", b"1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"j"),
+                        Expect::Str(b"-2.5e-9"),
+                        Expect::Str(b"e"),
+                        Expect::Str(b"5e-324"),
+                    ]),
+                ),
+            ],
+        },
         Case {
             family: "zsets",
             name: "zlexcount zremrangebylex",
@@ -3012,6 +3177,20 @@ fn corpus() -> Vec<Case> {
                 s(&[b"SET", b"fd3", b"v"], Expect::Ok),
                 s(&[b"FLUSHDB", b"ASYNC"], Expect::Ok),
                 s(&[b"DBSIZE"], Expect::Int(0)),
+            ],
+        },
+        // BUG-0213: a flush with an argument it does not know flushed. Redis
+        // refuses it and flushes nothing.
+        Case {
+            family: "connection",
+            name: "a flush with an unknown argument flushes nothing",
+            steps: vec![
+                s(&[b"SET", b"fu1", b"v"], Expect::Ok),
+                s(&[b"FLUSHALL", b"FOO"], Expect::Err("ERR syntax error")),
+                s(&[b"FLUSHDB", b"ASYNC", b"SYNC"], Expect::Err("ERR syntax error")),
+                s(&[b"GET", b"fu1"], Expect::Str(b"v")),
+                s(&[b"FLUSHALL", b"sync"], Expect::Ok),
+                s(&[b"EXISTS", b"fu1"], Expect::Int(0)),
             ],
         },
         Case {

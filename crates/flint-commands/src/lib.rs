@@ -63,6 +63,18 @@ pub fn json_debug_key(args: &[Vec<u8>]) -> Option<Option<&[u8]>> {
     })
 }
 
+/// Whether a `FLUSHALL` or `FLUSHDB` has arguments Redis accepts: none, or
+/// one `ASYNC` or `SYNC` (BUG-0213). The seat and the proxy both refuse the
+/// rest before anything is flushed; the proxy fans a flush out to every
+/// pair, so it must not send one that each seat would refuse.
+pub fn flush_args_ok(args: &[Vec<u8>]) -> bool {
+    match args {
+        [_] => true,
+        [_, mode] => mode.eq_ignore_ascii_case(b"ASYNC") || mode.eq_ignore_ascii_case(b"SYNC"),
+        _ => false,
+    }
+}
+
 /// True when `name` mutates the keyspace.
 pub fn is_write_command(name: &[u8]) -> bool {
     matches!(
@@ -352,5 +364,15 @@ mod tests {
                 "{name:?} classified as both"
             );
         }
+    }
+
+    #[test]
+    fn a_flush_takes_async_sync_or_nothing() {
+        let args = |a: &[&str]| a.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert!(flush_args_ok(&args(&["FLUSHALL"])));
+        assert!(flush_args_ok(&args(&["FLUSHDB", "async"])));
+        assert!(flush_args_ok(&args(&["FLUSHALL", "SYNC"])));
+        assert!(!flush_args_ok(&args(&["FLUSHALL", "FOO"])));
+        assert!(!flush_args_ok(&args(&["FLUSHALL", "ASYNC", "SYNC"])));
     }
 }

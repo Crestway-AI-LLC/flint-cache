@@ -10,7 +10,7 @@ use crate::Kv;
 use crate::encoding::{
     Cf, ComplexMeta, ValueType, VersionGen, envelope, subkey_envelope, subkey_prefix,
 };
-use crate::strings::{Clock, StoreError};
+use crate::strings::{Clock, StoreError, parse_redis_i64};
 
 /// (field, value) pairs.
 pub type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
@@ -177,10 +177,7 @@ impl<'a> HashStore<'a> {
     ) -> Result<i64, StoreError> {
         let current = match self.hget(slot, key, field)? {
             None => 0i64,
-            Some(raw) => std::str::from_utf8(&raw)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or(StoreError::NotInteger)?,
+            Some(raw) => parse_redis_i64(&raw).ok_or(StoreError::NotInteger)?,
         };
         let next = current.checked_add(delta).ok_or(StoreError::Overflow)?;
         self.hset(
