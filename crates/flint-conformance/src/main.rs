@@ -2058,6 +2058,17 @@ fn corpus() -> Vec<Case> {
                 s(&[b"ZRANGEBYLEX", b"zl", b"-", b"+", b"LIMIT", b"-1", b"2"], Expect::Arr(vec![])),
                 s(&[b"ZRANGEBYSCORE", b"zr", b"-inf", b"+inf", b"LIMIT", b"-1", b"2"], Expect::Arr(vec![])),
                 s(&[b"ZRANGE", b"nosuchzr", b"0", b"-1", b"BYSCORE"], Expect::Arr(vec![])),
+                // Another type is WRONGTYPE whatever the LIMIT (BUG-0216's
+                // first build answered an empty array to a count of 0).
+                s(&[b"SET", b"zstr", b"v"], Expect::Ok),
+                s(
+                    &[b"ZRANGE", b"zstr", b"0", b"-1", b"BYSCORE", b"LIMIT", b"0", b"0"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(
+                    &[b"ZRANGEBYSCORE", b"zstr", b"-inf", b"+inf", b"LIMIT", b"-1", b"1"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
             ],
         },
         // BUG-0215: ZRANK's WITHSCORE, Redis 7.2's.

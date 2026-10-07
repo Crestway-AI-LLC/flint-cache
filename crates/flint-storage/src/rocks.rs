@@ -853,6 +853,39 @@ impl Kv for RocksKv {
         }
     }
 
+    fn for_each_before(
+        &self,
+        prefix: &[u8],
+        start_before: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        // A reverse `From` lands on the last key at or below its seek key
+        // (seek_for_prev), so the seek key itself, and anything past the
+        // prefix it may land on, is skipped by comparison.
+        let end = crate::prefix_successor(prefix);
+        let mode = if !start_before.is_empty() {
+            rocksdb::IteratorMode::From(start_before, rocksdb::Direction::Reverse)
+        } else if let Some(end) = &end {
+            rocksdb::IteratorMode::From(end, rocksdb::Direction::Reverse)
+        } else {
+            rocksdb::IteratorMode::End
+        };
+        for (k, v) in self.db.iterator(mode).filter_map(Result::ok) {
+            if !start_before.is_empty() && k.as_ref() >= start_before {
+                continue;
+            }
+            if !k.starts_with(prefix) {
+                if k.as_ref() > prefix {
+                    continue;
+                }
+                return;
+            }
+            if !visit(&k, &v) {
+                return;
+            }
+        }
+    }
+
     fn clear(&self) {
         // Chunked delete batches: collecting every key into one Vec plus
         // one giant WriteBatch is FLUSHALL's version of the DBSIZE OOM —
@@ -2042,5 +2075,131 @@ mod archive_span_tests {
             held.describe(),
             "archive holds 3 segment(s), newest 4s old, oldest 43200s old"
         );
+    }
+}
+
+/// BUG-0216: RocksDB's reverse seek, against the in-memory store's, and the
+/// sorted-set reads that walk it.
+#[cfg(test)]
+mod reverse_scan {
+    use super::*;
+    use crate::MemKv;
+    use crate::zsets::{LexBound, ScoreBound, ZSetStore};
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("flint-rocks-reverse-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    fn down(kv: &dyn Kv, prefix: &[u8], start_before: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        kv.for_each_before(prefix, start_before, &mut |k, _| {
+            out.push(k.to_vec());
+            true
+        });
+        out
+    }
+
+    #[test]
+    fn rocks_walks_backwards_as_memory_does() {
+        let path = dir("keys");
+        let rocks = RocksKv::open(&path).expect("open");
+        let mem = MemKv::new();
+        let keys: [&[u8]; 9] = [
+            b"a",
+            b"a\xff",
+            b"a\xff\x00",
+            b"a\xff\xff",
+            b"a\xff\xff\x01",
+            b"b",
+            b"b\x00",
+            b"\xff",
+            b"\xff\x01",
+        ];
+        for k in keys {
+            rocks.put(k, b"v");
+            mem.put(k, b"v");
+        }
+        for prefix in [&b""[..], b"a", b"a\xff", b"a\xff\xff", b"b", b"\xff", b"c"] {
+            for start_before in [
+                &b""[..],
+                b"a\xff",
+                b"a\xff\xff\x01",
+                b"b",
+                b"zz",
+                b"\xff\x00",
+            ] {
+                assert_eq!(
+                    down(&rocks, prefix, start_before),
+                    down(&mem, prefix, start_before),
+                    "prefix {prefix:?} before {start_before:?}"
+                );
+            }
+        }
+        // Stopping early stops.
+        let mut seen = 0;
+        rocks.for_each_before(b"", b"", &mut |_, _| {
+            seen += 1;
+            seen < 2
+        });
+        assert_eq!(seen, 2);
+        drop(rocks);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn sorted_set_reads_on_rocks_match_memory() {
+        let path = dir("zset");
+        let rocks = RocksKv::open(&path).expect("open");
+        let mem = MemKv::new();
+        let now = || 1_000_000;
+        let zr = ZSetStore::new(&rocks, b"t", now);
+        let zm = ZSetStore::new(&mem, b"t", now);
+        for i in 0..200u32 {
+            let pair = [(
+                f64::from(i % 37) - 10.0,
+                format!("m{:03}", (i * 7) % 211).into_bytes(),
+            )];
+            assert_eq!(zr.zadd(1, b"z", &pair), zm.zadd(1, b"z", &pair));
+        }
+        let b = |s: &str| ScoreBound::parse(s.as_bytes()).expect("bound");
+        for (start, stop) in [(0, 0), (0, 9), (-10, -1), (5, 3), (0, -1)] {
+            for rev in [false, true] {
+                assert_eq!(
+                    zr.zrange_rev(1, b"z", start, stop, rev),
+                    zm.zrange_rev(1, b"z", start, stop, rev)
+                );
+            }
+        }
+        for (min, max) in [("-inf", "+inf"), ("(0", "5"), ("3", "(3.5"), ("20", "30")] {
+            for rev in [false, true] {
+                assert_eq!(
+                    zr.zrange_by_score(1, b"z", b(min), b(max), rev, 1, 4),
+                    zm.zrange_by_score(1, b"z", b(min), b(max), rev, 1, 4)
+                );
+            }
+            assert_eq!(
+                zr.zcount(1, b"z", b(min), b(max)),
+                zm.zcount(1, b"z", b(min), b(max))
+            );
+        }
+        let lex = |s: &str| LexBound::parse(s.as_bytes()).expect("lex");
+        for rev in [false, true] {
+            assert_eq!(
+                zr.zrange_by_lex(1, b"z", &lex("[m050"), &lex("(m100"), rev, 0, -1),
+                zm.zrange_by_lex(1, b"z", &lex("[m050"), &lex("(m100"), rev, 0, -1)
+            );
+        }
+        assert_eq!(
+            zr.zrank(1, b"z", b"m021", true),
+            zm.zrank(1, b"z", b"m021", true)
+        );
+        assert_eq!(zr.zpop(1, b"z", 3, true), zm.zpop(1, b"z", 3, true));
+        assert_eq!(zr.zpop(1, b"z", 3, false), zm.zpop(1, b"z", 3, false));
+        drop(zr);
+        drop(rocks);
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

@@ -147,6 +147,31 @@ pub trait Kv: Send + Sync {
             visit(k, v)
         });
     }
+    /// Like `for_each_from`, in DESCENDING key order: the keys under
+    /// `prefix` strictly BEFORE `start_before`, the last first, until
+    /// `visit` returns false. `start_before` empty = from the prefix's last
+    /// key. Same contract as `for_each_prefix`.
+    ///
+    /// The reverse sorted-set reads (ZREVRANGE, ZPOPMAX, ZREVRANGEBYSCORE)
+    /// walk this, so the top of a large set costs what is read, not the set
+    /// (BUG-0216). The default body materialises the prefix and walks it
+    /// backwards, which keeps every store correct, a buffering one included;
+    /// ordered stores override it with a real reverse seek.
+    fn for_each_before(
+        &self,
+        prefix: &[u8],
+        start_before: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        for (k, v) in self.scan_prefix(prefix).iter().rev() {
+            if !start_before.is_empty() && k.as_slice() >= start_before {
+                continue;
+            }
+            if !visit(k, v) {
+                return;
+            }
+        }
+    }
     /// All pairs whose key starts with `prefix`, in ascending key order.
     ///
     /// Materializes the whole range — use only where the range is bounded
@@ -205,6 +230,14 @@ impl Kv for ReadOnlyKv<'_> {
         visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
     ) {
         self.0.for_each_from(prefix, start_after, visit)
+    }
+    fn for_each_before(
+        &self,
+        prefix: &[u8],
+        start_before: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        self.0.for_each_before(prefix, start_before, visit)
     }
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.0.scan_prefix(prefix)
@@ -269,6 +302,67 @@ impl MemKv {
     }
 }
 
+impl MemKv {
+    /// `chunked`, descending: up to CHUNK rows per lock hold, below `cursor`
+    /// (exclusive) or from the prefix's last key.
+    fn chunked_rev(
+        &self,
+        prefix: &[u8],
+        mut cursor: Option<Vec<u8>>,
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        const CHUNK: usize = 1024;
+        let end = prefix_successor(prefix);
+        // A cursor past the prefix's last key is the end of the prefix; one
+        // at or below the prefix leaves nothing before it, and BTreeMap's
+        // `range` panics on a start above its end.
+        if let (Some(c), Some(e)) = (&cursor, &end)
+            && c > e
+        {
+            cursor = None;
+        }
+        if cursor.as_deref().is_some_and(|c| c <= prefix) {
+            return;
+        }
+        loop {
+            let chunk: Vec<(Vec<u8>, Vec<u8>)> = {
+                let upper = match (&cursor, &end) {
+                    (Some(k), _) => Bound::Excluded(k.as_slice()),
+                    (None, Some(e)) => Bound::Excluded(e.as_slice()),
+                    (None, None) => Bound::Unbounded,
+                };
+                self.read()
+                    .range::<[u8], _>((Bound::Included(prefix), upper))
+                    .rev()
+                    .take_while(|(k, _)| k.starts_with(prefix))
+                    .take(CHUNK)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
+            let exhausted = chunk.len() < CHUNK;
+            cursor = chunk.last().map(|(k, _)| k.clone());
+            for (k, v) in &chunk {
+                if !visit(k, v) {
+                    return;
+                }
+            }
+            if exhausted {
+                return;
+            }
+        }
+    }
+}
+
+/// The least key greater than every key starting with `prefix`: its last
+/// byte below 0xFF raised by one, the rest dropped. `None` when every byte
+/// is 0xFF, and nothing sorts after the prefix's keys.
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|&b| b != 0xFF)?;
+    let mut s = prefix[..=last].to_vec();
+    s[last] += 1;
+    Some(s)
+}
+
 impl Kv for MemKv {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.read().get(key).cloned()
@@ -298,6 +392,16 @@ impl Kv for MemKv {
         self.chunked(prefix, seed, visit);
     }
 
+    fn for_each_before(
+        &self,
+        prefix: &[u8],
+        start_before: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        let seed = (!start_before.is_empty()).then(|| start_before.to_vec());
+        self.chunked_rev(prefix, seed, visit);
+    }
+
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         // Overrides the default: one lock hold = an atomic snapshot of the
         // range, which the chunked streaming path deliberately gives up.
@@ -316,6 +420,71 @@ impl Kv for MemKv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-0216: the descending scan, against the ascending one reversed,
+    /// across prefixes that end in 0xFF and keys either side of the prefix.
+    #[test]
+    fn for_each_before_is_the_ascending_scan_reversed() {
+        assert_eq!(prefix_successor(b"ab"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_successor(b"a\xff\xff"), Some(b"b".to_vec()));
+        assert_eq!(prefix_successor(b"\xff"), None);
+        let kv = MemKv::new();
+        for k in [
+            &b"a"[..],
+            b"a\xff",
+            b"a\xff\x00",
+            b"a\xff\xff",
+            b"a\xff\xff\x01",
+            b"b",
+            b"\xff",
+            b"\xff\x01",
+        ] {
+            kv.put(k, b"v");
+        }
+        for prefix in [&b""[..], b"a", b"a\xff", b"a\xff\xff", b"\xff", b"c"] {
+            let mut up: Vec<Vec<u8>> = Vec::new();
+            kv.for_each_prefix(prefix, &mut |k, _| {
+                up.push(k.to_vec());
+                true
+            });
+            for outside in [&b"\x00"[..], b"a", b"zz", b"\xff\xff"] {
+                let want: Vec<Vec<u8>> = up
+                    .iter()
+                    .rev()
+                    .filter(|k| k.as_slice() < outside)
+                    .cloned()
+                    .collect();
+                let mut down: Vec<Vec<u8>> = Vec::new();
+                kv.for_each_before(prefix, outside, &mut |k, _| {
+                    down.push(k.to_vec());
+                    true
+                });
+                assert_eq!(down, want, "prefix {prefix:?} before {outside:?}");
+            }
+            for cut in 0..=up.len() {
+                let start_before = up.get(cut).cloned().unwrap_or_default();
+                let mut want: Vec<Vec<u8>> = up[..cut.min(up.len())].to_vec();
+                if start_before.is_empty() {
+                    want = up.clone();
+                }
+                want.reverse();
+                let mut down: Vec<Vec<u8>> = Vec::new();
+                kv.for_each_before(prefix, &start_before, &mut |k, _| {
+                    down.push(k.to_vec());
+                    true
+                });
+                assert_eq!(down, want, "prefix {prefix:?} before {start_before:?}");
+                // The trait's default body agrees with the override.
+                let mut default: Vec<Vec<u8>> = Vec::new();
+                for (k, _) in kv.scan_prefix(prefix).iter().rev() {
+                    if start_before.is_empty() || k.as_slice() < start_before.as_slice() {
+                        default.push(k.clone());
+                    }
+                }
+                assert_eq!(down, default);
+            }
+        }
+    }
 
     #[test]
     fn put_get_delete() {

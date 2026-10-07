@@ -258,6 +258,14 @@ AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands").
 > 128 members (its listpack); past that, Redis's skiplist seek depends on
 > random levels, and no other implementation can match it (BUG-0215).
 
+> Sorted-set reads cost what they return: a score range, a rank window, a
+> LIMIT, a pop or a count reads only the rows it answers from (BUG-0216).
+> **ZRANK and ZREVRANK are the exception: a rank costs its position**,
+> counted from the end the rank is measured from. The top of a leaderboard
+> (`ZREVRANK` of a high scorer) is as cheap as in Redis; the middle of a
+> million-member set is about 79 ms on the RocksDB engine, where Redis's
+> skiplist answers in O(log n).
+
 ### Flint-specific: the GC ranking primitives (ADR-0013)
 
 Flint never evicts, so "what should my cleanup daemon delete first" has to

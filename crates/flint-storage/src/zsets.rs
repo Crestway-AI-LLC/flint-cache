@@ -8,8 +8,8 @@
 
 use crate::Kv;
 use crate::encoding::{
-    Cf, ComplexMeta, MetaHeader, ValueType, VersionGen, decode_score, envelope, subkey_envelope,
-    zscore_envelope, zscore_prefix,
+    Cf, ComplexMeta, MetaHeader, ValueType, VersionGen, decode_score, encode_score, envelope,
+    subkey_envelope, zscore_envelope, zscore_prefix,
 };
 use crate::strings::{Clock, StoreError};
 
@@ -21,6 +21,17 @@ pub struct ZaddFlags {
     pub gt: bool,
     pub lt: bool,
     pub incr: bool,
+}
+
+/// How many rows a sorted-set read can return, for `read_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZsetRows {
+    /// A range with no LIMIT: possibly the whole set.
+    All,
+    /// A LIMIT's count, or a pop's.
+    AtMost(u64),
+    /// A rank window, negatives from the end.
+    Ranks(i64, i64),
 }
 
 /// What a `zadd_with` did: members added, members whose score changed, and
@@ -362,6 +373,41 @@ impl<'a> ZSetStore<'a> {
         Ok(self.read_meta(slot, key)?.map(|m| m.bytes))
     }
 
+    /// Bytes a read returning at most `rows` members (None = all of them)
+    /// would build, from ONE metadata read: the input BUG-0060's admission
+    /// sizes a sorted-set read by. The mean member cost times the rows, as
+    /// `ListStore::range_bytes` estimates; `None` when the key is missing.
+    /// Reads stop where they are told to since BUG-0216, so a narrow one is
+    /// charged what it returns rather than the set.
+    pub fn read_bytes(
+        &self,
+        slot: u16,
+        key: &[u8],
+        rows: ZsetRows,
+    ) -> Result<Option<u64>, StoreError> {
+        let Some(meta) = self.read_meta(slot, key)? else {
+            return Ok(None);
+        };
+        let len = u64::from(meta.size);
+        if len == 0 {
+            return Ok(Some(0));
+        }
+        let wanted = match rows {
+            ZsetRows::All => return Ok(Some(meta.bytes)),
+            ZsetRows::AtMost(n) => n.min(len),
+            ZsetRows::Ranks(start, stop) => {
+                let len = len as i64;
+                let norm = |i: i64| if i < 0 { len.saturating_add(i) } else { i };
+                let (from, to) = (norm(start).max(0), norm(stop).min(len - 1));
+                if from > to {
+                    return Ok(Some(0));
+                }
+                (to - from + 1) as u64
+            }
+        };
+        Ok(Some(wanted.saturating_mul(meta.bytes / len)))
+    }
+
     pub fn zscore(&self, slot: u16, key: &[u8], member: &[u8]) -> Result<Option<f64>, StoreError> {
         let Some(meta) = self.read_meta(slot, key)? else {
             return Ok(None);
@@ -427,48 +473,118 @@ impl<'a> ZSetStore<'a> {
         Ok(self.read_meta(slot, key)?.map_or(0, |m| m.size as u64))
     }
 
-    /// ZRANGE by rank (inclusive, negatives from end): (member, score) in
-    /// (score, member) order.
-    /// All (member, score) in ascending (score, member) order — the ZScore
-    /// CF is already ordered that way, so this is a single prefix scan.
+    /// The suffix, after a set's row prefix, that a forward walk starts
+    /// strictly after so it begins at the first row scored `from` or more.
+    /// Rows encoded one below `from` are visited too and the caller's bound
+    /// check skips them: no finite key sorts right below
+    /// `prefix || enc(from)` when a member may be any bytes.
+    fn after_score(from: f64) -> Vec<u8> {
+        encode_score(from)
+            .checked_sub(1)
+            .map_or_else(Vec::new, |e| e.to_be_bytes().to_vec())
+    }
+
+    /// The suffix a reverse walk starts strictly before, so it begins at
+    /// the last row scored `from` or less. Exact: every such row sorts below
+    /// `prefix || enc(from) + 1`.
+    fn before_score(from: f64) -> Vec<u8> {
+        encode_score(from)
+            .checked_add(1)
+            .map_or_else(Vec::new, |e| e.to_be_bytes().to_vec())
+    }
+
+    /// Walk a set's rows in score order, descending when `rev`, handing
+    /// `visit` each member and score until it returns false. `from` is a
+    /// suffix after the row prefix to start strictly after (forward) or
+    /// strictly before (reverse); empty starts at that end of the set.
     ///
-    /// **Bounded by the zset's cardinality, which is bounded by nothing.**
-    /// This comment used to end "a zset lives in ONE key, so this is bounded
-    /// by the zset's cardinality" and stop there, which is true and is the
-    /// reasoning BUG-0060 exists to reject: a tenant builds an arbitrarily
-    /// large zset with ordinary ZADDs and then asks for all of it, on any of
-    /// `max-conns` connections at once. One key is not a bound.
-    fn all_ordered(&self, slot: u16, key: &[u8]) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
+    /// Every sorted-set read goes through this, and reads only the rows it
+    /// is handed (BUG-0216). It replaced `all_ordered`, which built the
+    /// whole set before any read answered: ZRANK, ZCOUNT, ZPOPMIN and
+    /// `ZRANGE k 0 0` each cost about 80 ms on a 1M-member set, where Redis
+    /// answers in 0.12 ms, and each allocated the set outside BUG-0060's
+    /// admission. The rows are `prefix || score (8B, order-preserving) ||
+    /// member`, so key order is (score, member) order and a seek on a score
+    /// lands where the range starts.
+    fn walk(
+        &self,
+        slot: u16,
+        key: &[u8],
+        rev: bool,
+        from: &[u8],
+        visit: &mut dyn FnMut(&[u8], f64) -> bool,
+    ) -> Result<(), StoreError> {
         let Some(meta) = self.read_meta(slot, key)? else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let prefix = zscore_prefix(&self.ns, slot, key, meta.version);
-        // `for_each_prefix`, not `scan_prefix` — the SMEMBERS case exactly.
-        // A zset's member lives in the KEY, after the 8-byte score, so the
-        // materializing scan copies the whole collection to build its Vec and
-        // the suffix map copies it a second time. Streaming removes the first
-        // copy outright; hashes measured identical under the same edit only
-        // because they MOVE their values (ADR-0025).
-        //
-        // Scan order is already score order: the key is
-        // `prefix || score(8B big-endian) || member`, so ascending key order
-        // IS ascending score order and nothing needs sorting afterwards.
-        //
-        // This does NOT make the reply O(1) — the returned Vec still owns
-        // every member. That is the streaming-reply half of the ADR.
-        let mut out = Vec::new();
-        self.kv.for_each_prefix(&prefix, &mut |k, _| {
+        let start = if from.is_empty() {
+            Vec::new()
+        } else {
+            [prefix.as_slice(), from].concat()
+        };
+        let mut each = |k: &[u8], _: &[u8]| {
             let rest = &k[prefix.len()..];
             let score = decode_score(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
-            out.push((rest[8..].to_vec(), score));
-            true
-        });
-        Ok(out)
+            visit(&rest[8..], score)
+        };
+        if rev {
+            self.kv.for_each_before(&prefix, &start, &mut each);
+        } else {
+            self.kv.for_each_from(&prefix, &start, &mut each);
+        }
+        Ok(())
+    }
+
+    /// The rank window `[start, stop]` (negatives from the end), ascending,
+    /// or descending when `rev` (ZREVRANGE). Read from whichever end of the
+    /// set is nearer the window, so the top or the bottom of a large set
+    /// costs what is returned (BUG-0216).
+    fn rank_window(
+        &self,
+        slot: u16,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        rev: bool,
+    ) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
+        let len = self.zcard(slot, key)? as i64;
+        let norm = |i: i64| if i < 0 { len.saturating_add(i) } else { i };
+        let from = norm(start).max(0);
+        let to = norm(stop).min(len - 1);
+        if from > to {
+            return Ok(Vec::new());
+        }
+        // The window in ascending ranks, and the nearer end to read from.
+        let (lo, hi) = if rev {
+            (len - 1 - to, len - 1 - from)
+        } else {
+            (from, to)
+        };
+        let want = (hi - lo + 1) as usize;
+        let from_low = lo <= len - 1 - hi;
+        let mut skip = if from_low { lo } else { len - 1 - hi };
+        let mut rows = Vec::with_capacity(want.min(1024));
+        self.walk(slot, key, !from_low, b"", &mut |m, s| {
+            if skip > 0 {
+                skip -= 1;
+                return true;
+            }
+            rows.push((m.to_vec(), s));
+            rows.len() < want
+        })?;
+        // Read from the low end, the rows are ascending; from the high end,
+        // descending. Turn them to the order asked for.
+        if from_low == rev {
+            rows.reverse();
+        }
+        Ok(rows)
     }
 
     /// ZRANGEBYSCORE / ZREVRANGEBYSCORE: members whose score is in
     /// `[min,max]` (bounds may be exclusive), optionally reversed, then
-    /// LIMIT offset/count applied. Ascending output unless `rev`.
+    /// LIMIT offset/count applied. Ascending output unless `rev`. Seeks to
+    /// the near bound and stops at the far one or at `count` (BUG-0216).
     #[allow(clippy::too_many_arguments)]
     pub fn zrange_by_score(
         &self,
@@ -480,25 +596,49 @@ impl<'a> ZSetStore<'a> {
         offset: i64,
         count: i64,
     ) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
-        let mut hits: Vec<(Vec<u8>, f64)> = self
-            .all_ordered(slot, key)?
-            .into_iter()
-            .filter(|(_, sc)| min.ge_lower(*sc) && max.le_upper(*sc))
-            .collect();
-        if rev {
-            hits.reverse();
-        }
-        // LIMIT offset count (count < 0 = to the end); no LIMIT => all. A
-        // negative offset answers nothing, as Redis's skip loop does; it was
-        // read as 0 here (found with BUG-0215).
-        if offset < 0 {
+        // A negative offset answers nothing, as Redis's skip loop does; it
+        // was read as 0 here (found with BUG-0215). The type is checked
+        // first: another type's key is WRONGTYPE, whatever the LIMIT.
+        if self.read_meta(slot, key)?.is_none() || offset < 0 || count == 0 {
             return Ok(Vec::new());
         }
-        let off = (offset as usize).min(hits.len());
-        hits.drain(..off);
-        if count >= 0 {
-            hits.truncate(count as usize);
-        }
+        let limit = usize::try_from(count).unwrap_or(usize::MAX);
+        let mut skip = offset;
+        let mut hits = Vec::new();
+        let (near, far) = if rev { (&max, &min) } else { (&min, &max) };
+        let inside_near = |s: f64| {
+            if rev {
+                near.le_upper(s)
+            } else {
+                near.ge_lower(s)
+            }
+        };
+        let inside_far = |s: f64| {
+            if rev {
+                far.ge_lower(s)
+            } else {
+                far.le_upper(s)
+            }
+        };
+        let from = if rev {
+            Self::before_score(max.value)
+        } else {
+            Self::after_score(min.value)
+        };
+        self.walk(slot, key, rev, &from, &mut |m, s| {
+            if !inside_near(s) {
+                return true;
+            }
+            if !inside_far(s) {
+                return false;
+            }
+            if skip > 0 {
+                skip -= 1;
+                return true;
+            }
+            hits.push((m.to_vec(), s));
+            hits.len() < limit
+        })?;
         Ok(hits)
     }
 
@@ -506,19 +646,24 @@ impl<'a> ZSetStore<'a> {
     /// then LIMIT offset/count. Ascending output unless `rev`.
     ///
     /// WHY THIS WALKS AND STOPS INSTEAD OF FILTERING. The obvious body is
-    /// `all_ordered().filter(in range)`, and it is subtly not Redis. Redis
+    /// a filter over the whole set, and it is subtly not Redis. Redis
     /// seeks the first member past one bound and walks until one falls past
     /// the other, which differs from a filter exactly when scores are NOT
-    /// uniform:
-    /// the index is ordered by (score, member), so with mixed scores the
-    /// member sequence is not monotonic and a filter would collect members
-    /// that lie beyond the point Redis stops at.
+    /// uniform: the index is ordered by (score, member), so with mixed
+    /// scores the member sequence is not monotonic and a filter would
+    /// collect members that lie beyond the point Redis stops at.
     ///
     /// That case is documented as undefined, which is precisely why it must
     /// not be improvised — the conformance suite compares us against real
     /// Valkey, and "undefined" is only undefined until a corpus case lands
     /// on it. Matching the walk keeps us bit-identical wherever a client
     /// might stray, not merely wherever the docs promise.
+    ///
+    /// The walk is Redis's listpack walk, step for step (`zzlIsInLexRange`,
+    /// then `zzlFirstInLexRange` or `zzlLastInLexRange`, then the walk;
+    /// BUG-0215). When every member shares one score, the defined case,
+    /// score order is member order and the walk seeks straight to the bound
+    /// (BUG-0216); with mixed scores it reads from the end it starts at.
     #[allow(clippy::too_many_arguments)]
     pub fn zrange_by_lex(
         &self,
@@ -530,61 +675,88 @@ impl<'a> ZSetStore<'a> {
         offset: i64,
         count: i64,
     ) -> Result<Vec<Vec<u8>>, StoreError> {
-        let ordered: Vec<Vec<u8>> = self
-            .all_ordered(slot, key)?
-            .into_iter()
-            .map(|(m, _)| m)
-            .collect();
-        // Redis's listpack walk, step for step (`zzlIsInLexRange`, then
-        // `zzlFirstInLexRange` or `zzlLastInLexRange`, then the walk). This
-        // seeked the first member inside BOTH bounds until BUG-0215's
-        // differential: Redis seeks on one bound and stops at once if that
-        // member is past the other, which differs when scores are mixed.
+        let mut ends: [Option<(Vec<u8>, f64)>; 2] = [None, None];
+        for (i, end) in ends.iter_mut().enumerate() {
+            self.walk(slot, key, i == 1, b"", &mut |m, s| {
+                *end = Some((m.to_vec(), s));
+                false
+            })?;
+        }
+        let [Some((first, low)), Some((last, high))] = ends else {
+            return Ok(Vec::new());
+        };
         // 1. Empty unless the last member reaches the lower bound and the
         //    first is within the upper one.
-        let (Some(first), Some(last)) = (ordered.first(), ordered.last()) else {
-            return Ok(Vec::new());
-        };
-        if !min.ge_lower(last) || !max.le_upper(first) || offset < 0 {
+        if !min.ge_lower(&last) || !max.le_upper(&first) || offset < 0 || count == 0 {
             return Ok(Vec::new());
         }
-        // 2. Seek, forward to the first member at or above `min`, backward
-        //    to the last at or below `max`; that member must be within the
-        //    other bound. 3. Skip `offset` members, in range or not, then
-        //    walk while the far bound holds.
-        let limit = usize::try_from(count).unwrap_or(usize::MAX);
-        let skip = offset as usize;
-        let hits = if rev {
-            let Some(start) = ordered.iter().rposition(|m| max.le_upper(m)) else {
-                return Ok(Vec::new());
-            };
-            if !min.ge_lower(&ordered[start]) {
-                return Ok(Vec::new());
-            }
-            ordered[..=start]
-                .iter()
-                .rev()
-                .skip(skip)
-                .take_while(|m| min.ge_lower(m))
-                .take(limit)
-                .cloned()
-                .collect()
+        // 2. Seek: forward to the first member at or past `min`, backward to
+        //    the last at or below `max`. One score means member order, so
+        //    the seek can start at the bound itself.
+        let from = if encode_score(low) == encode_score(high) {
+            Self::lex_seek(low, if rev { max } else { min }, rev)
         } else {
-            let Some(start) = ordered.iter().position(|m| min.ge_lower(m)) else {
-                return Ok(Vec::new());
-            };
-            if !max.le_upper(&ordered[start]) {
-                return Ok(Vec::new());
-            }
-            ordered[start..]
-                .iter()
-                .skip(skip)
-                .take_while(|m| max.le_upper(m))
-                .take(limit)
-                .cloned()
-                .collect()
+            Vec::new()
         };
+        // 3. That member must be within the other bound. Then skip `offset`
+        //    members, in range or not, and walk while the far bound holds.
+        let limit = usize::try_from(count).unwrap_or(usize::MAX);
+        let mut skip = offset;
+        let mut started = false;
+        let mut hits = Vec::new();
+        let inside_near = |m: &[u8]| {
+            if rev {
+                max.le_upper(m)
+            } else {
+                min.ge_lower(m)
+            }
+        };
+        let inside_far = |m: &[u8]| {
+            if rev {
+                min.ge_lower(m)
+            } else {
+                max.le_upper(m)
+            }
+        };
+        self.walk(slot, key, rev, &from, &mut |m, _| {
+            if !started {
+                if !inside_near(m) {
+                    return true;
+                }
+                if !inside_far(m) {
+                    return false;
+                }
+                started = true;
+            }
+            if skip > 0 {
+                skip -= 1;
+                return true;
+            }
+            if !inside_far(m) {
+                return false;
+            }
+            hits.push(m.to_vec());
+            hits.len() < limit
+        })?;
         Ok(hits)
+    }
+
+    /// Where a lex walk over a set whose members all score `score` can
+    /// start: the suffix to start strictly after (forward, from `bound` as
+    /// a lower bound) or strictly before (reverse, as an upper bound).
+    /// Forward from `[v` it starts after `v` less its last byte, so a few
+    /// members below `v` may be visited and skipped; the rest are exact.
+    fn lex_seek(score: f64, bound: &LexBound, rev: bool) -> Vec<u8> {
+        let enc = encode_score(score).to_be_bytes();
+        let at = |member: &[u8]| [enc.as_slice(), member].concat();
+        match (rev, bound) {
+            (false, LexBound::Incl(v)) if !v.is_empty() => at(&v[..v.len() - 1]),
+            (false, LexBound::Excl(v)) => at(v),
+            (false, _) => Self::after_score(score),
+            (true, LexBound::Incl(v)) => at(&[v.as_slice(), &[0]].concat()),
+            (true, LexBound::Excl(v)) => at(v),
+            (true, _) => Self::before_score(score),
+        }
     }
 
     /// The destination side of ZUNIONSTORE / ZINTERSTORE: replace `key`
@@ -646,7 +818,8 @@ impl<'a> ZSetStore<'a> {
         self.zrem(slot, key, &doomed)
     }
 
-    /// ZCOUNT: members with score in `[min,max]`.
+    /// ZCOUNT: members with score in `[min,max]`, counted from a seek on
+    /// `min` without building them (BUG-0216).
     pub fn zcount(
         &self,
         slot: u16,
@@ -654,15 +827,33 @@ impl<'a> ZSetStore<'a> {
         min: ScoreBound,
         max: ScoreBound,
     ) -> Result<u64, StoreError> {
-        Ok(self
-            .all_ordered(slot, key)?
-            .into_iter()
-            .filter(|(_, sc)| min.ge_lower(*sc) && max.le_upper(*sc))
-            .count() as u64)
+        let mut n = 0u64;
+        self.walk(
+            slot,
+            key,
+            false,
+            &Self::after_score(min.value),
+            &mut |_, s| {
+                if !min.ge_lower(s) {
+                    return true;
+                }
+                if !max.le_upper(s) {
+                    return false;
+                }
+                n += 1;
+                true
+            },
+        )?;
+        Ok(n)
     }
 
     /// ZRANK / ZREVRANK: 0-based position of `member` in ascending (rev:
     /// descending) order; None if absent.
+    ///
+    /// Counted from the end the rank is measured from, without building
+    /// anything (BUG-0216), so the top of a leaderboard ranks cheaply. A
+    /// rank still costs its position: Redis's skiplist answers in O(log n),
+    /// which needs per-row counts this index does not keep.
     pub fn zrank(
         &self,
         slot: u16,
@@ -670,15 +861,19 @@ impl<'a> ZSetStore<'a> {
         member: &[u8],
         rev: bool,
     ) -> Result<Option<u64>, StoreError> {
-        let all = self.all_ordered(slot, key)?;
-        let Some(idx) = all.iter().position(|(m, _)| m.as_slice() == member) else {
+        let Some(score) = self.zscore(slot, key, member)? else {
             return Ok(None);
         };
-        Ok(Some(if rev {
-            (all.len() - 1 - idx) as u64
-        } else {
-            idx as u64
-        }))
+        let (mut before, mut found) = (0u64, false);
+        self.walk(slot, key, rev, b"", &mut |m, s| {
+            if s == score && m == member {
+                found = true;
+                return false;
+            }
+            before += 1;
+            true
+        })?;
+        Ok(found.then_some(before))
     }
 
     /// ZMSCORE: score of each member (None per missing).
@@ -692,7 +887,8 @@ impl<'a> ZSetStore<'a> {
     }
 
     /// ZPOPMIN / ZPOPMAX: remove and return up to `count` members from the
-    /// low (min) or high (max) end, in pop order.
+    /// low (min) or high (max) end, in pop order, reading only those
+    /// (BUG-0216).
     pub fn zpop(
         &self,
         slot: u16,
@@ -700,11 +896,13 @@ impl<'a> ZSetStore<'a> {
         count: usize,
         max_end: bool,
     ) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
-        let mut all = self.all_ordered(slot, key)?;
-        if max_end {
-            all.reverse();
+        let mut popped = Vec::new();
+        if count > 0 {
+            self.walk(slot, key, max_end, b"", &mut |m, s| {
+                popped.push((m.to_vec(), s));
+                popped.len() < count
+            })?;
         }
-        let popped: Vec<(Vec<u8>, f64)> = all.into_iter().take(count).collect();
         let members: Vec<Vec<u8>> = popped.iter().map(|(m, _)| m.clone()).collect();
         self.zrem(slot, key, &members)?;
         Ok(popped)
@@ -719,9 +917,8 @@ impl<'a> ZSetStore<'a> {
         max: ScoreBound,
     ) -> Result<u64, StoreError> {
         let doomed: Vec<Vec<u8>> = self
-            .all_ordered(slot, key)?
+            .zrange_by_score(slot, key, min, max, false, 0, -1)?
             .into_iter()
-            .filter(|(_, sc)| min.ge_lower(*sc) && max.le_upper(*sc))
             .map(|(m, _)| m)
             .collect();
         self.zrem(slot, key, &doomed)
@@ -736,17 +933,10 @@ impl<'a> ZSetStore<'a> {
         start: i64,
         stop: i64,
     ) -> Result<u64, StoreError> {
-        let all = self.all_ordered(slot, key)?;
-        let len = all.len() as i64;
-        let norm = |i: i64| if i < 0 { len + i } else { i };
-        let from = norm(start).max(0);
-        let to = norm(stop).min(len - 1);
-        if from > to || all.is_empty() {
-            return Ok(0);
-        }
-        let doomed: Vec<Vec<u8>> = all[from as usize..=to as usize]
-            .iter()
-            .map(|(m, _)| m.clone())
+        let doomed: Vec<Vec<u8>> = self
+            .rank_window(slot, key, start, stop, false)?
+            .into_iter()
+            .map(|(m, _)| m)
             .collect();
         self.zrem(slot, key, &doomed)
     }
@@ -761,20 +951,16 @@ impl<'a> ZSetStore<'a> {
         stop: i64,
         rev: bool,
     ) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
-        let mut all = self.all_ordered(slot, key)?;
-        if rev {
-            all.reverse();
-        }
-        let len = all.len() as i64;
-        let norm = |i: i64| if i < 0 { len + i } else { i };
-        let from = norm(start).max(0);
-        let to = norm(stop).min(len - 1);
-        if from > to {
-            return Ok(Vec::new());
-        }
-        Ok(all[from as usize..=to as usize].to_vec())
+        self.rank_window(slot, key, start, stop, rev)
     }
 
+    /// ZRANGE by rank, ascending.
+    ///
+    /// **`0 -1` is bounded by the zset's cardinality, which is bounded by
+    /// nothing.** A tenant builds an arbitrarily large zset with ordinary
+    /// ZADDs and then asks for all of it, on any of `max-conns` connections
+    /// at once; one key is not a bound, which is what BUG-0060's admission
+    /// is for.
     pub fn zrange(
         &self,
         slot: u16,
@@ -782,26 +968,7 @@ impl<'a> ZSetStore<'a> {
         start: i64,
         stop: i64,
     ) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
-        let Some(meta) = self.read_meta(slot, key)? else {
-            return Ok(Vec::new());
-        };
-        let prefix = zscore_prefix(&self.ns, slot, key, meta.version);
-        // Streamed rather than materialized, for the reason in `all_ordered`.
-        let mut all: Vec<(Vec<u8>, f64)> = Vec::new();
-        self.kv.for_each_prefix(&prefix, &mut |k, _| {
-            let rest = &k[prefix.len()..];
-            let score = decode_score(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
-            all.push((rest[8..].to_vec(), score));
-            true
-        });
-        let len = all.len() as i64;
-        let norm = |i: i64| if i < 0 { len + i } else { i };
-        let from = norm(start).max(0);
-        let to = norm(stop).min(len - 1);
-        if from > to {
-            return Ok(Vec::new());
-        }
-        Ok(all[from as usize..=to as usize].to_vec())
+        self.rank_window(slot, key, start, stop, false)
     }
 }
 
@@ -952,5 +1119,324 @@ mod tests {
         assert_eq!(z.zrem(1, b"z", &[b"a".to_vec(), b"x".to_vec()]), Ok(1));
         assert_eq!(z.zcard(1, b"z"), Ok(0));
         assert_eq!(z.zrange(1, b"z", 0, -1), Ok(vec![]));
+    }
+
+    /// A store that counts the rows its scans hand out.
+    struct CountingKv {
+        inner: MemKv,
+        rows: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingKv {
+        fn take(&self) -> usize {
+            self.rows.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+        fn counted<'a>(
+            &'a self,
+            visit: &'a mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) -> impl FnMut(&[u8], &[u8]) -> bool + 'a {
+            move |k, v| {
+                self.rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                visit(k, v)
+            }
+        }
+    }
+
+    impl Kv for CountingKv {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.inner.get(key)
+        }
+        fn put(&self, key: &[u8], value: &[u8]) {
+            self.inner.put(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> bool {
+            self.inner.delete(key)
+        }
+        fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+            self.inner.for_each_prefix(prefix, &mut self.counted(visit))
+        }
+        fn for_each_from(
+            &self,
+            prefix: &[u8],
+            start_after: &[u8],
+            visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) {
+            self.inner
+                .for_each_from(prefix, start_after, &mut self.counted(visit))
+        }
+        fn for_each_before(
+            &self,
+            prefix: &[u8],
+            start_before: &[u8],
+            visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) {
+            self.inner
+                .for_each_before(prefix, start_before, &mut self.counted(visit))
+        }
+        fn clear(&self) {
+            self.inner.clear()
+        }
+    }
+
+    /// BUG-0216: a one-element read on a large set reads a few rows, not the
+    /// set. Each of these read all 5,000 before the fix.
+    #[test]
+    fn one_element_reads_do_not_read_the_whole_set() {
+        let kv = CountingKv {
+            inner: MemKv::new(),
+            rows: Default::default(),
+        };
+        let z = ZSetStore::new(&kv, b"t", now);
+        let pairs: Vec<(f64, Vec<u8>)> = (0..5_000)
+            .map(|i| (f64::from(i), format!("m{i:05}").into_bytes()))
+            .collect();
+        z.zadd(1, b"z", &pairs).expect("zadd");
+        kv.take();
+        let bound = |raw: &str| ScoreBound::parse(raw.as_bytes()).expect("bound");
+        type Read<'a> = (&'a str, Box<dyn Fn() -> usize + 'a>);
+        let cases: Vec<Read> = vec![
+            (
+                "ZRANGE 0 0",
+                Box::new(|| z.zrange(1, b"z", 0, 0).expect("zrange").len()),
+            ),
+            (
+                "ZREVRANGE 0 9",
+                Box::new(|| z.zrange_rev(1, b"z", 0, 9, true).expect("zrange").len()),
+            ),
+            (
+                "ZRANGE -1 -1",
+                Box::new(|| z.zrange(1, b"z", -1, -1).expect("zrange").len()),
+            ),
+            (
+                "ZRANGEBYSCORE 2500 +inf LIMIT 0 1",
+                Box::new(|| {
+                    z.zrange_by_score(1, b"z", bound("2500"), bound("+inf"), false, 0, 1)
+                        .expect("by score")
+                        .len()
+                }),
+            ),
+            (
+                "ZREVRANGEBYSCORE 2500 -inf LIMIT 0 1",
+                Box::new(|| {
+                    z.zrange_by_score(1, b"z", bound("-inf"), bound("2500"), true, 0, 1)
+                        .expect("by score")
+                        .len()
+                }),
+            ),
+            (
+                "ZCOUNT 100 (103",
+                Box::new(|| {
+                    z.zcount(1, b"z", bound("100"), bound("(103"))
+                        .expect("zcount") as usize
+                }),
+            ),
+            (
+                "ZREVRANK m04998",
+                Box::new(|| {
+                    z.zrank(1, b"z", b"m04998", true)
+                        .expect("zrank")
+                        .map_or(9, |r| r as usize)
+                }),
+            ),
+            (
+                "ZPOPMIN",
+                Box::new(|| z.zpop(1, b"z", 1, false).expect("zpop").len()),
+            ),
+            (
+                "ZPOPMAX 2",
+                Box::new(|| z.zpop(1, b"z", 2, true).expect("zpop").len()),
+            ),
+        ];
+        for (name, run) in cases {
+            let got = run();
+            let rows = kv.take();
+            assert!(got > 0, "{name} answered nothing");
+            assert!(rows <= 12, "{name} read {rows} rows");
+        }
+    }
+
+    /// The seeking reads answer exactly what reading the whole set and
+    /// filtering it answers, over random sets of mixed and of uniform
+    /// scores, including the lex walk's Redis quirks.
+    #[test]
+    fn seeking_reads_agree_with_a_whole_set_model() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let letters = [
+            b"a".as_slice(),
+            b"b",
+            b"bb",
+            b"c",
+            b"d",
+            b"",
+            b"e\xff",
+            b"f",
+        ];
+        let scores = [-1.0, 0.0, 1.0, 1.5, 2.0, f64::INFINITY, f64::NEG_INFINITY];
+        let lex_bounds: Vec<LexBound> = [
+            "-", "+", "[a", "(a", "[b", "(bb", "[c", "(d", "[", "(", "[e", "[f",
+        ]
+        .iter()
+        .map(|b| LexBound::parse(b.as_bytes()).expect("lex"))
+        .collect();
+        let score_bounds: Vec<ScoreBound> = ["-inf", "+inf", "0", "(0", "1", "(1.5", "2", "(-1"]
+            .iter()
+            .map(|b| ScoreBound::parse(b.as_bytes()).expect("score"))
+            .collect();
+        for round in 0..300 {
+            let kv = MemKv::new();
+            let z = ZSetStore::new(&kv, b"t", now);
+            let uniform = round % 2 == 0;
+            for m in letters {
+                if rand(3) > 0 {
+                    let s = if uniform {
+                        0.0
+                    } else {
+                        scores[rand(scores.len() as u64) as usize]
+                    };
+                    z.zadd(1, b"z", &[(s, m.to_vec())]).expect("zadd");
+                }
+            }
+            // The model: every row, in (score, member) order.
+            let mut all: Vec<(Vec<u8>, f64)> = Vec::new();
+            for m in letters {
+                if let Ok(Some(s)) = z.zscore(1, b"z", m) {
+                    all.push((m.to_vec(), s));
+                }
+            }
+            all.sort_by(|a, b| {
+                encode_score(a.1)
+                    .cmp(&encode_score(b.1))
+                    .then(a.0.cmp(&b.0))
+            });
+            let n = all.len() as i64;
+            for (start, stop) in [(0, 0), (0, -1), (-1, -1), (1, 3), (-3, -2), (2, 1), (-9, 9)] {
+                for rev in [false, true] {
+                    let mut model = all.clone();
+                    if rev {
+                        model.reverse();
+                    }
+                    let norm = |i: i64| if i < 0 { n + i } else { i };
+                    let (from, to) = (norm(start).max(0), norm(stop).min(n - 1));
+                    let want = if from > to {
+                        vec![]
+                    } else {
+                        model[from as usize..=to as usize].to_vec()
+                    };
+                    assert_eq!(
+                        z.zrange_rev(1, b"z", start, stop, rev),
+                        Ok(want),
+                        "rank {start} {stop} {rev}"
+                    );
+                }
+            }
+            for min in &score_bounds {
+                for max in &score_bounds {
+                    let inside: Vec<(Vec<u8>, f64)> = all
+                        .iter()
+                        .filter(|(_, s)| min.ge_lower(*s) && max.le_upper(*s))
+                        .cloned()
+                        .collect();
+                    assert_eq!(z.zcount(1, b"z", *min, *max), Ok(inside.len() as u64));
+                    for (offset, count) in [(0, -1), (1, 1), (0, 2), (-1, 2), (5, -1)] {
+                        for rev in [false, true] {
+                            let mut want = inside.clone();
+                            if rev {
+                                want.reverse();
+                            }
+                            let want: Vec<_> = if offset < 0 {
+                                vec![]
+                            } else {
+                                want.into_iter()
+                                    .skip(offset as usize)
+                                    .take(usize::try_from(count).unwrap_or(usize::MAX))
+                                    .collect()
+                            };
+                            assert_eq!(
+                                z.zrange_by_score(1, b"z", *min, *max, rev, offset, count),
+                                Ok(want)
+                            );
+                        }
+                    }
+                }
+            }
+            for (i, (m, _)) in all.iter().enumerate() {
+                assert_eq!(z.zrank(1, b"z", m, false), Ok(Some(i as u64)));
+                assert_eq!(
+                    z.zrank(1, b"z", m, true),
+                    Ok(Some((all.len() - 1 - i) as u64))
+                );
+            }
+            // Redis's listpack lex walk, on the model.
+            let members: Vec<Vec<u8>> = all.iter().map(|(m, _)| m.clone()).collect();
+            for min in &lex_bounds {
+                for max in &lex_bounds {
+                    for (offset, count) in [(0, -1), (1, 1), (0, 2), (2, -1)] {
+                        for rev in [false, true] {
+                            let want = lex_model(&members, min, max, rev, offset, count);
+                            assert_eq!(
+                                z.zrange_by_lex(1, b"z", min, max, rev, offset, count),
+                                Ok(want),
+                                "lex {min:?} {max:?} rev {rev} limit {offset} {count} on {members:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `zzlIsInLexRange`, `zzlFirstInLexRange`/`zzlLastInLexRange` and the
+    /// walk, over a materialised member list: the BUG-0215 implementation.
+    fn lex_model(
+        ordered: &[Vec<u8>],
+        min: &LexBound,
+        max: &LexBound,
+        rev: bool,
+        offset: i64,
+        count: i64,
+    ) -> Vec<Vec<u8>> {
+        let (Some(first), Some(last)) = (ordered.first(), ordered.last()) else {
+            return vec![];
+        };
+        if !min.ge_lower(last) || !max.le_upper(first) || offset < 0 {
+            return vec![];
+        }
+        let limit = usize::try_from(count).unwrap_or(usize::MAX);
+        if rev {
+            let Some(start) = ordered.iter().rposition(|m| max.le_upper(m)) else {
+                return vec![];
+            };
+            if !min.ge_lower(&ordered[start]) {
+                return vec![];
+            }
+            ordered[..=start]
+                .iter()
+                .rev()
+                .skip(offset as usize)
+                .take_while(|m| min.ge_lower(m))
+                .take(limit)
+                .cloned()
+                .collect()
+        } else {
+            let Some(start) = ordered.iter().position(|m| min.ge_lower(m)) else {
+                return vec![];
+            };
+            if !max.le_upper(&ordered[start]) {
+                return vec![];
+            }
+            ordered[start..]
+                .iter()
+                .skip(offset as usize)
+                .take_while(|m| max.le_upper(m))
+                .take(limit)
+                .cloned()
+                .collect()
+        }
     }
 }

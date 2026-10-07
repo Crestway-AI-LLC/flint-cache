@@ -1099,6 +1099,25 @@ impl Kv for KeyGuard<'_> {
         });
     }
 
+    fn for_each_before(
+        &self,
+        prefix: &[u8],
+        start_before: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        let Some(owner) = self.scan_owner(prefix) else {
+            return;
+        };
+        self.under
+            .for_each_before(prefix, start_before, &mut |k, v| {
+                if row_owner(k).is_some_and(|(_, key)| key == owner.as_slice()) {
+                    visit(k, v)
+                } else {
+                    true
+                }
+            });
+    }
+
     fn clear(&self) {
         let mut s = self.strayed.lock().unwrap_or_else(|e| e.into_inner());
         s.get_or_insert(Stray::Keyspace);

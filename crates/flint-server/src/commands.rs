@@ -20,7 +20,7 @@ use flint_storage::strings::{
     BitfieldKind, BitfieldOp, BitfieldOverflow, Clock, SetExpiry, SetOptions, SetOutcome,
     StoreError, StringStore, parse_redis_i64,
 };
-use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore, ZaddFlags};
+use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore, ZaddFlags, ZsetRows};
 
 /// The JSON commands ADR-0055 added.
 mod json;
@@ -345,9 +345,12 @@ impl<'a> Dispatcher<'a> {
     /// Membership is decided by whether the command materialises the WHOLE
     /// collection, not by whether it looks like a range:
     ///
-    /// - `ZRANGE` and friends are IN even though they take bounds, because
-    ///   `ZSetStore::zrange` builds the entire ordered set and then slices it.
-    ///   A narrow range costs the whole zset today.
+    /// - `ZRANGE` and friends are IN, costed on what they can return: a rank
+    ///   window its length, a LIMIT its count, and a score or lex range
+    ///   without one the whole set. They were charged the whole set while
+    ///   `ZSetStore` built the entire ordered set and sliced it; since
+    ///   BUG-0216 a read stops where it is told to. ZPOPMIN and ZPOPMAX are
+    ///   IN for their count, the same way.
     /// - `LRANGE` is IN, but costed against the REQUESTED SLICE rather than the
     ///   key: `ListStore::lrange` reads only the ranks asked for, so charging
     ///   it the whole list would refuse `LRANGE key 0 0` on a large one. It was
@@ -367,7 +370,15 @@ impl<'a> Dispatcher<'a> {
             b"HGETALL" | b"HKEYS" | b"HVALS" => self.hashes.stored_bytes(slot, key),
             b"SMEMBERS" => self.sets.stored_bytes(slot, key),
             b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE" | b"ZRANGEBYLEX"
-            | b"ZREVRANGEBYLEX" => self.zsets.stored_bytes(slot, key),
+            | b"ZREVRANGEBYLEX" => {
+                self.zsets
+                    .read_bytes(slot, key, zset_read_rows(name_upper, args))
+            }
+            b"ZPOPMIN" | b"ZPOPMAX" => {
+                let count = args.get(2).map_or(Some(1), |c| parse_i64(c).ok())?;
+                self.zsets
+                    .read_bytes(slot, key, ZsetRows::AtMost(count.max(0) as u64))
+            }
             // Costed on the slice, not the key. Bounds that do not parse are
             // NOT admitted as zero: the command's own error answers that, and
             // sizing a request that will never run would bound nothing.
@@ -3865,6 +3876,33 @@ fn parse_f64(raw: &[u8]) -> Result<f64, ()> {
     }
 }
 
+/// How many rows a ZRANGE-family read can return, for BUG-0060's
+/// admission (BUG-0216). A LIMIT with a count of -1 is no LIMIT, as Redis
+/// reads it, and a rank range ignores one; arguments that do not parse are
+/// left to the command's own error, sized as the whole set.
+fn zset_read_rows(name_upper: &[u8], args: &[Vec<u8>]) -> ZsetRows {
+    let opts = args.get(4..).unwrap_or_default();
+    let has = |word: &[u8]| opts.iter().any(|a| a.eq_ignore_ascii_case(word));
+    let by_rank = matches!(name_upper, b"ZREVRANGE")
+        || name_upper == b"ZRANGE" && !has(b"BYSCORE") && !has(b"BYLEX");
+    if by_rank {
+        return match (
+            args.get(2).map(|a| parse_i64(a)),
+            args.get(3).map(|a| parse_i64(a)),
+        ) {
+            (Some(Ok(start)), Some(Ok(stop))) => ZsetRows::Ranks(start, stop),
+            _ => ZsetRows::All,
+        };
+    }
+    let limit = opts
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case(b"LIMIT"))
+        .and_then(|i| opts.get(i + 2))
+        .and_then(|c| parse_i64(c).ok())
+        .filter(|c| *c >= 0);
+    limit.map_or(ZsetRows::All, |c| ZsetRows::AtMost(c as u64))
+}
+
 /// The instant an `EX`, `PX`, `EXAT` or `PXAT` argument of SET, SETEX or
 /// GETEX names, in unix ms, or Redis's refusal (BUG-0213): a count of zero
 /// or less, absolute or not, or one whose milliseconds, or whose sum with
@@ -5359,6 +5397,48 @@ mod tests {
     /// Redis 7's EXPIRE conditions (BUG-0185), on all four commands: a key
     /// with no expiry counts as never expiring, a missing key answers 0, and
     /// the options are checked before the number, with upstream's errors.
+    /// BUG-0216: BUG-0060's admission charges a sorted-set read what it can
+    /// return. 100 members of 4 bytes cost 12 each with their scores.
+    #[test]
+    fn a_sorted_set_read_is_sized_by_what_it_returns() {
+        let s = MemKv::new();
+        let mut zadd = vec!["ZADD".to_string(), "z".to_string()];
+        for i in 0..100 {
+            zadd.push(i.to_string());
+            zadd.push(format!("m{i:03}"));
+        }
+        let zadd: Vec<&str> = zadd.iter().map(String::as_str).collect();
+        assert_eq!(ev(&s, &zadd), Value::Integer(100));
+        let d = Dispatcher::new(&s, system_clock);
+        let size = |parts: &[&str]| {
+            let args: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+            d.collection_read_bytes(&args[0].to_ascii_uppercase(), &args)
+        };
+        assert_eq!(size(&["ZRANGE", "z", "0", "0"]), Some(12));
+        assert_eq!(size(&["ZRANGE", "z", "0", "-1"]), Some(1200));
+        assert_eq!(size(&["ZREVRANGE", "z", "0", "9", "WITHSCORES"]), Some(120));
+        assert_eq!(
+            size(&["ZRANGE", "z", "0", "-1", "LIMIT", "0", "-1"]),
+            Some(1200)
+        );
+        assert_eq!(
+            size(&["ZRANGE", "z", "-inf", "+inf", "BYSCORE"]),
+            Some(1200)
+        );
+        assert_eq!(
+            size(&["ZRANGE", "z", "-inf", "+inf", "BYSCORE", "LIMIT", "0", "2"]),
+            Some(24)
+        );
+        assert_eq!(
+            size(&["ZRANGEBYSCORE", "z", "-inf", "+inf", "LIMIT", "5", "1"]),
+            Some(12)
+        );
+        assert_eq!(size(&["ZRANGEBYLEX", "z", "-", "+"]), Some(1200));
+        assert_eq!(size(&["ZPOPMIN", "z"]), Some(12));
+        assert_eq!(size(&["ZPOPMAX", "z", "500"]), Some(1200));
+        assert_eq!(size(&["ZRANGE", "nosuch", "0", "-1"]), None);
+    }
+
     /// BUG-0213. Not a corpus case: the reference's answer depends on how
     /// it was compiled (`string_expiry`), so only Flint's is pinned here.
     #[test]

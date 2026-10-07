@@ -150,6 +150,15 @@ impl Kv for WatchedKv {
         self.under.for_each_from(prefix, start_after, visit);
     }
 
+    fn for_each_before(
+        &self,
+        prefix: &[u8],
+        start_before: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        self.under.for_each_before(prefix, start_before, visit);
+    }
+
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.under.scan_prefix(prefix)
     }
