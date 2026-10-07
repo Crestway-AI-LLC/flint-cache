@@ -73,4 +73,15 @@ echo "  after restart, alpha GET -> $MOVED2"
 echo "$MOVED2" | grep -qE "MOVED $SLOT_A 127.0.0.1:7000" || { echo "FAIL: override lost across restart: $MOVED2"; exit 1; }
 [ "$(valkey-cli -p $PORT GET "{beta}:k")" = "vb" ] || { echo "FAIL: beta lost across restart"; exit 1; }
 
-echo "PASS: per-slot -MOVED enforcement works and survives restart; unrelated slots unaffected"
+echo "== a keyspace SCAN names no slot, whatever its cursor hashes to (BUG-0221)"
+# The cursor `0` hashes to slot 13907. Read as a key, it made `SCAN 0`
+# answer -MOVED once that slot was handed off, and `redis-cli --scan`
+# through the proxy failed on the first page.
+HANDOFF=$(valkey-cli -p $PORT FLINTSLOTMOVED 13907 "127.0.0.1:7000" 2>&1)
+echo "$HANDOFF" | grep -q "moved to" || { echo "FAIL: FLINTSLOTMOVED 13907 rejected: $HANDOFF"; exit 1; }
+SC=$(valkey-cli -p $PORT SCAN 0 COUNT 100 2>&1)
+echo "$SC" | grep -q MOVED && { echo "FAIL: SCAN 0 was redirected by its cursor: $SC"; exit 1; }
+echo "$SC" | grep -qx '{beta}:k' || { echo "FAIL: SCAN 0 did not list {beta}:k: $SC"; exit 1; }
+echo "  SCAN 0 served with slot 13907 handed off"
+
+echo "PASS: per-slot -MOVED enforcement works and survives restart; unrelated slots unaffected; SCAN's cursor is not a key"

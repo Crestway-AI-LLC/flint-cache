@@ -4693,6 +4693,23 @@ fn transaction_control(
             return Some(Value::Simple("OK".into()));
         }
         b"UNWATCH" => {
+            if args.len() != 1 {
+                if let Some(txn) = conn_txn.open.as_mut() {
+                    txn.poisoned = true;
+                }
+                return Some(Value::Error(
+                    "ERR wrong number of arguments for 'unwatch' command".into(),
+                ));
+            }
+            // Inside a transaction UNWATCH is queued, as upstream queues it
+            // (BUG-0220). The watches are what EXEC is about to check, so
+            // dropping them here let EXEC apply over a write that should
+            // have aborted it. EXEC clears every watch itself, which leaves
+            // the queued UNWATCH nothing to do there but answer OK.
+            if let Some(txn) = conn_txn.open.as_mut() {
+                txn.queued.push(args.to_vec());
+                return Some(Value::Simple("QUEUED".into()));
+            }
             conn_txn.watches.clear();
             return Some(Value::Simple("OK".into()));
         }
@@ -5172,6 +5189,12 @@ fn exec_transaction(
         let ro_store = flint_storage::ReadOnlyKv(&batching);
         let engine: &dyn Kv = if ro { &ro_store } else { &batching };
         for cmd in &txn.queued {
+            // A queued UNWATCH (BUG-0220): EXEC has checked and cleared the
+            // watches already.
+            if cmd[0].eq_ignore_ascii_case(b"UNWATCH") {
+                replies.push(Value::Simple("OK".into()));
+                continue;
+            }
             replies.push(
                 Dispatcher::with_limits(
                     engine,

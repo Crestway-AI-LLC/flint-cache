@@ -830,6 +830,17 @@ impl Topology {
             .flatten()
     }
 
+    /// Does one node hold every key `ns` has? A placed tenant's pair does
+    /// (ADR-0053), and so does the only pair of a one-pair fleet.
+    fn keyspace_on_one_pair(&self, ns: &[u8]) -> bool {
+        self.placed_pair(ns).is_some()
+            || (self.clusters.len() == 1
+                && self.clusters[0]
+                    .routing
+                    .read()
+                    .is_ok_and(|r| r.pairs.len() <= 1))
+    }
+
     fn route_replica(&self, ns: &[u8], slot: u16) -> Option<String> {
         let master = self.route(ns, slot)?;
         let routing = self.cluster_for(slot).routing.read().ok()?;
@@ -1603,6 +1614,10 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         b"SCRIPT",
         b"KEYS",
         b"TIME",
+        // A keyspace SCAN's argument is its cursor, not a key (BUG-0221):
+        // read as one, it bound a transaction to the cursor's slot and was
+        // sampled into the hot-key table as a read of key `0`.
+        b"SCAN",
     ];
     if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return None;
@@ -2939,10 +2954,9 @@ struct ProxyTxn {
     /// MULTI has been forwarded to `addr`. Deferred because the proxy
     /// cannot know which backend to open it on until a key appears.
     opened: bool,
-    /// One entry per command the backend QUEUED: whether that command's
-    /// null is a null ARRAY. RESP3 has one null, so EXEC's reply cannot say
-    /// which it was; this does (see the EXEC arm).
-    null_arrays: Vec<bool>,
+    /// One entry per command this transaction QUEUED, in order: the
+    /// backend's, or one queued here (see `Queued` and the EXEC arm).
+    queued: Vec<Queued>,
     /// The transaction was aborted while the client still has it open
     /// (BUG-0190). Its backend connection is gone, and with it the queue;
     /// until EXEC or DISCARD, every command answers QUEUED and none runs,
@@ -2953,12 +2967,22 @@ struct ProxyTxn {
     writes: Vec<Vec<Vec<u8>>>,
 }
 
+/// One command a transaction has queued.
+enum Queued {
+    /// Queued on the backend. Whether its null is a null ARRAY: RESP3 has
+    /// one null, so EXEC's reply cannot say which it was; this does.
+    Backend { null_array: bool },
+    /// Queued here, with nothing for a backend to do: the reply EXEC owes
+    /// in its place (BUG-0220).
+    Local(Value),
+}
+
 impl ProxyTxn {
     fn reset(&mut self) {
         self.open = false;
         self.addr = None;
         self.opened = false;
-        self.null_arrays.clear();
+        self.queued.clear();
         self.doomed = false;
         self.writes.clear();
     }
@@ -2984,6 +3008,14 @@ fn abort_txn(backends: &mut Backends, txn: &mut ProxyTxn, why: &str) -> Value {
     Value::Error(format!(
         "EXECABORT Transaction discarded: {why}. Retry the transaction."
     ))
+}
+
+/// Refuse a command as upstream refuses one that cannot be queued: the
+/// client hears why now, and EXEC answers EXECABORT. Retrying would be
+/// refused the same way, so this does not say "retry" as `abort_txn` does.
+fn refuse_in_txn(backends: &mut Backends, txn: &mut ProxyTxn, why: String) -> Value {
+    let _ = abort_txn(backends, txn, "");
+    Value::Error(why)
 }
 
 /// Send one frame to a pinned backend with NO retry and no rerouting.
@@ -3086,7 +3118,27 @@ async fn transaction_step(
                 Err(why) => Some(abort_txn(backends, txn, &why)),
             }
         }
-        b"UNWATCH" => {
+        // Inside a transaction UNWATCH is queued, as upstream queues it
+        // (BUG-0220), so EXEC still checks the watches it would drop. Bound
+        // to a backend, it queues there (the arm below); unbound, nothing is
+        // watched, so it is queued here and EXEC answers OK in its place.
+        b"UNWATCH" if txn.open && txn.addr.is_none() => {
+            if args.len() != 1 {
+                return Some(refuse_in_txn(
+                    backends,
+                    txn,
+                    "ERR wrong number of arguments for 'unwatch' command".into(),
+                ));
+            }
+            txn.queued.push(Queued::Local(Value::Simple("OK".into())));
+            Some(Value::Simple("QUEUED".into()))
+        }
+        b"UNWATCH" if !txn.open => {
+            if args.len() != 1 {
+                return Some(Value::Error(
+                    "ERR wrong number of arguments for 'unwatch' command".into(),
+                ));
+            }
             let Some(addr) = txn.addr.clone() else {
                 // Nothing was ever watched through this proxy connection.
                 return Some(Value::Simple("OK".into()));
@@ -3095,9 +3147,7 @@ async fn transaction_step(
                 Ok(v) => v,
                 Err(why) => return Some(abort_txn(backends, txn, &why)),
             };
-            if !txn.open {
-                txn.addr = None;
-            }
+            txn.addr = None;
             Some(reply)
         }
         b"MULTI" => {
@@ -3160,9 +3210,18 @@ async fn transaction_step(
             let pending = txn.opened.then(|| txn.addr.clone()).flatten();
             let mut ended = std::mem::take(txn);
             match pending {
-                // MULTI ... EXEC with nothing in between: no backend was
-                // ever chosen, and the answer is the empty array.
-                None => Some(Value::Array(Some(Vec::new()))),
+                // No backend was ever chosen: whatever was queued, was
+                // queued here.
+                None => Some(Value::Array(Some(
+                    ended
+                        .queued
+                        .into_iter()
+                        .filter_map(|q| match q {
+                            Queued::Local(v) => Some(v),
+                            Queued::Backend { .. } => None,
+                        })
+                        .collect(),
+                ))),
                 Some(addr) => Some(match call_pinned(backends, &addr, raw).await {
                     // RESP3 has exactly ONE null, and the backend hop always
                     // speaks it (see the HELLO 3 handshake). So the node's
@@ -3180,15 +3239,28 @@ async fn transaction_step(
                     // The same loss inside the reply: a queued command
                     // whose null is an array, such as a BLPOP that found
                     // nothing (ADR-0052 D4), which RESP3 also sends as `_`
-                    // (`flint_resp::null_is_array`).
-                    Ok(Value::Array(Some(items))) if items.len() == ended.null_arrays.len() => {
+                    // (`flint_resp::null_is_array`). And the replies queued
+                    // here go back in their places.
+                    Ok(Value::Array(Some(items)))
+                        if items.len()
+                            == ended
+                                .queued
+                                .iter()
+                                .filter(|q| matches!(q, Queued::Backend { .. }))
+                                .count() =>
+                    {
+                        let mut items = items.into_iter();
                         Value::Array(Some(
-                            items
-                                .into_iter()
-                                .zip(&ended.null_arrays)
-                                .map(|(v, &array)| match v {
-                                    Value::Null if array => Value::Array(None),
-                                    other => other,
+                            ended
+                                .queued
+                                .drain(..)
+                                .map(|q| match q {
+                                    Queued::Local(v) => v,
+                                    Queued::Backend { null_array } => match items.next() {
+                                        Some(Value::Null) if null_array => Value::Array(None),
+                                        Some(v) => v,
+                                        None => Value::Null,
+                                    },
                                 })
                                 .collect(),
                         ))
@@ -3197,6 +3269,24 @@ async fn transaction_step(
                     Err(why) => abort_txn(backends, &mut ended, &why),
                 }),
             }
+        }
+        // Outside a transaction `handle` fans these out over every pair.
+        // Queued, they answer for the one node the transaction runs on:
+        // FLUSHALL flushed one pair and answered OK, DBSIZE counted one
+        // pair's keys, and SCAN ended at that pair's last key (BUG-0222).
+        // Served only where that node holds the whole keyspace.
+        b"DBSIZE" | b"SCAN" | b"FLUSHALL" | b"FLUSHDB"
+            if txn.open && !topo.keyspace_on_one_pair(ns) =>
+        {
+            Some(refuse_in_txn(
+                backends,
+                txn,
+                format!(
+                    "ERR {} inside a transaction would answer for one shard of this \
+                     keyspace; send it outside MULTI",
+                    String::from_utf8_lossy(&name)
+                ),
+            ))
         }
         _ if txn.open => {
             // A command to queue. Bind the backend if this is the first one
@@ -3236,7 +3326,9 @@ async fn transaction_step(
             match call_pinned(backends, &addr, raw).await {
                 Ok(v) => {
                     if matches!(&v, Value::Simple(q) if q == "QUEUED") {
-                        txn.null_arrays.push(flint_resp::null_is_array(args));
+                        txn.queued.push(Queued::Backend {
+                            null_array: flint_resp::null_is_array(args),
+                        });
                     }
                     Some(v)
                 }
@@ -5740,6 +5832,15 @@ mod prefetch_tests {
         assert_eq!(
             route_key(&["SCRIPT", "LOAD", "x"].map(|p| p.as_bytes().to_vec())),
             None
+        );
+        // BUG-0221: a keyspace SCAN's argument is its cursor.
+        assert_eq!(
+            route_key(&["SCAN", "0"].map(|p| p.as_bytes().to_vec())),
+            None
+        );
+        assert_eq!(
+            route_key(&["SSCAN", "s", "0"].map(|p| p.as_bytes().to_vec())),
+            Some(&b"s"[..])
         );
 
         // An MGET within one slot is ordinary keyed traffic and still stages;

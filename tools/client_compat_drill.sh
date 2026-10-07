@@ -345,6 +345,28 @@ def flushdb():
     assert r.flushdb() is True, "flushdb did not answer OK"
     assert r.dbsize() == 0, f"{r.dbsize()} keys survived FLUSHDB"
 check("FLUSHDB empties the tenant's keyspace", flushdb)
+def keyspace_commands_in_a_transaction():
+    # BUG-0222: redis-py's pipeline() is a transaction by default. Queued in
+    # one, FLUSHDB flushed the pair the transaction ran on and answered OK;
+    # DBSIZE counted that pair's keys, and SCAN ended at that pair.
+    r.set("a", "1"); r.set("b", "1")  # one on each pair
+    for name, queue in (("FLUSHDB", lambda p: p.flushdb()),
+                        ("DBSIZE", lambda p: p.dbsize()),
+                        ("SCAN", lambda p: p.scan(0))):
+        p = r.pipeline()
+        queue(p)
+        try:
+            p.execute()
+        except redis.ResponseError as e:
+            assert "one shard" in str(e), f"{name} refused, but how: {e}"
+        else:
+            raise AssertionError(f"{name} in a transaction across two pairs was served")
+    assert r.mget("a", "b") == ["1", "1"], "the refused FLUSHDB flushed something"
+    # Not a transaction: each command fans out as it would on its own.
+    p = r.pipeline(transaction=False)
+    p.flushdb(); p.dbsize()
+    assert p.execute() == [True, 0], "a plain pipeline's FLUSHDB left keys"
+check("FLUSHDB, DBSIZE and SCAN in a transaction across pairs are refused", keyspace_commands_in_a_transaction)
 
 print("== a connection name (BUG-0183)")
 # CLIENT was unknown, and redis-py treats a failed CLIENT SETNAME as fatal:
@@ -605,6 +627,16 @@ def spread_still_refused():
     else:
         raise AssertionError("a spread tenant's transaction across pairs was served")
 check("a spread tenant's transaction across pairs is still refused", spread_still_refused)
+def keyspace_commands_in_a_placed_transaction():
+    # BUG-0222's other side: a placed tenant's pair holds its whole keyspace,
+    # so a transaction there answers for all of it.
+    j.set("a", "1"); j.set("b", "2")
+    p = j.pipeline()
+    p.dbsize(); p.flushdb(); p.dbsize()
+    got = p.execute()
+    assert got[0] >= 2 and got[1:] == [True, 0], f"-> {got!r}"
+    assert j.mget("a", "b") == [None, None], "FLUSHDB left keys"
+check("a placed tenant's transaction runs FLUSHDB and DBSIZE", keyspace_commands_in_a_placed_transaction)
 
 if fails:
     print(f"\nFAIL: {len(fails)} placed-tenant problem(s): {', '.join(fails)}")

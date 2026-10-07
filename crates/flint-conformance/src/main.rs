@@ -2469,6 +2469,20 @@ fn corpus() -> Vec<Case> {
                 s(&[b"MULTI"], Expect::Ok),
                 s(&[b"GET", b"{wt}k"], Expect::Simple("QUEUED")),
                 s(&[b"EXEC"], Expect::Arr(vec![Expect::Str(b"7")])),
+                // Inside a transaction UNWATCH is QUEUED, not run (BUG-0220):
+                // the watch it would drop is the one EXEC checks, so a broken
+                // watch still aborts. Without a watch, EXEC answers OK for it.
+                s(&[b"WATCH", b"{wt}k"], Expect::Ok),
+                s(&[b"SET", b"{wt}k", b"7"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"UNWATCH"], Expect::Simple("QUEUED")),
+                s(&[b"SET", b"{wt}k", b"lost"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::NilArray),
+                s(&[b"GET", b"{wt}k"], Expect::Str(b"7")),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"UNWATCH"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::Arr(vec![Expect::Ok])),
+                s(&[b"UNWATCH", b"x"], Expect::AnyError),
                 // DISCARD clears watches as well as the queue.
                 s(&[b"WATCH", b"{wt}k"], Expect::Ok),
                 s(&[b"MULTI"], Expect::Ok),

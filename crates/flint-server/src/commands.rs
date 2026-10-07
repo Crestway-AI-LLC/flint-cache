@@ -57,6 +57,10 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         b"SCRIPT",
         b"KEYS",
         b"TIME",
+        // A keyspace SCAN's argument is its cursor (BUG-0221). Read as a
+        // key, a cursor hashing to a handed-off slot answered -MOVED, and
+        // inside a transaction it bound the transaction to its slot.
+        b"SCAN",
     ];
     if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return None;
@@ -6331,6 +6335,18 @@ return nil"#;
         assert_eq!(command_key(&a(&["EVAL", "return 1", "0"])), None);
         assert_eq!(command_key(&a(&["SCRIPT", "LOAD", "x"])), None);
         assert_eq!(command_key(&a(&["KEYS", "*"])), None);
+    }
+
+    /// BUG-0221: a keyspace SCAN names no key, so no cursor can be taken for
+    /// one. `0` hashes to slot 13907; with that slot handed off, `SCAN 0`
+    /// answered -MOVED. The collection scans' first argument IS their key.
+    #[test]
+    fn a_keyspace_scan_names_no_key() {
+        let a = |p: &[&str]| p.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert_eq!(command_key(&a(&["SCAN", "0"])), None);
+        assert_eq!(command_key(&a(&["scan", "17", "MATCH", "k*"])), None);
+        assert_eq!(command_key(&a(&["HSCAN", "h", "0"])), Some(&b"h"[..]));
+        assert_eq!(command_key(&a(&["ZSCAN", "z", "0"])), Some(&b"z"[..]));
     }
 
     /// BUG-0182: HMSET is HSET answering +OK, and its errors name it.

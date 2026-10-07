@@ -130,6 +130,20 @@ single-slot, all or nothing. See "Lua scripts" below (ADR-0051).
 > rq and Sidekiq name keys that cannot share a hash tag, and need this. The
 > operator places a tenant when creating it (`self-hosting.md`).
 >
+> **DBSIZE, SCAN, FLUSHDB and FLUSHALL inside a transaction** are refused
+> through the proxy, poisoning it, unless the tenant's keys all live on the
+> node the transaction runs on: a placed tenant, or a fleet of one pair.
+> Outside a transaction each fans out over every pair; inside one it would
+> answer for that one node, so FLUSHDB would flush part of the keyspace and
+> answer OK (BUG-0222). redis-py's `pipeline()` is a transaction by
+> default; `pipeline(transaction=False)` sends them as ordinary commands.
+> KEYS and INFO are answered by the proxy only outside a transaction, and
+> inside one are refused as unknown.
+>
+> **HELLO and AUTH inside a transaction** are answered at once by the proxy
+> rather than queued, so EXEC's reply has no element for them. Upstream
+> queues both. No client library sends either inside MULTI.
+>
 > Queue-time errors — an unknown command, a wrong argument count, a
 > cross-slot key — poison the transaction, and EXEC then returns
 > `EXECABORT` having applied nothing. Runtime errors (WRONGTYPE, a bad
@@ -167,7 +181,9 @@ single-slot, all or nothing. See "Lua scripts" below (ADR-0051).
 > counting expiry and deletion as modifications — EXEC does nothing and
 > replies with a null array, and you retry. EXEC and DISCARD both clear the
 > watches. WATCH is refused inside a transaction, since a watch added after
-> MULTI could only describe a window that has already closed.
+> MULTI could only describe a window that has already closed. UNWATCH
+> inside one is queued, as upstream queues it, so EXEC still checks the
+> watches (BUG-0220).
 >
 > Detection is conservative by construction: it may occasionally abort a
 > transaction whose watched key did not actually change, and it will never

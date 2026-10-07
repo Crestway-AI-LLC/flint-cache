@@ -30,8 +30,7 @@ to choose the error Redis would give, so a well-formed command costs
 nothing more.
 
 Left as it was: `LSET k 9223372036854775807 v` overwrites the list's last
-member in Redis 8.2 and Valkey 9.1 (any index from 2^62 does, and
-i64::MIN), and
-answers `index out of range` here, as any index past the end does. Theirs
-looks like an overflow in their own list index; it writes data on a bogus
-argument, so it is not copied.
+member in Redis 8.2 and Valkey 9.1 (so does any index from 2^62, and
+i64::MIN), and answers `index out of range` here, as any index past the end
+does. Theirs looks like an overflow in their own list index; it writes data
+on a bogus argument, so it is not copied.
