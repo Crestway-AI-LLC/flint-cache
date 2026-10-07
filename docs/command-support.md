@@ -533,6 +533,16 @@ Smaller ones, which the corpus does not list:
   `-0.0`, which is `0` here and `-0` there. The values are equal.
 - Filters here also take `!` and exponent literals (`1e3`), which RedisJSON
   refuses as syntax errors.
+- **`SRANDMEMBER key <negative count>` is refused past the seat's
+  `max-value-bytes`** (512 MiB by default), estimated as the count times the
+  set's mean member size plus 64 bytes a member. A negative count repeats
+  members, so `-2000000000000` asks for two trillion of them from any set.
+  Redis builds whatever reply is asked for; a shared seat cannot let one
+  tenant's reply take every tenant's memory (BUG-0218).
+- **`LSET` with an index past the end is `index out of range`, however
+  large.** Redis 8.2 and Valkey 9.1 overwrite the last member for an index
+  from 2^62 up, and for i64::MIN, which looks like an overflow in their list index; that is
+  not copied (BUG-0219).
 - **Where Redis 8.2 and Valkey 9.1 disagree, Flint answers as Valkey
   does**, Valkey being the conformance oracle. `GETEX nokey EX 0` is an
   invalid-expire error here and in Valkey, which judge the time first;

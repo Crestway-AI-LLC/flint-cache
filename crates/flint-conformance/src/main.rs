@@ -316,6 +316,49 @@ fn corpus() -> Vec<Case> {
                 s(&[b"GETRANGE", b"nosuchg", b"0", b"-1"], Expect::Str(b"")),
             ],
         },
+        // BUG-0219: Redis reads the key before LINDEX's and LSET's index,
+        // and INCRBYFLOAT checks the type before its increment; i64::MIN is
+        // out of LREM's and SRANDMEMBER's symmetric range (BUG-0218), and
+        // LREM removed matches with it.
+        Case {
+            family: "lists",
+            name: "the key is read before a bad index, and i64::MIN is out of range",
+            steps: vec![
+                s(&[b"LINDEX", b"nosuchli", b"abc"], Expect::Nil),
+                s(&[b"LSET", b"nosuchli", b"abc", b"v"], Expect::Err("ERR no such key")),
+                s(&[b"SET", b"lstr", b"v"], Expect::Ok),
+                s(
+                    &[b"LINDEX", b"lstr", b"abc"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(
+                    &[b"LSET", b"lstr", b"abc", b"v"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(&[b"SADD", b"lset", b"m"], Expect::Int(1)),
+                s(
+                    &[b"INCRBYFLOAT", b"lset", b"abc"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(&[b"RPUSH", b"li", b"a", b"b", b"a"], Expect::Int(3)),
+                s(&[b"LINDEX", b"li", b"abc"], Expect::Err("ERR value is not an integer or out of range")),
+                s(
+                    &[b"LREM", b"li", b"-9223372036854775808", b"a"],
+                    Expect::Err(
+                        "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807",
+                    ),
+                ),
+                s(&[b"LLEN", b"li"], Expect::Int(3)),
+                s(&[b"SET", b"lnan", b"nan"], Expect::Ok),
+                s(&[b"INCRBYFLOAT", b"lnan", b"1"], Expect::Err("ERR value is not a valid float")),
+                s(
+                    &[b"SRANDMEMBER", b"lset", b"-9223372036854775808"],
+                    Expect::Err(
+                        "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807",
+                    ),
+                ),
+            ],
+        },
         // BUG-0215: LPOP and RPOP take a count, Redis 6.2's.
         Case {
             family: "lists",

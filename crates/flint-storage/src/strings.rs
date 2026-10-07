@@ -294,7 +294,13 @@ impl<'a> StringStore<'a> {
             None => (0f64, 0u64),
             Some(m) => {
                 let s = std::str::from_utf8(&m.payload).map_err(|_| StoreError::NotFloat)?;
-                let v: f64 = s.parse().map_err(|_| StoreError::NotFloat)?;
+                // Redis does not read a stored `nan` as a float, so the
+                // value is the error, not the sum (BUG-0219).
+                let v: f64 = s
+                    .parse()
+                    .ok()
+                    .filter(|v: &f64| !v.is_nan())
+                    .ok_or(StoreError::NotFloat)?;
                 (v, m.expire_ms)
             }
         };

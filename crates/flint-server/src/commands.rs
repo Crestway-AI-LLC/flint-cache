@@ -374,6 +374,16 @@ impl<'a> Dispatcher<'a> {
                 self.zsets
                     .read_bytes(slot, key, zset_read_rows(name_upper, args))
             }
+            // The whole set is built (`smembers`) and, for a negative count,
+            // `|count|` members besides (BUG-0218).
+            b"SRANDMEMBER" => {
+                let set = self.sets.stored_bytes(slot, key).ok().flatten()?;
+                let extra = match args.get(2).map(|c| parse_i64(c)) {
+                    Some(Ok(n)) if n < 0 => self.srandmember_reply_bytes(slot, key, n).ok()?,
+                    _ => 0,
+                };
+                Ok(Some(set.saturating_add(extra)))
+            }
             b"ZPOPMIN" | b"ZPOPMAX" => {
                 let count = args.get(2).map_or(Some(1), |c| parse_i64(c).ok())?;
                 self.zsets
@@ -494,7 +504,12 @@ impl<'a> Dispatcher<'a> {
                         .incr_by_float(slot_for_key(&a[1]), &a[1], delta),
                     |repr| Value::Bulk(Some(repr)),
                 ),
-                Err(_) => err("ERR value is not a valid float"),
+                // Redis checks the key's type before it reads the increment,
+                // so another type answers WRONGTYPE (BUG-0219).
+                Err(_) => match self.strings.strlen(slot_for_key(&a[1]), &a[1]) {
+                    Err(e) => store_err(e),
+                    Ok(_) => err("ERR value is not a valid float"),
+                },
             }),
             b"APPEND" => exact(args, 3, "append", |a| {
                 reply(
@@ -920,7 +935,14 @@ impl<'a> Dispatcher<'a> {
                     self.lists.lindex(slot_for_key(&a[1]), &a[1], rank),
                     Value::Bulk,
                 ),
-                Err(_) => err("ERR value is not an integer or out of range"),
+                // Redis reads the key before the index: a missing key is
+                // nil and another type WRONGTYPE, whatever the index says
+                // (BUG-0219).
+                Err(_) => match self.lists.llen(slot_for_key(&a[1]), &a[1]) {
+                    Ok(0) => Value::Bulk(None),
+                    Ok(_) => err("ERR value is not an integer or out of range"),
+                    Err(e) => store_err(e),
+                },
             }),
             b"LLEN" => exact(args, 2, "llen", |a| {
                 reply(self.lists.llen(slot_for_key(&a[1]), &a[1]), |n| {
@@ -947,7 +969,13 @@ impl<'a> Dispatcher<'a> {
                     Ok(LsetOutcome::OutOfRange) => err("ERR index out of range"),
                     Err(e) => store_err(e),
                 },
-                Err(_) => err("ERR value is not an integer or out of range"),
+                // As LINDEX: the key first, so `no such key` or WRONGTYPE
+                // before the index (BUG-0219).
+                Err(_) => match self.lists.llen(slot_for_key(&a[1]), &a[1]) {
+                    Ok(0) => err("ERR no such key"),
+                    Ok(_) => err("ERR value is not an integer or out of range"),
+                    Err(e) => store_err(e),
+                },
             }),
             b"LTRIM" => exact(args, 4, "ltrim", |a| {
                 match (parse_i64(&a[2]), parse_i64(&a[3])) {
@@ -960,6 +988,9 @@ impl<'a> Dispatcher<'a> {
             }),
             b"LPOS" => self.cmd_lpos(args),
             b"LREM" => exact(args, 4, "lrem", |a| match parse_i64(&a[2]) {
+                // Redis's bound is symmetric, so i64::MIN is out of it. It
+                // removed matches from the tail here (BUG-0219).
+                Ok(i64::MIN) => err(OUT_OF_SYMMETRIC_RANGE),
                 Ok(count) => reply(
                     self.lists.lrem(slot_for_key(&a[1]), &a[1], count, &a[3]),
                     |n| Value::Integer(n as i64),
@@ -3492,20 +3523,65 @@ impl<'a> Dispatcher<'a> {
 
     /// SRANDMEMBER key `[count]`. Without count: single bulk (or nil). With
     /// count: array — positive is distinct-clamped, negative repeats.
+    /// `SRANDMEMBER key [count]`. A negative count repeats members, so its
+    /// reply is `|count|` members however small the set. That reply was
+    /// built in one allocation, and `SRANDMEMBER k -2000000000000` on a
+    /// three-member set took the seat down (BUG-0218). It is refused past
+    /// the seat's reply ceiling now, and BUG-0060's admission sizes it
+    /// (`collection_read_bytes`).
     fn cmd_srandmember(&self, args: &[Vec<u8>]) -> Value {
         match args.len() {
             2 => match self.sets.srandmember(slot_for_key(&args[1]), &args[1], 1) {
                 Ok(mut picks) => Value::Bulk(picks.pop()),
                 Err(e) => store_err(e),
             },
-            3 => match parse_i64(&args[2]) {
-                Ok(n) => reply(
-                    self.sets.srandmember(slot_for_key(&args[1]), &args[1], n),
-                    |ms| Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())),
-                ),
-                Err(_) => err("ERR value is not an integer or out of range"),
-            },
+            3 => {
+                let n = match parse_i64(&args[2]) {
+                    // Redis's bound is symmetric, so i64::MIN is out of it.
+                    Ok(i64::MIN) => return err(OUT_OF_SYMMETRIC_RANGE),
+                    Ok(n) => n,
+                    Err(_) => return err("ERR value is not an integer or out of range"),
+                };
+                let slot = slot_for_key(&args[1]);
+                if n < 0 {
+                    match self.srandmember_reply_bytes(slot, &args[1], n) {
+                        Ok(bytes) if bytes > self.reply_ceiling() => {
+                            return err(&format!(
+                                "ERR SRANDMEMBER with count {n} would build a reply of about \
+                                 {bytes} bytes, past this server's limit of {} \
+                                 (max-value-bytes); ask for fewer",
+                                self.reply_ceiling()
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => return store_err(e),
+                    }
+                }
+                reply(self.sets.srandmember(slot, &args[1], n), |ms| {
+                    Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect()))
+                })
+            }
             _ => arity_err("srandmember"),
+        }
+    }
+
+    /// Bytes `SRANDMEMBER key count` builds for a negative `count`: each of
+    /// `|count|` members at the set's mean size, plus what a reply element
+    /// costs in memory (`REPLY_ELEMENT_BYTES`). 0 for a missing key.
+    fn srandmember_reply_bytes(&self, slot: u16, key: &[u8], n: i64) -> Result<u64, StoreError> {
+        let Some(bytes) = self.sets.stored_bytes(slot, key)? else {
+            return Ok(0);
+        };
+        let mean = bytes / self.sets.scard(slot, key)?.max(1);
+        Ok(n.unsigned_abs().saturating_mul(mean + REPLY_ELEMENT_BYTES))
+    }
+
+    /// The most a single reply may build: the seat's max-value-bytes, the
+    /// largest collection it accepts, or its default when that is off.
+    fn reply_ceiling(&self) -> u64 {
+        match self.limits.max_value_bytes {
+            0 => flint_storage::DEFAULT_MAX_VALUE_BYTES,
+            max => max,
         }
     }
 
@@ -3534,10 +3610,7 @@ impl<'a> Dispatcher<'a> {
                         );
                     }
                     // Redis's bound is symmetric, so i64::MIN is out of it.
-                    Ok(i64::MIN) => {
-                        return err("ERR value is out of range, value must between \
-                             -9223372036854775807 and 9223372036854775807");
-                    }
+                    Ok(i64::MIN) => return err(OUT_OF_SYMMETRIC_RANGE),
                     Ok(r) => rank = r,
                     Err(_) => return err("ERR value is not an integer or out of range"),
                 },
@@ -3966,6 +4039,16 @@ fn parse_i64(raw: &[u8]) -> Result<i64, ()> {
 fn parse_u64(raw: &[u8]) -> Option<u64> {
     std::str::from_utf8(raw).ok()?.parse().ok()
 }
+
+/// Redis's refusal of i64::MIN where its bound is symmetric
+/// (`getRangeLongFromObjectOrReply(-LONG_MAX, LONG_MAX)`): LPOS's RANK, LREM's
+/// count, SRANDMEMBER's count.
+const OUT_OF_SYMMETRIC_RANGE: &str =
+    "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807";
+
+/// What one reply element costs in memory beyond its bytes: the `Value`
+/// and its `Vec`'s header, rounded up.
+const REPLY_ELEMENT_BYTES: u64 = 64;
 
 /// The legacy-dialect JSON errors. Only ever reached from a non-`$` path:
 /// a JSONPath caller gets an empty or null-holding container instead, which
@@ -5397,6 +5480,42 @@ mod tests {
     /// Redis 7's EXPIRE conditions (BUG-0185), on all four commands: a key
     /// with no expiry counts as never expiring, a missing key answers 0, and
     /// the options are checked before the number, with upstream's errors.
+    /// BUG-0218: a negative count past the seat's reply ceiling is refused
+    /// with a reason and builds nothing. It built `|count|` members in one
+    /// allocation, and two trillion of them took the seat down.
+    #[test]
+    fn srandmember_refuses_a_reply_past_the_seats_limit() {
+        let s = MemKv::new();
+        assert_eq!(ev(&s, &["SADD", "s", "a", "b", "c"]), Value::Integer(3));
+        let Value::Error(e) = ev(&s, &["SRANDMEMBER", "s", "-2000000000000"]) else {
+            panic!("a two-trillion-member reply was not refused")
+        };
+        assert!(e.contains("past this server's limit"), "{e}");
+        assert_eq!(
+            ev(&s, &["SRANDMEMBER", "s", "-9223372036854775808"]),
+            Value::Error(OUT_OF_SYMMETRIC_RANGE.into())
+        );
+        let Value::Array(Some(picks)) = ev(&s, &["SRANDMEMBER", "s", "-5"]) else {
+            panic!("a small negative count must still answer")
+        };
+        assert_eq!(picks.len(), 5, "repeats members, as Redis does");
+        assert_eq!(
+            ev(&s, &["SRANDMEMBER", "nosuch", "-2000000000000"]),
+            Value::Array(Some(vec![]))
+        );
+        let d = Dispatcher::new(&s, system_clock);
+        let args: Vec<Vec<u8>> = ["SRANDMEMBER", "s", "-1000"]
+            .iter()
+            .map(|a| a.as_bytes().to_vec())
+            .collect();
+        // The set (3 members of 1 byte plus their accounting) and 1,000 reply
+        // elements are what admission is asked to hold.
+        let sized = d
+            .collection_read_bytes(b"SRANDMEMBER", &args)
+            .expect("sized");
+        assert!(sized >= 1000 * REPLY_ELEMENT_BYTES, "{sized}");
+    }
+
     /// BUG-0216: BUG-0060's admission charges a sorted-set read what it can
     /// return. 100 members of 4 bytes cost 12 each with their scores.
     #[test]
