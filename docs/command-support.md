@@ -219,7 +219,7 @@ SINTERSTORE, SUNIONSTORE, SDIFFSTORE.
 > ZUNIONSTORE accepts a plain set at score 1. That asymmetry is upstream's,
 > not ours.
 
-**Lists**: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM,
+**Lists**: LPUSH, RPUSH, LPOP and RPOP (with a count), LLEN, LRANGE, LINDEX, LSET, LTRIM,
 LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN), LMOVE, RPOPLPUSH, BLPOP, BRPOP,
 BLMOVE, BRPOPLPUSH (see "Blocking commands").
 
@@ -227,11 +227,12 @@ BLMOVE, BRPOPLPUSH (see "Blocking commands").
 > colocate source and destination with a hash tag or the move is refused
 > with `CROSSSLOT`. So are their blocking forms, BLMOVE and BRPOPLPUSH.
 
-**Sorted sets**: ZADD, ZSCORE, ZMSCORE, ZINCRBY, ZREM, ZCARD, ZRANGE,
+**Sorted sets**: ZADD (NX, XX, GT, LT, CH, INCR), ZSCORE, ZMSCORE, ZINCRBY,
+ZREM, ZCARD, ZRANGE (BYSCORE, BYLEX, REV, LIMIT, WITHSCORES),
 ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE (WITHSCORES, LIMIT, exclusive
 bounds, ±inf), ZRANGEBYLEX, ZREVRANGEBYLEX (LIMIT, exclusive bounds,
 `-`/`+`), ZLEXCOUNT, ZREMRANGEBYLEX (exclusive bounds, `-`/`+`; no LIMIT,
-as upstream), ZRANK, ZREVRANK, ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
+as upstream), ZRANK, ZREVRANK (WITHSCORE), ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
 ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT), ZUNIONSTORE, ZINTERSTORE (WEIGHTS,
 AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands").
 
@@ -253,7 +254,9 @@ AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands").
 > the same condition Redis states — because the index is ordered by
 > (score, member). Flint matches upstream's seek-then-walk behaviour rather
 > than filtering, so a mixed-score set returns what Valkey returns even
-> though neither defines it.
+> though neither defines it. That is the walk Redis does on a set of up to
+> 128 members (its listpack); past that, Redis's skiplist seek depends on
+> random levels, and no other implementation can match it (BUG-0215).
 
 ### Flint-specific: the GC ranking primitives (ADR-0013)
 

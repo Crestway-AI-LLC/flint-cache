@@ -153,6 +153,43 @@ impl<'a> ListStore<'a> {
         Ok(val)
     }
 
+    /// LPOP/RPOP with a count (BUG-0215): up to `n` elements from one end,
+    /// in the order they leave, under one metadata write. `None` when the
+    /// key is missing, which Redis answers with a null array where an empty
+    /// list would be an empty one.
+    pub fn pop_n(
+        &self,
+        slot: u16,
+        key: &[u8],
+        n: u64,
+        left: bool,
+    ) -> Result<Option<Vec<Vec<u8>>>, StoreError> {
+        let Some(mut meta) = self.read_meta(slot, key)? else {
+            return Ok(None);
+        };
+        let take = n.min((meta.tail - meta.head) as u64);
+        let mut out = Vec::with_capacity(take as usize);
+        for _ in 0..take {
+            let idx = if left {
+                meta.head += 1;
+                meta.head - 1
+            } else {
+                meta.tail -= 1;
+                meta.tail
+            };
+            let ek = self.elem_key(slot, key, meta.base.version, idx);
+            if let Some(v) = self.kv.get(&ek) {
+                meta.base.bytes = meta.base.bytes.saturating_sub(v.len() as u64);
+                out.push(v);
+            }
+            self.kv.delete(&ek);
+        }
+        if take > 0 {
+            self.write_meta(slot, key, &meta);
+        }
+        Ok(Some(out))
+    }
+
     pub fn llen(&self, slot: u16, key: &[u8]) -> Result<u64, StoreError> {
         Ok(self
             .read_meta(slot, key)?
@@ -556,6 +593,25 @@ mod tests {
         // Empty list deletes the key.
         assert_eq!(l.llen(1, b"l"), Ok(0));
         assert_eq!(l.pop(1, b"l", true), Ok(None));
+    }
+
+    #[test]
+    fn pop_n_takes_from_either_end_and_deletes_an_emptied_list() {
+        // BUG-0215.
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        assert_eq!(l.pop_n(1, b"l", 2, true), Ok(None));
+        assert_eq!(
+            l.push(1, b"l", &vs(&[b"a", b"b", b"c", b"d", b"e"]), false),
+            Ok(5)
+        );
+        assert_eq!(l.pop_n(1, b"l", 2, true), Ok(Some(vs(&[b"a", b"b"]))));
+        assert_eq!(l.pop_n(1, b"l", 2, false), Ok(Some(vs(&[b"e", b"d"]))));
+        assert_eq!(l.pop_n(1, b"l", 0, true), Ok(Some(Vec::new())));
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"c"])));
+        assert_eq!(l.pop_n(1, b"l", 10, false), Ok(Some(vs(&[b"c"]))));
+        assert_eq!(l.llen(1, b"l"), Ok(0));
+        assert_eq!(l.pop_n(1, b"l", 1, true), Ok(None));
     }
 
     #[test]

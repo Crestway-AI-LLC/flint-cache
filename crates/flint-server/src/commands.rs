@@ -20,7 +20,7 @@ use flint_storage::strings::{
     BitfieldKind, BitfieldOp, BitfieldOverflow, Clock, SetExpiry, SetOptions, SetOutcome,
     StoreError, StringStore, parse_redis_i64,
 };
-use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore};
+use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore, ZaddFlags};
 
 /// The JSON commands ADR-0055 added.
 mod json;
@@ -375,6 +375,17 @@ impl<'a> Dispatcher<'a> {
                 let (Ok(start), Ok(stop)) = (parse_i64(args.get(2)?), parse_i64(args.get(3)?))
                 else {
                     return None;
+                };
+                self.lists.range_bytes(slot, key, start, stop)
+            }
+            // A pop with a count materialises the slice it takes, costed as
+            // LRANGE costs one (BUG-0215).
+            b"LPOP" | b"RPOP" => {
+                let n = parse_i64(args.get(2)?).ok().filter(|n| *n > 0)?;
+                let (start, stop) = if name_upper == b"LPOP" {
+                    (0, n - 1)
+                } else {
+                    (-n, -1)
                 };
                 self.lists.range_bytes(slot, key, start, stop)
             }
@@ -873,13 +884,26 @@ impl<'a> Dispatcher<'a> {
             b"BRPOP" => self.cmd_bpop(args, "brpop", false, true),
             b"BZPOPMIN" => self.cmd_bpop(args, "bzpopmin", true, false),
             b"BZPOPMAX" => self.cmd_bpop(args, "bzpopmax", true, true),
-            b"LPOP" | b"RPOP" => exact(args, 2, "lpop", |a| {
+            // `LPOP key [count]` (BUG-0215: the count, Redis 6.2's, was an
+            // arity error, and RPOP's error named LPOP).
+            b"LPOP" | b"RPOP" => {
                 let left = name.eq_ignore_ascii_case(b"LPOP");
-                reply(
-                    self.lists.pop(slot_for_key(&a[1]), &a[1], left),
-                    Value::Bulk,
-                )
-            }),
+                match args {
+                    [_, key] => reply(self.lists.pop(slot_for_key(key), key, left), Value::Bulk),
+                    [_, key, count] => match parse_i64(count) {
+                        Ok(n) if n >= 0 => reply(
+                            self.lists.pop_n(slot_for_key(key), key, n as u64, left),
+                            |popped| {
+                                Value::Array(popped.map(|elems| {
+                                    elems.into_iter().map(|e| Value::Bulk(Some(e))).collect()
+                                }))
+                            },
+                        ),
+                        _ => err("ERR value is out of range, must be positive"),
+                    },
+                    _ => arity_err(if left { "lpop" } else { "rpop" }),
+                }
+            }
             b"LINDEX" => exact(args, 3, "lindex", |a| match parse_i64(&a[2]) {
                 Ok(rank) => reply(
                     self.lists.lindex(slot_for_key(&a[1]), &a[1], rank),
@@ -1655,37 +1679,148 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
+    /// `ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]`,
+    /// parsed as Redis's `zaddGenericCommand` parses it (BUG-0215: every
+    /// flag was read as a score). The flags lead, in any order, and the
+    /// first word that is not one starts the pairs.
     fn cmd_zadd(&self, args: &[Vec<u8>]) -> Value {
-        if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
+        if args.len() < 4 {
             return arity_err("zadd");
         }
-        let mut pairs = Vec::with_capacity((args.len() - 2) / 2);
-        for chunk in args[2..].chunks(2) {
+        let mut flags = ZaddFlags::default();
+        let mut ch = false;
+        let mut i = 2;
+        while let Some(opt) = args.get(i) {
+            match opt.to_ascii_uppercase().as_slice() {
+                b"NX" => flags.nx = true,
+                b"XX" => flags.xx = true,
+                b"GT" => flags.gt = true,
+                b"LT" => flags.lt = true,
+                b"CH" => ch = true,
+                b"INCR" => flags.incr = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        let rest = &args[i..];
+        if rest.is_empty() || !rest.len().is_multiple_of(2) {
+            return err("ERR syntax error");
+        }
+        if flags.nx && flags.xx {
+            return err("ERR XX and NX options at the same time are not compatible");
+        }
+        if (flags.gt || flags.lt) && flags.nx || flags.gt && flags.lt {
+            return err("ERR GT, LT, and/or NX options at the same time are not compatible");
+        }
+        if flags.incr && rest.len() > 2 {
+            return err("ERR INCR option supports a single increment-element pair");
+        }
+        let mut pairs = Vec::with_capacity(rest.len() / 2);
+        for chunk in rest.chunks(2) {
             let Ok(score) = parse_f64(&chunk[0]) else {
                 return err("ERR value is not a valid float");
             };
             pairs.push((score, chunk[1].clone()));
         }
-        reply(
-            self.zsets.zadd(slot_for_key(&args[1]), &args[1], &pairs),
-            |n| Value::Integer(n as i64),
-        )
+        match self
+            .zsets
+            .zadd_with(slot_for_key(&args[1]), &args[1], &pairs, flags)
+        {
+            // INCR answers the member's new score, or nil when the flags
+            // left it alone, as ZINCRBY would have answered.
+            Ok(done) if flags.incr => done.score.map_or(Value::Null, Value::Double),
+            Ok(done) if ch => Value::Integer((done.added + done.updated) as i64),
+            Ok(done) => Value::Integer(done.added as i64),
+            Err(e) => store_err(e),
+        }
     }
 
+    /// `ZRANGE key start stop [BYSCORE | BYLEX] [REV] [LIMIT offset count]
+    /// [WITHSCORES]`, Redis 6.2's form, parsed as Redis's
+    /// `zrangeGenericCommand` parses it (BUG-0215: only WITHSCORES was
+    /// taken). The options parse first, then the range in the kind they
+    /// chose. REV with BYSCORE or BYLEX takes the bounds as (max, min), as
+    /// ZREVRANGEBYSCORE does.
     fn cmd_zrange(&self, args: &[Vec<u8>]) -> Value {
-        let withscores = match args.len() {
-            4 => false,
-            5 if args[4].eq_ignore_ascii_case(b"WITHSCORES") => true,
-            5 => return err("ERR syntax error"),
-            _ => return arity_err("zrange"),
+        #[derive(PartialEq)]
+        enum By {
+            Rank,
+            Score,
+            Lex,
+        }
+        if args.len() < 4 {
+            return arity_err("zrange");
+        }
+        let (mut by, mut rev, mut withscores, mut limit) = (None, false, false, None);
+        let mut i = 4;
+        while i < args.len() {
+            let after = args.len() - i - 1;
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"WITHSCORES" => withscores = true,
+                b"LIMIT" if after >= 2 => {
+                    let (Ok(offset), Ok(count)) =
+                        (parse_i64(&args[i + 1]), parse_i64(&args[i + 2]))
+                    else {
+                        return err("ERR value is not an integer or out of range");
+                    };
+                    limit = Some((offset, count));
+                    i += 2;
+                }
+                b"REV" if !rev => rev = true,
+                b"BYSCORE" if by.is_none() => by = Some(By::Score),
+                b"BYLEX" if by.is_none() => by = Some(By::Lex),
+                _ => return err("ERR syntax error"),
+            }
+            i += 1;
+        }
+        let by = by.unwrap_or(By::Rank);
+        // Redis tells LIMIT from its absence by a count other than -1, so a
+        // rank range takes `LIMIT <offset> -1` and ignores it, offset and
+        // all.
+        if limit.is_some_and(|(_, count)| count != -1) && by == By::Rank {
+            return err(
+                "ERR syntax error, LIMIT is only supported in combination with either BYSCORE \
+                 or BYLEX",
+            );
+        }
+        if withscores && by == By::Lex {
+            return err("ERR syntax error, WITHSCORES not supported in combination with BYLEX");
+        }
+        let (slot, key) = (slot_for_key(&args[1]), &args[1]);
+        let (lo, hi) = if rev && by != By::Rank {
+            (&args[3], &args[2])
+        } else {
+            (&args[2], &args[3])
         };
-        match (parse_i64(&args[2]), parse_i64(&args[3])) {
-            (Ok(start), Ok(stop)) => reply(
-                self.zsets
-                    .zrange(slot_for_key(&args[1]), &args[1], start, stop),
-                |ranked| Self::zrows(ranked, withscores),
-            ),
-            _ => err("ERR value is not an integer or out of range"),
+        let (offset, count) = limit.unwrap_or((0, -1));
+        match by {
+            By::Rank => match (parse_i64(lo), parse_i64(hi)) {
+                (Ok(start), Ok(stop)) => reply(
+                    self.zsets.zrange_rev(slot, key, start, stop, rev),
+                    |ranked| Self::zrows(ranked, withscores),
+                ),
+                _ => err("ERR value is not an integer or out of range"),
+            },
+            By::Score => {
+                let (Some(min), Some(max)) = (ScoreBound::parse(lo), ScoreBound::parse(hi)) else {
+                    return err("ERR min or max is not a float");
+                };
+                reply(
+                    self.zsets
+                        .zrange_by_score(slot, key, min, max, rev, offset, count),
+                    |r| Self::zrows(r, withscores),
+                )
+            }
+            By::Lex => {
+                let (Some(min), Some(max)) = (LexBound::parse(lo), LexBound::parse(hi)) else {
+                    return err("ERR min or max not valid string range item");
+                };
+                reply(
+                    self.zsets
+                        .zrange_by_lex(slot, key, &min, &max, rev, offset, count),
+                    |ms| Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())),
+                )
+            }
         }
     }
 
@@ -2159,16 +2294,31 @@ impl<'a> Dispatcher<'a> {
         })
     }
 
+    /// `ZRANK key member [WITHSCORE]` and ZREVRANK. WITHSCORE (Redis 7.2)
+    /// answers `[rank, score]`, and a missing member a null array
+    /// (BUG-0215: it was an arity error).
     fn cmd_zrank(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {
-        exact(args, 3, name, |a| {
-            reply(
-                self.zsets.zrank(slot_for_key(&a[1]), &a[1], &a[2], rev),
-                |o| match o {
-                    Some(rank) => Value::Integer(rank as i64),
-                    None => Value::Bulk(None),
-                },
-            )
-        })
+        let withscore = match args.len() {
+            3 => false,
+            4 if args[3].eq_ignore_ascii_case(b"WITHSCORE") => true,
+            4 => return err("ERR syntax error"),
+            _ => return arity_err(name),
+        };
+        let (slot, key, member) = (slot_for_key(&args[1]), &args[1], &args[2]);
+        let rank = match self.zsets.zrank(slot, key, member, rev) {
+            Ok(Some(rank)) => rank as i64,
+            Ok(None) if withscore => return Value::Array(None),
+            Ok(None) => return Value::Bulk(None),
+            Err(e) => return store_err(e),
+        };
+        if !withscore {
+            return Value::Integer(rank);
+        }
+        match self.zsets.zscore(slot, key, member) {
+            Ok(Some(score)) => Value::Array(Some(vec![Value::Integer(rank), Value::Double(score)])),
+            Ok(None) => Value::Array(None),
+            Err(e) => store_err(e),
+        }
     }
 
     fn cmd_zcount(&self, args: &[Vec<u8>]) -> Value {

@@ -13,6 +13,26 @@ use crate::encoding::{
 };
 use crate::strings::{Clock, StoreError};
 
+/// ZADD's flags (BUG-0215). CH is not here: it changes only the reply.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ZaddFlags {
+    pub nx: bool,
+    pub xx: bool,
+    pub gt: bool,
+    pub lt: bool,
+    pub incr: bool,
+}
+
+/// What a `zadd_with` did: members added, members whose score changed, and
+/// the last score it set, which is INCR's reply (`None`, a nil, when the
+/// flags left the member alone).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ZaddOutcome {
+    pub added: u64,
+    pub updated: u64,
+    pub score: Option<f64>,
+}
+
 pub struct ZSetStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
@@ -33,16 +53,22 @@ pub struct ScoreBound {
 impl ScoreBound {
     /// Parse a Redis score-range token: "5" (inclusive), "(5" (exclusive),
     /// "-inf"/"+inf"/"inf". None = malformed.
+    ///
+    /// As Redis 8.2 and Valkey 9.1 read one (found with BUG-0215): an empty
+    /// number, `""` or a bare `(`, is 0, as C's `strtod` reads it; NaN and
+    /// surrounding spaces are malformed. This trimmed spaces and took `nan`
+    /// as a bound nothing satisfies.
     pub fn parse(raw: &[u8]) -> Option<ScoreBound> {
         let (inclusive, body) = match raw.first() {
             Some(b'(') => (false, &raw[1..]),
             _ => (true, raw),
         };
-        let text = std::str::from_utf8(body).ok()?.trim();
+        let text = std::str::from_utf8(body).ok()?;
         let value = match text.to_ascii_lowercase().as_str() {
+            "" => 0.0,
             "-inf" | "-infinity" => f64::NEG_INFINITY,
             "+inf" | "inf" | "+infinity" | "infinity" => f64::INFINITY,
-            other => other.parse::<f64>().ok()?,
+            other => other.parse::<f64>().ok().filter(|v| !v.is_nan())?,
         };
         Some(ScoreBound { value, inclusive })
     }
@@ -226,6 +252,101 @@ impl<'a> ZSetStore<'a> {
         Ok(added)
     }
 
+    /// `ZADD key [NX|XX] [GT|LT] [INCR] score member ...` (BUG-0215). The
+    /// pairs apply in order, as Redis's `zsetAdd` applies them, so a member
+    /// named twice sees its first pair's result: `GT 5 a 3 a` leaves 5, and
+    /// with `CH` both pairs count. Every outcome is decided before anything
+    /// is written, so a refusal (NaN, max-value-bytes) changes nothing.
+    ///
+    /// A missing key with XX is left missing. The parser has already refused
+    /// NX with XX, GT or LT, and GT with LT.
+    pub fn zadd_with(
+        &self,
+        slot: u16,
+        key: &[u8],
+        pairs: &[(f64, Vec<u8>)],
+        flags: ZaddFlags,
+    ) -> Result<ZaddOutcome, StoreError> {
+        let mut outcome = ZaddOutcome::default();
+        let meta = match self.read_meta(slot, key)? {
+            Some(m) => m,
+            None if flags.xx => return Ok(outcome),
+            None => ComplexMeta::new(ValueType::ZSet, VersionGen::next((self.clock)())),
+        };
+        // Each touched member's score as stored, and as this call leaves it.
+        let mut stored: std::collections::HashMap<&[u8], Option<f64>> = Default::default();
+        let mut now: std::collections::HashMap<&[u8], f64> = Default::default();
+        for (score, member) in pairs {
+            let before = *stored.entry(member.as_slice()).or_insert_with(|| {
+                self.kv
+                    .get(&self.member_key(slot, key, meta.version, member))
+                    .map(|b| f64::from_le_bytes(b.try_into().unwrap_or([0; 8])))
+            });
+            match now.get(member.as_slice()).copied().or(before) {
+                Some(current) => {
+                    if flags.nx {
+                        continue;
+                    }
+                    let next = if flags.incr { current + score } else { *score };
+                    if next.is_nan() {
+                        return Err(StoreError::NanScore);
+                    }
+                    if (flags.lt && next >= current) || (flags.gt && next <= current) {
+                        continue;
+                    }
+                    outcome.score = Some(next);
+                    if next != current {
+                        outcome.updated += 1;
+                        now.insert(member.as_slice(), next);
+                    }
+                }
+                None if flags.xx => {}
+                None => {
+                    outcome.added += 1;
+                    outcome.score = Some(*score);
+                    now.insert(member.as_slice(), *score);
+                }
+            }
+        }
+        if now.is_empty() {
+            return Ok(outcome);
+        }
+        let mut meta = meta;
+        let new_members = now.keys().filter(|m| stored[*m].is_none());
+        let bytes = meta.bytes + new_members.map(|m| member_cost(m)).sum::<u64>();
+        if bytes > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        for (member, score) in &now {
+            if let Some(old) = stored[member] {
+                if old == *score {
+                    continue;
+                }
+                self.kv.delete(&zscore_envelope(
+                    &self.ns,
+                    slot,
+                    key,
+                    meta.version,
+                    old,
+                    member,
+                ));
+            }
+            self.kv.put(
+                &self.member_key(slot, key, meta.version, member),
+                &score.to_le_bytes(),
+            );
+            self.kv.put(
+                &zscore_envelope(&self.ns, slot, key, meta.version, *score, member),
+                b"",
+            );
+        }
+        meta.size += outcome.added as u32;
+        meta.bytes = bytes;
+        meta.touch((self.clock)());
+        self.kv.put(&self.meta_key(slot, key), &meta.encode());
+        Ok(outcome)
+    }
+
     /// The collection's accounted size (`ComplexMeta.bytes`), from ONE cheap
     /// metadata read and without materialising anything. This is the quantity
     /// BUG-0060's admission divides by, so it must stay the SAME number the
@@ -367,11 +488,14 @@ impl<'a> ZSetStore<'a> {
         if rev {
             hits.reverse();
         }
-        // LIMIT offset count (count < 0 = to the end); no LIMIT => all.
-        if offset > 0 {
-            let off = (offset as usize).min(hits.len());
-            hits.drain(..off);
+        // LIMIT offset count (count < 0 = to the end); no LIMIT => all. A
+        // negative offset answers nothing, as Redis's skip loop does; it was
+        // read as 0 here (found with BUG-0215).
+        if offset < 0 {
+            return Ok(Vec::new());
         }
+        let off = (offset as usize).min(hits.len());
+        hits.drain(..off);
         if count >= 0 {
             hits.truncate(count as usize);
         }
@@ -383,8 +507,9 @@ impl<'a> ZSetStore<'a> {
     ///
     /// WHY THIS WALKS AND STOPS INSTEAD OF FILTERING. The obvious body is
     /// `all_ordered().filter(in range)`, and it is subtly not Redis. Redis
-    /// seeks to the first member in range and walks until one falls out,
-    /// which differs from a filter exactly when scores are NOT uniform:
+    /// seeks the first member past one bound and walks until one falls past
+    /// the other, which differs from a filter exactly when scores are NOT
+    /// uniform:
     /// the index is ordered by (score, member), so with mixed scores the
     /// member sequence is not monotonic and a filter would collect members
     /// that lie beyond the point Redis stops at.
@@ -405,32 +530,60 @@ impl<'a> ZSetStore<'a> {
         offset: i64,
         count: i64,
     ) -> Result<Vec<Vec<u8>>, StoreError> {
-        let mut ordered: Vec<Vec<u8>> = self
+        let ordered: Vec<Vec<u8>> = self
             .all_ordered(slot, key)?
             .into_iter()
             .map(|(m, _)| m)
             .collect();
-        if rev {
-            ordered.reverse();
+        // Redis's listpack walk, step for step (`zzlIsInLexRange`, then
+        // `zzlFirstInLexRange` or `zzlLastInLexRange`, then the walk). This
+        // seeked the first member inside BOTH bounds until BUG-0215's
+        // differential: Redis seeks on one bound and stops at once if that
+        // member is past the other, which differs when scores are mixed.
+        // 1. Empty unless the last member reaches the lower bound and the
+        //    first is within the upper one.
+        let (Some(first), Some(last)) = (ordered.first(), ordered.last()) else {
+            return Ok(Vec::new());
+        };
+        if !min.ge_lower(last) || !max.le_upper(first) || offset < 0 {
+            return Ok(Vec::new());
         }
-        // Seek to the first member inside the range, then walk until one
-        // falls out. "Inside" needs no sense of direction, so reversing the
-        // sequence is the ONLY thing `rev` changes — the reversed form seeks
-        // the last member in range and walks back, which is what this is
-        // once the order is flipped.
-        let in_range = |m: &[u8]| min.ge_lower(m) && max.le_upper(m);
-        let mut hits: Vec<Vec<u8>> = ordered
-            .into_iter()
-            .skip_while(|m| !in_range(m))
-            .take_while(|m| in_range(m))
-            .collect();
-        if offset > 0 {
-            let off = (offset as usize).min(hits.len());
-            hits.drain(..off);
-        }
-        if count >= 0 {
-            hits.truncate(count as usize);
-        }
+        // 2. Seek, forward to the first member at or above `min`, backward
+        //    to the last at or below `max`; that member must be within the
+        //    other bound. 3. Skip `offset` members, in range or not, then
+        //    walk while the far bound holds.
+        let limit = usize::try_from(count).unwrap_or(usize::MAX);
+        let skip = offset as usize;
+        let hits = if rev {
+            let Some(start) = ordered.iter().rposition(|m| max.le_upper(m)) else {
+                return Ok(Vec::new());
+            };
+            if !min.ge_lower(&ordered[start]) {
+                return Ok(Vec::new());
+            }
+            ordered[..=start]
+                .iter()
+                .rev()
+                .skip(skip)
+                .take_while(|m| min.ge_lower(m))
+                .take(limit)
+                .cloned()
+                .collect()
+        } else {
+            let Some(start) = ordered.iter().position(|m| min.ge_lower(m)) else {
+                return Ok(Vec::new());
+            };
+            if !max.le_upper(&ordered[start]) {
+                return Ok(Vec::new());
+            }
+            ordered[start..]
+                .iter()
+                .skip(skip)
+                .take_while(|m| max.le_upper(m))
+                .take(limit)
+                .cloned()
+                .collect()
+        };
         Ok(hits)
     }
 
@@ -683,6 +836,63 @@ mod tests {
             zs.stored_bytes(1, b"z"),
             Ok(Some(40 * (25 + 8))),
             "a zset's accounted size is member_cost summed: length PLUS 8 for the score"
+        );
+    }
+
+    #[test]
+    fn zadd_with_applies_pairs_in_order_and_writes_nothing_it_refuses() {
+        // BUG-0215, each against Redis 8.2's answer.
+        let kv = MemKv::new();
+        let z = ZSetStore::new(&kv, b"t", now);
+        let p = |s: f64, m: &str| (s, m.as_bytes().to_vec());
+        let gt = ZaddFlags {
+            gt: true,
+            ..Default::default()
+        };
+        // The second pair sees the first's result: GT 5 then GT 3 keeps 5.
+        let done = z.zadd_with(1, b"z", &[p(5.0, "a"), p(3.0, "a")], gt);
+        assert_eq!(done.map(|d| (d.added, d.updated)), Ok((1, 0)));
+        assert_eq!(z.zscore(1, b"z", b"a"), Ok(Some(5.0)));
+        // Added, then changed: CH would count both.
+        let plain = ZaddFlags::default();
+        let done = z.zadd_with(1, b"z", &[p(1.0, "b"), p(2.0, "b")], plain);
+        assert_eq!(done.map(|d| (d.added, d.updated)), Ok((1, 1)));
+        assert_eq!(z.zcard(1, b"z"), Ok(2));
+        // XX on a missing key leaves it missing.
+        let xx = ZaddFlags {
+            xx: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            z.zadd_with(1, b"none", &[p(1.0, "a")], xx),
+            Ok(ZaddOutcome::default())
+        );
+        assert_eq!(z.zcard(1, b"none"), Ok(0));
+        // INCR to NaN is refused before anything is written.
+        let incr = ZaddFlags {
+            incr: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            z.zadd_with(1, b"z", &[p(f64::INFINITY, "a")], incr)
+                .map(|d| d.score),
+            Ok(Some(f64::INFINITY))
+        );
+        assert_eq!(
+            z.zadd_with(1, b"z", &[p(f64::NEG_INFINITY, "a")], incr),
+            Err(StoreError::NanScore)
+        );
+        assert_eq!(z.zscore(1, b"z", b"a"), Ok(Some(f64::INFINITY)));
+        // NX on an existing member is a no-op: INCR answers nil.
+        let nx_incr = ZaddFlags {
+            nx: true,
+            incr: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            z.zadd_with(1, b"z", &[p(1.0, "b")], nx_incr)
+                .map(|d| d.score),
+            Ok(None)
         );
     }
 

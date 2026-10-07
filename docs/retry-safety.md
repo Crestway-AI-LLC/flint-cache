@@ -57,7 +57,8 @@ Three corollaries, each measured rather than assumed:
 **Absolute expiry**: `SETEX` · `SET … EXAT`/`PXAT` · `EXPIREAT` ·
 `PEXPIREAT` (plain, or `XX`) · `GETEX EXAT`/`PXAT`/`PERSIST`
 
-**Collections**: `HSET` · `HMSET` · `HDEL` · `SADD` · `SREM` · `ZADD` · `ZREM` ·
+**Collections**: `HSET` · `HMSET` · `HDEL` · `SADD` · `SREM` · `ZADD` (plain,
+or with `XX`, `GT`, `LT` or `CH`) · `ZREM` ·
 `LSET` (absolute index, absolute value) · `LREM key 0 m` ·
 `ZREMRANGEBYSCORE` · `ZREMRANGEBYLEX` · the `STORE` variants
 (`ZUNIONSTORE`, `ZINTERSTORE`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`),
@@ -77,7 +78,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 
 | Command | Hazard on retry |
 |---|---|
-| `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `HINCRBY` `HINCRBYFLOAT` `ZINCRBY` `JSON.NUMINCRBY` `JSON.NUMMULTBY` | Double-counts, or multiplies twice. |
+| `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `HINCRBY` `HINCRBYFLOAT` `ZINCRBY` `ZADD … INCR` `JSON.NUMINCRBY` `JSON.NUMMULTBY` | Double-counts, or multiplies twice. |
 | `BITFIELD` with `INCRBY` | Double-counts, as `INCRBY` does; Sidekiq's metrics flush is this shape. A `BITFIELD` of only `GET` and `SET` converges, but a retried `SET` answers the value the first attempt wrote, not the one before it. |
 | `APPEND` `JSON.ARRAPPEND` `JSON.STRAPPEND` | Double-appends. |
 | `LPUSH` `RPUSH` | Double-pushes. |
@@ -86,7 +87,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `LMOVE` `RPOPLPUSH` `BLMOVE` `BRPOPLPUSH` | Moves an EXTRA element. A worker taking one job from a queue takes two, and the reply names only the second, so the first sits in the destination list unclaimed. On one list (a rotation) it rotates twice. |
 | `LTRIM` `ZREMRANGEBYRANK` `LREM key <n≠0> m` `JSON.ARRTRIM` | Position- or count-addressed, so the retry cuts a DIFFERENT set. `LTRIM 1 2` twice on `a b c d` leaves `c`. Also silent data loss. |
 | `JSON.TOGGLE` | The retry flips the value back. The toggle the caller was told about is undone, and the second reply names the value it started from. |
-| `SET … NX` `SETNX` `HSETNX` | If the first succeeded but the ack was lost, the retry sees the key present and returns 0/nil, so the caller wrongly believes it failed. The classic lock hazard. |
+| `SET … NX` `SETNX` `HSETNX` `ZADD … NX` | If the first succeeded but the ack was lost, the retry sees the key present and returns 0/nil, so the caller wrongly believes it failed. The classic lock hazard. |
 | `GETDEL` | The first returns the value and the retry returns nil, so a retrying reader loses the only copy it was handed. |
 | `COPY` (without `REPLACE`) | Returns 0 on the retry: the copy exists, and the caller is told it does not. |
 | `RENAME` `RENAMENX` | The retry answers `ERR no such key` — the source moved on the first attempt. The rename SUCCEEDED and the caller sees an error. |

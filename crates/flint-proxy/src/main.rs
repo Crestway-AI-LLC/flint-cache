@@ -3177,10 +3177,10 @@ async fn transaction_step(
                     // and nowhere else. Array(None) still encodes to `_` for
                     // a RESP3 client, so this costs that path nothing.
                     Ok(Value::Null) => Value::Array(None),
-                    // The same loss inside the reply: a queued BLPOP,
-                    // BRPOP, BZPOPMIN or BZPOPMAX that found nothing
-                    // answers a null array, which RESP3 also sends as `_`
-                    // (ADR-0052 D4).
+                    // The same loss inside the reply: a queued command
+                    // whose null is an array, such as a BLPOP that found
+                    // nothing (ADR-0052 D4), which RESP3 also sends as `_`
+                    // (`flint_resp::null_is_array`).
                     Ok(Value::Array(Some(items))) if items.len() == ended.null_arrays.len() => {
                         Value::Array(Some(
                             items
@@ -3236,10 +3236,7 @@ async fn transaction_step(
             match call_pinned(backends, &addr, raw).await {
                 Ok(v) => {
                     if matches!(&v, Value::Simple(q) if q == "QUEUED") {
-                        txn.null_arrays.push(matches!(
-                            name.as_slice(),
-                            b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX"
-                        ));
+                        txn.null_arrays.push(flint_resp::null_is_array(args));
                     }
                     Some(v)
                 }
@@ -3886,7 +3883,14 @@ async fn data_command(
         )
         .placed(topo.placed_pair(ns).is_some())
     });
-    let reply = handle(topo, b, ns, args, raw, read_replica, idle).await;
+    let reply = match handle(topo, b, ns, args, raw, read_replica, idle).await {
+        // RESP3 has one null and the backend hop speaks it, so a seat's null
+        // ARRAY arrives as `Value::Null`, which a RESP2 client would read as
+        // a null bulk. The commands whose null is an array get it back, as
+        // EXEC's does in `transaction_step` (BUG-0215).
+        Value::Null if flint_resp::null_is_array(args) => Value::Array(None),
+        other => other,
+    };
     cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
     reply
 }

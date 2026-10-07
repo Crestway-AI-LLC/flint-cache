@@ -316,6 +316,26 @@ fn corpus() -> Vec<Case> {
                 s(&[b"GETRANGE", b"nosuchg", b"0", b"-1"], Expect::Str(b"")),
             ],
         },
+        // BUG-0215: LPOP and RPOP take a count, Redis 6.2's.
+        Case {
+            family: "lists",
+            name: "lpop and rpop take a count",
+            steps: vec![
+                s(&[b"RPUSH", b"lc", b"a", b"b", b"c", b"d", b"e"], Expect::Int(5)),
+                s(&[b"LPOP", b"lc", b"2"], Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"b")])),
+                s(&[b"RPOP", b"lc", b"2"], Expect::Arr(vec![Expect::Str(b"e"), Expect::Str(b"d")])),
+                s(&[b"LPOP", b"lc", b"0"], Expect::Arr(vec![])),
+                s(&[b"LPOP", b"lc", b"-1"], Expect::Err("ERR value is out of range, must be positive")),
+                s(&[b"LPOP", b"lc", b"x"], Expect::Err("ERR value is out of range, must be positive")),
+                s(&[b"RPOP", b"lc", b"5"], Expect::Arr(vec![Expect::Str(b"c")])),
+                s(&[b"EXISTS", b"lc"], Expect::Int(0)),
+                s(&[b"LPOP", b"lc", b"2"], Expect::NilArray),
+                s(&[b"RPOP", b"lc", b"0"], Expect::NilArray),
+                s(&[b"LPOP", b"lc"], Expect::Nil),
+                s(&[b"LPOP", b"lc", b"1", b"2"], Expect::Err("ERR wrong number of arguments for 'lpop' command")),
+                s(&[b"RPOP", b"lc", b"1", b"2"], Expect::Err("ERR wrong number of arguments for 'rpop' command")),
+            ],
+        },
         // BUG-0214, from a three-way differential against Redis 8.2 and
         // Valkey: GETRANGE is not LRANGE. An end before the string clamps
         // to its first byte; two negatives in the wrong order are empty.
@@ -1917,6 +1937,145 @@ fn corpus() -> Vec<Case> {
                     ],
                     Expect::Int(8),
                 ),
+            ],
+        },
+        // BUG-0215: ZADD's flags were read as scores.
+        Case {
+            family: "zsets",
+            name: "zadd takes nx xx gt lt ch and incr",
+            steps: vec![
+                s(&[b"ZADD", b"zo", b"1", b"a", b"2", b"b", b"3", b"c"], Expect::Int(3)),
+                s(&[b"ZADD", b"zo", b"CH", b"5", b"a", b"2", b"b"], Expect::Int(1)),
+                s(&[b"ZADD", b"zo", b"NX", b"10", b"a", b"4", b"d"], Expect::Int(1)),
+                s(&[b"ZADD", b"zo", b"XX", b"6", b"a", b"7", b"nope"], Expect::Int(0)),
+                s(&[b"ZADD", b"zo", b"XX", b"CH", b"6", b"a"], Expect::Int(0)),
+                s(&[b"ZADD", b"zo", b"GT", b"1", b"a"], Expect::Int(0)),
+                s(&[b"ZADD", b"zo", b"GT", b"CH", b"8", b"a"], Expect::Int(1)),
+                s(&[b"ZADD", b"zo", b"LT", b"100", b"a"], Expect::Int(0)),
+                s(&[b"ZADD", b"zo", b"lt", b"ch", b"0", b"a"], Expect::Int(1)),
+                s(
+                    &[b"ZADD", b"zo", b"NX", b"XX", b"1", b"a"],
+                    Expect::Err("ERR XX and NX options at the same time are not compatible"),
+                ),
+                s(
+                    &[b"ZADD", b"zo", b"NX", b"GT", b"1", b"a"],
+                    Expect::Err("ERR GT, LT, and/or NX options at the same time are not compatible"),
+                ),
+                s(&[b"ZADD", b"zo", b"INCR", b"2", b"a"], Expect::Str(b"2")),
+                s(
+                    &[b"ZADD", b"zo", b"INCR", b"2", b"a", b"3", b"b"],
+                    Expect::Err("ERR INCR option supports a single increment-element pair"),
+                ),
+                s(&[b"ZADD", b"zo", b"NX", b"INCR", b"1", b"a"], Expect::Nil),
+                s(&[b"ZADD", b"zo", b"XX", b"INCR", b"1", b"newm"], Expect::Nil),
+                s(&[b"ZADD", b"zo", b"GT", b"INCR", b"-1", b"a"], Expect::Nil),
+                s(&[b"ZADD", b"zo", b"1", b"a", b"2"], Expect::Err("ERR syntax error")),
+                // Pairs apply in order: the second sees the first's result.
+                s(&[b"ZADD", b"zo", b"GT", b"5", b"dup", b"3", b"dup"], Expect::Int(1)),
+                s(&[b"ZSCORE", b"zo", b"dup"], Expect::Str(b"5")),
+                s(&[b"ZADD", b"zo", b"CH", b"1", b"dup2", b"2", b"dup2"], Expect::Int(2)),
+                s(
+                    &[b"ZRANGE", b"zo", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"2"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"2"),
+                        Expect::Str(b"dup2"),
+                        Expect::Str(b"2"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"3"),
+                        Expect::Str(b"d"),
+                        Expect::Str(b"4"),
+                        Expect::Str(b"dup"),
+                        Expect::Str(b"5"),
+                    ]),
+                ),
+                // XX on a missing key leaves it missing.
+                s(&[b"ZADD", b"zx", b"XX", b"1", b"a"], Expect::Int(0)),
+                s(&[b"EXISTS", b"zx"], Expect::Int(0)),
+            ],
+        },
+        // BUG-0215: ZRANGE's Redis 6.2 form.
+        Case {
+            family: "zsets",
+            name: "zrange takes byscore bylex rev and limit",
+            steps: vec![
+                s(&[b"ZADD", b"zr", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d", b"5", b"e"], Expect::Int(5)),
+                s(&[b"ZRANGE", b"zr", b"1", b"3", b"REV"], Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"c"), Expect::Str(b"b")])),
+                s(&[b"ZRANGE", b"zr", b"2", b"4", b"BYSCORE"], Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c"), Expect::Str(b"d")])),
+                s(&[b"ZRANGE", b"zr", b"(2", b"4", b"BYSCORE"], Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"d")])),
+                s(&[b"ZRANGE", b"zr", b"4", b"2", b"BYSCORE", b"REV"], Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"c"), Expect::Str(b"b")])),
+                s(
+                    &[b"ZRANGE", b"zr", b"-inf", b"+inf", b"BYSCORE", b"LIMIT", b"1", b"2"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c")]),
+                ),
+                s(
+                    &[b"ZRANGE", b"zr", b"-inf", b"+inf", b"BYSCORE", b"LIMIT", b"1", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c"), Expect::Str(b"d"), Expect::Str(b"e")]),
+                ),
+                s(&[b"ZRANGE", b"zr", b"-inf", b"+inf", b"BYSCORE", b"LIMIT", b"-1", b"2"], Expect::Arr(vec![])),
+                s(
+                    &[b"ZRANGE", b"zr", b"4", b"2", b"BYSCORE", b"REV", b"WITHSCORES", b"LIMIT", b"0", b"2"],
+                    Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"4"), Expect::Str(b"c"), Expect::Str(b"3")]),
+                ),
+                s(
+                    &[b"ZRANGE", b"zr", b"0", b"-1", b"LIMIT", b"0", b"1"],
+                    Expect::Err(
+                        "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+                    ),
+                ),
+                s(
+                    &[b"ZRANGE", b"zr", b"[a", b"[c", b"BYLEX", b"WITHSCORES"],
+                    Expect::Err("ERR syntax error, WITHSCORES not supported in combination with BYLEX"),
+                ),
+                // A count of -1 reads as no LIMIT, so a rank range ignores it.
+                s(
+                    &[b"ZRANGE", b"zr", b"3", b"4", b"LIMIT", b"1", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"e")]),
+                ),
+                s(&[b"ZRANGE", b"zr", b"0", b"-1", b"BYSCORE", b"BYLEX"], Expect::Err("ERR syntax error")),
+                s(&[b"ZRANGE", b"zr", b"0", b"-1", b"REV", b"REV"], Expect::Err("ERR syntax error")),
+                s(&[b"ZRANGE", b"zr", b"0", b"-1", b"LIMIT", b"0"], Expect::Err("ERR syntax error")),
+                s(&[b"ZRANGE", b"zr", b"1", b"abc", b"BYSCORE"], Expect::Err("ERR min or max is not a float")),
+                // A score bound reads as Redis's does: an empty number is 0,
+                // and NaN or a padded number is not a float.
+                s(&[b"ZADD", b"zr", b"-1", b"neg", b"0", b"zero"], Expect::Int(2)),
+                s(&[b"ZCOUNT", b"zr", b"(", b"+inf"], Expect::Int(5)),
+                s(&[b"ZCOUNT", b"zr", b"", b"+inf"], Expect::Int(6)),
+                s(&[b"ZCOUNT", b"zr", b"nan", b"+inf"], Expect::Err("ERR min or max is not a float")),
+                s(&[b"ZCOUNT", b"zr", b" 1", b"+inf"], Expect::Err("ERR min or max is not a float")),
+                s(&[b"ZREM", b"zr", b"neg", b"zero"], Expect::Int(2)),
+                s(&[b"ZRANGE", b"zr", b"a", b"c", b"BYLEX"], Expect::Err("ERR min or max not valid string range item")),
+                s(&[b"ZADD", b"zl", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d"], Expect::Int(4)),
+                s(&[b"ZRANGE", b"zl", b"[b", b"(d", b"BYLEX"], Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c")])),
+                s(
+                    &[b"ZRANGE", b"zl", b"+", b"-", b"BYLEX", b"REV", b"LIMIT", b"0", b"2"],
+                    Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"c")]),
+                ),
+                s(&[b"ZRANGE", b"zl", b"-", b"+", b"BYLEX", b"LIMIT", b"1", b"1"], Expect::Arr(vec![Expect::Str(b"b")])),
+                // A negative offset answers nothing, in the older forms too.
+                s(&[b"ZRANGEBYLEX", b"zl", b"-", b"+", b"LIMIT", b"-1", b"2"], Expect::Arr(vec![])),
+                s(&[b"ZRANGEBYSCORE", b"zr", b"-inf", b"+inf", b"LIMIT", b"-1", b"2"], Expect::Arr(vec![])),
+                s(&[b"ZRANGE", b"nosuchzr", b"0", b"-1", b"BYSCORE"], Expect::Arr(vec![])),
+            ],
+        },
+        // BUG-0215: ZRANK's WITHSCORE, Redis 7.2's.
+        Case {
+            family: "zsets",
+            name: "zrank and zrevrank take withscore",
+            steps: vec![
+                s(&[b"ZADD", b"zk", b"1", b"a", b"2.5", b"b"], Expect::Int(2)),
+                s(&[b"ZRANK", b"zk", b"b", b"WITHSCORE"], Expect::Arr(vec![Expect::Int(1), Expect::Str(b"2.5")])),
+                s(&[b"ZREVRANK", b"zk", b"b", b"withscore"], Expect::Arr(vec![Expect::Int(0), Expect::Str(b"2.5")])),
+                s(&[b"ZRANK", b"zk", b"nope", b"WITHSCORE"], Expect::NilArray),
+                s(&[b"ZRANK", b"zk", b"nope"], Expect::Nil),
+                s(&[b"ZRANK", b"zk", b"a", b"FOO"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"ZRANK", b"zk", b"a", b"WITHSCORE", b"x"],
+                    Expect::Err("ERR wrong number of arguments for 'zrank' command"),
+                ),
+                s(&[b"ZRANK", b"zk", b"a"], Expect::Int(0)),
             ],
         },
         // BUG-0212: +inf plus -inf is NaN, which Redis refuses to store.

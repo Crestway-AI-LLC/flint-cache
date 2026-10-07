@@ -190,6 +190,26 @@ pub fn fmt_double(s: f64) -> Vec<u8> {
     out
 }
 
+/// True when this command's null reply is a null ARRAY, `*-1` under RESP2,
+/// rather than a null bulk. RESP3 has one null, `_`, and the proxy reads
+/// seats in RESP3, so it needs this to give a RESP2 client the null Redis
+/// sends:
+/// - BLPOP, BRPOP, BZPOPMIN and BZPOPMAX, in any form;
+/// - LPOP and RPOP with a count, and ZRANK and ZREVRANK with WITHSCORE
+///   (BUG-0215).
+pub fn null_is_array(args: &[Vec<u8>]) -> bool {
+    let Some(name) = args.first() else {
+        return false;
+    };
+    let is = |n: &[u8]| name.eq_ignore_ascii_case(n);
+    is(b"BLPOP")
+        || is(b"BRPOP")
+        || is(b"BZPOPMIN")
+        || is(b"BZPOPMAX")
+        || (is(b"LPOP") || is(b"RPOP")) && args.len() == 3
+        || (is(b"ZRANK") || is(b"ZREVRANK")) && args.len() == 4
+}
+
 /// True for commands whose RESP3 reply carries [`Value::Resp3Nested`]'s
 /// extra array layer.
 ///
