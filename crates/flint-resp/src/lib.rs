@@ -258,8 +258,12 @@ pub fn fmt_json_double(d: f64) -> Vec<u8> {
 /// The proxy reads backends in RESP3, so this is the direction it needs:
 /// `*1 :6` becomes the JSON text `[6]` for a `$` caller, or the bare `6`
 /// for a legacy one. Every input is derivable — the array holds the
-/// matches, and the path the caller wrote says which spelling they expect.
-pub fn json_numincrby_resp2(resp3_reply: &Value, jsonpath: bool) -> Value {
+/// matches, and the path the caller wrote (`None` for none, the legacy
+/// root) says which spelling they expect and names itself in the legacy
+/// refusal (BUG-0236).
+pub fn json_numincrby_resp2(resp3_reply: &Value, path: Option<&[u8]>) -> Value {
+    let path = String::from_utf8_lossy(path.unwrap_or(b"."));
+    let jsonpath = path.starts_with('$');
     let Value::Array(Some(items)) = resp3_reply else {
         // An error (or anything unexpected) passes straight through: it is
         // already the same in both dialects.
@@ -289,7 +293,27 @@ pub fn json_numincrby_resp2(resp3_reply: &Value, jsonpath: bool) -> Value {
     // about the KIND of the reply rather than its shape.
     match items.first() {
         Some(Value::Integer(_) | Value::Double(_)) => Value::Bulk(Some(render(&items[0]))),
-        _ => Value::Error("ERR Path does not exist or does not contains a number".into()),
+        _ => Value::Error(format!(
+            "ERR Path '{}' does not exist or does not contains a number",
+            json_fixed_path(&path)
+        )),
+    }
+}
+
+/// A JSON path as most of RedisJSON's errors name it: a `$` path as
+/// written, a legacy one rewritten the module's way, `.` to `$`, `.a` to
+/// `$.a`, and anything else behind `$.`, so `a` is `$.a` and `[0]` is
+/// `$.[0]` (BUG-0236). Here rather than in the server so the proxy, which
+/// rebuilds one of those errors, spells it the same way.
+pub fn json_fixed_path(path: &str) -> String {
+    if path.starts_with('$') {
+        path.to_string()
+    } else if path == "." {
+        "$".to_string()
+    } else if path.starts_with('.') {
+        format!("${path}")
+    } else {
+        format!("$.{path}")
     }
 }
 
@@ -1394,12 +1418,18 @@ mod flushing_encoder_tests {
             Value::Null,
         ]));
         assert_eq!(
-            json_numincrby_resp2(&reply, true),
+            json_numincrby_resp2(&reply, Some(b"$.a")),
             Value::Bulk(Some(b"[3.0,4,null]".to_vec()))
         );
         assert_eq!(
-            json_numincrby_resp2(&Value::Array(Some(vec![Value::Double(6.0)])), false),
+            json_numincrby_resp2(&Value::Array(Some(vec![Value::Double(6.0)])), Some(b".a")),
             Value::Bulk(Some(b"6.0".to_vec()))
         );
+        // BUG-0236: the legacy refusal names the path as RedisJSON rewrites it.
+        assert_eq!(
+            json_numincrby_resp2(&Value::Array(Some(vec![])), Some(b"a")),
+            Value::Error("ERR Path '$.a' does not exist or does not contains a number".into())
+        );
+        assert_eq!(json_fixed_path("[0]"), "$.[0]");
     }
 }

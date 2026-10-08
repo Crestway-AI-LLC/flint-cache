@@ -425,7 +425,7 @@ honest.
   | | `JSON.GET d $.a` | `JSON.GET d .a` |
   |---|---|---|
   | match | `[1]` | `1` |
-  | no match | `[]` | `ERR Path does not exist` |
+  | no match | `[]` | `ERR Path '$.a' does not exist` |
   | wrong shape (`ARRLEN` on an object) | one null element | error |
 
   JSON.GET and JSON.NUMINCRBY carry the container inside the JSON they
@@ -491,7 +491,8 @@ honest.
     appear anywhere among the paths.
 - **JSON writes create the leaf, never intermediate levels**, so a typo
   cannot silently grow a document a shape you did not ask for.
-  **JSON.SET will not overwrite a non-JSON key** (WRONGTYPE) — unlike a
+  **JSON.SET will not overwrite a non-JSON key** (`Existing key has wrong
+  Redis type`, RedisJSON's words) — unlike a
   plain SET, a document write is never a silent way to destroy a string or a
   hash. JSON.NUMINCRBY adds an integer to an integer exactly, in 64-bit
   integer arithmetic, and refuses an overflow; an increment written as a
@@ -554,7 +555,24 @@ Smaller ones, which the corpus does not list:
   JSON.RESP renders a double as Redis does (`1e+20`, BUG-0214), `-0`
   included (BUG-0230).
 - Filters here also take `!` and exponent literals (`1e3`), which RedisJSON
-  refuses as syntax errors.
+  refuses as syntax errors, and a `$` path here may hold a space in a member
+  name (`$.a b`), which RedisJSON refuses.
+- **Error replies are RedisJSON's words** (BUG-0236), down to naming the
+  path as each command names it, which key or argument is read first, and
+  the module's quirks (`does not contains a number`, `Err wrong static
+  path`, `Existing key has wrong Redis type` with no `ERR`). Three kinds
+  are not: a path that does not parse is `ERR malformed JSON path`, where
+  RedisJSON's text comes from its parser generator (`Error occurred on
+  position 7, …`); the refusals this list describes keep texts of their
+  own; and so do the deliberate ones above.
+- A value with something after it (`1 x`, `[1] 2`) is refused here, in
+  serde's words (`trailing characters at line 1 column 3`). RedisJSON's
+  JSON.SET, MSET, MERGE, ARRAPPEND and ARRINSERT read the first value and
+  drop the rest; its STRAPPEND refuses as Flint does.
+- A negative index past the start of an array (`$.b[-9]` on three
+  elements) names nothing here, as JSONPath has it. RedisJSON takes the
+  first element, for writes too: its `JSON.DEL d $.b[-9]` removes `b[0]`.
+- JSON.SET's `FORMAT` option is not taken: a syntax error.
 - **`SRANDMEMBER key <negative count>` is refused past the seat's
   `max-value-bytes`** (512 MiB by default), estimated as the count times the
   set's mean member size plus 64 bytes a member. A negative count repeats

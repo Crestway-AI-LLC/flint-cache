@@ -3910,6 +3910,37 @@ fn corpus() -> Vec<Case> {
         // out inline, listed in tools/redisjson_compare.sh and in
         // docs/command-support.md.
         // BUG-0234: the number is read as JSON, as RedisJSON reads it.
+        // BUG-0236: JSON errors in RedisJSON's words, each family once.
+        Case {
+            family: "json",
+            name: "json errors are redisjson's words",
+            steps: vec![
+                s(&[b"JSON.SET", b"{je}d", b"$", br#"{"a":1,"b":[1],"s":"x"}"#], Expect::Ok),
+                s(&[b"JSON.GET", b"{je}d", b".x"], Expect::Err("ERR Path '$.x' does not exist")),
+                s(&[b"JSON.ARRAPPEND", b"{je}d", b".a", b"1"], Expect::Err("ERR Path '.a' does not exist or not an array")),
+                s(&[b"JSON.ARRLEN", b"{je}d", b".x"], Expect::Err("ERR Path '.x' does not exist")),
+                s(&[b"JSON.ARRPOP", b"{je}d", b"a"], Expect::Err("ERR Path '$.a' does not exist or not an array")),
+                s(
+                    &[b"JSON.NUMINCRBY", b"{je}d", b".s", b"1"],
+                    Expect::Err("ERR Path '$.s' does not exist or does not contains a number"),
+                ),
+                s(&[b"JSON.TOGGLE", b"{je}d", b".a"], Expect::Err("ERR Path '$.a' does not exist or not a bool")),
+                s(&[b"JSON.STRAPPEND", b"{je}d", b".a", br#""y""#], Expect::Err("ERR Path '$.a' does not exist or not a string")),
+                s(&[b"JSON.STRAPPEND", b"{je}d", b"$.s", b"1"], Expect::Err("WRONGTYPE wrong type of path value - expected string but found 1")),
+                s(&[b"JSON.SET", b"{je}d", b"$.a", b"bad"], Expect::Err("expected value at line 1 column 1")),
+                s(&[b"JSON.ARRINDEX", b"{je}d", b"$.b", b"bad"], Expect::Err("ERR expected value at line 1 column 1")),
+                s(&[b"JSON.ARRINSERT", b"{je}d", b"$.b", b"x", b"1"], Expect::Err("Couldn't parse as integer")),
+                s(&[b"JSON.SET", b"{je}d", b"$.b[5]", b"1"], Expect::Err("ERR array index out of range")),
+                s(&[b"JSON.SET", b"{je}d", b"$..a", b"1", b"NX"], Expect::Err("Err wrong static path")),
+                s(&[b"JSON.SET", b"{je}d", b"$", b"1", b"NX", b"XX"], Expect::Err("ERR syntax error")),
+                s(&[b"JSON.TYPE", b"{je}d", b".["], Expect::Nil),
+                s(&[b"SET", b"{je}str", b"v"], Expect::Ok),
+                s(&[b"JSON.GET", b"{je}str", b"$["], Expect::Err("Existing key has wrong Redis type")),
+                s(&[b"JSON.GET", b"{je}none", b"$["], Expect::Nil),
+                s(&[b"JSON.OBJLEN", b"{je}none", b"$.a"], Expect::Err("ERR Path '$.a' does not exist or not an object")),
+                s(&[b"JSON.MGET", b"{je}d", b"{je}none", b"$["], Expect::Arr(vec![Expect::Nil, Expect::Nil])),
+            ],
+        },
         Case {
             family: "json",
             name: "numincrby reads its number as json",
@@ -5400,8 +5431,7 @@ impl Client {
         // the proxy uses rather than a generic re-render.
         let v = match args.first() {
             Some(n) if flint_resp::resp3_differs_in_kind(n) && !matches!(v, Value::Error(_)) => {
-                let jsonpath = args.get(2).is_some_and(|p| p.first() == Some(&b'$'));
-                flint_resp::json_numincrby_resp2(&v, jsonpath)
+                flint_resp::json_numincrby_resp2(&v, args.get(2).map(|p| p.as_slice()))
             }
             _ => v,
         };

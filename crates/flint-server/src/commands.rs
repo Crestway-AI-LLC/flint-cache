@@ -2506,31 +2506,49 @@ impl<'a> Dispatcher<'a> {
         key: &[u8],
         path_arg: Option<&Vec<u8>>,
     ) -> Result<(crate::json_path::Path, Option<serde_json::Value>), Value> {
-        let raw = path_arg.map(|p| String::from_utf8_lossy(p).to_string());
-        // No path argument means the LEGACY root, not `$`: `JSON.GET key`
-        // must answer the document, not a container holding it.
-        let path = match crate::json_path::parse(raw.as_deref().unwrap_or(".")) {
-            Ok(p) => p,
-            Err(crate::json_path::PathError::Unsupported) => {
-                return Err(err(UNSUPPORTED_PATH));
-            }
-            Err(crate::json_path::PathError::Malformed) => {
-                return Err(err("ERR malformed JSON path"));
-            }
-        };
+        let doc = self.json_load(key)?;
+        let path = Self::json_path_of(path_arg, doc.is_some())?;
+        Ok((path, doc))
+    }
+
+    /// A JSON key's document, read before its path as RedisJSON reads it
+    /// (BUG-0236): a key of another type is the module's "Existing key has
+    /// wrong Redis type", whatever the path says.
+    fn json_load(&self, key: &[u8]) -> Result<Option<serde_json::Value>, Value> {
         let bytes = match self.json.get(slot_for_key(key), key) {
             Ok(b) => b,
+            Err(StoreError::WrongType) => return Err(err(JSON_WRONG_KEY_TYPE)),
             Err(e) => return Err(store_err(e)),
         };
-        let doc = match bytes {
-            None => None,
+        match bytes {
+            None => Ok(None),
             Some(b) => match serde_json::from_slice(&b) {
-                Ok(v) => Some(v),
+                Ok(v) => Ok(Some(v)),
                 // A row that fails to parse is corruption, not a user error.
-                Err(_) => return Err(err("ERR stored document is not valid JSON")),
+                Err(_) => Err(err("ERR stored document is not valid JSON")),
             },
-        };
-        Ok((path, doc))
+        }
+    }
+
+    /// A command's path argument. No argument means the LEGACY root, not
+    /// `$`: `JSON.GET key` must answer the document, not a container holding
+    /// it. On a missing key the path is not read at all, as in RedisJSON,
+    /// which answers a missing key first (BUG-0236): a malformed path there
+    /// answers what a missing key answers.
+    fn json_path_of(
+        path_arg: Option<&Vec<u8>>,
+        doc_present: bool,
+    ) -> Result<crate::json_path::Path, Value> {
+        let raw = path_arg.map_or_else(
+            || ".".to_string(),
+            |p| String::from_utf8_lossy(p).to_string(),
+        );
+        match crate::json_path::parse(&raw) {
+            Ok(p) => Ok(p),
+            Err(_) if !doc_present => Ok(crate::json_path::Path::unread(&raw)),
+            Err(crate::json_path::PathError::Unsupported) => Err(err(UNSUPPORTED_PATH)),
+            Err(crate::json_path::PathError::Malformed) => Err(err(MALFORMED_PATH)),
+        }
     }
 
     /// Serialize a JSON value into a bulk reply.
@@ -2557,14 +2575,14 @@ impl<'a> Dispatcher<'a> {
     fn json_doc_matches(
         path: &crate::json_path::Path,
         found: Option<Option<serde_json::Value>>,
-        legacy_err: &str,
+        legacy_err: Value,
     ) -> Value {
         match (path.is_jsonpath(), found) {
             (true, Some(Some(v))) => Self::json_bulk(&serde_json::json!([v])),
             (true, Some(None)) => Self::json_bulk(&serde_json::json!([serde_json::Value::Null])),
             (true, None) => Self::json_bulk(&serde_json::json!([])),
             (false, Some(Some(v))) => Self::json_bulk(&v),
-            (false, _) => err(legacy_err),
+            (false, _) => legacy_err,
         }
     }
 
@@ -2573,14 +2591,14 @@ impl<'a> Dispatcher<'a> {
     fn json_resp_matches(
         path: &crate::json_path::Path,
         found: Option<Option<Value>>,
-        legacy_err: &str,
+        legacy_err: Value,
     ) -> Value {
         match (path.is_jsonpath(), found) {
             (true, Some(Some(v))) => Value::Array(Some(vec![v])),
             (true, Some(None)) => Value::Array(Some(vec![Value::Bulk(None)])),
             (true, None) => Value::Array(Some(Vec::new())),
             (false, Some(Some(v))) => v,
-            (false, _) => err(legacy_err),
+            (false, _) => legacy_err,
         }
     }
 
@@ -2623,20 +2641,33 @@ impl<'a> Dispatcher<'a> {
     /// requires the key AND the path's parent to exist (no silent creation
     /// of intermediate levels).
     fn cmd_json_set(&self, args: &[Vec<u8>]) -> Value {
-        if args.len() < 4 || args.len() > 5 {
+        if args.len() < 4 {
             return arity_err("json.set");
         }
-        let (nx, xx) = match args.get(4).map(|f| f.to_ascii_uppercase()) {
-            None => (false, false),
-            Some(f) if f == b"NX" => (true, false),
-            Some(f) if f == b"XX" => (false, true),
-            Some(_) => return err("ERR syntax error"),
+        // RedisJSON's order (BUG-0236): the options, then the key, then the
+        // value, then a missing key's XX, and only then the path. One of NX
+        // or XX at most; anything else is a syntax error.
+        let (mut nx, mut xx) = (false, false);
+        for opt in &args[4..] {
+            match opt.to_ascii_uppercase().as_slice() {
+                b"NX" if !nx && !xx => nx = true,
+                b"XX" if !nx && !xx => xx = true,
+                _ => return err("ERR syntax error"),
+            }
+        }
+        let mut doc = match self.json_load(&args[1]) {
+            Ok(d) => d,
+            Err(reply) => return reply,
         };
-        let Ok(value): Result<serde_json::Value, _> = serde_json::from_slice(&args[3]) else {
-            return err("ERR value is not valid JSON");
-        };
-        let (path, mut doc) = match self.json_open(&args[1], Some(&args[2])) {
+        let value: serde_json::Value = match serde_json::from_slice(&args[3]) {
             Ok(v) => v,
+            Err(e) => return json_value_err(&e),
+        };
+        if doc.is_none() && xx {
+            return Value::Bulk(None);
+        }
+        let path = match Self::json_path_of(Some(&args[2]), doc.is_some()) {
+            Ok(p) => p,
             Err(reply) => return reply,
         };
         match Self::json_set_in(&mut doc, &path, value, nx, xx) {
@@ -2684,7 +2715,6 @@ impl<'a> Dispatcher<'a> {
         // nothing is refused there, and so is NX, which only ever adds; XX
         // matching nothing is nil. Verified against RedisJSON v8.2.8.
         if path.selectors().is_some() {
-            const NOT_ADDED: &str = "ERR a multi-match path replaces existing values and adds none";
             if nx {
                 return Err(err(NOT_ADDED));
             }
@@ -2710,12 +2740,7 @@ impl<'a> Dispatcher<'a> {
         }
         match crate::json_path::set(doc, path, value) {
             crate::json_path::SetOutcome::Set | crate::json_path::SetOutcome::Created => Ok(true),
-            crate::json_path::SetOutcome::MissingParent => Err(err(
-                "ERR path parent does not exist (intermediate levels are not created)",
-            )),
-            crate::json_path::SetOutcome::ShapeMismatch => Err(err(
-                "ERR path does not fit the document's shape at that position",
-            )),
+            outcome => Err(json_unset_err(path, outcome)),
         }
     }
 
@@ -2801,6 +2826,11 @@ impl<'a> Dispatcher<'a> {
         }
         let (path, doc) = match self.json_open(&args[1], args.get(2)) {
             Ok(v) => v,
+            // A legacy path that does not parse is nil, as one that names
+            // nothing is (BUG-0236).
+            Err(e) if Self::json_legacy_unparsable(&e, args.get(2)) => {
+                return Value::Resp3Nested(Box::new(Value::Bulk(None)));
+            }
             Err(reply) => return reply,
         };
         // A missing key's nil takes the RESP3 nesting too (BUG-0210):
@@ -2835,7 +2865,7 @@ impl<'a> Dispatcher<'a> {
         nest(Self::json_resp_matches(
             &path,
             Some(Some(name)),
-            PATH_MISSING,
+            path_err(&path.fixed(), ""),
         ))
     }
 
@@ -3131,15 +3161,17 @@ impl<'a> Dispatcher<'a> {
             }
             return paired(Self::json_bulk(&serde_json::Value::Array(as_json)), as_resp);
         }
+        // Missing or not a number, the legacy refusal is the same one.
+        let not_a_number = || path_err(&path.fixed(), " or does not contains a number");
         let Some(slot) = crate::json_path::get_mut(&mut doc, &path) else {
             return paired(
-                Self::json_doc_matches(&path, None, PATH_MISSING),
+                Self::json_doc_matches(&path, None, not_a_number()),
                 Vec::new(),
             );
         };
         if !slot.is_number() {
             return paired(
-                Self::json_doc_matches(&path, Some(None), "ERR path does not hold a number"),
+                Self::json_doc_matches(&path, Some(None), not_a_number()),
                 vec![Value::Null],
             );
         }
@@ -3154,7 +3186,7 @@ impl<'a> Dispatcher<'a> {
         match self.json_save(&args[1], &doc) {
             Some(e) => e,
             None => paired(
-                Self::json_doc_matches(&path, Some(Some(out.clone())), PATH_MISSING),
+                Self::json_doc_matches(&path, Some(Some(out.clone())), not_a_number()),
                 vec![numeric(Some(&out))],
             ),
         }
@@ -3210,7 +3242,7 @@ impl<'a> Dispatcher<'a> {
         for raw in &args[3..] {
             match serde_json::from_slice(raw) {
                 Ok(v) => values.push(v),
-                Err(_) => return err("ERR value is not valid JSON"),
+                Err(e) => return json_value_err(&e),
             }
         }
         let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
@@ -3242,17 +3274,20 @@ impl<'a> Dispatcher<'a> {
             }
             return Value::Array(Some(out));
         }
+        // ARRAPPEND and ARRLEN name the path as written; the rest of the
+        // module rewrites it (`Path::fixed`).
+        let not_an_array = || path_err(path.original(), " or not an array");
         let Some(target) = crate::json_path::get_mut(&mut doc, &path) else {
-            return Self::json_resp_matches(&path, None, PATH_MISSING);
+            return Self::json_resp_matches(&path, None, not_an_array());
         };
         let serde_json::Value::Array(arr) = target else {
-            return Self::json_resp_matches(&path, Some(None), NOT_AN_ARRAY);
+            return Self::json_resp_matches(&path, Some(None), not_an_array());
         };
         arr.extend(values);
         let len = arr.len() as i64;
         match self.json_save(&args[1], &doc) {
             Some(e) => e,
-            None => Self::json_resp_matches(&path, Some(Some(Value::Integer(len))), NOT_AN_ARRAY),
+            None => Self::json_resp_matches(&path, Some(Some(Value::Integer(len))), not_an_array()),
         }
     }
 
@@ -3286,16 +3321,17 @@ impl<'a> Dispatcher<'a> {
         }
         // The two failure shapes carry different legacy messages, so they
         // are separate calls rather than one folded expression.
+        let not_an_array = || path_err(path.original(), " or not an array");
         let Some(v) = crate::json_path::get(&doc, &path) else {
-            return Self::json_resp_matches(&path, None, PATH_MISSING);
+            return Self::json_resp_matches(&path, None, path_err(path.original(), ""));
         };
         match v {
             serde_json::Value::Array(a) => Self::json_resp_matches(
                 &path,
                 Some(Some(Value::Integer(a.len() as i64))),
-                NOT_AN_ARRAY,
+                not_an_array(),
             ),
-            _ => Self::json_resp_matches(&path, Some(None), NOT_AN_ARRAY),
+            _ => Self::json_resp_matches(&path, Some(None), not_an_array()),
         }
     }
 
@@ -4134,14 +4170,53 @@ const OUT_OF_SYMMETRIC_RANGE: &str =
 /// and its `Vec`'s header, rounded up.
 const REPLY_ELEMENT_BYTES: u64 = 64;
 
-/// The legacy-dialect JSON errors. Only ever reached from a non-`$` path:
-/// a JSONPath caller gets an empty or null-holding container instead, which
-/// is the whole point of the two dialects.
-const PATH_MISSING: &str = "ERR Path does not exist";
+/// RedisJSON's error for a path that names nothing, or nothing of the kind
+/// the command acts on: `ERR Path '<path>' does not exist` plus `tail`,
+/// naming the path as the command spells it (BUG-0236). Only ever reached
+/// from a non-`$` path, or a missing key: a JSONPath caller otherwise gets
+/// an empty or null-holding container, which is the whole point of the
+/// two dialects.
+fn path_err(shown: &str, tail: &str) -> Value {
+    Value::Error(format!("ERR Path '{shown}' does not exist{tail}"))
+}
+
+/// A value argument that is not JSON, in serde's words as RedisJSON
+/// answers it. JSON.SET, MSET, MERGE, ARRAPPEND and ARRINSERT answer the
+/// text alone; ARRINDEX and STRAPPEND put `ERR ` before it.
+fn json_value_err(e: &serde_json::Error) -> Value {
+    Value::Error(e.to_string())
+}
+
+/// A JSON write that could not land where its path points. RedisJSON
+/// refuses one whose last step is an index the location cannot take as
+/// "array index out of range"; a missing parent or a member where there is
+/// no object it answers nil, and Flint refuses in its own words, a
+/// documented difference.
+fn json_unset_err(path: &crate::json_path::Path, outcome: crate::json_path::SetOutcome) -> Value {
+    if matches!(path.steps.last(), Some(crate::json_path::Step::Index(_))) {
+        return err("ERR array index out of range");
+    }
+    match outcome {
+        crate::json_path::SetOutcome::MissingParent => {
+            err("ERR path parent does not exist (intermediate levels are not created)")
+        }
+        _ => err("ERR path does not fit the document's shape at that position"),
+    }
+}
+
+/// A path Flint cannot parse. RedisJSON's own words here come from its
+/// parser generator and are not copied (BUG-0236).
+const MALFORMED_PATH: &str = "ERR malformed JSON path";
+/// RedisJSON's refusal when the key holds another type, without the `ERR`.
+const JSON_WRONG_KEY_TYPE: &str = "Existing key has wrong Redis type";
+/// A multi-match JSON write that would have to add a value, which only a
+/// path naming one location can do. RedisJSON's text, spelled `Err`.
+const NOT_ADDED: &str = "Err wrong static path";
+/// An index argument (ARRINSERT, ARRTRIM, ARRINDEX) that is not an integer.
+const NOT_AN_INDEX: &str = "Couldn't parse as integer";
 const UNSUPPORTED_PATH: &str = "ERR path contains an unsupported construct (multi-match \
      outside the $ dialect, a regex or multi-match operand in a filter, a \
      negative slice step, or a slice in a union)";
-const NOT_AN_ARRAY: &str = "ERR path does not hold an array";
 const NO_SUCH_KEY: &str = "ERR could not perform this operation on a key that doesn't exist";
 
 fn err(msg: &str) -> Value {
@@ -4817,18 +4892,157 @@ mod tests {
             call(&s, &[b"JSON.ARRAPPEND", b"d", b".o", b"1"]),
             Value::Error(e) if e.contains("array")
         ));
-        // Invalid JSON input is rejected before it can be stored.
-        assert!(matches!(
+        // Invalid JSON input is rejected before it can be stored, in
+        // serde's words, as RedisJSON answers it (BUG-0236).
+        assert_eq!(
             call(&s, &[b"JSON.SET", b"d2", b"$", b"{not json"]),
-            Value::Error(e) if e.contains("valid JSON")
-        ));
+            Value::Error("key must be a string at line 1 column 2".into())
+        );
         assert_eq!(call(&s, &[b"EXISTS", b"d2"]), Value::Integer(0));
-        // WRONGTYPE both directions against a string.
+        // The wrong type both directions against a string: RedisJSON's
+        // words one way, Redis's the other.
         call(&s, &[b"SET", b"str", b"v"]);
-        assert!(
-            matches!(call(&s, &[b"JSON.GET", b"str"]), Value::Error(e) if e.starts_with("WRONGTYPE"))
+        assert_eq!(
+            call(&s, &[b"JSON.GET", b"str"]),
+            Value::Error("Existing key has wrong Redis type".into())
         );
         assert!(matches!(call(&s, &[b"GET", b"d"]), Value::Error(e) if e.starts_with("WRONGTYPE")));
+    }
+
+    /// BUG-0236: JSON errors in RedisJSON 8.2.8's words and order, each
+    /// checked against the module. The key is read before the path, a path
+    /// is named as each command names it, and the arguments are read in
+    /// the module's order.
+    #[test]
+    fn json_errors_take_redisjsons_words_and_order() {
+        let s = MemKv::new();
+        let e = |text: &str| Value::Error(text.into());
+        call(
+            &s,
+            &[b"JSON.SET", b"{j}d", b"$", br#"{"a":1,"b":[1],"s":"x"}"#],
+        );
+        call(&s, &[b"SET", b"{j}str", b"v"]);
+        let c = |parts: &[&[u8]]| call(&s, parts);
+        // A path that names nothing, as each command names it.
+        assert_eq!(
+            c(&[b"JSON.GET", b"{j}d", b"x"]),
+            e("ERR Path '$.x' does not exist")
+        );
+        assert_eq!(
+            c(&[b"JSON.GET", b"{j}d", b"[0]"]),
+            e("ERR Path '$.[0]' does not exist")
+        );
+        // Among several, the first that names nothing, as written.
+        assert_eq!(
+            c(&[b"JSON.GET", b"{j}d", b".a", b"x"]),
+            e("ERR Path 'x' does not exist")
+        );
+        assert_eq!(
+            c(&[b"JSON.ARRAPPEND", b"{j}d", b".a", b"1"]),
+            e("ERR Path '.a' does not exist or not an array")
+        );
+        assert_eq!(
+            c(&[b"JSON.ARRLEN", b"{j}d", b".x"]),
+            e("ERR Path '.x' does not exist")
+        );
+        assert_eq!(
+            c(&[b"JSON.TOGGLE", b"{j}d", b"."]),
+            e("ERR Path '$' does not exist or not a bool")
+        );
+        // The key first: another type, then a missing key, before the path.
+        assert_eq!(
+            c(&[b"JSON.GET", b"{j}str", b"$["]),
+            e("Existing key has wrong Redis type")
+        );
+        assert_eq!(c(&[b"JSON.GET", b"{j}none", b"$["]), Value::Bulk(None));
+        assert_eq!(
+            c(&[b"JSON.ARRAPPEND", b"{j}none", b"$[", b"1"]),
+            e("ERR could not perform this operation on a key that doesn't exist")
+        );
+        assert_eq!(
+            c(&[b"JSON.ARRINDEX", b"{j}none", b".a", b"1"]),
+            e("ERR Path '.a' does not exist")
+        );
+        assert_eq!(
+            c(&[b"JSON.OBJLEN", b"{j}none", b"$.a"]),
+            e("ERR Path '$.a' does not exist or not an object")
+        );
+        assert_eq!(
+            c(&[b"JSON.SET", b"{j}none", b"$.a", b"1", b"XX"]),
+            Value::Bulk(None)
+        );
+        assert_eq!(
+            c(&[b"JSON.SET", b"{j}none", b"$[", b"1"]),
+            e("ERR new objects must be created at the root")
+        );
+        // A legacy path that does not parse is nil where one naming
+        // nothing is, but not past a key of another type.
+        assert_eq!(c(&[b"JSON.OBJKEYS", b"{j}d", b".["]), Value::Bulk(None));
+        assert_eq!(
+            c(&[b"JSON.OBJKEYS", b"{j}str", b".["]),
+            e("Existing key has wrong Redis type")
+        );
+        assert_eq!(
+            c(&[b"JSON.MGET", b"{j}d", b"{j}none", b"$["]),
+            Value::Array(Some(vec![Value::Bulk(None), Value::Bulk(None)]))
+        );
+        // Values and indexes, in serde's words and the module's.
+        assert_eq!(
+            c(&[b"JSON.SET", b"{j}d", b"$.a", b"bad"]),
+            e("expected value at line 1 column 1")
+        );
+        assert_eq!(
+            c(&[b"JSON.SET", b"{j}str", b"$", b"bad"]),
+            e("Existing key has wrong Redis type")
+        );
+        assert_eq!(
+            c(&[b"JSON.MERGE", b"{j}str", b"$", b"bad"]),
+            e("Existing key has wrong Redis type")
+        );
+        assert_eq!(
+            c(&[b"JSON.ARRINDEX", b"{j}d", b"$.b", b"bad"]),
+            e("ERR expected value at line 1 column 1")
+        );
+        assert_eq!(
+            c(&[b"JSON.ARRINSERT", b"{j}d", b"$.b", b"x", b"1"]),
+            e("Couldn't parse as integer")
+        );
+        // STRAPPEND reads its value at the first string, and names it.
+        assert_eq!(
+            c(&[b"JSON.STRAPPEND", b"{j}d", b"$.a", b"bad"]),
+            Value::Array(Some(vec![Value::Bulk(None)]))
+        );
+        assert_eq!(
+            c(&[b"JSON.STRAPPEND", b"{j}d", b"$.s", b"[1]"]),
+            e("WRONGTYPE wrong type of path value - expected string but found [1]")
+        );
+        // Writes that cannot land, and JSON.SET's options.
+        assert_eq!(
+            c(&[b"JSON.SET", b"{j}d", b"$.b[5]", b"1"]),
+            e("ERR array index out of range")
+        );
+        assert_eq!(
+            c(&[b"JSON.SET", b"{j}d", b"$..a", b"1", b"NX"]),
+            e("Err wrong static path")
+        );
+        assert_eq!(
+            c(&[b"JSON.SET", b"{j}d", b"$", b"1", b"NX", b"XX"]),
+            e("ERR syntax error")
+        );
+        // JSON.MSET reads each triple in turn: the first's landing before
+        // the second's value.
+        assert_eq!(
+            c(&[
+                b"JSON.MSET",
+                b"{j}d",
+                b"$.b[5]",
+                b"1",
+                b"{j}d",
+                b"$",
+                b"bad"
+            ]),
+            e("ERR array index out of range")
+        );
     }
 
     /// ADR-0054: an indefinite `$` path reads every match and writes every
@@ -4925,8 +5139,9 @@ mod tests {
             &[b"JSON.SET", b"d", b"$.*.z", b"true", b"NX"],
             &[b"JSON.SET", b"d", b"$..n", b"0", b"NX"],
         ] {
-            assert!(
-                matches!(call(&s, set), Value::Error(e) if e.contains("adds none")),
+            assert_eq!(
+                call(&s, set),
+                Value::Error("Err wrong static path".into()),
                 "{set:?}"
             );
         }

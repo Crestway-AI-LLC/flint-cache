@@ -67,6 +67,8 @@ pub struct Path {
     pub steps: Vec<Step>,
     pub mode: Mode,
     pub multi: Option<Vec<Sel>>,
+    /// The path as the caller wrote it, for the errors that name it.
+    pub text: String,
 }
 
 impl Path {
@@ -77,7 +79,38 @@ impl Path {
             steps,
             mode: Mode::Legacy,
             multi: None,
+            text: String::new(),
         }
+    }
+
+    /// The path of a command on a MISSING key, which RedisJSON answers
+    /// before it reads the path (BUG-0236): the dialect from the leading
+    /// `$`, nothing selected, and never the root, so a write there is still
+    /// "new objects must be created at the root".
+    pub(crate) fn unread(text: &str) -> Self {
+        Self {
+            steps: Vec::new(),
+            mode: if text.trim().starts_with('$') {
+                Mode::JsonPath
+            } else {
+                Mode::Legacy
+            },
+            multi: Some(Vec::new()),
+            text: text.to_string(),
+        }
+    }
+
+    /// The path as the caller wrote it.
+    pub fn original(&self) -> &str {
+        &self.text
+    }
+
+    /// The path as most of RedisJSON's errors name it: a `$` path as
+    /// written, a legacy one rewritten the module's way, `.` to `$`, `.a`
+    /// to `$.a`, and anything else behind `$.`, so `a` is `$.a` and `[0]`
+    /// is `$.[0]` (BUG-0236).
+    pub fn fixed(&self) -> String {
+        flint_resp::json_fixed_path(&self.text)
     }
 
     /// An indefinite path's selectors, or `None` for a definite path.
@@ -191,6 +224,7 @@ pub fn parse(path: &str) -> Result<Path, PathError> {
             steps: Vec::new(),
             mode,
             multi: None,
+            text: path.to_string(),
         });
     }
     let body = s.strip_prefix('$').unwrap_or(s);
@@ -211,6 +245,7 @@ pub fn parse(path: &str) -> Result<Path, PathError> {
             steps,
             mode,
             multi: None,
+            text: path.to_string(),
         });
     }
     if mode == Mode::Legacy {
@@ -220,6 +255,7 @@ pub fn parse(path: &str) -> Result<Path, PathError> {
         steps: Vec::new(),
         mode,
         multi: Some(sels),
+        text: path.to_string(),
     })
 }
 
@@ -953,6 +989,27 @@ mod tests {
 
     fn p(s: &str) -> Path {
         parse(s).expect("parse")
+    }
+
+    #[test]
+    fn fixed_spells_a_path_as_redisjson_errors_name_it() {
+        // BUG-0236, each RedisJSON 8.2.8's own spelling.
+        for (path, want) in [
+            ("$.a", "$.a"),
+            ("$", "$"),
+            (".", "$"),
+            (".a", "$.a"),
+            ("a", "$.a"),
+            (".x.y", "$.x.y"),
+            ("[0]", "$.[0]"),
+            (".b[9]", "$.b[9]"),
+        ] {
+            assert_eq!(p(path).fixed(), want, "{path}");
+            assert_eq!(p(path).original(), path);
+        }
+        let missing = Path::unread("$[");
+        assert!(missing.is_jsonpath() && !missing.is_root());
+        assert!(!Path::unread(".[").is_jsonpath());
     }
 
     #[test]

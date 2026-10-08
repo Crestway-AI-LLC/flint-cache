@@ -13,12 +13,15 @@ use super::*;
 use crate::json_path::{self, Path, Step};
 use serde_json::Value as J;
 
-const NOT_AN_ARRAY: &str = "ERR Path does not exist or not an array";
-const NOT_A_STRING: &str = "ERR Path does not exist or not a string";
-const NOT_AN_OBJECT: &str = "ERR Path does not exist or not an object";
-const NOT_A_BOOL: &str = "ERR Path does not exist or not a bool";
+// The tails RedisJSON puts after "ERR Path '<path>' does not exist" (see
+// `path_err`), naming what the command wanted to find there.
+const OR_NOT_AN_ARRAY: &str = " or not an array";
+const OR_NOT_A_STRING: &str = " or not a string";
+const OR_NOT_AN_OBJECT: &str = " or not an object";
+const OR_NOT_A_BOOL: &str = " or not a bool";
+/// ARRPOP's index, which Flint refuses where RedisJSON pops the last
+/// element (a documented difference), so the words are Flint's.
 const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
-const NOT_JSON: &str = "ERR value is not valid JSON";
 
 /// What a per-location operation answers: `Ok(None)` for a value of the
 /// wrong type, `Ok(Some((reply, changed)))` otherwise, or `Err(reply)` to
@@ -161,6 +164,19 @@ impl JsonFormat {
 }
 
 impl<'a> Dispatcher<'a> {
+    /// A legacy path argument that does not parse. JSON.TYPE, OBJKEYS and
+    /// OBJLEN answer it nil, as RedisJSON does, where it names nothing
+    /// (BUG-0236); a `$` path that does not parse stays an error.
+    pub(super) fn json_legacy_unparsable(reply: &Value, arg: Option<&Vec<u8>>) -> bool {
+        // The key is read first: another type is still an error.
+        matches!(reply, Value::Error(e) if e == MALFORMED_PATH)
+            && arg.is_some_and(|raw| {
+                let text = String::from_utf8_lossy(raw);
+                !text.trim().starts_with('$')
+                    && json_path::parse(&text) == Err(json_path::PathError::Malformed)
+            })
+    }
+
     /// Shape per-location answers for the caller's dialect. Under `$` each
     /// location answers its own element, a value of the wrong type a null
     /// one. A legacy path names at most one location: its answer, `wrong`
@@ -243,7 +259,7 @@ impl<'a> Dispatcher<'a> {
         &self,
         args: &[Vec<u8>],
         path_arg: Option<&Vec<u8>>,
-        legacy_err: &str,
+        legacy_tail: &str,
         op: impl FnMut(&mut J) -> Answer,
     ) -> Value {
         let (path, doc) = match self.json_open(&args[1], path_arg) {
@@ -260,7 +276,8 @@ impl<'a> Dispatcher<'a> {
         if changed && let Some(e) = self.json_save(&args[1], &doc) {
             return e;
         }
-        Self::json_shape(&path, answers, err(legacy_err), err(legacy_err))
+        let legacy = path_err(&path.fixed(), legacy_tail);
+        Self::json_shape(&path, answers, legacy.clone(), legacy)
     }
 
     /// `JSON.STRLEN key [path]` — a string's length in bytes.
@@ -281,11 +298,12 @@ impl<'a> Dispatcher<'a> {
         };
         let len = |v: &J| v.as_str().map(|s| Value::Integer(s.len() as i64));
         let answers = Self::json_read(&doc, &path, len);
+        let missing = path_err(&path.fixed(), "");
         let wrong = match Self::json_first(&doc, &path) {
             Some(v) => wrongtype("string", v),
-            None => err(PATH_MISSING),
+            None => missing.clone(),
         };
-        Self::json_shape(&path, answers, err(PATH_MISSING), wrong)
+        Self::json_shape(&path, answers, missing, wrong)
     }
 
     /// `JSON.STRAPPEND key [path] value` — append a JSON string to each
@@ -299,16 +317,21 @@ impl<'a> Dispatcher<'a> {
             3 => (None, &args[2]),
             _ => (Some(&args[2]), &args[3]),
         };
-        let Ok(tail) = serde_json::from_slice::<J>(raw) else {
-            return err(NOT_JSON);
-        };
-        // A value that is not a JSON string fails at the first string it
-        // would be appended to, as in RedisJSON; matches that are not
-        // strings still answer null.
-        self.json_write(args, path_arg, NOT_A_STRING, |v| {
+        // The value is read at the first string it would be appended to, as
+        // in RedisJSON (BUG-0236): a key, a path or a match that is not a
+        // string answers first, and a value that is not JSON, or not a JSON
+        // string, fails there in the module's words, which name the value.
+        let tail = serde_json::from_slice::<J>(raw);
+        self.json_write(args, path_arg, OR_NOT_A_STRING, |v| {
             let J::String(s) = v else { return Ok(None) };
-            let J::String(t) = &tail else {
-                return Err(wrongtype("string", &tail));
+            let t = match &tail {
+                Ok(J::String(t)) => t,
+                Ok(other) => {
+                    return Err(Value::Error(format!(
+                        "WRONGTYPE wrong type of path value - expected string but found {other}"
+                    )));
+                }
+                Err(e) => return Err(Value::Error(format!("ERR {e}"))),
             };
             s.push_str(t);
             Ok(Some((Value::Integer(s.len() as i64), true)))
@@ -322,11 +345,12 @@ impl<'a> Dispatcher<'a> {
         }
         let (path, doc) = match self.json_open(&args[1], args.get(2)) {
             Ok(v) => v,
+            Err(e) if Self::json_legacy_unparsable(&e, args.get(2)) => return Value::Bulk(None),
             Err(reply) => return reply,
         };
         let Some(doc) = doc else {
             return if path.is_jsonpath() {
-                err(NOT_AN_OBJECT)
+                path_err(&path.fixed(), OR_NOT_AN_OBJECT)
             } else {
                 Value::Bulk(None)
             };
@@ -347,6 +371,7 @@ impl<'a> Dispatcher<'a> {
         }
         let (path, doc) = match self.json_open(&args[1], args.get(2)) {
             Ok(v) => v,
+            Err(e) if Self::json_legacy_unparsable(&e, args.get(2)) => return Value::Bulk(None),
             Err(reply) => return reply,
         };
         let Some(doc) = doc else {
@@ -366,7 +391,8 @@ impl<'a> Dispatcher<'a> {
             })
         };
         let answers = Self::json_read(&doc, &path, keys);
-        Self::json_shape(&path, answers, Value::Bulk(None), err(NOT_AN_OBJECT))
+        let wrong = path_err(&path.fixed(), OR_NOT_AN_OBJECT);
+        Self::json_shape(&path, answers, Value::Bulk(None), wrong)
     }
 
     /// `JSON.TOGGLE key path` — flip each boolean. Under `$` each answers its
@@ -376,7 +402,7 @@ impl<'a> Dispatcher<'a> {
             return arity_err("json.toggle");
         }
         let jsonpath = args[2].first() == Some(&b'$');
-        self.json_write(args, Some(&args[2]), NOT_A_BOOL, |v| {
+        self.json_write(args, Some(&args[2]), OR_NOT_A_BOOL, |v| {
             let J::Bool(b) = v else { return Ok(None) };
             *b = !*b;
             let reply = match jsonpath {
@@ -394,22 +420,26 @@ impl<'a> Dispatcher<'a> {
         if !(4..=6).contains(&args.len()) {
             return arity_err("json.arrindex");
         }
-        let Ok(needle) = serde_json::from_slice::<J>(&args[3]) else {
-            return err(NOT_JSON);
+        let needle = match serde_json::from_slice::<J>(&args[3]) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(format!("ERR {e}")),
         };
         let (Some(start), Some(stop)) = (
             args.get(4).map_or(Some(0), |a| parse_i64(a)),
             args.get(5).map_or(Some(0), |a| parse_i64(a)),
         ) else {
-            return err(NOT_AN_INTEGER);
+            return err(NOT_AN_INDEX);
         };
         let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
             Ok(v) => v,
             Err(reply) => return reply,
         };
+        // A missing key names the path as written; a missing path, the
+        // module's rewrite of it.
         let Some(doc) = doc else {
-            return err(PATH_MISSING);
+            return path_err(path.original(), "");
         };
+        let missing = path_err(&path.fixed(), "");
         let find = |v: &J| {
             let a = v.as_array()?;
             let len = a.len() as i64;
@@ -431,9 +461,9 @@ impl<'a> Dispatcher<'a> {
         let answers = Self::json_read(&doc, &path, find);
         let wrong = match Self::json_first(&doc, &path) {
             Some(v) => wrongtype("array", v),
-            None => err(PATH_MISSING),
+            None => missing.clone(),
         };
-        Self::json_shape(&path, answers, err(PATH_MISSING), wrong)
+        Self::json_shape(&path, answers, missing, wrong)
     }
 
     /// `JSON.ARRINSERT key path index value [value ...]` — insert before
@@ -444,16 +474,16 @@ impl<'a> Dispatcher<'a> {
             return arity_err("json.arrinsert");
         }
         let Some(index) = parse_i64(&args[3]) else {
-            return err(NOT_AN_INTEGER);
+            return err(NOT_AN_INDEX);
         };
         let mut values = Vec::with_capacity(args.len() - 4);
         for raw in &args[4..] {
             match serde_json::from_slice::<J>(raw) {
                 Ok(v) => values.push(v),
-                Err(_) => return err(NOT_JSON),
+                Err(e) => return json_value_err(&e),
             }
         }
-        self.json_write(args, Some(&args[2]), NOT_AN_ARRAY, |v| {
+        self.json_write(args, Some(&args[2]), OR_NOT_AN_ARRAY, |v| {
             let J::Array(a) = v else { return Ok(None) };
             let len = a.len() as i64;
             let at = if index < 0 { len + index } else { index };
@@ -480,7 +510,7 @@ impl<'a> Dispatcher<'a> {
                 None => return err(NOT_AN_INTEGER),
             },
         };
-        self.json_write(args, args.get(2), NOT_AN_ARRAY, |v| {
+        self.json_write(args, args.get(2), OR_NOT_AN_ARRAY, |v| {
             let J::Array(a) = v else { return Ok(None) };
             if a.is_empty() {
                 return Ok(Some((Value::Bulk(None), false)));
@@ -503,9 +533,9 @@ impl<'a> Dispatcher<'a> {
             return arity_err("json.arrtrim");
         }
         let (Some(start), Some(stop)) = (parse_i64(&args[3]), parse_i64(&args[4])) else {
-            return err(NOT_AN_INTEGER);
+            return err(NOT_AN_INDEX);
         };
-        self.json_write(args, Some(&args[2]), NOT_AN_ARRAY, |v| {
+        self.json_write(args, Some(&args[2]), OR_NOT_AN_ARRAY, |v| {
             let J::Array(a) = v else { return Ok(None) };
             let len = a.len() as i64;
             let clamp = |i: i64| {
@@ -589,11 +619,18 @@ impl<'a> Dispatcher<'a> {
         if args.len() != 4 {
             return arity_err("json.merge");
         }
-        let Ok(patch) = serde_json::from_slice::<J>(&args[3]) else {
-            return err(NOT_JSON);
+        // RedisJSON's order (BUG-0236): the key, then the value, then the
+        // path.
+        let doc = match self.json_load(&args[1]) {
+            Ok(d) => d,
+            Err(reply) => return reply,
         };
-        let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
+        let patch = match serde_json::from_slice::<J>(&args[3]) {
             Ok(v) => v,
+            Err(e) => return json_value_err(&e),
+        };
+        let path = match Self::json_path_of(Some(&args[2]), doc.is_some()) {
+            Ok(p) => p,
             Err(reply) => return reply,
         };
         let key = &args[1];
@@ -611,18 +648,11 @@ impl<'a> Dispatcher<'a> {
         let locs = json_path::select(&doc, &path);
         if locs.is_empty() {
             if path.selectors().is_some() {
-                return err("ERR a multi-match path replaces existing values and adds none");
+                return err(NOT_ADDED);
             }
             match json_path::set(&mut doc, &path, patch) {
                 json_path::SetOutcome::Set | json_path::SetOutcome::Created => {}
-                json_path::SetOutcome::MissingParent => {
-                    return err(
-                        "ERR path parent does not exist (intermediate levels are not created)",
-                    );
-                }
-                json_path::SetOutcome::ShapeMismatch => {
-                    return err("ERR path does not fit the document's shape at that position");
-                }
+                outcome => return json_unset_err(&path, outcome),
             }
         } else {
             // Innermost first, so a merge into an ancestor cannot strand a
@@ -653,7 +683,11 @@ impl<'a> Dispatcher<'a> {
         let path = match json_path::parse(&raw) {
             Ok(p) => p,
             Err(json_path::PathError::Unsupported) => return err(UNSUPPORTED_PATH),
-            Err(json_path::PathError::Malformed) => return err("ERR malformed JSON path"),
+            // RedisJSON answers each key nil, as for a key it cannot read
+            // (BUG-0236).
+            Err(json_path::PathError::Malformed) => {
+                return Value::Array(Some(vec![Value::Bulk(None); keys.len()]));
+            }
         };
         let one = |key: &Vec<u8>| -> Value {
             let Ok(Some(bytes)) = self.json.get(slot_for_key(key), key) else {
@@ -693,10 +727,9 @@ impl<'a> Dispatcher<'a> {
         let mut before: Vec<(Vec<u8>, Option<J>)> = Vec::new();
         let mut work: Vec<(Vec<u8>, Option<J>)> = Vec::new();
         let mut steps = Vec::with_capacity(triples.len());
+        // Each triple in turn, as RedisJSON reads them (BUG-0236): its key,
+        // then where its path lands, then its value.
         for t in &triples {
-            let Ok(value) = serde_json::from_slice::<J>(&t[2]) else {
-                return err(NOT_JSON);
-            };
             let (path, doc) = match self.json_open(&t[0], Some(&t[1])) {
                 Ok(v) => v,
                 Err(reply) => return reply,
@@ -705,14 +738,20 @@ impl<'a> Dispatcher<'a> {
                 before.push((t[0].clone(), doc.clone()));
                 work.push((t[0].clone(), doc));
             }
-            // Checked against the document before the command.
+            // Checked against the document before the command. Where a
+            // write lands does not depend on what it writes, so the value
+            // is read after.
             let mut probe = before
                 .iter()
                 .find(|(k, _)| *k == t[0])
                 .and_then(|(_, d)| d.clone());
-            if let Err(e) = Self::json_set_in(&mut probe, &path, value.clone(), false, false) {
+            if let Err(e) = Self::json_set_in(&mut probe, &path, J::Null, false, false) {
                 return e;
             }
+            let value = match serde_json::from_slice::<J>(&t[2]) {
+                Ok(v) => v,
+                Err(e) => return json_value_err(&e),
+            };
             steps.push((t[0].clone(), path, value));
         }
         for (key, path, value) in steps {
@@ -748,7 +787,8 @@ impl<'a> Dispatcher<'a> {
             return Value::Bulk(None);
         };
         let answers = Self::json_read(&doc, &path, |v| Some(json_to_resp(v)));
-        Self::json_shape(&path, answers, err(PATH_MISSING), err(PATH_MISSING))
+        let missing = path_err(&path.fixed(), "");
+        Self::json_shape(&path, answers, missing.clone(), missing)
     }
 
     /// `JSON.DEBUG MEMORY key [path]` | `JSON.DEBUG HELP`. MEMORY answers the bytes each
@@ -786,7 +826,8 @@ impl<'a> Dispatcher<'a> {
             ))
         };
         let answers = Self::json_read(&doc, &path, size);
-        Self::json_shape(&path, answers, err(PATH_MISSING), err(PATH_MISSING))
+        let missing = path_err(&path.fixed(), "");
+        Self::json_shape(&path, answers, missing.clone(), missing)
     }
 
     /// `JSON.GET key [INDENT s] [NEWLINE s] [SPACE s] [NOESCAPE] [path ...]`.
@@ -849,7 +890,7 @@ impl<'a> Dispatcher<'a> {
             }
             return match json_path::get(&doc, &first) {
                 Some(v) => render(v),
-                None => err(PATH_MISSING),
+                None => path_err(&first.fixed(), ""),
             };
         }
         let mut parsed = Vec::with_capacity(paths.len());
@@ -858,7 +899,7 @@ impl<'a> Dispatcher<'a> {
             match json_path::parse(&text) {
                 Ok(p) => parsed.push((text, p)),
                 Err(json_path::PathError::Unsupported) => return err(UNSUPPORTED_PATH),
-                Err(json_path::PathError::Malformed) => return err("ERR malformed JSON path"),
+                Err(json_path::PathError::Malformed) => return err(MALFORMED_PATH),
             }
         }
         let any_jsonpath = parsed.iter().any(|(_, p)| p.is_jsonpath());
@@ -867,9 +908,12 @@ impl<'a> Dispatcher<'a> {
             let v = if any_jsonpath {
                 J::Array(Self::json_selected(&doc, &p).into_iter().cloned().collect())
             } else {
+                // Among several legacy paths, the first that names nothing
+                // is refused as written, where a lone one is rewritten:
+                // RedisJSON's two spellings (BUG-0236).
                 match json_path::get(&doc, &p) {
                     Some(v) => v.clone(),
-                    None => return err(PATH_MISSING),
+                    None => return path_err(&text, ""),
                 }
             };
             out.insert(text, v);

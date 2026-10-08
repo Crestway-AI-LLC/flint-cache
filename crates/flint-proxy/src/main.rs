@@ -1667,9 +1667,9 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
         .is_some_and(|n| flint_resp::resp3_differs_in_kind(n))
         && !matches!(v, Value::Error(_))
     {
-        let jsonpath = args.get(2).is_some_and(|p| p.first() == Some(&b'$'));
+        let path = args.get(2).map(Vec::as_slice);
         return Value::ByProto {
-            resp2: Box::new(flint_resp::json_numincrby_resp2(&v, jsonpath)),
+            resp2: Box::new(flint_resp::json_numincrby_resp2(&v, path)),
             resp3: Box::new(v),
         };
     }
