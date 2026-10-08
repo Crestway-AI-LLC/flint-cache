@@ -662,6 +662,12 @@ by the conformance corpus. What Flint adds is the frame around a script:
   with "nonexistent global variable". Globals and the libraries are
   read-only, and a script's text compiles as text, never as bytecode.
   `redis.setresp(3)` is refused: a script sees replies in RESP2's shapes.
+- **What a script returns.** As upstream converts it, Redis 7's typed tables
+  included: `{double=n}`, `{map={...}}` and `{set={...}}` answer a double, a
+  map and a set (a bulk string, a flat array and an array under RESP2)
+  (BUG-0232). `{big_number='...'}` and `{verbatim_string={...}}` answer
+  their text as a bulk string, which is upstream's RESP2 reply. Under
+  RESP3, upstream frames them as `(` and `=`.
 - **`EVALSHA` through the proxy.** The proxy keeps each tenant's script
   texts (from `EVAL` and `SCRIPT LOAD`) and forwards an `EVALSHA` it knows as
   the `EVAL` it stands for, so a script loaded once runs on either pair; one

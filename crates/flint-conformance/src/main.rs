@@ -1265,6 +1265,22 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             family: "scripting",
+            name: "a script returns redis 7's typed replies",
+            // BUG-0232: each answered an empty array. A double is a bulk
+            // string under RESP2 and a map a flat array; a `double` that is
+            // not a number leaves an ordinary table.
+            steps: vec![
+                s(&[b"EVAL", b"return {double=1.5}", b"0"], Expect::Str(b"1.5")),
+                s(&[b"EVAL", b"return {double=3}", b"0"], Expect::Str(b"3")),
+                s(&[b"EVAL", b"return {1, {double=2.5}}", b"0"], Expect::Arr(vec![Expect::Int(1), Expect::Str(b"2.5")])),
+                s(&[b"EVAL", b"return {double='2.5'}", b"0"], Expect::Arr(vec![])),
+                s(&[b"EVAL", b"return {map={a='x'}}", b"0"], Expect::UnorderedPairs(vec![(b"a", b"x")])),
+                s(&[b"EVAL", b"return {set={a=true}, 'z'}", b"0"], Expect::UnorderedStrs(vec![b"a"])),
+                s(&[b"EVAL", b"return {ok='fine', double=2}", b"0"], Expect::Simple("fine")),
+            ],
+        },
+        Case {
+            family: "scripting",
             name: "an empty error reply and the script verbs' refusals, in upstream's words",
             // BUG-0225.
             steps: vec![

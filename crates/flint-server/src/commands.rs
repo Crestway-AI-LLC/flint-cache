@@ -6996,4 +6996,37 @@ return nil"#;
         assert_eq!(call(&s, &cmd), Value::Integer(1));
         assert_eq!(call(&s, &[b"ZSCORE", b"{n}d", b"m"]), Value::Double(0.0));
     }
+
+    /// BUG-0232: a script's Redis 7 typed return converts to that reply; each
+    /// answered an empty array. The corpus pins `double`, `map` and `set`
+    /// against Valkey. RESP3 frames a big number and a verbatim string as
+    /// `(` and `=`, which our parser does not read, so these two answer
+    /// their text as a bulk string, which is upstream's RESP2 reply.
+    #[test]
+    fn a_script_returns_redis_7_typed_replies() {
+        let s = MemKv::new();
+        let eval = |body: &[u8]| call(&s, &[b"EVAL", body, b"0"]);
+        assert_eq!(eval(b"return {double=1.5}"), Value::Double(1.5));
+        assert_eq!(
+            eval(b"return {map={a=1}}"),
+            Value::Map(vec![(Value::Bulk(Some(b"a".to_vec())), Value::Integer(1))])
+        );
+        assert_eq!(
+            eval(b"return {set={a=true}}"),
+            Value::Set(vec![Value::Bulk(Some(b"a".to_vec()))])
+        );
+        assert_eq!(
+            eval(b"return {big_number='12\\r\\n3'}"),
+            Value::Bulk(Some(b"12  3".to_vec()))
+        );
+        assert_eq!(
+            eval(b"return {verbatim_string={format='txt', string='hi'}}"),
+            Value::Bulk(Some(b"hi".to_vec()))
+        );
+        // A verbatim string without a format is an ordinary table.
+        assert_eq!(
+            eval(b"return {verbatim_string={string='hi'}}"),
+            Value::Array(Some(vec![]))
+        );
+    }
 }

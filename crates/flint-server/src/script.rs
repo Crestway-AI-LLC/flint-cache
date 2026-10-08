@@ -766,8 +766,9 @@ const MAX_REPLY_DEPTH: usize = 1000;
 
 /// A script's return value as a reply, as Redis converts it: a number
 /// truncates to an integer, `true` is 1, `false` and nil are nil, a table
-/// with `err` is an error and one with `ok` a status, and any other table
-/// is an array of its elements from 1 up to the first nil.
+/// with `err` is an error and one with `ok` a status, one with `double`,
+/// `big_number`, `verbatim_string`, `map` or `set` that reply type, and any
+/// other table is an array of its elements from 1 up to the first nil.
 fn to_reply(v: &LuaValue, depth: usize) -> Value {
     if depth > MAX_REPLY_DEPTH {
         return Value::Error("ERR reached lua stack limit".into());
@@ -791,6 +792,45 @@ fn table_reply(t: &Table, depth: usize) -> Value {
     }
     if let Ok(LuaValue::String(s)) = t.raw_get::<LuaValue>("ok") {
         return Value::Simple(s.to_string_lossy());
+    }
+    // Redis 7's typed replies, in upstream's order. Each converts under
+    // RESP2 too, where a double is a bulk string and a map a flat array; they
+    // were read as arrays with no elements, `[]` (BUG-0232).
+    match t.raw_get::<LuaValue>("double") {
+        Ok(LuaValue::Number(n)) => return Value::Double(n),
+        Ok(LuaValue::Integer(i)) => return Value::Double(i as f64),
+        _ => {}
+    }
+    // RESP3 frames these as `(` and `=`, which our parser does not read, so
+    // both answer their text as a bulk string: upstream's RESP2 reply, and
+    // the same bytes in a plainer frame under RESP3.
+    if let Ok(LuaValue::String(n)) = t.raw_get::<LuaValue>("big_number") {
+        // Upstream maps CR and LF to spaces, as it does in a status.
+        let mut text = n.as_bytes().to_vec();
+        text.iter_mut()
+            .filter(|b| matches!(b, b'\r' | b'\n'))
+            .for_each(|b| *b = b' ');
+        return Value::Bulk(Some(text));
+    }
+    if let Ok(LuaValue::Table(v)) = t.raw_get::<LuaValue>("verbatim_string")
+        && let Ok(LuaValue::String(_)) = v.raw_get::<LuaValue>("format")
+        && let Ok(LuaValue::String(text)) = v.raw_get::<LuaValue>("string")
+    {
+        return Value::Bulk(Some(text.as_bytes().to_vec()));
+    }
+    // A map's pairs and a set's keys, in Lua's `next` order, as upstream
+    // walks them; a set's values are ignored.
+    if let Ok(LuaValue::Table(m)) = t.raw_get::<LuaValue>("map") {
+        let pairs = m.pairs::<LuaValue, LuaValue>().filter_map(Result::ok);
+        return Value::Map(
+            pairs
+                .map(|(k, v)| (to_reply(&k, depth + 1), to_reply(&v, depth + 1)))
+                .collect(),
+        );
+    }
+    if let Ok(LuaValue::Table(set)) = t.raw_get::<LuaValue>("set") {
+        let keys = set.pairs::<LuaValue, LuaValue>().filter_map(Result::ok);
+        return Value::Set(keys.map(|(k, _)| to_reply(&k, depth + 1)).collect());
     }
     let mut out = Vec::new();
     for i in 1.. {
