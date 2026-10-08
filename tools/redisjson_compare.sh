@@ -48,6 +48,9 @@ EXPECTED_DIVERGENCES=(
   'JSON.GET d $.a[?(@ =~ "x")]'      # regex filter refused (ADR-0054)
   'JSON.GET d $.a[?(@..c)]'          # multi-match filter operand refused (ADR-0054)
   'JSON.NUMMULTBY m $.i 3037000500'  # overflow refused; RedisJSON wraps (ADR-0055)
+  'JSON.SET jt $.a 2 x'              # trailing text refused; RedisJSON stores 2 (Jeff 10/8)
+  'JSON.DEL jn $.b[-9]'              # names nothing; RedisJSON deletes b[0] (Jeff 10/8)
+  'JSON.SET jf $ 1 FORMAT STRING'    # no FORMAT option; RedisJSON takes it (Jeff 10/8)
 )
 
 cleanup() { [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null; }

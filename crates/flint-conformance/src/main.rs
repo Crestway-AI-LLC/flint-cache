@@ -4920,6 +4920,45 @@ fn corpus() -> Vec<Case> {
                 s(&[b"JSON.GET", b"m", b"$.i"], Expect::Str(b"[3037000500]")),
             ],
         },
+        // Three more kept by decision (Jeff, 2026-10-08): each is a place
+        // RedisJSON stores something the caller did not write.
+        Case {
+            family: "json",
+            name: "a value with trailing text is refused",
+            steps: vec![
+                s(&[b"JSON.SET", b"jt", b"$", br#"{"a":1}"#], Expect::Ok),
+                // DIVERGENCE (deliberate): RedisJSON reads the first value,
+                // stores 2, and drops the rest.
+                s(
+                    &[b"JSON.SET", b"jt", b"$.a", b"2 x"],
+                    Expect::Err("trailing characters at line 1 column 3"),
+                ),
+                s(&[b"JSON.GET", b"jt", b"$.a"], Expect::Str(b"[1]")),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "a negative index past the start names nothing",
+            steps: vec![
+                s(&[b"JSON.SET", b"jn", b"$", br#"{"b":[10,20,30]}"#], Expect::Ok),
+                // DIVERGENCE (deliberate): RedisJSON takes the first element
+                // and deletes it.
+                s(&[b"JSON.DEL", b"jn", b"$.b[-9]"], Expect::Int(0)),
+                s(&[b"JSON.GET", b"jn", b"$.b"], Expect::Str(b"[[10,20,30]]")),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "JSON.SET takes no FORMAT option",
+            steps: vec![
+                // DIVERGENCE (deliberate): RedisJSON takes FORMAT.
+                s(
+                    &[b"JSON.SET", b"jf", b"$", b"1", b"FORMAT", b"STRING"],
+                    Expect::Err("ERR syntax error"),
+                ),
+                s(&[b"EXISTS", b"jf"], Expect::Int(0)),
+            ],
+        },
         Case {
             family: "json",
             name: "type gate: WRONGTYPE in both directions",

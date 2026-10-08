@@ -532,6 +532,20 @@ it (`tools/redisjson_compare.sh`). These cases differ, each on purpose:
 
 7. **An integer overflow in JSON.NUMMULTBY is refused**, as in
    JSON.NUMINCRBY (3). RedisJSON wraps.
+8. **A value with something after it is refused** (`2 x`, `[1] 2`), in
+   serde's words (`trailing characters at line 1 column 3`). RedisJSON's
+   JSON.SET, MSET, MERGE, ARRAPPEND and ARRINSERT read the first value and
+   drop the rest, so a client bug that sends `2 x` stores `2`; its
+   STRAPPEND refuses, as Flint does.
+9. **A negative index past the start of an array names nothing**
+   (`$.b[-9]` on three elements), as JSONPath has it. RedisJSON takes the
+   first element, for writes too: its `JSON.DEL d $.b[-9]` removes `b[0]`.
+10. **JSON.SET takes no `FORMAT` option**: a syntax error. RedisJSON takes
+    `FORMAT`.
+
+Jeff chose all three on 2026-10-08, after BUG-0236's inventory found them:
+each is a place where RedisJSON stores what the caller did not write, or
+cannot be asked to.
 
 Smaller ones, which the corpus does not list:
 - A write to a missing intermediate (`$.x.y` where `x` does not exist) is an
@@ -565,14 +579,6 @@ Smaller ones, which the corpus does not list:
   RedisJSON's text comes from its parser generator (`Error occurred on
   position 7, …`); the refusals this list describes keep texts of their
   own; and so do the deliberate ones above.
-- A value with something after it (`1 x`, `[1] 2`) is refused here, in
-  serde's words (`trailing characters at line 1 column 3`). RedisJSON's
-  JSON.SET, MSET, MERGE, ARRAPPEND and ARRINSERT read the first value and
-  drop the rest; its STRAPPEND refuses as Flint does.
-- A negative index past the start of an array (`$.b[-9]` on three
-  elements) names nothing here, as JSONPath has it. RedisJSON takes the
-  first element, for writes too: its `JSON.DEL d $.b[-9]` removes `b[0]`.
-- JSON.SET's `FORMAT` option is not taken: a syntax error.
 - **`SRANDMEMBER key <negative count>` is refused past the seat's
   `max-value-bytes`** (512 MiB by default), estimated as the count times the
   set's mean member size plus 64 bytes a member. A negative count repeats
