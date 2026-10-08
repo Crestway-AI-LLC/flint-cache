@@ -7,7 +7,12 @@ playground's runs after the rc.79 roll. Held by the new CORE drill
 one that ships it**: `flintctl upgrade` rolls the controller after the pairs,
 so during the roll that ships the fix the old controller is still watching.
 `flintctl failover` is protected as soon as the controller is on the fixed
-build.
+build. **Observed on the playground**: the rc.80 roll, the one that shipped
+it, showed the race once more as predicted. The rc.81 roll (2026-10-08
+01:45Z) was the first protected one. The controller logged `holding: a
+planned handover is in progress on this pair (CP hold, 4706 ms left) -- not
+promoting into its gap`, promoted nothing, and the roll alone promoted
+172.31.64.94:7002 at (0,86).
 **Severity:** medium, latent so far. On all four playground rolls checked
 (rc.76, rc.77, rc.78, rc.79) the controller promoted the old master in the
 middle of the roll's handover, and the roll then gave the new master the same
