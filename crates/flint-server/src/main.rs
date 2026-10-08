@@ -8718,8 +8718,19 @@ mod serve_tests {
     use super::*;
     use std::net::TcpStream;
 
+    /// The test serial lock, held for the whole of a test that runs a server.
+    type Serial = std::sync::MutexGuard<'static, ()>;
+
     /// Ephemeral server running `serve` with a per-connection MemKv.
-    fn spawn_server() -> std::net::SocketAddr {
+    ///
+    /// Returns the test serial lock with the address, to be held for the
+    /// whole test: a served write takes the process-global write locks, and
+    /// one landing beside a `write_lock` test can deadlock it. Those tests
+    /// hold `GLOBAL.read()` while a thread they join waits for another read,
+    /// and a pending `lock_all()` queues that read behind it (BUG-0243).
+    /// Taken here so a new test cannot forget it.
+    fn spawn_server() -> (std::net::SocketAddr, Serial) {
+        let serial = crate::write_lock::test_serial();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         std::thread::spawn(move || {
@@ -8744,7 +8755,7 @@ mod serve_tests {
                 });
             }
         });
-        addr
+        (addr, serial)
     }
 
     /// BUG-0181, over the wire: a cross-slot MSET after a SET is refused when
@@ -8753,7 +8764,7 @@ mod serve_tests {
     /// SET through: the partial apply a queue-time refusal exists to prevent.
     #[test]
     fn a_cross_slot_mset_in_multi_poisons_the_whole_transaction() {
-        let addr = spawn_server();
+        let (addr, _serial) = spawn_server();
         let mut s = connect(addr);
         let mut p = Vec::new();
         for c in [
@@ -8792,8 +8803,7 @@ mod serve_tests {
     /// (measured: 111 and 118 of 3,000 races lost a renamed hash).
     #[test]
     fn a_script_reaching_past_its_keys_runs_again_under_every_writer() {
-        let _serial = crate::write_lock::test_serial();
-        let addr = spawn_server();
+        let (addr, _serial) = spawn_server();
         let mut s = connect(addr);
         let mut p = Vec::new();
         let script = "redis.call('set', KEYS[1], 'a') redis.call('set', '{t}u', 'b') \
@@ -8831,7 +8841,7 @@ mod serve_tests {
     /// queue's list, in two slots.
     #[test]
     fn a_whole_connections_transaction_may_span_slots() {
-        let addr = spawn_server();
+        let (addr, _serial) = spawn_server();
         let send = |cmds: &[&[&str]]| {
             let mut s = connect(addr);
             let mut p = Vec::new();
@@ -8913,7 +8923,8 @@ mod serve_tests {
     /// bulk must be refused at parse time, not buffered until OOM.
     #[test]
     fn oversized_bulk_declaration_is_refused_not_buffered() {
-        let mut s = connect(spawn_server());
+        let (addr, _serial) = spawn_server();
+        let mut s = connect(addr);
         s.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4294967296\r\n")
             .expect("send");
         let mut reply = Vec::new();
@@ -8928,7 +8939,8 @@ mod serve_tests {
 
     #[test]
     fn runaway_inline_line_is_refused() {
-        let mut s = connect(spawn_server());
+        let (addr, _serial) = spawn_server();
+        let mut s = connect(addr);
         // An inline command that never terminates must not accumulate
         // forever; past MAX_INLINE_LEN the server errors and closes.
         s.write_all(&vec![b'a'; MAX_INLINE_LEN + 1024])
@@ -9026,7 +9038,7 @@ mod serve_tests {
     #[cfg(feature = "rocks")]
     #[test]
     fn a_cursor_ahead_of_the_master_is_refused_but_not_as_a_walgap() {
-        let (addr, _dir) = spawn_rocks_server();
+        let (addr, _dir, _serial) = spawn_rocks_server();
         let mut c = TcpStream::connect(addr).expect("connect");
         for i in 0..5 {
             let k = format!("k{i}");
@@ -9066,7 +9078,9 @@ mod serve_tests {
     /// `spawn_server` uses MemKv with `rocks: None`, so every test through it
     /// takes the unbatched path and proves nothing about this.
     #[cfg(feature = "rocks")]
-    fn spawn_rocks_server() -> (std::net::SocketAddr, std::path::PathBuf) {
+    fn spawn_rocks_server() -> (std::net::SocketAddr, std::path::PathBuf, Serial) {
+        // Held for the caller's whole test; see `spawn_server` (BUG-0243).
+        let serial = crate::write_lock::test_serial();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         // A monotonic counter, NOT the thread id: ids are reused once a
@@ -9106,7 +9120,7 @@ mod serve_tests {
                 });
             }
         });
-        (addr, out)
+        (addr, out, serial)
     }
 
     /// A rocks seat built the way `main` builds one: ONE watch table shared by
@@ -9115,7 +9129,9 @@ mod serve_tests {
     /// unwrapped store, so no test through it can see one connection's write
     /// break another's WATCH.
     #[cfg(feature = "rocks")]
-    fn spawn_watched_rocks_server() -> (std::net::SocketAddr, std::path::PathBuf) {
+    fn spawn_watched_rocks_server() -> (std::net::SocketAddr, std::path::PathBuf, Serial) {
+        // Held for the caller's whole test; see `spawn_server` (BUG-0243).
+        let serial = crate::write_lock::test_serial();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -9154,7 +9170,7 @@ mod serve_tests {
                 });
             }
         });
-        (addr, out)
+        (addr, out, serial)
     }
 
     /// Send one command and read its reply.
@@ -9178,8 +9194,7 @@ mod serve_tests {
     #[cfg(feature = "rocks")]
     #[test]
     fn another_connections_transaction_breaks_a_watch() {
-        let _serial = crate::write_lock::test_serial();
-        let (addr, _dir) = spawn_watched_rocks_server();
+        let (addr, _dir, _serial) = spawn_watched_rocks_server();
         let (mut a, mut b) = (connect(addr), connect(addr));
         assert_eq!(
             roundtrip(&mut a, &["SET", "{w}k", "1"]),
@@ -9249,8 +9264,7 @@ mod serve_tests {
     fn a_pipeline_of_only_pure_sets_is_committed_on_drain() {
         // Serialised against write_lock's tests: these run real servers over
         // the same process-global locks (see write_lock::test_serial).
-        let _serial = crate::write_lock::test_serial();
-        let (addr, _dir) = spawn_rocks_server();
+        let (addr, _dir, _serial) = spawn_rocks_server();
         let mut s = connect(addr);
         let n = 50;
         let mut pipeline = Vec::new();
@@ -9292,9 +9306,8 @@ mod serve_tests {
     #[test]
     #[ignore]
     fn bench_pipelined_pure_writes() {
-        // Serialised against write_lock's tests: these run real servers over
-        // the same process-global locks (see write_lock::test_serial).
-        let _serial = crate::write_lock::test_serial();
+        // Serialised against write_lock's tests by `spawn_rocks_server`,
+        // which hands back the serial lock (BUG-0243).
         let conns: usize = std::env::var("BENCH_CONNS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -9303,7 +9316,7 @@ mod serve_tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20_000);
-        let (addr, _dir) = spawn_rocks_server();
+        let (addr, _dir, _serial) = spawn_rocks_server();
         let start = std::time::Instant::now();
         let workers: Vec<_> = (0..conns)
             .map(|c| {
@@ -9354,8 +9367,7 @@ mod serve_tests {
     fn a_transaction_is_not_batched_and_still_reads_its_own_writes() {
         // Serialised against write_lock's tests: these run real servers over
         // the same process-global locks (see write_lock::test_serial).
-        let _serial = crate::write_lock::test_serial();
-        let (addr, _dir) = spawn_rocks_server();
+        let (addr, _dir, _serial) = spawn_rocks_server();
         let mut s = connect(addr);
         let mut p = Vec::new();
         encode(
@@ -9415,8 +9427,7 @@ mod serve_tests {
     #[cfg(feature = "rocks")]
     #[test]
     fn a_batch_takes_the_global_lock_once_not_once_per_key() {
-        let _serial = crate::write_lock::test_serial();
-        let (addr, _dir) = spawn_rocks_server();
+        let (addr, _dir, _serial) = spawn_rocks_server();
         let mut s = connect(addr);
         let n = 120;
         let mut pipeline = Vec::new();
@@ -9447,8 +9458,7 @@ mod serve_tests {
     fn a_read_in_the_same_pipeline_sees_the_writes_before_it() {
         // Serialised against write_lock's tests: these run real servers over
         // the same process-global locks (see write_lock::test_serial).
-        let _serial = crate::write_lock::test_serial();
-        let (addr, _dir) = spawn_rocks_server();
+        let (addr, _dir, _serial) = spawn_rocks_server();
         let mut s = connect(addr);
         let mut pipeline = Vec::new();
         set_frame("a", "1", &mut pipeline);
@@ -9475,7 +9485,8 @@ mod serve_tests {
 
     #[test]
     fn pipelined_replies_flush_incrementally_and_stay_correct() {
-        let mut s = connect(spawn_server());
+        let (addr, _serial) = spawn_server();
+        let mut s = connect(addr);
         let value = vec![b'v'; 64 * 1024];
         let mut pipeline = Vec::new();
         encode(
