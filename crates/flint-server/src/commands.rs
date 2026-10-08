@@ -3100,7 +3100,8 @@ impl<'a> Dispatcher<'a> {
                     }
                 }
                 // RedisBloom also takes any word by its first letters
-                // (`I` for ITEMS); the words are spelled out here.
+                // (`I` for ITEMS); the words are spelled out here
+                // (ADR-0016 D7.7).
                 _ => return err("Unknown argument received"),
             }
             i += 1;
@@ -4079,7 +4080,7 @@ const BF_ERROR_RANGE: &str = "ERR error rate must be in the range (0.000000, 1.0
 const BF_CAPACITY_RANGE: &str = "ERR capacity must be in the range [1, 1073741824]";
 const BF_EXPANSION_RANGE: &str = "ERR expansion must be in the range [0, 32768]";
 /// Flint's own bound: a filter keeps its growth factor in one byte, so an
-/// expansion RedisBloom takes above 255 is refused here.
+/// expansion RedisBloom takes above 255 is refused here (ADR-0016 D7.6).
 const BF_EXPANSION_UNSUPPORTED: &str = "ERR expansion above 255 is not supported";
 
 /// BF.MADD's and BF.INSERT's reply: each item's answer, and a refusal in

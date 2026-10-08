@@ -66,9 +66,10 @@ fi
 # here as a thing we were checking — had never been sent to RedisBloom at
 # all. A gate that cannot reach half its own assertions is not a gate.
 #
-# NOTE the asymmetry in what a failure MEANS. On D7.2-D7.3 RedisBloom is
-# "right" and we differ on purpose. On D7.4 the reverse: RedisBloom accepts
-# garbage and we refuse it. Anything NOT listed here that fails is a place
+# NOTE the asymmetry in what a failure MEANS. On D7.2, D7.3, D7.6 and D7.8
+# RedisBloom is "right" and we differ on purpose. On D7.4, D7.5 and D7.7 the
+# reverse: RedisBloom accepts garbage, or answers for a key of another type,
+# and we refuse. Anything NOT listed here that fails is a place
 # where a real client behaves differently against Flint than against
 # RedisBloom, which is the whole thing this family exists to avoid.
 # D7.1 (TYPE answering "bloom") is gone: TYPE answers RedisBloom's
@@ -77,6 +78,10 @@ EXPECTED_DIVERGENCES=(
   "DIVERGENCE D7.2"   # BF.SCANDUMP refused: our block layout is not theirs
   "DIVERGENCE D7.3"   # BF.INFO SIZE counts materialised, not reserved, bytes
   "DIVERGENCE D7.4"   # we refuse unknown BF.RESERVE options; they ignore them
+  "DIVERGENCE D7.5"   # BF.EXISTS on another type: WRONGTYPE here, 0 there
+  "DIVERGENCE D7.6"   # EXPANSION above 255 refused: one byte on disk here
+  "DIVERGENCE D7.7"   # BF.INSERT words spelled out; they read first letters
+  "DIVERGENCE D7.8"   # BF.DEBUG not served: it prints their in-memory layout
 )
 
 cleanup() { [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null; }

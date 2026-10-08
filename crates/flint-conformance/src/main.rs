@@ -5184,6 +5184,55 @@ fn corpus() -> Vec<Case> {
                 s(&[b"BF.LOADCHUNK", b"i", b"1", b"zz"], Expect::AnyError),
             ],
         },
+        // D7.5 to D7.8, kept by Jeff on 2026-10-08 after an inventory against
+        // RedisBloom 8.2.8, each a case to itself for the reason above.
+        Case {
+            family: "bloom",
+            name: "DIVERGENCE D7.5: BF.EXISTS on another type is WRONGTYPE",
+            steps: vec![
+                s(&[b"SET", b"str", b"v"], Expect::Ok),
+                // RedisBloom answers 0, though its BF.ADD and BF.CARD say
+                // WRONGTYPE for the same key.
+                s(&[b"BF.EXISTS", b"str", b"a"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"BF.MEXISTS", b"str", b"a", b"b"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "DIVERGENCE D7.6: an EXPANSION above 255 is refused",
+            steps: vec![
+                // RedisBloom takes up to 32768; the growth factor is one
+                // byte on disk here.
+                s(
+                    &[b"BF.RESERVE", b"w", b"0.01", b"100", b"EXPANSION", b"256"],
+                    Expect::Err("ERR expansion above 255 is not supported"),
+                ),
+                s(
+                    &[b"BF.INSERT", b"w", b"EXPANSION", b"300", b"ITEMS", b"x"],
+                    Expect::Err("ERR expansion above 255 is not supported"),
+                ),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "DIVERGENCE D7.7: BF.INSERT option words are spelled out",
+            steps: vec![
+                // RedisBloom reads `I` as ITEMS, by its first letter.
+                s(
+                    &[b"BF.INSERT", b"p", b"I", b"x"],
+                    Expect::Err("Unknown argument received"),
+                ),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "DIVERGENCE D7.8: BF.DEBUG is not served",
+            steps: vec![
+                s(&[b"BF.ADD", b"d", b"x"], Expect::Int(1)),
+                // It prints RedisBloom's in-memory layout, which ours is not.
+                s(&[b"BF.DEBUG", b"d"], Expect::AnyError),
+            ],
+        },
         Case {
             family: "bloom",
             name: "BF.RESERVE parameters and BF.INSERT",

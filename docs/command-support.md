@@ -345,12 +345,11 @@ scaling filter is full]` — because the items before it are stored
 on, `EXPANSION 0` means `NONSCALING`, and `BF.RESERVE` refuses both together
 as RedisBloom does (BUG-0238). Every argument of `BF.RESERVE` and
 `BF.INSERT` is read, and refused in RedisBloom's words, before the key is
-(BUG-0240). Flint's own limit: a growth factor is kept in one byte, so an
-`EXPANSION` above 255, which RedisBloom takes, is refused here when it would
-make a filter.
+(BUG-0240).
 
-Three deliberate differences, confirmed against RedisBloom 8.2.8 (built from
-source on 2026-10-08) by `tools/redisbloom_compare.sh`:
+Seven deliberate differences, confirmed against RedisBloom 8.2.8 (built from
+source on 2026-10-08) by `tools/redisbloom_compare.sh`, and kept by Jeff on
+2026-10-08 when the cheap one (`TYPE`) was closed:
 
 - **`BF.SCANDUMP` and `BF.LOADCHUNK` are refused**, with an error saying
   why. Their payload is a serialized filter and our layout is not
@@ -366,6 +365,19 @@ source on 2026-10-08) by `tools/redisbloom_compare.sh`:
   recognise (`BF.RESERVE k 0.01 100 WAT` returns `OK`). Matching that would
   let a misspelled `NONSCALNG` hand back a scaling filter the caller
   believes is capped.
+- **`BF.EXISTS` and `BF.MEXISTS` on a key of another type answer WRONGTYPE**,
+  where RedisBloom answers 0, though its own `BF.ADD`, `BF.CARD` and
+  `BF.INFO` answer WRONGTYPE there. "Not present" for a string key would hide
+  the caller's bug.
+- **An `EXPANSION` above 255 is refused** when it would make a filter
+  (`ERR expansion above 255 is not supported`); RedisBloom takes up to
+  32768. A filter keeps its growth factor in one byte, so widening it is a
+  format change, and a chain is capped at 32 links anyway.
+- **`BF.INSERT`'s option words are spelled out.** RedisBloom reads the first
+  letter or two, so `BF.INSERT k I x` is `ITEMS x` there and `Unknown
+  argument received` here, for the same reason as the one above.
+- **`BF.DEBUG` is not served.** It prints RedisBloom's in-memory layout,
+  which ours is not, like the dump commands.
 
 Plus **defaults differ.** An auto-created filter (a `BF.ADD` with no prior
 `BF.RESERVE`) is sized for 100,000 items rather than RedisBloom's 100, and a

@@ -275,6 +275,23 @@ against RedisBloom 8.2.8 on 2026-10-08, when 1 was withdrawn:
    error here. That is still the safer direction — the client learns at
    once instead of getting a filter that ignored the request.
 
+Four more, found by an inventory against RedisBloom 8.2.8 and kept by Jeff on
+2026-10-08 ("keep D7.2-D7.4 and the rest as you recommend"):
+
+5. **`BF.EXISTS`/`BF.MEXISTS` on a key of another type answer WRONGTYPE**,
+   where RedisBloom answers 0 (its `bfGetChain` status other than OK reads
+   as empty). Its own BF.ADD, BF.CARD and BF.INFO answer WRONGTYPE there,
+   and "not present" for a string key hides the caller's bug.
+6. **`EXPANSION` above 255 is refused** where it would make a filter.
+   RedisBloom takes 0 to 32768; the growth factor is one byte of our
+   metadata row, so widening it is a format change every older release
+   would have to read, for growth past what a 32-link chain needs.
+7. **`BF.INSERT` option words are spelled out.** RedisBloom dispatches on
+   the first letter (`I…` is ITEMS, `C…` CAPACITY, `NOC…` NOCREATE), so a
+   misspelling is an option there. Same reasoning as 4.
+8. **`BF.DEBUG` is not served.** It describes RedisBloom's in-memory filters,
+   which ours are not; same reasoning as 2.
+
 **Defaults also differ** (D5), because a link costs a disk read here. Not
 numbered with the above: it changes what you get when you ask for nothing,
 not how a given command is answered.

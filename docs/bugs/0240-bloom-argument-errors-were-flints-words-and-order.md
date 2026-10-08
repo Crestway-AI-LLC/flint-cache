@@ -35,8 +35,9 @@ cap; RedisBloom refuses it.
 
 Both commands read, bound and refuse every argument in RedisBloom's order
 and words before the key, with Redis's integer parsing. BF.RESERVE answers
-arity for more than seven arguments, as RedisBloom does. Kept different:
-an unknown BF.RESERVE word is still refused (ADR-0016 D7.4), BF.INSERT's
-option words are spelled out where RedisBloom takes their first letters,
-and an EXPANSION above 255 is refused when it would make a filter, since a
-growth factor is kept in one byte here.
+arity for more than seven arguments, as RedisBloom does. Kept different
+(ADR-0016 D7, Jeff 2026-10-08): an unknown BF.RESERVE word is still refused
+(D7.4), an EXPANSION above 255 is refused when it would make a filter,
+since a growth factor is kept in one byte here (D7.6), and BF.INSERT's
+option words are spelled out where RedisBloom takes their first letters
+(D7.7).
