@@ -173,7 +173,9 @@ echo "$RES" | grep -q "MIGRATEIN-OK" || { echo "FAIL: migration did not complete
 # metadata and dropped the blocks would leave a key that still answers
 # BF.INFO and has forgotten its contents.
 DTYPE=$(valkey-cli -p $DPORT TYPE "$KEY" | tr -d '\r')
-[ "$DTYPE" = "bloom" ] || { echo "FAIL: destination TYPE is '$DTYPE', not bloom"; exit 1; }
+# RedisBloom's type name, which TYPE answers since 2026-10-08 (ADR-0016 D7.1
+# withdrawn).
+[ "$DTYPE" = "MBbloom--" ] || { echo "FAIL: destination TYPE is '$DTYPE', not MBbloom--"; exit 1; }
 DLINKS=$(valkey-cli -p $DPORT BF.INFO "$KEY" FILTERS | tr -d '\r')
 DCARD=$(valkey-cli -p $DPORT BF.CARD "$KEY" | tr -d '\r')
 DSIZE=$(valkey-cli -p $DPORT BF.INFO "$KEY" SIZE | tr -d '\r')

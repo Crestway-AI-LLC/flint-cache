@@ -6,7 +6,8 @@ Date: 2026-08-10
 
 Accepted. D2's block size was reasoned when this was written and has since
 been **measured** (D2, Verification 4). The chain bound in D5 remains a
-choice rather than a measurement, and is marked as such.
+choice rather than a measurement, and is marked as such. **D7.1 withdrawn
+2026-10-08** (Jeff): `TYPE` answers `MBbloom--`, as RedisBloom does.
 
 ## Context
 
@@ -238,11 +239,14 @@ case to ITSELF in the conformance corpus — see Verification 3 for why that
 turned out to be load-bearing rather than tidy.
 
 **All four were confirmed against RedisBloom 2.8.16 on 2026-08-11**, which
-is also when the list stopped being three:
+is also when the list stopped being three. 2 to 4 were confirmed again
+against RedisBloom 8.2.8 on 2026-10-08, when 1 was withdrawn:
 
-1. **`TYPE` returns `bloom`, not `MBbloom--`.** Following the precedent
-   already set: Flint's JSON type answers `json` where RedisJSON answers
-   `ReJSON-RL` (conformance corpus, `crates/flint-conformance/src/main.rs:2224`).
+1. **WITHDRAWN 2026-10-08.** ~~`TYPE` returns `bloom`, not `MBbloom--`,
+   following JSON's `json` for RedisJSON's `ReJSON-RL`.~~ Jeff asked for
+   the documented divergences to be closed where that cost little; this one
+   was a name, so `TYPE` answers `MBbloom--` and `SCAN … TYPE MBbloom--`
+   finds filters (public BUG-0241 fixed SCAN's filter at the same time).
 2. **`BF.SCANDUMP` and `BF.LOADCHUNK` are refused in v1**, with an error
    that says why. Their payload is a serialized filter, and ours is a
    different layout, so implementing them would emit a blob that looks
@@ -259,7 +263,8 @@ is also when the list stopped being three:
 4. **An unknown `BF.RESERVE` option is refused, not ignored** — the one
    divergence where WE are the stricter side. RedisBloom 2.8.16 accepts and
    silently drops trailing tokens it does not recognise: `BF.RESERVE k 0.01
-   100 WAT WAT WAT` returns `OK`, and so does `EXPANSION notanum`.
+   100 WAT WAT WAT` returns `OK`, and so does `EXPANSION notanum` (8.2.8
+   refuses the second, `ERR bad expansion`, and still takes the first).
    Matching that would mean a misspelled `NONSCALNG` quietly produces a
    SCALING filter — the caller believes the size is capped and it grows
    instead. An error is recoverable in one line; a filter that silently

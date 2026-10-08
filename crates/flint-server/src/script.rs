@@ -728,6 +728,8 @@ fn to_lua(lua: &Lua, v: Value) -> mlua::Result<LuaValue> {
             LuaValue::Table(t)
         }
         Value::Integer(i) => LuaValue::Number(i as f64),
+        // The RESP2 view: a boolean is the integer RESP2 spells it as.
+        Value::Boolean(b) => LuaValue::Number(if b { 1.0 } else { 0.0 }),
         Value::Bulk(Some(b)) => LuaValue::String(lua.create_string(b)?),
         Value::Bulk(None) | Value::Array(None) | Value::Null => LuaValue::Boolean(false),
         Value::Array(Some(items)) | Value::Set(items) => array(lua, items)?,

@@ -66,13 +66,14 @@ fi
 # here as a thing we were checking — had never been sent to RedisBloom at
 # all. A gate that cannot reach half its own assertions is not a gate.
 #
-# NOTE the asymmetry in what a failure MEANS. On D7.1-D7.3 RedisBloom is
+# NOTE the asymmetry in what a failure MEANS. On D7.2-D7.3 RedisBloom is
 # "right" and we differ on purpose. On D7.4 the reverse: RedisBloom accepts
 # garbage and we refuse it. Anything NOT listed here that fails is a place
 # where a real client behaves differently against Flint than against
 # RedisBloom, which is the whole thing this family exists to avoid.
+# D7.1 (TYPE answering "bloom") is gone: TYPE answers RedisBloom's
+# "MBbloom--" since Jeff's 2026-10-08 decision, and its case asserts that.
 EXPECTED_DIVERGENCES=(
-  "DIVERGENCE D7.1"   # TYPE: we answer "bloom", RedisBloom "MBbloom--"
   "DIVERGENCE D7.2"   # BF.SCANDUMP refused: our block layout is not theirs
   "DIVERGENCE D7.3"   # BF.INFO SIZE counts materialised, not reserved, bytes
   "DIVERGENCE D7.4"   # we refuse unknown BF.RESERVE options; they ignore them

@@ -329,13 +329,29 @@ actually on disk rather than the reserved capacity.
 `BF.INFO key FIELD` answers with a **one-element array**, not a bare value
 — `*1\r\n:5000\r\n` — matching RedisBloom, whose own clients index `[0]`.
 The nil for a `NONSCALING` filter's expansion is wrapped the same way; an
-unknown field name is a bare error.
+unknown field name is a bare error. Under RESP3 the replies take RedisBloom's
+RESP3 kinds: `BF.ADD`, `BF.EXISTS`, `BF.MADD`, `BF.MEXISTS` and `BF.INSERT`
+answer booleans (`#t`/`#f`), `BF.INFO` a map, and `BF.INFO key FIELD` a
+one-pair map naming the field (BUG-0239).
 
-Four deliberate differences, all confirmed against RedisBloom 2.8.16 by
-`tools/redisbloom_compare.sh`:
+`TYPE` answers RedisBloom's module type name, `MBbloom--`, and `SCAN … TYPE
+MBbloom--` finds filters (BUG-0241). Until 2026-10-08 it answered `bloom`, a
+deliberate difference Jeff withdrew because matching cost little.
 
-- **`TYPE` answers `bloom`**, where RedisBloom answers `MBbloom--`. Same
-  choice JSON already makes against `ReJSON-RL`.
+A batch that fills a `NONSCALING` filter part-way answers each item, with the
+error in the place of the item it stopped at — `[0, 1, (error) ERR non
+scaling filter is full]` — because the items before it are stored
+(BUG-0237). `NONSCALING` holds whichever side of `EXPANSION` it is written
+on, `EXPANSION 0` means `NONSCALING`, and `BF.RESERVE` refuses both together
+as RedisBloom does (BUG-0238). Every argument of `BF.RESERVE` and
+`BF.INSERT` is read, and refused in RedisBloom's words, before the key is
+(BUG-0240). Flint's own limit: a growth factor is kept in one byte, so an
+`EXPANSION` above 255, which RedisBloom takes, is refused here when it would
+make a filter.
+
+Three deliberate differences, confirmed against RedisBloom 8.2.8 (built from
+source on 2026-10-08) by `tools/redisbloom_compare.sh`:
+
 - **`BF.SCANDUMP` and `BF.LOADCHUNK` are refused**, with an error saying
   why. Their payload is a serialized filter and our layout is not
   RedisBloom's, so implementing them would emit a blob that looks portable,
@@ -347,9 +363,9 @@ Four deliberate differences, all confirmed against RedisBloom 2.8.16 by
   allocates up front. Ours is the number you are billed for.
 - **An unknown `BF.RESERVE` option is an error, not ignored** — the one
   place we are STRICTER. RedisBloom accepts and drops tokens it does not
-  recognise (`BF.RESERVE k 0.01 100 WAT` returns `OK`, as does `EXPANSION
-  notanum`). Matching that would let a misspelled `NONSCALNG` hand back a
-  scaling filter the caller believes is capped.
+  recognise (`BF.RESERVE k 0.01 100 WAT` returns `OK`). Matching that would
+  let a misspelled `NONSCALNG` hand back a scaling filter the caller
+  believes is capped.
 
 Plus **defaults differ.** An auto-created filter (a `BF.ADD` with no prior
 `BF.RESERVE`) is sized for 100,000 items rather than RedisBloom's 100, and a

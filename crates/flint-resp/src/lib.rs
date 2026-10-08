@@ -62,6 +62,12 @@ pub enum Value {
     Error(String),
     /// `:42\r\n`
     Integer(i64),
+    /// A yes/no answer. RESP3 sends `#t`/`#f`; RESP2 has no boolean and
+    /// sends `:1`/`:0`, as Redis downgrades one. RedisBloom answers
+    /// `BF.ADD`, `BF.EXISTS` and their multi forms this way under RESP3
+    /// (BUG-0239), and a RESP3 client library hands the caller `True`
+    /// rather than `1`.
+    Boolean(bool),
     /// `$5\r\nhello\r\n`; `None` is the null bulk string `$-1\r\n`.
     Bulk(Option<Vec<u8>>),
     /// `*2\r\n...`; `None` is the null array `*-1\r\n`.
@@ -249,6 +255,24 @@ pub fn fmt_json_double(d: f64) -> Vec<u8> {
         Some(n) => n.to_string().into_bytes(),
         // Not finite: the seat refuses such a result, so none arrives here.
         None => fmt_double(d),
+    }
+}
+
+/// True for `BF.INFO key field`, whose two dialects differ in shape in a way
+/// no generic downgrade recovers: RedisBloom answers a one-pair map under
+/// RESP3 (`%1 +Capacity :100`) and a one-element array holding only the
+/// value under RESP2 (`*1 :100`), where flattening the map would give two
+/// elements (BUG-0239).
+pub fn bf_info_field(args: &[Vec<u8>]) -> bool {
+    args.len() == 3 && args[0].eq_ignore_ascii_case(b"BF.INFO")
+}
+
+/// Rebuild a one-field `BF.INFO`'s RESP2 reply from its RESP3 map: the value
+/// alone, in a one-element array. Anything else (an error) passes through.
+pub fn bf_info_field_resp2(resp3_reply: &Value) -> Value {
+    match resp3_reply {
+        Value::Map(pairs) if pairs.len() == 1 => Value::Array(Some(vec![pairs[0].1.clone()])),
+        other => other.clone(),
     }
 }
 
@@ -555,6 +579,12 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
             out.extend_from_slice(i.to_string().as_bytes());
             out.extend_from_slice(b"\r\n");
         }
+        Value::Boolean(b) => out.extend_from_slice(match (resp3_sel, b) {
+            (true, true) => b"#t\r\n",
+            (true, false) => b"#f\r\n",
+            (false, true) => b":1\r\n",
+            (false, false) => b":0\r\n",
+        }),
         // Both spellings of "absent" collapse to RESP3's single null.
         Value::Bulk(None) | Value::Array(None) if resp3_sel => out.extend_from_slice(b"_\r\n"),
         Value::Bulk(None) => out.extend_from_slice(b"$-1\r\n"),
@@ -771,18 +801,20 @@ fn decode_at(input: &[u8], depth: usize) -> Result<Decoded, ProtocolError> {
             };
             Ok(Decoded::Complete(Value::Double(d), 1 + line_end + 2))
         }
-        // `#t` / `#f`. We never emit booleans, but a RESP3 peer may, and
-        // silently failing to parse one would desynchronize the stream.
+        // `#t` / `#f`. Decoded as a boolean, not an integer, so the proxy
+        // reading a seat in RESP3 can still send a RESP3 client `#t`
+        // (BUG-0239): meaning must survive the decode for the re-encode
+        // to pick the client's spelling.
         b'#' => {
             let Some(line_end) = find_crlf(&input[1..]) else {
                 return Ok(Decoded::NeedMore);
             };
             let v = match &input[1..1 + line_end] {
-                b"t" => 1,
-                b"f" => 0,
+                b"t" => true,
+                b"f" => false,
                 _ => return Err(ProtocolError::BadInteger),
             };
-            Ok(Decoded::Complete(Value::Integer(v), 1 + line_end + 2))
+            Ok(Decoded::Complete(Value::Boolean(v), 1 + line_end + 2))
         }
         other => Err(ProtocolError::UnknownType(other)),
     }
@@ -1052,15 +1084,20 @@ mod tests {
                 buf.len()
             ))
         );
-        // Booleans: we never send them, but must not choke on one.
+        // Booleans decode as themselves (BUG-0239), and each dialect
+        // spells one its own way: RESP2 has none and sends an integer.
         assert_eq!(
             decode(b"#t\r\n"),
-            Ok(Decoded::Complete(Value::Integer(1), 4))
+            Ok(Decoded::Complete(Value::Boolean(true), 4))
         );
         assert_eq!(
             decode(b"#f\r\n"),
-            Ok(Decoded::Complete(Value::Integer(0), 4))
+            Ok(Decoded::Complete(Value::Boolean(false), 4))
         );
+        assert_eq!(enc(&Value::Boolean(true), Proto::Resp3), b"#t\r\n");
+        assert_eq!(enc(&Value::Boolean(false), Proto::Resp3), b"#f\r\n");
+        assert_eq!(enc(&Value::Boolean(true), Proto::Resp2), b":1\r\n");
+        assert_eq!(enc(&Value::Boolean(false), Proto::Resp2), b":0\r\n");
         // A truncated null is NeedMore, not a silent accept.
         assert_eq!(decode(b"_"), Ok(Decoded::NeedMore));
     }

@@ -5017,6 +5017,35 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "json",
+            name: "inside a transaction, JSON replies keep their shapes",
+            // BUG-0242: through the proxy, JSON.TYPE came back one layer
+            // deeper and NUMINCRBY as RESP3's array for its RESP2 text,
+            // because EXEC's items skipped the repair a reply outside a
+            // transaction gets.
+            steps: vec![
+                s(&[b"JSON.SET", b"{x}j", b"$", br#"{"a":1}"#], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"JSON.TYPE", b"{x}j", b"$.a"], Expect::Simple("QUEUED")),
+                s(
+                    &[b"JSON.NUMINCRBY", b"{x}j", b"$.a", b"1"],
+                    Expect::Simple("QUEUED"),
+                ),
+                s(
+                    &[b"JSON.NUMINCRBY", b"{x}j", b".a", b"1"],
+                    Expect::Simple("QUEUED"),
+                ),
+                s(
+                    &[b"EXEC"],
+                    Expect::Arr(vec![
+                        Expect::Arr(vec![Expect::Str(b"integer")]),
+                        Expect::Str(b"[2]"),
+                        Expect::Str(b"3"),
+                    ]),
+                ),
+            ],
+        },
+        Case {
             family: "bloom",
             name: "BF lifecycle: add, exists, card, multi forms, TTL",
             steps: vec![
@@ -5064,12 +5093,22 @@ fn corpus() -> Vec<Case> {
         // never once been exercised against RedisBloom.
         Case {
             family: "bloom",
-            name: "DIVERGENCE D7.1: TYPE names the type, not the module",
+            name: "TYPE and SCAN TYPE name a filter as RedisBloom does",
             steps: vec![
-                s(&[b"BF.ADD", b"bf", b"a"], Expect::Int(1)),
-                // RedisBloom answers its module type name, `MBbloom--`. We
-                // answer the type, matching what JSON already does.
-                s(&[b"TYPE", b"bf"], Expect::Simple("bloom")),
+                s(&[b"BF.ADD", b"{s}bf", b"a"], Expect::Int(1)),
+                s(&[b"SET", b"{s}str", b"v"], Expect::Ok),
+                // RedisBloom's module type name (Jeff, 2026-10-08). Until
+                // then this was divergence D7.1, answering `bloom`.
+                s(&[b"TYPE", b"{s}bf"], Expect::Simple("MBbloom--")),
+                // BUG-0241: SCAN's TYPE filter knew only the core types,
+                // so no name found a filter.
+                s(
+                    &[b"SCAN", b"0", b"TYPE", b"MBbloom--", b"COUNT", b"1000"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"{s}bf"]),
+                    ]),
+                ),
             ],
         },
         Case {
@@ -5079,7 +5118,8 @@ fn corpus() -> Vec<Case> {
                 s(&[b"BF.RESERVE", b"r", b"0.001", b"5000"], Expect::Ok),
                 // Nothing on disk until a block is touched (ADR-0016 D3),
                 // so a freshly reserved filter is 0 bytes. RedisBloom
-                // allocates the whole filter up front and reports ~6992.
+                // allocates the whole filter up front and reports its own
+                // number (~6992 in 2.8.16, 9984 in 8.2.8).
                 // Both are honest answers to "how big is this filter"; they
                 // are answers to different questions, and ours is the one
                 // that matches what the tenant is billed for.
@@ -5212,6 +5252,137 @@ fn corpus() -> Vec<Case> {
                 s(&[b"SET", b"str", b"v"], Expect::Ok),
                 s(&[b"BF.ADD", b"str", b"x"], Expect::AnyError),
                 s(&[b"GET", b"i"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "inside a transaction, BF replies keep their shapes",
+            // BUG-0242: the proxy repaired a one-field BF.INFO outside EXEC
+            // and not inside it.
+            steps: vec![
+                s(&[b"BF.RESERVE", b"{x}b", b"0.01", b"10"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"BF.INFO", b"{x}b", b"CAPACITY"], Expect::Simple("QUEUED")),
+                s(&[b"BF.ADD", b"{x}b", b"a"], Expect::Simple("QUEUED")),
+                s(&[b"BF.INFO", b"{x}b", b"ITEMS"], Expect::Simple("QUEUED")),
+                s(
+                    &[b"EXEC"],
+                    Expect::Arr(vec![
+                        Expect::Arr(vec![Expect::Int(10)]),
+                        Expect::Int(1),
+                        Expect::Arr(vec![Expect::Int(1)]),
+                    ]),
+                ),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "a batch that fills a filter answers each item, the error in its place",
+            // BUG-0237: the items before the refusal are stored, so one
+            // error for the whole batch told the caller nothing was.
+            steps: vec![
+                s(
+                    &[b"BF.RESERVE", b"f", b"0.001", b"2", b"NONSCALING"],
+                    Expect::Ok,
+                ),
+                s(&[b"BF.ADD", b"f", b"a"], Expect::Int(1)),
+                s(
+                    &[b"BF.MADD", b"f", b"a", b"b", b"c", b"d"],
+                    Expect::Arr(vec![Expect::Int(0), Expect::Int(1), Expect::Err("ERR non scaling filter is full")]),
+                ),
+                s(&[b"BF.EXISTS", b"f", b"b"], Expect::Int(1)),
+                s(&[b"BF.CARD", b"f"], Expect::Int(2)),
+                s(
+                    &[b"BF.INSERT", b"f", b"ITEMS", b"e", b"g"],
+                    Expect::Arr(vec![Expect::Err("ERR non scaling filter is full")]),
+                ),
+                s(&[b"BF.ADD", b"f", b"e"], Expect::Err("ERR non scaling filter is full")),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "NONSCALING holds against EXPANSION, and EXPANSION 0 is NONSCALING",
+            // BUG-0238: the later option won, so `NONSCALING EXPANSION 2`
+            // made a filter that grows.
+            steps: vec![
+                s(
+                    &[b"BF.INSERT", b"a", b"NONSCALING", b"EXPANSION", b"2", b"ITEMS", b"x"],
+                    Expect::Arr(vec![Expect::Int(1)]),
+                ),
+                s(
+                    &[b"BF.INFO", b"a", b"EXPANSION"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                s(
+                    &[b"BF.INSERT", b"b", b"EXPANSION", b"0", b"ITEMS", b"x"],
+                    Expect::Arr(vec![Expect::Int(1)]),
+                ),
+                s(
+                    &[b"BF.INFO", b"b", b"EXPANSION"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                s(
+                    &[b"BF.RESERVE", b"r", b"0.01", b"100", b"NONSCALING", b"EXPANSION", b"2"],
+                    Expect::Err("Nonscaling filters cannot expand"),
+                ),
+                s(
+                    &[b"BF.RESERVE", b"r", b"0.01", b"100", b"EXPANSION", b"0"],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"BF.INFO", b"r", b"EXPANSION"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "BF arguments are refused in RedisBloom's words, before the key",
+            // BUG-0240: an existing filter or another type answered first,
+            // and the words were Flint's own.
+            steps: vec![
+                s(&[b"SET", b"str", b"v"], Expect::Ok),
+                s(&[b"BF.RESERVE", b"f", b"0.01", b"10"], Expect::Ok),
+                s(
+                    &[b"BF.RESERVE", b"f", b"0", b"100"],
+                    Expect::Err("ERR error rate must be in the range (0.000000, 1.000000)"),
+                ),
+                s(
+                    &[b"BF.RESERVE", b"str", b"0.01", b"0"],
+                    Expect::Err("ERR capacity must be in the range [1, 1073741824]"),
+                ),
+                s(
+                    &[b"BF.RESERVE", b"n", b"0.01", b"1073741825"],
+                    Expect::Err("ERR capacity must be in the range [1, 1073741824]"),
+                ),
+                s(
+                    &[b"BF.RESERVE", b"n", b"0.01", b"100", b"EXPANSION"],
+                    Expect::Err("ERR no expansion"),
+                ),
+                s(
+                    &[b"BF.RESERVE", b"n", b"0.01", b"100", b"EXPANSION", b"-1"],
+                    Expect::Err("ERR expansion must be in the range [0, 32768]"),
+                ),
+                s(
+                    &[b"BF.INSERT", b"f", b"CAPACITY", b"0", b"ITEMS", b"x"],
+                    Expect::Err("Bad capacity"),
+                ),
+                s(
+                    &[b"BF.INSERT", b"str", b"ERROR", b"1", b"ITEMS", b"x"],
+                    Expect::Err("Bad error rate"),
+                ),
+                s(
+                    &[b"BF.INSERT", b"n", b"WAT", b"ITEMS", b"x"],
+                    Expect::Err("Unknown argument received"),
+                ),
+                s(
+                    &[b"BF.INSERT", b"n", b"CAPACITY", b"10"],
+                    Expect::Err("ERR wrong number of arguments for 'bf.insert' command"),
+                ),
+                s(
+                    &[b"BF.RESERVE", b"f", b"0.01", b"100"],
+                    Expect::Err("ERR item exists"),
+                ),
             ],
         },
         Case {
@@ -5363,6 +5534,9 @@ struct Client {
     stream: flint_tls::Stream,
     buf: Vec<u8>,
     proto: Proto,
+    /// The commands queued since MULTI, so EXEC's items fold as each
+    /// command's own reply folds (BUG-0242). `None` outside a transaction.
+    queued: Option<Vec<Vec<Vec<u8>>>>,
 }
 
 impl Client {
@@ -5380,6 +5554,7 @@ impl Client {
             stream: flint_tls::connect_edge(&ep.target, &ep.tls)?,
             buf: Vec::new(),
             proto: Proto::Resp2,
+            queued: None,
         };
         // Before HELLO, so a rejected credential fails here with -WRONGPASS
         // rather than as ninety-nine identical case failures.
@@ -5419,7 +5594,7 @@ impl Client {
             match decode(&self.buf) {
                 Ok(Decoded::Complete(value, used)) => {
                     self.buf.drain(..used);
-                    return Ok(self.normalize(args, value));
+                    return Ok(self.track_and_normalize(args, value));
                 }
                 Ok(Decoded::NeedMore) => {
                     let n = self.stream.read(&mut chunk)?;
@@ -5456,6 +5631,49 @@ impl Client {
         if self.proto == Proto::Resp2 {
             return v;
         }
+        let v = Self::fold(args, v);
+        self.downgrade(v)
+    }
+
+    /// Keep the commands a transaction queues, and fold each item of EXEC's
+    /// reply as that command's reply folds outside a transaction. Without
+    /// this a RESP3 run could not hold a JSON.TYPE, NUMINCRBY or one-field
+    /// BF.INFO inside EXEC to the RESP2 shape, which is the case the proxy
+    /// got wrong (BUG-0242).
+    fn track_and_normalize(&mut self, args: &[Vec<u8>], v: Value) -> Value {
+        let is = |n: &[u8]| args.first().is_some_and(|a| a.eq_ignore_ascii_case(n));
+        if is(b"EXEC") || is(b"DISCARD") {
+            let queued = self.queued.take().unwrap_or_default();
+            let v = match v {
+                Value::Array(Some(items)) if is(b"EXEC") && items.len() == queued.len() => {
+                    Value::Array(Some(
+                        items
+                            .into_iter()
+                            .zip(&queued)
+                            .map(|(item, cmd)| match self.proto {
+                                Proto::Resp3 => Self::fold(cmd, item),
+                                Proto::Resp2 => item,
+                            })
+                            .collect(),
+                    ))
+                }
+                other => other,
+            };
+            return self.normalize(args, v);
+        }
+        if is(b"MULTI") && matches!(&v, Value::Simple(s) if s == "OK") {
+            self.queued = Some(Vec::new());
+        } else if let Some(q) = self.queued.as_mut()
+            && matches!(&v, Value::Simple(s) if s == "QUEUED")
+        {
+            q.push(args.to_vec());
+        }
+        self.normalize(args, v)
+    }
+
+    /// The per-command half of [`Client::normalize`]: the replies whose
+    /// two dialects differ in a way the generic downgrade cannot recover.
+    fn fold(args: &[Vec<u8>], v: Value) -> Value {
         // JSON.TYPE carries an extra array layer under RESP3 (RedisJSON's
         // quirk, which we match); peel it before comparing.
         let v = match args.first() {
@@ -5474,6 +5692,17 @@ impl Client {
             }
             _ => v,
         };
+        // A one-field BF.INFO is a one-pair map under RESP3; RESP2's reply
+        // is the value alone, in a one-element array (BUG-0239).
+        match flint_resp::bf_info_field(args) {
+            true => flint_resp::bf_info_field_resp2(&v),
+            false => v,
+        }
+    }
+
+    /// The generic half of [`Client::normalize`]: re-render through the
+    /// server's own RESP2 encoder.
+    fn downgrade(&self, v: Value) -> Value {
         // Score pairs are the one shape the wire cannot hand back as
         // itself: `ScorePairs` encodes to nested [member, double] arrays,
         // and decoding those yields exactly that — plain arrays, with no

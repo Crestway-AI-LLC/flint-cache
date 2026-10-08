@@ -1673,7 +1673,40 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
             resp3: Box::new(v),
         };
     }
+    // A one-field BF.INFO is a one-pair map under RESP3 and the bare value
+    // in a one-element array under RESP2; flattening the map would give
+    // two elements (BUG-0239).
+    if flint_resp::bf_info_field(args) {
+        return Value::ByProto {
+            resp2: Box::new(flint_resp::bf_info_field_resp2(&v)),
+            resp3: Box::new(v),
+        };
+    }
     v
+}
+
+/// Whether [`repair_reply`] changes this command's reply, so a transaction
+/// keeps the command to repair its item in EXEC's array (BUG-0242).
+fn needs_repair(args: &[Vec<u8>]) -> bool {
+    args.first()
+        .is_some_and(|n| flint_resp::resp3_nests_reply(n) || flint_resp::resp3_differs_in_kind(n))
+        || flint_resp::bf_info_field(args)
+}
+
+/// One queued command's item in EXEC's reply, put in the client's dialect
+/// as the same reply outside a transaction is: a null that was an array
+/// typed back as one, and the command's own repair applied. Without the
+/// repair a RESP2 client through the proxy got JSON.TYPE nested one layer
+/// deep and NUMINCRBY's RESP3 array for its text (BUG-0242).
+fn exec_item(null_array: bool, repair: Option<&[Vec<u8>]>, v: Option<Value>) -> Value {
+    match v {
+        Some(Value::Null) if null_array => Value::Array(None),
+        Some(v) => match repair {
+            Some(args) => repair_reply(args, v),
+            None => v,
+        },
+        None => Value::Null,
+    }
 }
 
 /// Collect a prefetched command's reply.
@@ -2980,8 +3013,13 @@ struct ProxyTxn {
 /// One command a transaction has queued.
 enum Queued {
     /// Queued on the backend. Whether its null is a null ARRAY: RESP3 has
-    /// one null, so EXEC's reply cannot say which it was; this does.
-    Backend { null_array: bool },
+    /// one null, so EXEC's reply cannot say which it was; this does. And the
+    /// command itself when its reply needs [`repair_reply`], which its item
+    /// in EXEC's array needs as much as a reply outside one (BUG-0242).
+    Backend {
+        null_array: bool,
+        repair: Option<Vec<Vec<u8>>>,
+    },
     /// Queued here, with nothing for a backend to do: the reply EXEC owes
     /// in its place (BUG-0220).
     Local(Value),
@@ -3266,11 +3304,9 @@ async fn transaction_step(
                                 .drain(..)
                                 .map(|q| match q {
                                     Queued::Local(v) => v,
-                                    Queued::Backend { null_array } => match items.next() {
-                                        Some(Value::Null) if null_array => Value::Array(None),
-                                        Some(v) => v,
-                                        None => Value::Null,
-                                    },
+                                    Queued::Backend { null_array, repair } => {
+                                        exec_item(null_array, repair.as_deref(), items.next())
+                                    }
                                 })
                                 .collect(),
                         ))
@@ -3338,6 +3374,7 @@ async fn transaction_step(
                     if matches!(&v, Value::Simple(q) if q == "QUEUED") {
                         txn.queued.push(Queued::Backend {
                             null_array: flint_resp::null_is_array(args),
+                            repair: needs_repair(args).then(|| args.to_vec()),
                         });
                     }
                     Some(v)
@@ -7280,6 +7317,82 @@ mod connect_err_tests {
         assert_eq!(
             connect_err(Error::new(ErrorKind::WouldBlock, "x")).kind(),
             ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::{Value, repair_reply};
+    use flint_resp::Proto;
+
+    fn wire(v: &Value, proto: Proto) -> Vec<u8> {
+        let mut out = Vec::new();
+        flint_resp::encode_proto(v, proto, &mut out);
+        out
+    }
+
+    fn args(parts: &[&[u8]]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.to_vec()).collect()
+    }
+
+    /// BUG-0239: a one-field BF.INFO reaches the proxy as the seat's RESP3
+    /// one-pair map, and a RESP2 client is owed the value alone in a
+    /// one-element array, not the flattened pair. The whole BF.INFO and an
+    /// error pass as they came; a boolean keeps its meaning both ways.
+    #[test]
+    fn a_seats_resp3_bloom_replies_reach_each_client_in_its_own_shape() {
+        let field = Value::Map(vec![(Value::Simple("Capacity".into()), Value::Integer(10))]);
+        let one = repair_reply(&args(&[b"BF.INFO", b"k", b"CAPACITY"]), field.clone());
+        assert_eq!(wire(&one, Proto::Resp2), b"*1\r\n:10\r\n");
+        assert_eq!(wire(&one, Proto::Resp3), b"%1\r\n+Capacity\r\n:10\r\n");
+
+        let whole = repair_reply(&args(&[b"BF.INFO", b"k"]), field);
+        assert_eq!(wire(&whole, Proto::Resp2), b"*2\r\n+Capacity\r\n:10\r\n");
+
+        let refused = Value::Error("ERR not found".into());
+        let e = repair_reply(&args(&[b"BF.INFO", b"k", b"CAPACITY"]), refused.clone());
+        assert_eq!(wire(&e, Proto::Resp2), wire(&refused, Proto::Resp2));
+
+        let added = repair_reply(&args(&[b"BF.ADD", b"k", b"x"]), Value::Boolean(true));
+        assert_eq!(wire(&added, Proto::Resp2), b":1\r\n");
+        assert_eq!(wire(&added, Proto::Resp3), b"#t\r\n");
+    }
+
+    /// BUG-0242: inside EXEC, each queued command's item takes the repair
+    /// its reply takes outside a transaction, and only the commands that
+    /// need one keep their arguments for it.
+    #[test]
+    fn an_exec_item_is_repaired_as_its_command_is() {
+        use super::{exec_item, needs_repair};
+        let info = args(&[b"BF.INFO", b"k", b"CAPACITY"]);
+        let ty = args(&[b"JSON.TYPE", b"k", b"$.a"]);
+        let incr = args(&[b"JSON.NUMINCRBY", b"k", b"$.a", b"1"]);
+        for (cmd, want) in [(&info, true), (&ty, true), (&incr, true)] {
+            assert_eq!(needs_repair(cmd), want, "{cmd:?}");
+        }
+        assert!(!needs_repair(&args(&[b"BF.INFO", b"k"])));
+        assert!(!needs_repair(&args(&[b"GET", b"k"])));
+
+        let field = Value::Map(vec![(Value::Simple("Capacity".into()), Value::Integer(10))]);
+        let one = exec_item(false, Some(&info), Some(field));
+        assert_eq!(wire(&one, Proto::Resp2), b"*1\r\n:10\r\n");
+        let nested = Value::Array(Some(vec![Value::Array(Some(vec![Value::Bulk(Some(
+            b"integer".to_vec(),
+        ))]))]));
+        let t = exec_item(false, Some(&ty), Some(nested));
+        assert_eq!(wire(&t, Proto::Resp2), b"*1\r\n$7\r\ninteger\r\n");
+        let n = exec_item(
+            false,
+            Some(&incr),
+            Some(Value::Array(Some(vec![Value::Integer(3)]))),
+        );
+        assert_eq!(wire(&n, Proto::Resp2), b"$3\r\n[3]\r\n");
+        // A null that was an array is still typed back as one.
+        assert_eq!(exec_item(true, None, Some(Value::Null)), Value::Array(None));
+        assert_eq!(
+            exec_item(false, None, Some(Value::Integer(1))),
+            Value::Integer(1)
         );
     }
 }

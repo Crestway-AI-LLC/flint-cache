@@ -431,9 +431,32 @@ impl<'a> BloomStore<'a> {
         Ok(true)
     }
 
-    /// BF.MADD: one result per item, in order.
-    pub fn madd(&self, slot: u16, key: &[u8], items: &[Vec<u8>]) -> Result<Vec<bool>, StoreError> {
-        items.iter().map(|i| self.add(slot, key, i)).collect()
+    /// BF.MADD, and BF.INSERT's adds: one result per item, in order, up to
+    /// and including the first item that could not be added (BUG-0237).
+    ///
+    /// The items before a refusal ARE stored, so the refusal cannot be the
+    /// whole answer: a caller handed one error believes nothing was
+    /// written. RedisBloom answers this way too, each item its own answer
+    /// and the error in its place, nothing after it attempted. A key of
+    /// another type refuses the whole call before any item, as it does
+    /// there.
+    pub fn madd(
+        &self,
+        slot: u16,
+        key: &[u8],
+        items: &[Vec<u8>],
+    ) -> Result<Vec<Result<bool, StoreError>>, StoreError> {
+        self.read_meta(slot, key)?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let r = self.add(slot, key, item);
+            let refused = r.is_err();
+            out.push(r);
+            if refused {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// BF.EXISTS.
@@ -725,7 +748,7 @@ mod store_tests {
         assert_eq!(b.card(1, b"f"), Ok(1));
         assert_eq!(
             b.madd(1, b"f", &[b"a".to_vec(), b"c".to_vec()]),
-            Ok(vec![false, true])
+            Ok(vec![Ok(false), Ok(true)])
         );
         assert_eq!(
             b.mexists(1, b"f", &[b"a".to_vec(), b"c".to_vec(), b"zz".to_vec()]),
@@ -902,6 +925,28 @@ mod store_tests {
         }
     }
 
+    /// BUG-0237: a batch that fills a NONSCALING filter part-way answers
+    /// each item, the refusal in its place and nothing after it, because
+    /// the items before it were stored. One error for the whole batch
+    /// told the caller nothing was written.
+    #[test]
+    fn a_batch_that_fills_a_filter_answers_each_item_up_to_the_refusal() {
+        test_clock!(NOW, now, 1_000_000);
+        let kv = MemKv::new();
+        let b = BloomStore::new(&kv, b"t", now);
+        b.reserve(1, b"f", 2, 0.001, 0).expect("reserve");
+        b.add(1, b"f", b"a").expect("first");
+        let batch = [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
+        assert_eq!(
+            b.madd(1, b"f", &batch),
+            Ok(vec![Ok(false), Ok(true), Err(StoreError::FilterFull)])
+        );
+        // `b` was stored, `d` was never tried.
+        assert_eq!(b.exists(1, b"f", b"b"), Ok(true));
+        assert_eq!(b.card(1, b"f"), Ok(2));
+        assert_eq!(b.madd(1, b"none", &[]), Ok(vec![]));
+    }
+
     /// Blocks materialize lazily (D3): a filter reserved for a million
     /// items and holding three occupies three rows, not the nominal size.
     #[test]
@@ -947,6 +992,11 @@ mod store_tests {
         assert_eq!(b.exists(1, b"str", b"x"), Err(StoreError::WrongType));
         assert_eq!(b.card(1, b"str"), Err(StoreError::WrongType));
         assert_eq!(b.info(1, b"str"), Err(StoreError::WrongType));
+        // A batch refuses whole, before any item (BUG-0237).
+        assert_eq!(
+            b.madd(1, b"str", &[b"x".to_vec()]),
+            Err(StoreError::WrongType)
+        );
 
         b.add(1, b"bf", b"x").expect("add");
         assert_eq!(s.get(1, b"bf"), Err(StoreError::WrongType));
@@ -978,8 +1028,8 @@ mod store_tests {
         let ks = crate::keyspace::Keyspace::new(&kv, b"t", now);
         assert_eq!(
             ks.value_type(1, b"f").map(|t| t.name()),
-            Some("bloom"),
-            "TYPE answers `bloom`, not RedisBloom's `MBbloom--` (ADR-0016 D7.1)"
+            Some("MBbloom--"),
+            "TYPE answers RedisBloom's `MBbloom--` (D7.1 withdrawn 2026-10-08)"
         );
         assert!(ks.expire_at(1, b"f", 1_000_010));
         NOW.store(1_000_011, Ordering::Relaxed);

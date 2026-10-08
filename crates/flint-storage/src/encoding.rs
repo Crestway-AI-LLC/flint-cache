@@ -43,6 +43,18 @@ pub enum ValueType {
 }
 
 impl ValueType {
+    /// Every type, for a lookup by the name TYPE answers (SCAN's TYPE
+    /// filter), so that name is spelled in one place (BUG-0241).
+    pub const ALL: [ValueType; 7] = [
+        Self::String,
+        Self::Hash,
+        Self::Set,
+        Self::ZSet,
+        Self::List,
+        Self::Json,
+        Self::Bloom,
+    ];
+
     pub fn from_flags(flags: u8) -> Option<Self> {
         match flags & 0x0F {
             0 => Some(Self::String),
@@ -64,10 +76,10 @@ impl ValueType {
             Self::ZSet => "zset",
             Self::List => "list",
             Self::Json => "json",
-            // RedisBloom answers `MBbloom--` here. Deliberate divergence
-            // (ADR-0016 D7.1), following the precedent JSON already set by
-            // answering `json` where RedisJSON answers `ReJSON-RL`.
-            Self::Bloom => "bloom",
+            // RedisBloom's module type name, so a tool that dispatches on
+            // TYPE recognises a filter (Jeff, 2026-10-08; ADR-0016 D7.1
+            // answered `bloom` until then).
+            Self::Bloom => "MBbloom--",
         }
     }
 }
