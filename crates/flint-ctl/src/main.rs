@@ -1737,6 +1737,14 @@ fn coproc_seat_name(inv: &Inventory, i: usize) -> String {
     coproc_seat(family, addr)
 }
 
+/// Co-processor `i`'s own directory, its `--vec-dir`. Also how a running one is
+/// found: `pids_in_ps` matches an exact argv token, and this is the token that
+/// names the seat. Its bare seat name is not one: `start` probed with it, read
+/// every live co-processor as dead, and died beside it (BUG-0227).
+fn coproc_vec_dir(inv: &Inventory, i: usize) -> String {
+    format!("{}/{}", inv.statedir, coproc_seat_name(inv, i))
+}
+
 /// A co-processor seat's flags. It presents the SERVER-ONLY `coproc` leaf
 /// (ADR-0010 D2): serverAuth without clientAuth, so a compromised
 /// co-processor cannot turn around and dial the mesh as a member. That is
@@ -1765,7 +1773,7 @@ fn coproc_args(inv: &Inventory, i: usize) -> Vec<String> {
             .unwrap_or(DEFAULT_COPROC_INDEX_BYTES)
             .to_string(),
         "--vec-dir".to_string(),
-        format!("{d}/{}", coproc_seat_name(inv, i)),
+        coproc_vec_dir(inv, i),
     ];
     if let Some(total) = inv.coproc_index_total_bytes {
         args.extend(["--index-mem-total-bytes".to_string(), total.to_string()]);
@@ -5143,7 +5151,7 @@ fn launch(inv: &Inventory, register: bool) {
         let bin =
             coproc_bin(coproc_family(inv, i)).expect("inventory parse rejected unknown families");
         let seat = coproc_seat_name(inv, i);
-        if seat_alive(&coproc_runner(inv, i), bin, &seat) {
+        if seat_alive(&coproc_runner(inv, i), bin, &coproc_vec_dir(inv, i)) {
             eprintln!("  {seat} already up");
             continue;
         }
@@ -8988,7 +8996,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
             &coproc_runner(inv, i),
             &seat,
             bin,
-            &format!("{d}/{seat}"),
+            &coproc_vec_dir(inv, i),
             Some(port_of(&addr)),
         ) {
             die_on(&seat, e);
@@ -10609,6 +10617,36 @@ mod cert_manifest_tests {
         assert_eq!(
             flag(&on, "--index-mem-total-bytes").as_deref(),
             Some("8589934592")
+        );
+    }
+
+    /// BUG-0227: `start` decides a co-processor is running by an exact token of
+    /// its argv, so that token has to be one `coproc_args` puts there. The
+    /// seat name was not: a live seat read as dead, `start` died beside it,
+    /// and under flint-supervise that left the proxies and the controller
+    /// unsupervised every minute.
+    #[test]
+    fn start_finds_a_running_coproc_by_a_token_its_argv_carries() {
+        let inv = inv_from(
+            "statedir /var/lib/flint\n\
+             bins /opt/flint/bin\n\
+             cp 10.0.0.1:7500\n\
+             pair 10.0.0.2:7001,10.0.0.3:7002\n\
+             proxy 0.0.0.0:7379\n\
+             coproc VEC. 127.0.0.1:7420\n",
+            "alive",
+        );
+        let ps = format!(
+            "4242 /opt/flint/bin/flint-vec {}\n",
+            coproc_args(&inv, 0).join(" ")
+        );
+        assert_eq!(
+            pids_in_ps(&ps, "flint-vec", &coproc_vec_dir(&inv, 0), None),
+            vec![4242]
+        );
+        assert!(
+            pids_in_ps(&ps, "flint-vec", &coproc_seat_name(&inv, 0), None).is_empty(),
+            "the seat name is not an argv token; probing with it is the defect"
         );
     }
 

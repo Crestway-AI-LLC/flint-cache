@@ -202,6 +202,24 @@ echo "  vec-7974: old process gone, new one reports $TAG2"
 [ "$(vec VEC.SEARCH er 1,0,0 1 | head -1)" = "a" ] || { echo "FAIL: after the second roll VEC.SEARCH answers: $(vec VEC.SEARCH er 1,0,0 1)"; exit 1; }
 echo "  the set survives the roll: rebuilt from durable rows, still routed"
 
+echo "== BUG-0227: start, as flint-supervise runs it every minute, leaves the running co-processor be"
+# `start` found a co-processor by its bare seat name, which is no argv token:
+# a live one read as dead, `start` tried to spawn it, found the live pid and
+# died, before the proxies and the controller. On the playground that failed
+# flint-supervise every minute and paged.
+VPID="$(cat "$STATE/pids/vec-7974.pid" 2>/dev/null)"
+for n in 1 2; do
+  $CTL start >"$D/start-coproc-$n.log" 2>&1 || {
+    tail -6 "$D/start-coproc-$n.log" | sed 's/^/  | /'
+    echo "FAIL: start (run $n) exited non-zero with the co-processor running"; exit 1; }
+  grep -q "vec-7974 already up" "$D/start-coproc-$n.log" || {
+    grep -n "vec-" "$D/start-coproc-$n.log" | sed 's/^/  | /'
+    echo "FAIL: start (run $n) did not find the running co-processor"; exit 1; }
+done
+[ "$(cat "$STATE/pids/vec-7974.pid" 2>/dev/null)" = "$VPID" ] && kill -0 "$VPID" 2>/dev/null \
+  || { echo "FAIL: start replaced or lost vec-7974 ($VPID)"; exit 1; }
+echo "  two starts exit 0, each says vec-7974 is already up, and its process is untouched"
+
 echo "== BUG-0205: a coproc line removed and rolled clears the family"
 grep -v '^coproc VEC\. 127\.0\.0\.1:7974$' "$INV" > "$INV.new" && mv "$INV.new" "$INV"
 TAG3=edge-roll-11
@@ -259,4 +277,4 @@ case "$ROW" in
           exit 1 ;;
 esac
 
-echo "PASS: a client-TLS fleet rolls to completion and every seat REPORTS the build, liveness means ANSWERING rather than merely holding the port — the branch no other drill executes — and an upgrade starts, routes, rolls and (with its line removed) unroutes the fleet's co-processor"
+echo "PASS: a client-TLS fleet rolls to completion and every seat REPORTS the build, liveness means ANSWERING rather than merely holding the port — the branch no other drill executes — and an upgrade starts, routes, rolls and (with its line removed) unroutes the fleet's co-processor, which start leaves be"
