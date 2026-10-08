@@ -40,8 +40,9 @@ fi
 # fail", in both directions: a NEW failure is a regression, and a
 # disappearing one means the divergence was quietly dropped. Each sits in a
 # case of its own (or last in one), since a failing step ends its case.
+# `TYPE doc` is gone: TYPE answers RedisJSON's "ReJSON-RL" since Jeff's
+# 2026-10-08 decision, and its case asserts that.
 EXPECTED_DIVERGENCES=(
-  "TYPE doc"                         # we answer "json"; RedisJSON "ReJSON-RL"
   "JSON.SET d \$.a[3]"               # index == len appends here, RedisJSON refuses
   'JSON.NUMINCRBY d $.m 1'           # overflow refused; RedisJSON wraps (BUG-0208)
   'JSON.GET d ..b'                   # legacy-dialect multi-match refused (ADR-0054)

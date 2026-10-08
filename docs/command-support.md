@@ -542,9 +542,10 @@ Everything above matches the RedisJSON module (v8.2.8, the one Redis 8.2
 loads) reply-for-reply, verified by running the conformance corpus against
 it (`tools/redisjson_compare.sh`). These cases differ, each on purpose:
 
-1. **`TYPE key` answers `json`**, where RedisJSON answers its module type
-   name `ReJSON-RL`. Ours fits the rest of our TYPE vocabulary. Tools that
-   dispatch on the literal `ReJSON-RL` will not recognize the type.
+1. **Withdrawn 2026-10-08.** `TYPE key` answered `json` where RedisJSON
+   answers its module type name; it answers `ReJSON-RL` now (Jeff), as
+   Bloom answers `MBbloom--`, and `SCAN … TYPE ReJSON-RL` finds documents.
+   The number is kept so the others keep theirs.
 2. **Writing at index == length appends.** `JSON.SET d $.a[3] 40` on a
    3-element array grows it; RedisJSON refuses. Past the end is refused
    either way, so no write can punch a hole.

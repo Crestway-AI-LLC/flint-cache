@@ -247,6 +247,7 @@ against RedisBloom 8.2.8 on 2026-10-08, when 1 was withdrawn:
    the documented divergences to be closed where that cost little; this one
    was a name, so `TYPE` answers `MBbloom--` and `SCAN … TYPE MBbloom--`
    finds filters (public BUG-0241 fixed SCAN's filter at the same time).
+   JSON followed the same day: its TYPE answers `ReJSON-RL`.
 2. **`BF.SCANDUMP` and `BF.LOADCHUNK` are refused in v1**, with an error
    that says why. Their payload is a serialized filter, and ours is a
    different layout, so implementing them would emit a blob that looks

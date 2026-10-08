@@ -75,7 +75,10 @@ impl ValueType {
             Self::Set => "set",
             Self::ZSet => "zset",
             Self::List => "list",
-            Self::Json => "json",
+            // RedisJSON's module type name, so a tool that dispatches on
+            // TYPE recognises a document (Jeff, 2026-10-08; `json` until
+            // then, a deliberate difference since withdrawn).
+            Self::Json => "ReJSON-RL",
             // RedisBloom's module type name, so a tool that dispatches on
             // TYPE recognises a filter (Jeff, 2026-10-08; ADR-0016 D7.1
             // answered `bloom` until then).

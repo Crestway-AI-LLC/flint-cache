@@ -23,6 +23,7 @@ nothing.
 ## The fix
 
 SCAN looks the name up in `ValueType::ALL` by the name TYPE answers, so the
-two read one list. With TYPE now answering `MBbloom--` for a filter,
-`SCAN … TYPE MBbloom--` finds filters, case-insensitively, as on Redis with
-the module.
+two read one list. With TYPE now answering the modules' names (`MBbloom--`
+for a filter, `ReJSON-RL` for a document, both by Jeff's decision the same
+day), `SCAN … TYPE MBbloom--` finds filters and `SCAN … TYPE ReJSON-RL`
+documents, case-insensitively, as on Redis with the modules.

@@ -4867,7 +4867,15 @@ mod tests {
         call(&s, &[b"SET", b"str", b"v"]);
         assert_eq!(scan_all(&s, &[b"TYPE", b"MBbloom--"]), vec![b"bf".to_vec()]);
         assert_eq!(scan_all(&s, &[b"TYPE", b"mbbloom--"]), vec![b"bf".to_vec()]);
-        assert_eq!(scan_all(&s, &[b"TYPE", b"json"]), vec![b"doc".to_vec()]);
+        assert_eq!(
+            scan_all(&s, &[b"TYPE", b"ReJSON-RL"]),
+            vec![b"doc".to_vec()]
+        );
+        assert_eq!(
+            scan_all(&s, &[b"TYPE", b"rejson-rl"]),
+            vec![b"doc".to_vec()]
+        );
+        assert!(scan_all(&s, &[b"TYPE", b"json"]).is_empty());
         assert!(scan_all(&s, &[b"TYPE", b"bloom"]).is_empty());
     }
 
@@ -5052,7 +5060,10 @@ mod tests {
             call(&s, &[b"JSON.SET", b"d", b"$", br#"{"a":1,"t":["x"]}"#]),
             Value::Simple("OK".into())
         );
-        assert_eq!(call(&s, &[b"TYPE", b"d"]), Value::Simple("json".into()));
+        assert_eq!(
+            call(&s, &[b"TYPE", b"d"]),
+            Value::Simple("ReJSON-RL".into())
+        );
         // `$` paths reply in containers; the legacy spellings reply bare.
         // Both arrive wrapped in `Resp3Nested`, which adds a level under
         // RESP3 only — matching how RedisJSON answers JSON.TYPE there.

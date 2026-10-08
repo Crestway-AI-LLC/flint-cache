@@ -3972,10 +3972,12 @@ fn corpus() -> Vec<Case> {
                     ],
                     Expect::Ok,
                 ),
-                // DIVERGENCE (deliberate): RedisJSON answers its module type
-                // name, "ReJSON-RL". We answer the type, which is what the
-                // rest of our TYPE vocabulary looks like.
-                s(&[b"TYPE", b"doc"], Expect::Simple("json")),
+                // RedisJSON's module type name (Jeff, 2026-10-08). Until
+                // then this was a deliberate difference answering `json`,
+                // and every step after it in this case went unchecked
+                // against RedisJSON, because a case stops at its first
+                // failing step.
+                s(&[b"TYPE", b"doc"], Expect::Simple("ReJSON-RL")),
                 // JSONPath dialect: every reply is a container of matches.
                 s(
                     &[b"JSON.TYPE", b"doc", b"$"],
