@@ -163,6 +163,15 @@ fn member_cost(member: &[u8]) -> u64 {
     member.len() as u64 + 8
 }
 
+/// The score a member is stored at: `-0` is stored as `0` (BUG-0228). The
+/// two are equal as doubles, which is how Redis orders them (a tie, broken
+/// by member), but `encode_score` keeps them apart, so a stored `-0` sorted
+/// below every `0`. Redis's listpack stores `-0` as the integer 0, so its
+/// ZSCORE answers `0` too.
+fn stored_score(score: f64) -> f64 {
+    if score == 0.0 { 0.0 } else { score }
+}
+
 impl<'a> ZSetStore<'a> {
     pub fn new(kv: &'a dyn Kv, ns: &[u8], clock: Clock) -> Self {
         Self::with_max_value_bytes(kv, ns, clock, crate::DEFAULT_MAX_VALUE_BYTES)
@@ -218,7 +227,7 @@ impl<'a> ZSetStore<'a> {
         // the check happens before any write.
         let mut unique: std::collections::HashMap<&[u8], f64> = Default::default();
         for (score, member) in pairs {
-            unique.insert(member, *score);
+            unique.insert(member, stored_score(*score));
         }
         let mut added = 0u64;
         let mut bytes = meta.bytes;
@@ -239,7 +248,10 @@ impl<'a> ZSetStore<'a> {
             let mk = self.member_key(slot, key, meta.version, member);
             if let Some(old) = self.kv.get(&mk) {
                 let old_score = f64::from_le_bytes(old.try_into().unwrap_or([0; 8]));
-                if old_score != *score {
+                // By bits, as the index row is keyed: a set written before
+                // BUG-0228 may hold `-0`, which equals `0` as a double and
+                // so kept its row when moved to `0`.
+                if old_score.to_bits() != score.to_bits() {
                     self.kv.delete(&zscore_envelope(
                         &self.ns,
                         slot,
@@ -298,7 +310,7 @@ impl<'a> ZSetStore<'a> {
                     if flags.nx {
                         continue;
                     }
-                    let next = if flags.incr { current + score } else { *score };
+                    let next = stored_score(if flags.incr { current + score } else { *score });
                     if next.is_nan() {
                         return Err(StoreError::NanScore);
                     }
@@ -312,10 +324,12 @@ impl<'a> ZSetStore<'a> {
                     }
                 }
                 None if flags.xx => {}
+                // A new member answers its score as given, `-0` and all, as
+                // upstream's does (BUG-0230), and is stored as 0.
                 None => {
                     outcome.added += 1;
                     outcome.score = Some(*score);
-                    now.insert(member.as_slice(), *score);
+                    now.insert(member.as_slice(), stored_score(*score));
                 }
             }
         }
@@ -330,7 +344,7 @@ impl<'a> ZSetStore<'a> {
         }
         for (member, score) in &now {
             if let Some(old) = stored[member] {
-                if old == *score {
+                if old.to_bits() == score.to_bits() {
                     continue;
                 }
                 self.kv.delete(&zscore_envelope(
@@ -458,8 +472,9 @@ impl<'a> ZSetStore<'a> {
         delta: f64,
         member: &[u8],
     ) -> Result<f64, StoreError> {
-        let current = self.zscore(slot, key, member)?.unwrap_or(0.0);
-        let next = current + delta;
+        // A new member takes the increment itself, as upstream's does, so
+        // `ZINCRBY k -0 new` answers `-0` (BUG-0230); it is stored as 0.
+        let next = self.zscore(slot, key, member)?.map_or(delta, |c| c + delta);
         // `+inf` plus `-inf` (BUG-0212). Stored, a NaN score has no place
         // in (score, member) order and prints as `NaN`.
         if next.is_nan() {
@@ -478,7 +493,11 @@ impl<'a> ZSetStore<'a> {
     /// Rows encoded one below `from` are visited too and the caller's bound
     /// check skips them: no finite key sorts right below
     /// `prefix || enc(from)` when a member may be any bytes.
+    ///
+    /// A zero starts below both zeros: a set written before BUG-0228 may
+    /// hold `-0`, which encodes below `0` and is equal to it.
     fn after_score(from: f64) -> Vec<u8> {
+        let from = if from == 0.0 { -0.0 } else { from };
         encode_score(from)
             .checked_sub(1)
             .map_or_else(Vec::new, |e| e.to_be_bytes().to_vec())
@@ -487,7 +506,11 @@ impl<'a> ZSetStore<'a> {
     /// The suffix a reverse walk starts strictly before, so it begins at
     /// the last row scored `from` or less. Exact: every such row sorts below
     /// `prefix || enc(from) + 1`.
+    ///
+    /// A zero starts above both zeros, so a `-0` bound still reaches the
+    /// members scored `0` (BUG-0228).
     fn before_score(from: f64) -> Vec<u8> {
+        let from = if from == 0.0 { 0.0 } else { from };
         encode_score(from)
             .checked_add(1)
             .map_or_else(Vec::new, |e| e.to_be_bytes().to_vec())
@@ -1074,6 +1097,133 @@ mod tests {
             Err(StoreError::NanScore)
         );
         assert_eq!(z.zscore(1, b"z", b"m"), Ok(Some(f64::INFINITY)));
+    }
+
+    /// Every score-index row of `key`, in index order, by walking the rows
+    /// themselves: ZRANGE stops at ZCARD and would hide a phantom row.
+    fn index_rows(z: &ZSetStore, key: &[u8]) -> Vec<(Vec<u8>, u64)> {
+        let mut rows = Vec::new();
+        z.walk(1, key, false, &[], &mut |m, s| {
+            rows.push((m.to_vec(), s.to_bits()));
+            true
+        })
+        .expect("walk");
+        rows
+    }
+
+    #[test]
+    fn a_score_of_minus_zero_is_stored_as_zero_and_ties_by_member() {
+        // BUG-0228, each against Redis 8.2's answer.
+        let kv = MemKv::new();
+        let z = ZSetStore::new(&kv, b"t", now);
+        let p = |s: f64, m: &str| (s, m.as_bytes().to_vec());
+        let zero = 0.0f64.to_bits();
+        assert_eq!(z.zadd(1, b"z", &[p(0.0, "b"), p(-0.0, "g")]), Ok(2));
+        // A tie, broken by member, as Redis orders -0 and 0.
+        assert_eq!(
+            index_rows(&z, b"z"),
+            vec![(b"b".to_vec(), zero), (b"g".to_vec(), zero)]
+        );
+        // ZADD INCR and ZINCRBY store -0 as 0 too.
+        let incr = ZaddFlags {
+            incr: true,
+            ..Default::default()
+        };
+        // They answer -0, as upstream's do for a new member (BUG-0230).
+        let minus_zero = Ok(Some((-0.0f64).to_bits()));
+        assert_eq!(
+            z.zadd_with(1, b"z", &[p(-0.0, "a")], incr)
+                .map(|d| d.score.map(f64::to_bits)),
+            minus_zero
+        );
+        assert_eq!(
+            z.zincr_by(1, b"z", -0.0, b"c").map(|s| Some(s.to_bits())),
+            minus_zero
+        );
+        assert_eq!(
+            z.zscore(1, b"z", b"c").map(|s| s.map(f64::to_bits)),
+            Ok(Some(zero))
+        );
+        assert_eq!(
+            z.zscore(1, b"z", b"a").map(|s| s.map(f64::to_bits)),
+            Ok(Some(zero))
+        );
+        assert_eq!(index_rows(&z, b"z").len(), 4);
+        // Moving off zero leaves one row per member.
+        assert_eq!(z.zadd(1, b"z", &[p(1.0, "g")]), Ok(0));
+        assert_eq!(index_rows(&z, b"z").len(), 4);
+        assert_eq!(z.zscore(1, b"z", b"g"), Ok(Some(1.0)));
+        // A -0 bound reaches the members scored 0 from either end.
+        let bound = |raw: &str| ScoreBound::parse(raw.as_bytes()).expect("bound");
+        let names =
+            |rows: Vec<(Vec<u8>, f64)>| rows.into_iter().map(|(m, _)| m).collect::<Vec<_>>();
+        assert_eq!(
+            z.zrange_by_score(1, b"z", bound("-inf"), bound("-0"), true, 0, -1)
+                .map(names),
+            Ok(vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()])
+        );
+        assert_eq!(
+            z.zrange_by_score(1, b"z", bound("-0"), bound("-0"), false, 0, -1)
+                .map(names),
+            Ok(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+        );
+    }
+
+    #[test]
+    fn a_member_stored_at_minus_zero_before_the_fix_moves_with_one_row() {
+        // BUG-0228: a set written before the fix may hold -0, which equals 0
+        // as a double. Moving it to 0 kept its -0 row beside the new one, and
+        // ZRANGE then read the stale row. The empty member is the row a
+        // forward seek from 0 would start exactly on.
+        let kv = MemKv::new();
+        let z = ZSetStore::new(&kv, b"t", now);
+        let members: [&[u8]; 2] = [b"", b"m"];
+        let pairs: Vec<(f64, Vec<u8>)> = members.iter().map(|m| (5.0, m.to_vec())).collect();
+        assert_eq!(z.zadd(1, b"z", &pairs), Ok(2));
+        let version = z.read_meta(1, b"z").expect("meta").expect("set").version;
+        for m in members {
+            kv.delete(&zscore_envelope(b"t", 1, b"z", version, 5.0, m));
+            kv.put(&z.member_key(1, b"z", version, m), &(-0.0f64).to_le_bytes());
+            kv.put(&zscore_envelope(b"t", 1, b"z", version, -0.0, m), b"");
+        }
+        // The -0 rows are reached by a 0 bound, forward and reverse.
+        let bound = |raw: &str| ScoreBound::parse(raw.as_bytes()).expect("bound");
+        for rev in [false, true] {
+            assert_eq!(
+                z.zrange_by_score(1, b"z", bound("0"), bound("0"), rev, 0, -1)
+                    .map(|r| r.len()),
+                Ok(2),
+                "rev {rev}"
+            );
+        }
+        let minus_zero = (-0.0f64).to_bits();
+        assert_eq!(z.zadd(1, b"z", &[(0.0, b"m".to_vec())]), Ok(0));
+        assert_eq!(
+            index_rows(&z, b"z"),
+            vec![
+                (b"".to_vec(), minus_zero),
+                (b"m".to_vec(), 0.0f64.to_bits())
+            ]
+        );
+        assert_eq!(z.zadd(1, b"z", &[(1.0, b"m".to_vec())]), Ok(0));
+        assert_eq!(
+            index_rows(&z, b"z"),
+            vec![
+                (b"".to_vec(), minus_zero),
+                (b"m".to_vec(), 1.0f64.to_bits())
+            ]
+        );
+        assert_eq!(z.zscore(1, b"z", b"m"), Ok(Some(1.0)));
+        // ZADD's flagged path moves one too, here to 1 and back in one call.
+        let pairs = [(1.0, b"".to_vec()), (0.0, b"".to_vec())];
+        assert!(z.zadd_with(1, b"z", &pairs, ZaddFlags::default()).is_ok());
+        assert_eq!(
+            index_rows(&z, b"z"),
+            vec![
+                (b"".to_vec(), 0.0f64.to_bits()),
+                (b"m".to_vec(), 1.0f64.to_bits())
+            ]
+        );
     }
 
     #[test]

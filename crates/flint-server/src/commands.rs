@@ -1931,9 +1931,6 @@ impl<'a> Dispatcher<'a> {
         } else {
             (&args[2], &args[3])
         };
-        let (Some(min), Some(max)) = (ScoreBound::parse(lo_raw), ScoreBound::parse(hi_raw)) else {
-            return err("ERR min or max is not a float");
-        };
         let mut withscores = false;
         let (mut offset, mut count) = (0i64, -1i64);
         let mut i = 4;
@@ -1955,6 +1952,11 @@ impl<'a> Dispatcher<'a> {
             }
             i += 1;
         }
+        // The bounds after the options, as upstream's zrangeGenericCommand
+        // reads them (BUG-0230).
+        let (Some(min), Some(max)) = (ScoreBound::parse(lo_raw), ScoreBound::parse(hi_raw)) else {
+            return err("ERR min or max is not a float");
+        };
         reply(
             self.zsets.zrange_by_score(
                 slot_for_key(&args[1]),
@@ -1983,9 +1985,6 @@ impl<'a> Dispatcher<'a> {
             (&args[3], &args[2])
         } else {
             (&args[2], &args[3])
-        };
-        let (Some(min), Some(max)) = (LexBound::parse(lo_raw), LexBound::parse(hi_raw)) else {
-            return err("ERR min or max not valid string range item");
         };
         let (mut offset, mut count) = (0i64, -1i64);
         let mut i = 4;
@@ -2016,6 +2015,10 @@ impl<'a> Dispatcher<'a> {
             }
             i += 1;
         }
+        // The bounds after the options, as upstream reads them (BUG-0230).
+        let (Some(min), Some(max)) = (LexBound::parse(lo_raw), LexBound::parse(hi_raw)) else {
+            return err("ERR min or max not valid string range item");
+        };
         reply(
             self.zsets.zrange_by_lex(
                 slot_for_key(&args[1]),
@@ -2215,11 +2218,14 @@ impl<'a> Dispatcher<'a> {
     /// cardinality. The proxy routes by the first key, which for these is
     /// the destination — correct precisely because every key shares its slot.
     ///
-    /// TWO PLACES A NaN CAN APPEAR, both of which upstream turns into 0 and
-    /// neither of which is guesswork — they were confirmed against a live
-    /// server: `0 * inf` when a weight zeroes an infinite score, and
-    /// `+inf + -inf` when SUM meets both infinities. Left alone, a NaN score
-    /// would encode and then order unpredictably against every other member.
+    /// TWO PLACES A NaN CAN APPEAR, both confirmed against a live server:
+    /// `0 * inf` when a weight zeroes an infinite score, and `+inf + -inf`
+    /// when SUM meets both infinities. Upstream turns the second into 0, and
+    /// the first into 0 for every union input but only for the intersection's
+    /// FIRST input: a later input's NaN goes into the aggregate as it is, so
+    /// SUM makes it 0 and MIN or MAX keep the score so far (BUG-0231, which
+    /// zeroed it first). Left alone, a NaN score would encode and then order
+    /// unpredictably against every other member.
     fn cmd_zstore(&self, args: &[Vec<u8>], name: &str, inter: bool) -> Value {
         use std::collections::HashMap;
         use std::collections::hash_map::Entry;
@@ -2242,6 +2248,33 @@ impl<'a> Dispatcher<'a> {
             return err("ERR syntax error");
         }
         let keys = &args[3..3 + numkeys];
+
+        let dst = &args[1];
+        let slot = slot_for_key(dst);
+        if let Some(bad) = keys.iter().find(|k| slot_for_key(k) != slot) {
+            return Value::Error(format!(
+                "CROSSSLOT Keys in request don't hash to the same slot ({} is slot {}, \
+                 {} is slot {}) — use a hash tag such as {{tag}}key to colocate them",
+                String::from_utf8_lossy(dst),
+                slot,
+                String::from_utf8_lossy(bad),
+                slot_for_key(bad)
+            ));
+        }
+        // Every input's type before the options and before any read, as
+        // upstream checks them: an intersection stops at its first empty
+        // input, and a WRONGTYPE input after it was never looked at, so
+        // the empty result replaced the destination where Redis refuses
+        // (BUG-0229). One metadata read per input.
+        if keys.iter().any(|k| {
+            use flint_storage::encoding::ValueType as VT;
+            !matches!(
+                self.keyspace.value_type(slot, k),
+                None | Some(VT::ZSet) | Some(VT::Set)
+            )
+        }) {
+            return store_err(StoreError::WrongType);
+        }
 
         let mut weights = vec![1.0f64; numkeys];
         let mut aggregate = b"SUM".to_vec();
@@ -2279,19 +2312,8 @@ impl<'a> Dispatcher<'a> {
             i += 1;
         }
 
-        let dst = &args[1];
-        let slot = slot_for_key(dst);
-        if let Some(bad) = keys.iter().find(|k| slot_for_key(k) != slot) {
-            return Value::Error(format!(
-                "CROSSSLOT Keys in request don't hash to the same slot ({} is slot {}, \
-                 {} is slot {}) — use a hash tag such as {{tag}}key to colocate them",
-                String::from_utf8_lossy(dst),
-                slot,
-                String::from_utf8_lossy(bad),
-                slot_for_key(bad)
-            ));
-        }
-
+        // `a` is the score so far. `f64::min` and `max` return it when `b`
+        // is NaN, as upstream's `val < *target ? val : *target` does.
         let combine = |a: f64, b: f64| -> f64 {
             let v = match aggregate.as_slice() {
                 b"MIN" => a.min(b),
@@ -2310,9 +2332,10 @@ impl<'a> Dispatcher<'a> {
                 Ok(m) => m,
                 Err(e) => return store_err(e),
             };
+            let zero_nan = !inter || n == 0;
             let weighted = members.into_iter().map(|(m, s)| {
                 let v = s * weights[n];
-                (m, if v.is_nan() { 0.0 } else { v })
+                (m, if zero_nan && v.is_nan() { 0.0 } else { v })
             });
             if n == 0 {
                 acc = weighted.collect();
@@ -2426,8 +2449,9 @@ impl<'a> Dispatcher<'a> {
             2 => (1usize, false),
             3 => match parse_i64(&args[2]) {
                 Ok(n) if n >= 0 => (n as usize, true),
-                Ok(_) => return err("ERR value is out of range, must be positive"),
-                Err(_) => return err("ERR value is not an integer or out of range"),
+                // Upstream reads the count with getPositiveLongFromObjectOrReply,
+                // which words a non-integer as it words a negative (BUG-0230).
+                _ => return err("ERR value is out of range, must be positive"),
             },
             _ => return arity_err(name),
         };
@@ -6886,5 +6910,90 @@ return nil"#;
             members(call(&s, &[b"SINTER", b"{s}alpha", b"{s}beta"])),
             Vec::<Vec<u8>>::new()
         );
+    }
+
+    /// BUG-0229: an intersection that empties early still refuses a later
+    /// input of another type, as Redis does, and so leaves the destination
+    /// of its STORE form alone. ZUNIONSTORE and ZINTERSTORE check the types
+    /// before their options, in upstream's order.
+    #[test]
+    fn an_early_empty_intersection_still_refuses_a_later_wrong_type() {
+        let wrongtype = Value::Error(
+            "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+        );
+        let s = MemKv::new();
+        call(&s, &[b"SADD", b"{s}set", b"x"]);
+        call(&s, &[b"SET", b"{s}str", b"v"]);
+        call(&s, &[b"SADD", b"{s}dst", b"kept"]);
+        call(&s, &[b"ZADD", b"{s}zdst", b"1", b"kept"]);
+        let inputs: [&[u8]; 3] = [b"{s}none", b"{s}set", b"{s}str"];
+        for op in [&b"SINTER"[..], b"SDIFF"] {
+            let cmd = [&[op][..], &inputs[..]].concat();
+            assert_eq!(call(&s, &cmd), wrongtype, "{}", String::from_utf8_lossy(op));
+        }
+        let cmd = [&[&b"SINTERSTORE"[..], b"{s}dst"][..], &inputs[..]].concat();
+        assert_eq!(call(&s, &cmd), wrongtype);
+        assert_eq!(call(&s, &[b"SCARD", b"{s}dst"]), Value::Integer(1));
+        let cmd = [&[&b"ZINTERSTORE"[..], b"{s}zdst", b"3"][..], &inputs[..]].concat();
+        assert_eq!(call(&s, &cmd), wrongtype);
+        assert_eq!(call(&s, &[b"ZCARD", b"{s}zdst"]), Value::Integer(1));
+        assert_eq!(
+            call(&s, &[b"ZUNIONSTORE", b"{s}zdst", b"1", b"{s}str", b"BOGUS"]),
+            wrongtype
+        );
+        assert_eq!(
+            call(&s, &[b"ZUNIONSTORE", b"{s}zdst", b"1", b"{s}set", b"BOGUS"]),
+            Value::Error("ERR syntax error".into())
+        );
+        assert_eq!(call(&s, &[b"ZCARD", b"{s}zdst"]), Value::Integer(1));
+    }
+
+    /// BUG-0231: a weight that zeroes an infinite score is NaN. Upstream
+    /// makes it 0 for the intersection's first input only; a later one goes
+    /// into the aggregate as NaN, which SUM turns into 0 and MIN or MAX
+    /// ignore. Each score below is Redis 8.2's.
+    #[test]
+    fn a_later_intersection_input_aggregates_its_nan_as_upstream_does() {
+        let s = MemKv::new();
+        call(&s, &[b"ZADD", b"{n}a", b"5", b"m"]);
+        call(&s, &[b"ZADD", b"{n}b", b"inf", b"m"]);
+        for (aggregate, want) in [(&b"SUM"[..], 0.0), (b"MIN", 5.0), (b"MAX", 5.0)] {
+            let cmd: [&[u8]; 9] = [
+                b"ZINTERSTORE",
+                b"{n}d",
+                b"2",
+                b"{n}a",
+                b"{n}b",
+                b"WEIGHTS",
+                b"1",
+                b"0",
+                b"AGGREGATE",
+            ];
+            assert_eq!(
+                call(&s, &[&cmd[..], &[aggregate]].concat()),
+                Value::Integer(1)
+            );
+            assert_eq!(
+                call(&s, &[b"ZSCORE", b"{n}d", b"m"]),
+                Value::Double(want),
+                "{}",
+                String::from_utf8_lossy(aggregate)
+            );
+        }
+        // The first input's NaN is 0 before anything aggregates it.
+        let cmd: [&[u8]; 10] = [
+            b"ZINTERSTORE",
+            b"{n}d",
+            b"2",
+            b"{n}b",
+            b"{n}a",
+            b"WEIGHTS",
+            b"0",
+            b"1",
+            b"AGGREGATE",
+            b"MIN",
+        ];
+        assert_eq!(call(&s, &cmd), Value::Integer(1));
+        assert_eq!(call(&s, &[b"ZSCORE", b"{n}d", b"m"]), Value::Double(0.0));
     }
 }

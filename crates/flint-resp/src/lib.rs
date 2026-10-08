@@ -145,6 +145,14 @@ pub fn fmt_double(s: f64) -> Vec<u8> {
             b"-inf".to_vec()
         };
     }
+    // Redis's d2string spells the sign of a zero (BUG-0230).
+    if s == 0.0 {
+        return if s.is_sign_negative() {
+            b"-0".to_vec()
+        } else {
+            b"0".to_vec()
+        };
+    }
     const HALF: f64 = (i64::MAX / 2) as f64;
     if s.fract() == 0.0 && (-HALF..=HALF).contains(&s) {
         return (s as i64).to_string().into_bytes();
@@ -1322,6 +1330,8 @@ mod flushing_encoder_tests {
             (f64::MAX, "1.7976931348623157e+308"),
             (f64::INFINITY, "inf"),
             (f64::NEG_INFINITY, "-inf"),
+            // BUG-0230: d2string spells the sign of a zero.
+            (-0.0, "-0"),
         ];
         for &(d, want) in cases {
             assert_eq!(fmt_double(d), want.as_bytes(), "{d:e}");

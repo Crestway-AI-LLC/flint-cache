@@ -260,8 +260,14 @@ AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands").
 >
 > A plain SET is a legal input, each member scoring 1. An empty result
 > removes the destination rather than leaving an empty sorted set behind.
-> Where a computed score would be NaN — a zero weight against an infinite
-> score, or SUM over both infinities — the score is 0, matching upstream.
+> Where a computed score would be NaN, Flint does what upstream does. A
+> zero weight against an infinite score is 0 for every union input and for
+> the intersection's first input. A later intersection input's NaN is
+> aggregated as it is: SUM makes it 0, and MIN or MAX keep the score so far
+> (BUG-0231). SUM over both infinities is 0.
+> A score of `-0` is stored as `0`, as Redis's listpack stores it, and ties
+> with `0` by member (BUG-0228). ZINCRBY or ZADD INCR on a new member with
+> `-0` still answers `-0`, as upstream does.
 > `ZINCRBY` to a NaN (`-inf` added to `+inf`) is refused with upstream's
 > `ERR resulting score is not a number (NaN)`, and the member keeps its
 > score (BUG-0212).
@@ -545,8 +551,8 @@ Smaller ones, which the corpus does not list:
   text. RedisJSON answers the size of its in-memory tree. Both are each
   server's own accounting, not a common unit.
 - Numbers are spelled by serde_json: `1e+20` where RedisJSON writes `1e20`.
-  JSON.RESP renders a double as Redis does (`1e+20`, BUG-0214), except
-  `-0.0`, which is `0` here and `-0` there. The values are equal.
+  JSON.RESP renders a double as Redis does (`1e+20`, BUG-0214), `-0`
+  included (BUG-0230).
 - Filters here also take `!` and exponent literals (`1e3`), which RedisJSON
   refuses as syntax errors.
 - **`SRANDMEMBER key <negative count>` is refused past the seat's

@@ -2169,6 +2169,139 @@ fn corpus() -> Vec<Case> {
                 s(&[b"ZSCORE", b"zn", b"m"], Expect::Str(b"inf")),
             ],
         },
+        // BUG-0228: -0 and 0 are one score, tied by member. A member moved
+        // between them kept a stale index row, which ZRANGE then read.
+        Case {
+            family: "zsets",
+            name: "a score of -0 is the score 0",
+            steps: vec![
+                s(&[b"ZADD", b"zz", b"0", b"b", b"-0", b"g"], Expect::Int(2)),
+                s(
+                    &[b"ZRANGE", b"zz", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"b"),
+                        Expect::Str(b"0"),
+                        Expect::Str(b"g"),
+                        Expect::Str(b"0"),
+                    ]),
+                ),
+                s(&[b"ZADD", b"zz", b"0", b"g"], Expect::Int(0)),
+                s(&[b"ZADD", b"zz", b"1", b"g"], Expect::Int(0)),
+                s(
+                    &[b"ZRANGE", b"zz", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"b"),
+                        Expect::Str(b"0"),
+                        Expect::Str(b"g"),
+                        Expect::Str(b"1"),
+                    ]),
+                ),
+                s(&[b"ZINCRBY", b"zz", b"-0", b"b"], Expect::Str(b"0")),
+                s(&[b"ZSCORE", b"zz", b"b"], Expect::Str(b"0")),
+                s(
+                    &[b"ZREVRANGEBYSCORE", b"zz", b"-0", b"-inf"],
+                    Expect::Arr(vec![Expect::Str(b"b")]),
+                ),
+                s(&[b"ZCARD", b"zz"], Expect::Int(2)),
+            ],
+        },
+        // BUG-0230: the range commands read their options before their
+        // bounds, a ZPOPMIN count is refused in upstream's words, and a new
+        // member's -0 increment answers -0.
+        Case {
+            family: "zsets",
+            name: "sorted-set refusals in upstream's order, and a -0 reply",
+            steps: vec![
+                s(&[b"ZADD", b"zr", b"1", b"a"], Expect::Int(1)),
+                s(
+                    &[b"ZRANGEBYSCORE", b"zr", b"x", b"1", b"LIMIT", b"a", b"1"],
+                    Expect::Err("ERR value is not an integer or out of range"),
+                ),
+                s(&[b"ZREVRANGEBYSCORE", b"zr", b"1", b"x", b"BOGUS"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"ZRANGEBYLEX", b"zr", b"x", b"+", b"LIMIT", b"a", b"1"],
+                    Expect::Err("ERR value is not an integer or out of range"),
+                ),
+                s(&[b"ZREVRANGEBYLEX", b"zr", b"+", b"x", b"BOGUS"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"ZPOPMIN", b"zr", b"abc"],
+                    Expect::Err("ERR value is out of range, must be positive"),
+                ),
+                s(&[b"ZINCRBY", b"zr", b"-0", b"new"], Expect::Str(b"-0")),
+                s(&[b"ZADD", b"zr", b"INCR", b"-0", b"new2"], Expect::Str(b"-0")),
+                s(&[b"ZSCORE", b"zr", b"new"], Expect::Str(b"0")),
+                s(&[b"ZINCRBY", b"zr", b"-0", b"new"], Expect::Str(b"0")),
+            ],
+        },
+        // BUG-0231: a zero weight against an infinite score is NaN, which
+        // upstream zeroes for the intersection's first input only.
+        Case {
+            family: "zsets",
+            name: "a later intersection input's nan goes into the aggregate",
+            steps: vec![
+                s(&[b"ZADD", b"{nw}a", b"5", b"m"], Expect::Int(1)),
+                s(&[b"ZADD", b"{nw}b", b"inf", b"m"], Expect::Int(1)),
+                s(
+                    &[b"ZINTERSTORE", b"{nw}d", b"2", b"{nw}a", b"{nw}b", b"WEIGHTS", b"1", b"0"],
+                    Expect::Int(1),
+                ),
+                s(&[b"ZSCORE", b"{nw}d", b"m"], Expect::Str(b"0")),
+                s(
+                    &[
+                        b"ZINTERSTORE", b"{nw}d", b"2", b"{nw}a", b"{nw}b", b"WEIGHTS", b"1", b"0",
+                        b"AGGREGATE", b"MIN",
+                    ],
+                    Expect::Int(1),
+                ),
+                s(&[b"ZSCORE", b"{nw}d", b"m"], Expect::Str(b"5")),
+                s(
+                    &[
+                        b"ZINTERSTORE", b"{nw}d", b"2", b"{nw}b", b"{nw}a", b"WEIGHTS", b"0", b"1",
+                        b"AGGREGATE", b"MIN",
+                    ],
+                    Expect::Int(1),
+                ),
+                s(&[b"ZSCORE", b"{nw}d", b"m"], Expect::Str(b"0")),
+            ],
+        },
+        // BUG-0229: an intersection that empties early still type-checks
+        // every input, so its STORE form leaves the destination alone.
+        Case {
+            family: "zsets",
+            name: "an intersection checks every input's type before it answers",
+            steps: vec![
+                s(&[b"SADD", b"{it}set", b"x"], Expect::Int(1)),
+                s(&[b"SET", b"{it}str", b"v"], Expect::Ok),
+                s(&[b"SADD", b"{it}dst", b"kept"], Expect::Int(1)),
+                s(&[b"ZADD", b"{it}zdst", b"1", b"kept"], Expect::Int(1)),
+                s(
+                    &[b"SINTER", b"{it}none", b"{it}set", b"{it}str"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(
+                    &[b"SDIFF", b"{it}none", b"{it}set", b"{it}str"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(
+                    &[b"SINTERSTORE", b"{it}dst", b"{it}none", b"{it}set", b"{it}str"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(&[b"SCARD", b"{it}dst"], Expect::Int(1)),
+                s(
+                    &[b"ZINTERSTORE", b"{it}zdst", b"3", b"{it}none", b"{it}set", b"{it}str"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(
+                    &[b"ZUNIONSTORE", b"{it}zdst", b"1", b"{it}str", b"BOGUS"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(
+                    &[b"ZUNIONSTORE", b"{it}zdst", b"1", b"{it}set", b"BOGUS"],
+                    Expect::Err("ERR syntax error"),
+                ),
+                s(&[b"ZCARD", b"{it}zdst"], Expect::Int(1)),
+            ],
+        },
         // BUG-0214: a score is spelled as Redis's d2string spells it. Large
         // and small values were written out in full here.
         Case {

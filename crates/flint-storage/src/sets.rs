@@ -222,6 +222,13 @@ impl<'a> SetStore<'a> {
         let Some((first, rest)) = keys.split_first() else {
             return Ok(Vec::new());
         };
+        // Every key's type first, as upstream checks them: the walk below
+        // stops at an empty intersection or difference, and a WRONGTYPE key
+        // after that point was answered as empty, so SINTERSTORE replaced
+        // its destination where Redis refuses (BUG-0229). One meta read each.
+        for k in keys {
+            self.read_meta(slot, k)?;
+        }
         let mut acc: std::collections::HashSet<Vec<u8>> =
             self.smembers(slot, first)?.into_iter().collect();
         for k in rest {
@@ -311,6 +318,23 @@ mod tests {
 
     fn now() -> u64 {
         1_000_000
+    }
+
+    #[test]
+    fn an_empty_intersection_still_refuses_a_later_key_of_another_type() {
+        // BUG-0229: the walk stops at an empty intersection or difference,
+        // and a sorted set after that point was answered as empty where
+        // Redis refuses WRONGTYPE.
+        let kv = MemKv::new();
+        let st = SetStore::new(&kv, b"t", now);
+        let z = crate::zsets::ZSetStore::new(&kv, b"t", now);
+        assert_eq!(st.sadd(1, b"s", &[b"a".to_vec()]), Ok(1));
+        assert_eq!(z.zadd(1, b"z", &[(1.0, b"a".to_vec())]), Ok(1));
+        let keys = [b"none".to_vec(), b"s".to_vec(), b"z".to_vec()];
+        for op in [SetOp::Inter, SetOp::Diff, SetOp::Union] {
+            assert_eq!(st.sop(1, op, &keys), Err(StoreError::WrongType));
+        }
+        assert_eq!(st.sop(1, SetOp::Inter, &keys[..2]), Ok(Vec::new()));
     }
 
     #[test]
