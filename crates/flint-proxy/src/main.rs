@@ -2456,6 +2456,16 @@ ttl_max_ms:{}
                 return AuthStep::Reply(Value::Error(e));
             }
         }
+        // A name `CLIENT SETNAME` would refuse refuses the HELLO, after its
+        // credentials, as upstream orders it (BUG-0225). It used to answer
+        // the handshake and drop the name.
+        if req
+            .setname
+            .as_deref()
+            .is_some_and(|n| !valid_client_attr(n))
+        {
+            return AuthStep::Reply(Value::Error(CLIENT_NAME_INVALID.into()));
+        }
         // The dialect switches only once the handshake is otherwise good,
         // so a failed HELLO leaves the connection exactly as it was.
         if let Some(p) = req.proto {
@@ -4525,6 +4535,10 @@ struct ClientConn {
     lib_ver: Option<Vec<u8>>,
 }
 
+/// Upstream's refusal of a connection name `valid_client_attr` rejects.
+const CLIENT_NAME_INVALID: &str =
+    "ERR Client names cannot contain spaces, newlines or special characters.";
+
 /// Upstream's rule for a client name or library attribute: printable ASCII
 /// with no space.
 fn valid_client_attr(v: &[u8]) -> bool {
@@ -4558,10 +4572,7 @@ impl ClientConn {
         match sub.as_slice() {
             b"SETNAME" if args.len() == 3 => {
                 if !valid_client_attr(&args[2]) {
-                    return Value::Error(
-                        "ERR Client names cannot contain spaces, newlines or special characters."
-                            .into(),
-                    );
+                    return Value::Error(CLIENT_NAME_INVALID.into());
                 }
                 // An empty name clears it, as upstream.
                 self.name = (!args[2].is_empty()).then(|| args[2].clone());
@@ -6225,6 +6236,43 @@ mod route_tests {
             family_budget: FAMILY_CHANNEL_BUDGET,
             family_deadline: FAMILY_CHANNEL_DEADLINE,
         }
+    }
+
+    /// BUG-0225: a HELLO naming the connection as `CLIENT SETNAME` would
+    /// refuse is refused, as upstream refuses it, and the dialect stays as it
+    /// was. It used to answer the handshake and drop the name.
+    #[test]
+    fn a_hello_with_a_name_setname_refuses_is_refused() {
+        let t = Arc::new(two_pair_topo());
+        let a = |p: &[&str]| p.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+        let (mut ns, mut rr, mut lc, mut aw, mut admin) = (None, false, false, false, false);
+        let mut proto = flint_resp::Proto::Resp2;
+        let mut hello = |args: &[&str], proto: &mut flint_resp::Proto| {
+            auth_step(
+                &t,
+                &mut ns,
+                &mut rr,
+                &mut lc,
+                &mut aw,
+                &mut admin,
+                proto,
+                &a(args),
+            )
+        };
+        assert!(matches!(
+            hello(&["HELLO", "3", "SETNAME", "my app"], &mut proto),
+            AuthStep::Reply(Value::Error(e)) if e == CLIENT_NAME_INVALID
+        ));
+        assert_eq!(
+            proto,
+            flint_resp::Proto::Resp2,
+            "a refused HELLO switched dialect"
+        );
+        assert!(matches!(
+            hello(&["HELLO", "3", "SETNAME", "my-app"], &mut proto),
+            AuthStep::Reply(Value::Map(_))
+        ));
+        assert_eq!(proto, flint_resp::Proto::Resp3);
     }
 
     fn two_pair_topo() -> Topology {

@@ -287,23 +287,29 @@ pub struct HelloRequest {
     pub setname: Option<Vec<u8>>,
 }
 
-/// Why a `HELLO` could not be honored. Both map to specific errors Redis
-/// clients recognize, so they stay distinct.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a `HELLO` could not be honored, in Redis's and Valkey's words
+/// (BUG-0225): clients recognize `-NOPROTO`, so the cases stay distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelloError {
-    /// A protover we do not speak. Redis answers `-NOPROTO`.
+    /// An integer protover we do not speak. Redis answers `-NOPROTO`.
     NoProto,
-    /// Malformed arguments.
-    Syntax,
+    /// A protover that is not an integer.
+    NotInteger,
+    /// An option HELLO does not take, or one short of its arguments: the
+    /// option as the client spelled it.
+    Syntax(String),
 }
 
 impl HelloError {
     pub fn reply(self) -> Value {
         match self {
-            HelloError::NoProto => Value::Error(
-                "NOPROTO unsupported protocol version, supported versions are 2 and 3".into(),
-            ),
-            HelloError::Syntax => Value::Error("ERR syntax error in HELLO".into()),
+            HelloError::NoProto => Value::Error("NOPROTO unsupported protocol version".into()),
+            HelloError::NotInteger => {
+                Value::Error("ERR Protocol version is not an integer or out of range".into())
+            }
+            HelloError::Syntax(opt) => {
+                Value::Error(format!("ERR Syntax error in HELLO option '{opt}'"))
+            }
         }
     }
 }
@@ -317,7 +323,7 @@ pub fn parse_hello(args: &[Vec<u8>]) -> Result<HelloRequest, HelloError> {
     let ver = std::str::from_utf8(&args[1])
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
-        .ok_or(HelloError::NoProto)?;
+        .ok_or(HelloError::NotInteger)?;
     req.proto = Some(Proto::from_version(ver).ok_or(HelloError::NoProto)?);
     let mut i = 2;
     while i < args.len() {
@@ -333,7 +339,11 @@ pub fn parse_hello(args: &[Vec<u8>]) -> Result<HelloRequest, HelloError> {
                 req.setname = Some(args[i + 1].clone());
                 i += 2;
             }
-            _ => return Err(HelloError::Syntax),
+            _ => {
+                return Err(HelloError::Syntax(
+                    String::from_utf8_lossy(&args[i]).into_owned(),
+                ));
+            }
         }
     }
     Ok(req)
@@ -1082,16 +1092,28 @@ mod tests {
         );
         // Versions we do not speak, and junk, stay distinguishable.
         assert_eq!(parse_hello(&a(&["HELLO", "4"])), Err(HelloError::NoProto));
-        assert_eq!(parse_hello(&a(&["HELLO", "x"])), Err(HelloError::NoProto));
         assert_eq!(
-            parse_hello(&a(&["HELLO", "3", "BOGUS"])),
-            Err(HelloError::Syntax)
+            parse_hello(&a(&["HELLO", "x"])),
+            Err(HelloError::NotInteger)
+        );
+        assert_eq!(
+            parse_hello(&a(&["HELLO", "3", "bogus"])),
+            Err(HelloError::Syntax("bogus".into()))
+        );
+        // Redis's and Valkey's words (BUG-0225).
+        assert_eq!(
+            HelloError::Syntax("bogus".into()).reply(),
+            Value::Error("ERR Syntax error in HELLO option 'bogus'".into())
+        );
+        assert_eq!(
+            HelloError::NotInteger.reply(),
+            Value::Error("ERR Protocol version is not an integer or out of range".into())
         );
         // A truncated AUTH clause is a syntax error, never a silent
         // "authenticated with an empty password".
         assert_eq!(
             parse_hello(&a(&["HELLO", "3", "AUTH", "u"])),
-            Err(HelloError::Syntax)
+            Err(HelloError::Syntax("AUTH".into()))
         );
     }
 

@@ -579,7 +579,11 @@ Smaller ones, which the corpus does not list:
   ceiling alone. Values stay at Redis's own 512 MB
   (`--max-value-bytes`).
 - **INCRBYFLOAT** and **HINCRBYFLOAT** format like Redis (`%.17f`,
-  trailing zeros trimmed).
+  trailing zeros trimmed), and compute in a 64-bit double. Redis and Valkey
+  compute in C's `long double`, which is 80-bit on x86-64 Linux: there a
+  value past 1.8e308 increments, and here it is refused. They also read a
+  hexadecimal float (`0x10`, `0x1p3`) as a number; Flint refuses one as
+  "not a valid float". Measured 2026-10-07 against Valkey 9.1 on Linux.
 - **Expiry is lazy + swept**: an expired key reads as missing immediately;
   physical reclamation is background.
 - **Cluster is invisible**: clients never see `-MOVED`/`-ASK`; the proxy

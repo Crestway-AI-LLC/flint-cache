@@ -1727,7 +1727,12 @@ impl<'a> Dispatcher<'a> {
             // A script is stopped by its time limit, not by SCRIPT KILL, and
             // none outlives the command that runs it.
             b"KILL" if args.len() == 2 => err("NOTBUSY No scripts in execution right now."),
-            b"LOAD" | b"EXISTS" | b"FLUSH" | b"KILL" => arity_err("script"),
+            // Upstream's words (BUG-0225).
+            b"FLUSH" => err("ERR SCRIPT FLUSH only support SYNC|ASYNC option"),
+            b"LOAD" | b"EXISTS" | b"KILL" => arity_err(&format!(
+                "script|{}",
+                String::from_utf8_lossy(sub).to_ascii_lowercase()
+            )),
             _ => err(&format!(
                 "ERR unknown subcommand '{}'. Try SCRIPT HELP.",
                 String::from_utf8_lossy(sub)
@@ -3302,13 +3307,14 @@ impl<'a> Dispatcher<'a> {
                     }
                     None => return err("ERR syntax error"),
                 },
-                b"COUNT" => match args.get(i + 1).and_then(|c| parse_i64(c).ok()) {
-                    Some(n) if n >= 1 => {
+                b"COUNT" => match scan_count(args.get(i + 1)) {
+                    Ok(n) => {
                         count = (n as usize).min(10_000);
                         i += 2;
                     }
-                    _ => return err("ERR syntax error"),
+                    Err(e) => return e,
                 },
+                b"NOVALUES" => return err(NOVALUES_HSCAN_ONLY),
                 b"TYPE" => match args.get(i + 1).map(|t| t.to_ascii_lowercase()) {
                     Some(t) => {
                         use flint_storage::encoding::ValueType as VT;
@@ -3448,6 +3454,25 @@ impl<'a> Dispatcher<'a> {
         {
             return err("ERR invalid cursor");
         }
+        let slot = slot_for_key(&args[1]);
+        // The key is read before the options, as upstream reads it
+        // (BUG-0225): a missing key answers an empty scan whatever follows,
+        // and another type answers WRONGTYPE.
+        let len = match kind {
+            ScanKind::Hash => self.hashes.hlen(slot, &args[1]),
+            ScanKind::Set => self.sets.scard(slot, &args[1]),
+            ScanKind::ZSet => self.zsets.zcard(slot, &args[1]),
+        };
+        match len {
+            Err(e) => return store_err(e),
+            Ok(0) => {
+                return Value::Array(Some(vec![
+                    Value::Bulk(Some(b"0".to_vec())),
+                    Value::Array(Some(Vec::new())),
+                ]));
+            }
+            Ok(_) => {}
+        }
         let mut pattern: Option<&[u8]> = None;
         let mut novalues = false;
         let mut i = 3;
@@ -3460,19 +3485,19 @@ impl<'a> Dispatcher<'a> {
                     }
                     None => return err("ERR syntax error"),
                 },
-                b"COUNT" => match args.get(i + 1).and_then(|c| parse_i64(c).ok()) {
-                    Some(n) if n >= 1 => i += 2,
-                    _ => return err("ERR syntax error"),
+                b"COUNT" => match scan_count(args.get(i + 1)) {
+                    Ok(_) => i += 2,
+                    Err(e) => return e,
                 },
                 b"NOVALUES" if matches!(kind, ScanKind::Hash) => {
                     novalues = true;
                     i += 1;
                 }
+                b"NOVALUES" => return err(NOVALUES_HSCAN_ONLY),
                 _ => return err("ERR syntax error"),
             }
         }
         let keep = |s: &[u8]| pattern.is_none_or(|p| glob_match(p, s));
-        let slot = slot_for_key(&args[1]);
         let items = match kind {
             ScanKind::Hash => match self.hashes.hgetall(slot, &args[1]) {
                 Ok(pairs) => pairs
@@ -3943,6 +3968,19 @@ fn multi_key(args: &[Vec<u8>], name: &str, mut f: impl FnMut(&[u8]) -> bool) -> 
     }
     Value::Integer(args[1..].iter().filter(|k| f(k)).count() as i64)
 }
+
+/// A SCAN family COUNT, read as upstream reads it (BUG-0225): one that is
+/// not an integer is answered so, and an integer below 1 is a syntax error.
+fn scan_count(raw: Option<&Vec<u8>>) -> Result<i64, Value> {
+    match raw.map(|c| parse_i64(c)) {
+        Some(Ok(n)) if n >= 1 => Ok(n),
+        Some(Err(_)) => Err(err("ERR value is not an integer or out of range")),
+        _ => Err(err("ERR syntax error")),
+    }
+}
+
+/// Upstream's refusal of NOVALUES anywhere but HSCAN.
+const NOVALUES_HSCAN_ONLY: &str = "ERR NOVALUES option can only be used in HSCAN";
 
 fn parse_f64(raw: &[u8]) -> Result<f64, ()> {
     let s = std::str::from_utf8(raw).map_err(|_| ())?;

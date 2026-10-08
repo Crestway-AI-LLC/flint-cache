@@ -296,12 +296,23 @@ impl Engine {
         ] {
             redis.raw_set(name, v)?;
         }
-        redis.raw_set(
-            "sha1hex",
-            lua.create_function(|lua, s: LuaString| {
+        // Upstream's arity check, raised as a call's error is, so the reply
+        // names the script's line (BUG-0225). A Lua wrapper would lose it to
+        // `return redis.sha1hex()`, a tail call that drops the script's frame.
+        let sha1hex = {
+            let pending = Rc::clone(&pending);
+            lua.create_function(move |lua, args: MultiValue| {
+                let mut args = args.into_iter();
+                let (Some(s), None) = (args.next(), args.next()) else {
+                    let text = "ERR wrong number of arguments".to_string();
+                    *pending.borrow_mut() = Some(text.clone());
+                    return Err(mlua::Error::runtime(text));
+                };
+                let s: LuaString = lua.unpack(s)?;
                 lua.create_string(flint_tls::sha1_hex(&s.as_bytes()[..]))
-            })?,
-        )?;
+            })?
+        };
+        redis.raw_set("sha1hex", sha1hex)?;
         g.raw_set("redis", redis.clone())?;
         lua.load(PRELUDE)
             .set_name("=flint")
@@ -774,7 +785,9 @@ fn to_reply(v: &LuaValue, depth: usize) -> Value {
 
 fn table_reply(t: &Table, depth: usize) -> Value {
     if let Ok(LuaValue::String(e)) = t.raw_get::<LuaValue>("err") {
-        return Value::Error(e.to_string_lossy());
+        let e = e.to_string_lossy();
+        // An empty one is upstream's `ERR ` (BUG-0225), never a bare `-` line.
+        return Value::Error(if e.is_empty() { "ERR ".into() } else { e });
     }
     if let Ok(LuaValue::String(s)) = t.raw_get::<LuaValue>("ok") {
         return Value::Simple(s.to_string_lossy());

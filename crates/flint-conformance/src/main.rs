@@ -1265,6 +1265,30 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             family: "scripting",
+            name: "an empty error reply and the script verbs' refusals, in upstream's words",
+            // BUG-0225.
+            steps: vec![
+                s(&[b"EVAL", b"return redis.error_reply('')", b"0"], Expect::Err("ERR ")),
+                s(
+                    &[b"EVAL", b"return redis.sha1hex()", b"0"],
+                    Expect::Err("ERR wrong number of arguments script: on @user_script:1."),
+                ),
+                s(
+                    &[b"EVAL", b"return redis.sha1hex('abc')", b"0"],
+                    Expect::Str(b"a9993e364706816aba3e25717850c26c9cd0d89d"),
+                ),
+                s(
+                    &[b"SCRIPT", b"EXISTS"],
+                    Expect::Err("ERR wrong number of arguments for 'script|exists' command"),
+                ),
+                s(
+                    &[b"SCRIPT", b"FLUSH", b"BOGUS"],
+                    Expect::Err("ERR SCRIPT FLUSH only support SYNC|ASYNC option"),
+                ),
+            ],
+        },
+        Case {
+            family: "scripting",
             name: "a script may touch a key it builds, in the slot of its keys",
             // ADR-0052 D2: Redis Cluster's rule. Flint runs such a script
             // again holding every writer; the answer is the same.
@@ -4954,6 +4978,46 @@ fn corpus() -> Vec<Case> {
                         Expect::UnorderedStrs(vec![b"sc:a", b"sc:b", b"sc:c"]),
                     ]),
                 ),
+            ],
+        },
+        Case {
+            family: "scan",
+            name: "scan options are read after the key, in upstream's words",
+            // BUG-0225: a missing key answers an empty scan whatever follows
+            // it, another type answers WRONGTYPE, and then a COUNT that is not
+            // an integer and a NOVALUES outside HSCAN are named as such.
+            steps: vec![
+                s(&[b"SADD", b"{so}s", b"a"], Expect::Int(1)),
+                s(
+                    &[b"SSCAN", b"{so}none", b"0", b"BOGUS"],
+                    Expect::Arr(vec![Expect::Str(b"0"), Expect::Arr(vec![])]),
+                ),
+                s(
+                    &[b"HSCAN", b"{so}none", b"0", b"COUNT", b"abc"],
+                    Expect::Arr(vec![Expect::Str(b"0"), Expect::Arr(vec![])]),
+                ),
+                s(
+                    &[b"ZSCAN", b"{so}s", b"0", b"COUNT", b"abc"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(
+                    &[b"SSCAN", b"{so}s", b"0", b"COUNT", b"abc"],
+                    Expect::Err("ERR value is not an integer or out of range"),
+                ),
+                s(&[b"SSCAN", b"{so}s", b"0", b"COUNT", b"0"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"SSCAN", b"{so}s", b"0", b"NOVALUES"],
+                    Expect::Err("ERR NOVALUES option can only be used in HSCAN"),
+                ),
+                s(
+                    &[b"SCAN", b"0", b"COUNT", b"abc"],
+                    Expect::Err("ERR value is not an integer or out of range"),
+                ),
+                s(
+                    &[b"SCAN", b"0", b"NOVALUES"],
+                    Expect::Err("ERR NOVALUES option can only be used in HSCAN"),
+                ),
+                s(&[b"DEL", b"{so}s"], Expect::Int(1)),
             ],
         },
         Case {
