@@ -131,4 +131,15 @@ A2=$(p1 GET '{ncx}a'); B2=$(p1 GET '{ncx}b')
   echo "      the transaction's writes did not invalidate its own proxy's cache"; exit 1; }
 echo "  {ncx}a reads a2 and {ncx}b is gone, straight after EXEC"
 
-echo "PASS: read-your-own-writes holds through one proxy, a transaction's included; the cross-client window is real and is bounded by the TTL"
+echo "== a write read back in the SAME pipeline is fresh (BUG-0223)"
+# The pipelined path answered a GET behind a write from the cache, before the
+# write's reply had invalidated it, so SET then GET in one pipeline read the
+# value the SET had just replaced.
+[ "$(p1 SET ncxp p1)" = "OK" ] && [ "$(p1 GET ncxp)" = "p1" ] || { echo "FAIL: seed and cache ncxp through proxy 1"; exit 1; }
+PIPE=$(python3 tools/lib/resp_pipe.py 6645 --auth tok-acme -- 'SET ncxp p2' 'GET ncxp' | tr '\n' ' ')
+[ "$PIPE" = "OK p2 " ] || {
+  echo "FAIL: SET ncxp p2 then GET ncxp in one pipeline through proxy 1 answered: $PIPE"
+  echo "      (want OK p2): the GET was served from the cache the SET had not yet invalidated"; exit 1; }
+echo "  SET then GET in one pipeline reads p2"
+
+echo "PASS: read-your-own-writes holds through one proxy, a transaction's and a pipeline's included; the cross-client window is real and is bounded by the TTL"

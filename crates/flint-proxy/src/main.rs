@@ -3678,15 +3678,36 @@ async fn prefetch_run(
     // value: read-your-own-writes, which every client assumes and nothing here
     // would restore.
     //
-    // So the lane is sticky once a write appears. Reads before the first write
-    // take the read lane and are genuinely isolated; from the first write
-    // onward the whole rest of the run stays on the write lane, in order, on
-    // one FIFO.
+    // So a run that writes at all goes on the write lane, from its FIRST
+    // command, in order, on one FIFO. Only a read-only run takes the read
+    // lane. The order matters in both directions: this used to keep the reads
+    // AHEAD of the first write on the read lane, and the two connections were
+    // flushed independently, so `GET k; SET k v` could run the SET first and
+    // answer the GET with `v` (BUG-0223).
     //
     // The consequence is worth stating because it decides who benefits: a
-    // client that alternates SET/GET in one pipeline gets nothing from this,
-    // and a read-only pipeline -- the common cache shape -- gets all of it.
-    let mut saw_write = false;
+    // pipeline that writes anything gets nothing from this, and a read-only
+    // pipeline -- the common cache shape -- gets all of it.
+    let lane = if cmds
+        .iter()
+        .take(MAX_PREFETCH)
+        .take_while(|(args, _)| {
+            args.first()
+                .is_some_and(|name| prefetchable(args, name, replica_reads))
+        })
+        .any(|(args, _)| {
+            args.first()
+                .is_some_and(|n| flint_commands::is_write_command(n))
+        }) {
+        apool::Lane::Write
+    } else {
+        apool::Lane::Read
+    };
+    // A write earlier in this run. A GET behind one is answered by its seat,
+    // never the near-cache: the write invalidates the cache only once its
+    // reply is back, so until then the cache holds the value it replaced
+    // (BUG-0223).
+    let mut wrote = false;
     for (i, (args, raw)) in cmds.iter().enumerate() {
         if i >= MAX_PREFETCH {
             break;
@@ -3696,11 +3717,14 @@ async fn prefetch_run(
             break;
         }
         let is_write = flint_commands::is_write_command(name);
+        let behind_a_write = wrote;
+        wrote |= is_write;
         if let Some(shed) = topo.quota_gate(ns, name, is_write, false) {
             plan[i] = Prefetch::Shed(shed);
             continue;
         }
-        let cacheable = local_cache
+        let cacheable = !behind_a_write
+            && local_cache
             && topo.cache.enabled()
             && args.len() == 2
             && args[0].eq_ignore_ascii_case(b"GET");
@@ -3727,12 +3751,6 @@ async fn prefetch_run(
             )
             .placed(topo.placed_pair(ns).is_some())
         });
-        saw_write |= is_write;
-        let lane = if saw_write {
-            apool::Lane::Write
-        } else {
-            apool::Lane::Read
-        };
         let lkey = (addr.clone(), lane);
         let lease = match leases.get(&lkey) {
             Some(l) => l,
@@ -3805,7 +3823,10 @@ async fn data_command(
             )
             .placed(topo.placed_pair(ns).is_some())
         });
-        let reply = forward_collect(topo, b, ns, args, raw, ticket, addr).await;
+        let reply = null_as_array(
+            args,
+            forward_collect(topo, b, ns, args, raw, ticket, addr).await,
+        );
         cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
         return reply;
     }
@@ -3975,16 +3996,24 @@ async fn data_command(
         )
         .placed(topo.placed_pair(ns).is_some())
     });
-    let reply = match handle(topo, b, ns, args, raw, read_replica, idle).await {
-        // RESP3 has one null and the backend hop speaks it, so a seat's null
-        // ARRAY arrives as `Value::Null`, which a RESP2 client would read as
-        // a null bulk. The commands whose null is an array get it back, as
-        // EXEC's does in `transaction_step` (BUG-0215).
-        Value::Null if flint_resp::null_is_array(args) => Value::Array(None),
-        other => other,
-    };
+    let reply = null_as_array(
+        args,
+        handle(topo, b, ns, args, raw, read_replica, idle).await,
+    );
     cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
     reply
+}
+
+/// RESP3 has one null and the backend hop speaks it, so a seat's null ARRAY
+/// arrives as `Value::Null`, which a RESP2 client would read as a null bulk.
+/// The commands whose null is an array get it back, as EXEC's does in
+/// `transaction_step` (BUG-0215), whether or not the command was pipelined
+/// (BUG-0224).
+fn null_as_array(args: &[Vec<u8>], reply: Value) -> Value {
+    match reply {
+        Value::Null if flint_resp::null_is_array(args) => Value::Array(None),
+        other => other,
+    }
 }
 
 /// Each tenant's Lua script texts, by SHA1 (ADR-0051). Bounded per tenant

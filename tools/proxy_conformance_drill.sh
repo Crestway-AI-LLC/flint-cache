@@ -108,4 +108,15 @@ for PROTO in 2 3; do
   echo "  RESP$PROTO  $(echo "$OUT" | grep '^overall')"
 done
 
-echo "PASS: the compatibility corpus is clean through the proxy as a tenant on RESP2 and RESP3 — the path a client actually takes, in the dialect it actually speaks"
+echo "== a PIPELINED reply is re-typed like a single one (BUG-0224)"
+# The corpus sends one command at a time, so it never reaches the proxy's
+# pipelined path. There a pop with a count on a missing key answered RESP2's
+# null BULK, because the null array the seat sent arrives as RESP3's one null
+# and only the one-at-a-time path rebuilt it.
+PIPE=$(python3 tools/lib/resp_pipe.py 7962 --auth tok-conf -- 'LPOP pc:none 2' 'RPOP pc:none 2' 'GET pc:none' | tr '\n' ' ')
+[ "$PIPE" = "(nil-array) (nil-array) (nil) " ] || {
+  echo "FAIL: pipelined LPOP/RPOP with a count, then GET, on a missing key answered: $PIPE"
+  echo "      (want (nil-array) (nil-array) (nil), as Redis answers RESP2)"; exit 1; }
+echo "  pipelined pops answer a null array"
+
+echo "PASS: the compatibility corpus is clean through the proxy as a tenant on RESP2 and RESP3 — the path a client actually takes, in the dialect it actually speaks; a pipelined reply is typed as a single one"

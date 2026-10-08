@@ -276,6 +276,15 @@ first write take the read lane, and from the first write onward the rest of
 the run stays on the write lane, in order, on one FIFO. `SET k v; GET k` in
 one pipeline cannot split.
 
+> **Corrected 2026-10-07 (public BUG-0223).** That held one order and broke
+> the other. The two lanes are two connections, flushed independently, so
+> the reads kept ahead of the first write could run AFTER it: a pipelined
+> `GET k; SET k v` answered the GET with `v` about one time in three
+> through a local proxy. A run that writes at all now goes on the write lane
+> from its first command; only a read-only run takes the read lane. A
+> read-only pipeline, the cache shape this ADR is for, keeps all of the
+> isolation, and a pipeline that writes gets none.
+
 **The same drill that found the harm, re-run against the implementation. Both
 rows are the gate box — the platform the fleet runs on:**
 

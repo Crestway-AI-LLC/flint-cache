@@ -233,6 +233,22 @@ def txn():
     assert r.get("{ct}:log") == "debit"
 check("MULTI/EXEC/WATCH (same slot)", txn)
 
+print("== a pipeline runs in the order it was sent (BUG-0223)")
+# The proxy staged the reads ahead of a pipeline's first write on its read
+# connection and the write on its write connection, flushed apart, so the
+# write could run first: GET then SET answered the GET with the SET's value
+# about one time in three, and LRANGE then DEL could read the list empty.
+def pipeline_order():
+    for i in range(200):
+        r.delete("po:k", "po:q")
+        r.rpush("po:q", "a", "b")
+        p = r.pipeline(transaction=False)
+        p.get("po:k"); p.set("po:k", "new"); p.lrange("po:q", 0, -1); p.delete("po:q")
+        got = p.execute()
+        assert got[0] is None, f"run {i}: the GET saw the SET sent after it"
+        assert got[2] == ["a", "b"], f"run {i}: the LRANGE saw the DEL sent after it: {got[2]!r}"
+check("a pipeline's read never sees a write sent after it", pipeline_order)
+
 print("== multi-key deletes across the two pairs (BUG-0179)")
 # `a` is slot 15495 and `b` slot 3300: the two pairs' halves of the range. A
 # DEL or EXISTS naming both used to be forwarded whole to `a`'s pair, which
