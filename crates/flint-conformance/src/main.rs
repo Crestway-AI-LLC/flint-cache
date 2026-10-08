@@ -1263,6 +1263,18 @@ fn corpus() -> Vec<Case> {
                 s(&[b"EVAL", RATE_LIMIT_REDIS_5_INCR, b"1", b"{rl}r5", b"1", b"60000"], Expect::Arr(vec![Expect::Int(2), Expect::Int(60000)])),
             ],
         },
+        // BUG-0233: a float that is negative zero after 17 places is `0`.
+        Case {
+            family: "strings",
+            name: "incrbyfloat writes a negative zero as 0",
+            steps: vec![
+                s(&[b"INCRBYFLOAT", b"nz", b"-0.000000000000000001"], Expect::Str(b"0")),
+                s(&[b"GET", b"nz"], Expect::Str(b"0")),
+                s(&[b"HSET", b"nzh", b"f", b"-0"], Expect::Int(1)),
+                s(&[b"HINCRBYFLOAT", b"nzh", b"f", b"-0"], Expect::Str(b"0")),
+                s(&[b"HGET", b"nzh", b"f"], Expect::Str(b"0")),
+            ],
+        },
         Case {
             family: "scripting",
             name: "a script returns redis 7's typed replies",

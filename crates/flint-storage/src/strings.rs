@@ -607,7 +607,9 @@ fn unsigned_overflow(value: u64, incr: i64, bits: u32, overflow: BitfieldOverflo
 }
 
 /// Redis's LD_STR_HUMAN float shape: fixed `%.17f`, then trim trailing
-/// zeros, then a bare trailing dot. (`10.75` → "10.75", `3.0` → "3".) On
+/// zeros, then a bare trailing dot. (`10.75` → "10.75", `3.0` → "3".) What
+/// is left of a negative zero, or of a negative too small for 17 places, is
+/// `-0`, which upstream writes as `0` (BUG-0233). On
 /// aarch64 `long double` IS `double`, so f64 reproduces the reference
 /// output bit-for-bit on this platform class — the conformance oracle
 /// referees.
@@ -620,6 +622,9 @@ pub fn fmt_float_human(x: f64) -> Vec<u8> {
         if s.ends_with('.') {
             s.pop();
         }
+    }
+    if s == "-0" {
+        s.remove(0);
     }
     s.into_bytes()
 }
@@ -839,6 +844,15 @@ mod tests {
         assert_eq!(s.incr_by_float(1, b"f", 0.25), Ok(b"10.75".to_vec()));
         assert_eq!(s.incr_by_float(1, b"f", -0.75), Ok(b"10".to_vec()));
         assert_eq!(s.get(1, b"f"), Ok(Some(b"10".to_vec())));
+        // A negative zero, and a negative too small for 17 places, are
+        // upstream's `0` (BUG-0233); one just large enough keeps its sign.
+        assert_eq!(s.incr_by_float(1, b"z", -0.0), Ok(b"0".to_vec()));
+        assert_eq!(s.incr_by_float(1, b"z", -4e-18), Ok(b"0".to_vec()));
+        assert_eq!(s.get(1, b"z"), Ok(Some(b"0".to_vec())));
+        assert_eq!(
+            s.incr_by_float(1, b"z", -6e-18),
+            Ok(b"-0.00000000000000001".to_vec())
+        );
         // Exponent-form stored values parse; output is always human form.
         s.set(1, b"e", b"3.0e3", SetOptions::default())
             .expect("set");
