@@ -3909,6 +3909,25 @@ fn corpus() -> Vec<Case> {
         // reading of the docs. The places we knowingly differ are called
         // out inline, listed in tools/redisjson_compare.sh and in
         // docs/command-support.md.
+        // BUG-0234: the number is read as JSON, as RedisJSON reads it.
+        Case {
+            family: "json",
+            name: "numincrby reads its number as json",
+            steps: vec![
+                s(&[b"JSON.SET", b"jn", b"$", br#"{"i":5}"#], Expect::Ok),
+                s(&[b"JSON.NUMINCRBY", b"jn", b"$.i", b"+1"], Expect::Err("ERR expected value at line 1 column 1")),
+                s(&[b"JSON.NUMINCRBY", b"jn", b"$.i", b"01"], Expect::Err("ERR invalid number at line 1 column 2")),
+                s(&[b"JSON.NUMINCRBY", b"jn", b"$.i", b"true"], Expect::Err("bad input number")),
+                s(&[b"JSON.GET", b"jn", b"$.i"], Expect::Str(b"[5]")),
+                s(&[b"JSON.NUMINCRBY", b"jn", b"$.i", b" 1"], Expect::Str(b"[6]")),
+                s(&[b"JSON.NUMINCRBY", b"jn", b"$.i", b"-0"], Expect::Str(b"[6.0]")),
+                s(&[b"JSON.SET", b"jn", b"$.s", br#""x""#], Expect::Ok),
+                s(&[b"JSON.NUMINCRBY", b"jn", b"$.s", b"+1"], Expect::Str(b"[null]")),
+                s(&[b"JSON.NUMINCRBY", b"jn", b"$.none", b"true"], Expect::Str(b"[]")),
+                s(&[b"JSON.SET", b"jn", b"$.e", b"1e308"], Expect::Ok),
+                s(&[b"JSON.NUMMULTBY", b"jn", b"$.e", b"10"], Expect::Err("result is not a number")),
+            ],
+        },
         Case {
             family: "json",
             name: "document roundtrip: root set, path get, TYPE vocabulary",

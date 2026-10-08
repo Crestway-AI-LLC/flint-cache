@@ -3060,21 +3060,21 @@ impl<'a> Dispatcher<'a> {
                 "json.numincrby"
             });
         }
-        let Some(by) = std::str::from_utf8(&args[3])
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-        else {
-            return err("ERR value is not a number");
-        };
+        // The number is read as JSON, as RedisJSON reads it, and refused in
+        // its words (BUG-0234). Rust's parsers took `+1`, `01`, `.5` and
+        // `1.`, which JSON does not, refused ` 1`, which it does, and read
+        // `-0` as an integer. Like RedisJSON, a bad number is refused only
+        // when it would be applied: a path with no number to change answers
+        // as it always does.
+        //
         // The increment as an exact integer, when it is written as one.
         // `2.0` is a float, so an integer incremented by it becomes one,
-        // as in RedisJSON.
-        let by = (
-            by,
-            std::str::from_utf8(&args[3])
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok()),
-        );
+        // as in RedisJSON, and so is `-0`, which serde reads as a float.
+        let by = match serde_json::from_slice::<serde_json::Value>(&args[3]) {
+            Ok(serde_json::Value::Number(n)) => Ok((n.as_f64().unwrap_or(f64::NAN), n.as_i64())),
+            Ok(_) => Err(err("bad input number")),
+            Err(e) => Err(err(&format!("ERR {e}"))),
+        };
         let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
             Ok(v) => v,
             Err(reply) => return reply,
@@ -3114,6 +3114,10 @@ impl<'a> Dispatcher<'a> {
                     as_resp.push(Value::Null);
                     continue;
                 }
+                let by = match &by {
+                    Ok(by) => *by,
+                    Err(e) => return e.clone(),
+                };
                 if let Err(e) = Self::json_numop(slot, by, mult) {
                     return e;
                 }
@@ -3139,6 +3143,10 @@ impl<'a> Dispatcher<'a> {
                 vec![Value::Null],
             );
         }
+        let by = match by {
+            Ok(by) => by,
+            Err(e) => return e,
+        };
         if let Err(e) = Self::json_numop(slot, by, mult) {
             return e;
         }
@@ -3183,7 +3191,7 @@ impl<'a> Dispatcher<'a> {
         let cur = slot.as_f64().unwrap_or(0.0);
         let next = if mult { cur * by.0 } else { cur + by.0 };
         if !next.is_finite() {
-            return Err(err("ERR result is not a finite number"));
+            return Err(err("result is not a number"));
         }
         *slot = match serde_json::Number::from_f64(next) {
             Some(n) => serde_json::Value::Number(n),
@@ -5098,6 +5106,28 @@ mod tests {
         // RedisJSON, whether or not it is whole.
         assert_eq!(incr("1", "2.0").1, json("3.0"));
         assert_eq!(incr("-5", "2.5").1, json("-2.5"));
+        // The number is read as JSON (BUG-0234): `-0` is a float, a space
+        // around it is allowed, and a spelling JSON refuses changes nothing.
+        assert_eq!(incr("5", "-0").1, json("5.0"));
+        assert_eq!(incr("5", " 1 ").1, json("6"));
+        for bad in ["+1", "01", ".5", "1.", "nan"] {
+            let (reply, stored) = incr("5", bad);
+            assert!(
+                matches!(&reply, Value::Error(e) if e.starts_with("ERR ")),
+                "{bad}: {reply:?}"
+            );
+            assert_eq!(stored, json("5"), "{bad}");
+        }
+        assert_eq!(incr("5", "true").0, Value::Error("bad input number".into()));
+        // A bad number is refused only where it would apply.
+        call(&s, &[b"JSON.SET", b"p", b"$", br#"{"a":"x"}"#]);
+        assert_eq!(
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"p", b"$.a", b"+1"]),
+                Proto::Resp2
+            ),
+            b"$6\r\n[null]\r\n"
+        );
         // The `$` dialect takes the same path.
         call(&s, &[b"JSON.SET", b"p", b"$", br#"{"a":9007199254740993}"#]);
         assert_eq!(
