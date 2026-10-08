@@ -33,4 +33,10 @@ Found by the randomised differential behind BUG-0219, probing i64::MIN.
   command-support.md. A shared seat cannot let one tenant's reply take
   every tenant's memory.
 - BUG-0060's admission sizes SRANDMEMBER: the set, which it builds, plus
-  the repeated members of a negative count.
+  the repeated members of a negative count. A count the command refuses
+  (i64::MIN, or a reply past the ceiling) is not sized, so the command's
+  own error answers it. The first gate of this fix found that: sized, the
+  i64::MIN count asked admission for 2^64 bytes and was refused THROTTLED,
+  a retry that could never succeed. A seat on macOS cannot read node
+  memory and admits every read unbudgeted, so a local corpus run did not
+  see it.

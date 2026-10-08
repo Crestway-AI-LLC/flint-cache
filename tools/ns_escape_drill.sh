@@ -59,13 +59,16 @@ GUARD_PREFIX=$(grep -o 'starts_with(b"[A-Z]*")' crates/flint-proxy/src/main.rs \
 [ -n "$GUARD_PREFIX" ] || { echo "FAIL: could not find the proxy's guard prefix"; exit 1; }
 echo "  proxy refuses commands beginning: $GUARD_PREFIX"
 
-# Every name the server dispatches. ACK, HELLO, EVAL and EVALSHA are the
-# reviewed exceptions: ACK is parsed only INSIDE an established replication
-# stream (never in general dispatch, so a client cannot reach it), HELLO is
-# a genuinely public RESP3 command, and EVAL/EVALSHA are public data
-# commands the proxy forwards by design (ADR-0051) -- `main` names them only
-# to commit a script's writes as one batch, and the command itself is the
-# dispatcher's, with its keys checked against the namespace like any other.
+# Every name the server dispatches. ACK, HELLO, EVAL, EVALSHA and UNWATCH
+# are the reviewed exceptions: ACK is parsed only INSIDE an established
+# replication stream (never in general dispatch, so a client cannot reach
+# it), HELLO is a genuinely public RESP3 command, and EVAL/EVALSHA are public
+# data commands the proxy forwards by design (ADR-0051) -- `main` names them
+# only to commit a script's writes as one batch, and the command itself is
+# the dispatcher's, with its keys checked against the namespace like any
+# other. UNWATCH is a public transaction command the proxy forwards by design;
+# `main` names it to answer a queued UNWATCH at EXEC (BUG-0220), and it
+# touches nothing but this connection's own watches.
 # Anything else outside the prefix is a command a tenant can send straight
 # to a backend.
 DISPATCHED=$(grep -oh 'eq_ignore_ascii_case(b"[A-Z]*")' crates/flint-server/src/main.rs \
@@ -76,7 +79,7 @@ DISPATCHED=$(grep -oh 'eq_ignore_ascii_case(b"[A-Z]*")' crates/flint-server/src/
   echo "      be re-taught before it can be trusted."
   exit 1
 }
-UNCOVERED=$(echo "$DISPATCHED" | grep -v "^$GUARD_PREFIX" | grep -vxE 'ACK|HELLO|EVAL|EVALSHA' || true)
+UNCOVERED=$(echo "$DISPATCHED" | grep -v "^$GUARD_PREFIX" | grep -vxE 'ACK|HELLO|EVAL|EVALSHA|UNWATCH' || true)
 if [ -n "$UNCOVERED" ]; then
   echo "FAIL: the server dispatches command(s) the proxy's '$GUARD_PREFIX' guard does not cover:"
   echo "$UNCOVERED" | sed 's/^/        /'
@@ -86,7 +89,7 @@ if [ -n "$UNCOVERED" ]; then
   echo "      reason. Do not add one to silence the check."
   exit 1
 fi
-echo "  $(echo "$DISPATCHED" | wc -l | tr -d ' ') dispatched names, all covered (exceptions: ACK, HELLO, EVAL, EVALSHA)"
+echo "  $(echo "$DISPATCHED" | wc -l | tr -d ' ') dispatched names, all covered (exceptions: ACK, HELLO, EVAL, EVALSHA, UNWATCH)"
 
 # The command set the runtime matrix will use, derived the same way.
 CMDS=$(echo "$DISPATCHED" | grep "^$GUARD_PREFIX" | tr '\n' ' ')

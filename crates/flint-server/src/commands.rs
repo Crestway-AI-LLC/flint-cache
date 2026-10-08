@@ -380,10 +380,20 @@ impl<'a> Dispatcher<'a> {
             }
             // The whole set is built (`smembers`) and, for a negative count,
             // `|count|` members besides (BUG-0218).
+            // A count the command refuses, i64::MIN or one whose reply would
+            // pass the ceiling, is left to the command: sized here, it was
+            // refused as THROTTLED, a retry that can never succeed.
             b"SRANDMEMBER" => {
                 let set = self.sets.stored_bytes(slot, key).ok().flatten()?;
                 let extra = match args.get(2).map(|c| parse_i64(c)) {
-                    Some(Ok(n)) if n < 0 => self.srandmember_reply_bytes(slot, key, n).ok()?,
+                    Some(Ok(n)) if n < 0 && n != i64::MIN => {
+                        let reply = self.srandmember_reply_bytes(slot, key, n).ok()?;
+                        if reply > self.reply_ceiling() {
+                            0
+                        } else {
+                            reply
+                        }
+                    }
                     _ => 0,
                 };
                 Ok(Some(set.saturating_add(extra)))
@@ -5518,6 +5528,18 @@ mod tests {
             .collection_read_bytes(b"SRANDMEMBER", &args)
             .expect("sized");
         assert!(sized >= 1000 * REPLY_ELEMENT_BYTES, "{sized}");
+        // A count the command refuses is not sized: admission would answer it
+        // THROTTLED before the command could say why.
+        for count in ["-9223372036854775808", "-2000000000000"] {
+            let args: Vec<Vec<u8>> = ["SRANDMEMBER", "s", count]
+                .iter()
+                .map(|a| a.as_bytes().to_vec())
+                .collect();
+            let sized = d
+                .collection_read_bytes(b"SRANDMEMBER", &args)
+                .expect("sized");
+            assert!(sized < REPLY_ELEMENT_BYTES, "{count}: {sized}");
+        }
     }
 
     /// BUG-0216: BUG-0060's admission charges a sorted-set read what it can
