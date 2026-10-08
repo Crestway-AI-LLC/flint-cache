@@ -1780,8 +1780,14 @@ fn coproc_args(inv: &Inventory, i: usize) -> Vec<String> {
             format!("{d}/certs/coproc.key"),
         ]);
     }
+    // The co-processor dials the edge back (PROXYCHAN), so it is one more
+    // consumer `edge_trust_path` exists for (BUG-0226).
     if inv.client_tls {
-        args.push("--client-tls".to_string());
+        args.extend([
+            "--client-tls".to_string(),
+            "--edge-ca".to_string(),
+            edge_trust_path(inv),
+        ]);
     }
     args
 }
@@ -10604,6 +10610,39 @@ mod cert_manifest_tests {
             flag(&on, "--index-mem-total-bytes").as_deref(),
             Some("8589934592")
         );
+    }
+
+    /// BUG-0226: the co-processor dials the edge back, so it trusts what every
+    /// other edge dialler trusts: `edge-trust` when declared, else the
+    /// internal CA. It was handed the internal CA always.
+    #[test]
+    fn a_coproc_seat_trusts_the_edge_the_inventory_names() {
+        let base = "statedir /var/lib/flint\n\
+                    bins /opt/flint/bin\n\
+                    tls on\n\
+                    client-tls on\n\
+                    cp 10.0.0.1:7500\n\
+                    pair 10.0.0.2:7001,10.0.0.3:7002\n\
+                    proxy 0.0.0.0:7379\n\
+                    coproc VEC. 127.0.0.1:7420\n";
+        let flag = |a: &[String], f: &str| a.iter().position(|x| x == f).map(|i| a[i + 1].clone());
+        let own = coproc_args(&inv_from(base, "edgeown"), 0);
+        assert_eq!(
+            flag(&own, "--edge-ca").as_deref(),
+            Some("/var/lib/flint/certs/ca.crt")
+        );
+        let public = coproc_args(
+            &inv_from(
+                &format!("{base}edge-trust /etc/pki/tls/certs/ca-bundle.crt\n"),
+                "edgepub",
+            ),
+            0,
+        );
+        assert_eq!(
+            flag(&public, "--edge-ca").as_deref(),
+            Some("/etc/pki/tls/certs/ca-bundle.crt")
+        );
+        assert!(public.iter().any(|a| a == "--client-tls"));
     }
 
     /// ...and ONLY a co-processor host. The leaf is server-auth only by design

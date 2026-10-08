@@ -39,6 +39,12 @@
 # trusts the check passing, and separately proves at the file level that the
 # cert on disk really did change signers.
 #
+# AND THE CO-PROCESSOR (BUG-0226): a vector namespace's first command rebuilds
+# its index over a PROXYCHAN dial-back to the same edge, and the co-processor
+# verified that edge with the internal CA, so on the playground, whose edge
+# cert is public, every vector set answered LOADING for ever. With
+# `edge-trust` declared it must serve.
+#
 # NOT COVERED HERE: the agent's own `--edge-ca` dials. The agent is a
 # fleet-repository binary, so that half is drilled there. flintctl's half —
 # three of the five bugs above — is this repository's, and is what this
@@ -48,7 +54,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-edgeca 7451 7452 7453 7454
+fleet_init $FLINT_DRILL_ROOT/flint-edgeca 7451 7452 7453 7454 7455
 fleet_guard
 D=$FLINT_DRILL_ROOT/flint-edgeca
 STATE=$D/state
@@ -59,14 +65,15 @@ A=127.0.0.1:7451
 B=127.0.0.1:7452
 PROXY=127.0.0.1:7453
 CP=127.0.0.1:7454
+VEC=127.0.0.1:7455
 
 fleet_kill controller; fleet_kill server
-fleet_kill proxy; fleet_kill controlplane
+fleet_kill proxy; fleet_kill controlplane; fleet_kill vec
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop >/dev/null 2>&1
   fleet_kill controller; fleet_kill server
-  fleet_kill proxy; fleet_kill controlplane
+  fleet_kill proxy; fleet_kill controlplane; fleet_kill vec
   [ -n "${KEEP:-}" ] || rm -rf "$D"
 }
 trap cleanup EXIT
@@ -75,7 +82,7 @@ rm -rf "$D"; mkdir -p "$D" "$OUTER"
 command -v openssl >/dev/null 2>&1 || { echo "SKIP: no openssl"; exit 0; }
 
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
-  -p flint-controller -p flint-ctl --features flint-server/rocks \
+  -p flint-controller -p flint-ctl -p flint-vec --features flint-server/rocks \
   || { echo "FAIL: build"; exit 1; }
 
 # No `edge-trust` line yet — that is deliberate, and it is the control.
@@ -240,4 +247,32 @@ echo "$OUT" | grep -q "VERIFY OK" || {
   echo "$OUT" | sed 's/^/  | /'; exit 1; }
 echo "  liveness, build column and the data-plane probe all work over a foreign-CA edge"
 
-echo "PASS: an edge cert signed by a CA the fleet does not own is unreadable without edge-trust and fully readable with it — the shape every real deployment has, and the one no other drill exercises"
+echo "== a co-processor added to this running fleet, as ADR-0050 step 4 adds one"
+printf 'coproc VEC. %s\n' "$VEC" >> "$INV"
+$CTL upgrade --version-tag edge-ca-coproc --soak-ms 1500 >"$D/upgrade.log" 2>&1 || {
+  echo "FAIL: the upgrade that adds the co-processor"; tail -10 "$D/upgrade.log" | sed 's/^/  | /'; exit 1; }
+grep -q "vec-7455 reports edge-ca-coproc" "$D/upgrade.log" || {
+  echo "FAIL: the upgrade did not start the co-processor:"
+  grep -n "co-processor\|vec-" "$D/upgrade.log" | sed 's/^/  | /'; exit 1; }
+
+echo "== the co-processor dials the same edge back, and serves (BUG-0226)"
+# The first VEC command in a namespace rebuilds its index through the edge, and
+# answers LOADING until that is done; a co-processor that cannot verify the
+# edge answers LOADING for ever. Ten seconds is many times what an empty
+# namespace takes.
+vec() { valkey-cli -p 7453 --tls --cacert "$OUTER/ca.crt" -a tok-acme --no-auth-warning "$@" 2>&1; }
+R=""
+for _ in $(seq 1 20); do
+  R=$(vec VEC.CREATE s DIM 3 METRIC l2)
+  case "$R" in LOADING*) sleep 0.5 ;; *) break ;; esac
+done
+[ "$R" = "OK" ] || {
+  echo "FAIL: VEC.CREATE through the foreign-CA edge answered: $R"
+  echo "      The co-processor cannot dial the edge back; its log:"
+  tail -3 "$STATE"/logs/vec-7455.log 2>/dev/null | sed 's/^/  | /'
+  exit 1; }
+[ "$(vec VEC.SET s a 1,2,3)" = "OK" ] || { echo "FAIL: VEC.SET"; exit 1; }
+vec VEC.SEARCH s 1,2,3 1 | grep -qx a || { echo "FAIL: VEC.SEARCH did not find the vector it stored"; exit 1; }
+echo "  a vector set created, written and searched through the foreign-CA edge"
+
+echo "PASS: an edge cert signed by a CA the fleet does not own is unreadable without edge-trust and fully readable with it, the co-processor's dial-back included — the shape every real deployment has, and the one no other drill exercises"

@@ -299,8 +299,14 @@ fn arg(args: &[String], flag: &str) -> Option<String> {
 
 /// Build the mesh-TLS identity from the flags (ADR-0010 D5). The three
 /// `--internal-*` flags are all-or-nothing (matching flint-server/flint-proxy);
-/// `--client-tls` additionally TLS-wraps the PROXYCHAN dial-back and reuses the
-/// internal CA to verify the edge.
+/// `--client-tls` additionally TLS-wraps the PROXYCHAN dial-back, verifying
+/// the edge against `--edge-ca`: the bundle the fleet's edge certificate
+/// chains to, which flintctl takes from the inventory's `edge-trust`. Without
+/// it the internal CA, which signs the edge certificate `bootstrap` mints.
+///
+/// BUG-0226: this used the internal CA always, so on a fleet whose edge
+/// certificate is publicly issued every rebuild's dial-back failed
+/// `UnknownIssuer` and every vector set answered LOADING for ever.
 fn build_tls(args: &[String]) -> Tls {
     let inbound = match (
         arg(args, "--internal-ca"),
@@ -315,11 +321,11 @@ fn build_tls(args: &[String]) -> Tls {
         _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
     };
     let edge = if args.iter().any(|a| a == "--client-tls") {
-        let ca = arg(args, "--internal-ca").unwrap_or_else(|| {
-            panic!(
-                "--client-tls needs --internal-ca (the edge is verified against the internal CA)"
-            )
-        });
+        let ca = arg(args, "--edge-ca")
+            .or_else(|| arg(args, "--internal-ca"))
+            .unwrap_or_else(|| {
+                panic!("--client-tls needs --edge-ca or --internal-ca to verify the edge")
+            });
         Some(flint_tls::edge_client_config(&ca).unwrap_or_else(|e| panic!("edge TLS config: {e}")))
     } else {
         None
