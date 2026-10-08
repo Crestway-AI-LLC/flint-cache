@@ -237,6 +237,21 @@ pub fn resp3_differs_in_kind(command: &[u8]) -> bool {
         || command.eq_ignore_ascii_case(b"JSON.NUMMULTBY")
 }
 
+/// A finite double as the seat's JSON text spells it, by the same code: the
+/// seat writes NUMINCRBY's RESP2 text with serde_json, and the proxy
+/// rebuilds that text from the seat's RESP3 reply, where a double is only a
+/// number. Spelled the Redis way (`fmt_double`), `3.0` came back as `3`
+/// (BUG-0235). serde_json's formatter is not Rust's `{:e}`: where two
+/// shortest spellings tie, they pick differently, so only the seat's own
+/// library matches it everywhere.
+pub fn fmt_json_double(d: f64) -> Vec<u8> {
+    match serde_json::Number::from_f64(d) {
+        Some(n) => n.to_string().into_bytes(),
+        // Not finite: the seat refuses such a result, so none arrives here.
+        None => fmt_double(d),
+    }
+}
+
 /// Rebuild `JSON.NUMINCRBY`'s (or `JSON.NUMMULTBY`'s) RESP2 reply from its
 /// RESP3 array.
 ///
@@ -250,10 +265,11 @@ pub fn json_numincrby_resp2(resp3_reply: &Value, jsonpath: bool) -> Value {
         // already the same in both dialects.
         return resp3_reply.clone();
     };
+    // JSON text, as the seat writes it: a double keeps its `.0` (BUG-0235).
     let render = |v: &Value| -> Vec<u8> {
         match v {
             Value::Integer(i) => i.to_string().into_bytes(),
-            Value::Double(d) => fmt_double(*d),
+            Value::Double(d) => fmt_json_double(*d),
             _ => b"null".to_vec(),
         }
     };
@@ -1336,5 +1352,54 @@ mod flushing_encoder_tests {
         for &(d, want) in cases {
             assert_eq!(fmt_double(d), want.as_bytes(), "{d:e}");
         }
+    }
+
+    #[test]
+    fn fmt_json_double_spells_a_double_as_the_seats_json_does() {
+        // BUG-0235. Each spelling is the seat's own (serde_json), read back
+        // from JSON.GET on 2026-10-08.
+        let cases: &[(f64, &str)] = &[
+            (3.0, "3.0"),
+            (-0.0, "-0.0"),
+            (0.0, "0.0"),
+            (1.5, "1.5"),
+            (100.0, "100.0"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1e17, "1e+17"),
+            (1e21, "1e+21"),
+            (1e300, "1e+300"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"),
+            (1.2345678901234566e16, "1.2345678901234566e+16"),
+            (123456789.123, "123456789.123"),
+            (0.1, "0.1"),
+            (0.0001, "0.0001"),
+            (0.00001, "0.00001"),
+            (0.000123, "0.000123"),
+            (1e-7, "1e-7"),
+            (1.5e-7, "1.5e-7"),
+            (-2.5e-9, "-2.5e-9"),
+            (5e-324, "5e-324"),
+            // The double nearest this is ...099.25, which ...099.2 and ...099.3
+            // name equally well: serde_json and RedisJSON write `.2`, Rust's
+            // `{:e}` writes `.3`.
+            (900_719_925_474_099.2, "900719925474099.2"),
+        ];
+        for &(d, want) in cases {
+            assert_eq!(fmt_json_double(d), want.as_bytes(), "{d:e}");
+        }
+        let reply = Value::Array(Some(vec![
+            Value::Double(3.0),
+            Value::Integer(4),
+            Value::Null,
+        ]));
+        assert_eq!(
+            json_numincrby_resp2(&reply, true),
+            Value::Bulk(Some(b"[3.0,4,null]".to_vec()))
+        );
+        assert_eq!(
+            json_numincrby_resp2(&Value::Array(Some(vec![Value::Double(6.0)])), false),
+            Value::Bulk(Some(b"6.0".to_vec()))
+        );
     }
 }

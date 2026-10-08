@@ -7,5 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+# Only to spell a JSON number exactly as the seat does (BUG-0235).
+serde_json = "1"
+
 [lints]
 workspace = true
