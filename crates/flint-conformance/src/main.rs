@@ -206,6 +206,22 @@ fn seat_only(family: &str) -> bool {
     matches!(family, "flint")
 }
 
+/// Families a bare seat cannot answer: what the proxy serves on a client's
+/// connection itself, as the oracle does. A subscription is held by the
+/// proxy, and a seat refuses `SUBSCRIBE` (ADR-0052 D5), so these run against
+/// the reference and through an authenticated proxy, and are skipped, and
+/// said to be, against a seat.
+fn edge_only(family: &str) -> bool {
+    matches!(family, "pubsub_edge")
+}
+
+/// What a seat answers a subscription command: a proxy holds subscriptions
+/// (ADR-0052 D5).
+const SEAT_SUBSCRIBE: &str =
+    "ERR a seat serves subscriptions to proxies only: subscribe through the proxy (ADR-0052)";
+/// What sharded pub/sub is answered with, at a seat and through a proxy.
+const SHARDED: &str = "ERR sharded pub/sub is not served: use SUBSCRIBE and PUBLISH (ADR-0052)";
+
 fn corpus() -> Vec<Case> {
     let big = vec![0xABu8; 1024];
     vec![
@@ -686,6 +702,155 @@ fn corpus() -> Vec<Case> {
                 s(&[b"BITOP", b"WAT", b"{bo}d", b"{bo}a"], Expect::Err("ERR syntax error")),
                 s(&[b"RPUSH", b"{bo}l", b"x"], Expect::Int(1)),
                 s(&[b"BITOP", b"AND", b"{bo}d", b"{bo}a", b"{bo}l"], Expect::AnyError),
+            ],
+        },
+        // A seat holds no client's subscription: a proxy does, and
+        // subscribes at the seat for it (ADR-0052 D5). Sharded pub/sub is
+        // not served anywhere.
+        Case {
+            family: "flint",
+            name: "a seat refuses subscriptions and sharded pub/sub",
+            steps: vec![
+                s(&[b"SUBSCRIBE", b"ch"], Expect::Err(SEAT_SUBSCRIBE)),
+                s(&[b"PSUBSCRIBE", b"ch"], Expect::Err(SEAT_SUBSCRIBE)),
+                s(&[b"UNSUBSCRIBE", b"ch"], Expect::Err(SEAT_SUBSCRIBE)),
+                s(&[b"PUNSUBSCRIBE", b"ch"], Expect::Err(SEAT_SUBSCRIBE)),
+                s(&[b"SSUBSCRIBE", b"ch"], Expect::Err(SHARDED)),
+                s(&[b"SUNSUBSCRIBE", b"ch"], Expect::Err(SHARDED)),
+                s(&[b"SPUBLISH", b"ch", b"m"], Expect::Err(SHARDED)),
+            ],
+        },
+        // One connection's subscriptions, as the proxy holds them: each
+        // confirmation counts the channels and patterns held, a RESP3 push
+        // and a RESP2 array alike. Messages take two connections, which the
+        // corpus does not have: tools/pubsub_drill.sh.
+        Case {
+            family: "pubsub_edge",
+            name: "pubsub: subscription confirmations",
+            steps: vec![
+                s(
+                    &[b"SUBSCRIBE", b"{pe}a"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"subscribe"),
+                        Expect::Str(b"{pe}a"),
+                        Expect::Int(1),
+                    ]),
+                ),
+                s(
+                    &[b"SUBSCRIBE", b"{pe}a"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"subscribe"),
+                        Expect::Str(b"{pe}a"),
+                        Expect::Int(1),
+                    ]),
+                ),
+                s(
+                    &[b"PSUBSCRIBE", b"{pe}*"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"psubscribe"),
+                        Expect::Str(b"{pe}*"),
+                        Expect::Int(2),
+                    ]),
+                ),
+                s(
+                    &[b"UNSUBSCRIBE", b"{pe}zz"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"unsubscribe"),
+                        Expect::Str(b"{pe}zz"),
+                        Expect::Int(2),
+                    ]),
+                ),
+                s(
+                    &[b"UNSUBSCRIBE", b"{pe}a"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"unsubscribe"),
+                        Expect::Str(b"{pe}a"),
+                        Expect::Int(1),
+                    ]),
+                ),
+                s(
+                    &[b"PUNSUBSCRIBE", b"{pe}*"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"punsubscribe"),
+                        Expect::Str(b"{pe}*"),
+                        Expect::Int(0),
+                    ]),
+                ),
+                s(
+                    &[b"UNSUBSCRIBE"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"unsubscribe"),
+                        Expect::Nil,
+                        Expect::Int(0),
+                    ]),
+                ),
+                s(
+                    &[b"PUNSUBSCRIBE"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"punsubscribe"),
+                        Expect::Nil,
+                        Expect::Int(0),
+                    ]),
+                ),
+                s(
+                    &[b"SUBSCRIBE"],
+                    Expect::Err("ERR wrong number of arguments for 'subscribe' command"),
+                ),
+                s(&[b"PING"], Expect::Pong),
+            ],
+        },
+        // Pub/sub on one connection with no subscriber (ADR-0052 D5): the
+        // replies a publisher sees. Delivery takes two connections, which
+        // the corpus does not have; tools/pubsub_drill.sh covers it.
+        Case {
+            family: "pubsub",
+            name: "pubsub: PUBLISH and PUBSUB with no subscriber",
+            steps: vec![
+                s(&[b"PUBLISH", b"{ps}ch", b"hello"], Expect::Int(0)),
+                s(
+                    &[b"PUBLISH", b"{ps}ch"],
+                    Expect::Err("ERR wrong number of arguments for 'publish' command"),
+                ),
+                s(
+                    &[b"PUBSUB", b"NUMSUB", b"{ps}ch", b"{ps}x"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"{ps}ch"),
+                        Expect::Int(0),
+                        Expect::Str(b"{ps}x"),
+                        Expect::Int(0),
+                    ]),
+                ),
+                s(&[b"PUBSUB", b"numsub"], Expect::Arr(vec![])),
+                s(&[b"PUBSUB", b"CHANNELS", b"{ps}*"], Expect::Arr(vec![])),
+                s(
+                    &[b"PUBSUB", b"SHARDNUMSUB", b"{ps}ch"],
+                    Expect::Arr(vec![Expect::Str(b"{ps}ch"), Expect::Int(0)]),
+                ),
+                s(&[b"PUBSUB", b"SHARDCHANNELS"], Expect::Arr(vec![])),
+                s(
+                    &[b"PUBSUB", b"CHANNELS", b"a", b"b"],
+                    Expect::Err(
+                        "ERR unknown subcommand or wrong number of arguments for 'CHANNELS'. \
+                         Try PUBSUB HELP.",
+                    ),
+                ),
+                s(
+                    &[b"PUBSUB", b"NUMPAT", b"x"],
+                    Expect::Err("ERR wrong number of arguments for 'pubsub|numpat' command"),
+                ),
+                s(
+                    &[b"PUBSUB", b"BOGUS"],
+                    Expect::Err("ERR unknown subcommand 'BOGUS'. Try PUBSUB HELP."),
+                ),
+                s(
+                    &[b"PUBSUB"],
+                    Expect::Err("ERR wrong number of arguments for 'pubsub' command"),
+                ),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{ps}k", b"v"], Expect::Simple("QUEUED")),
+                s(&[b"PUBLISH", b"{ps}k", b"done"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::Arr(vec![Expect::Ok, Expect::Int(0)])),
+                s(&[b"DEL", b"{ps}k"], Expect::Int(1)),
             ],
         },
         Case {
@@ -6236,6 +6401,7 @@ fn main() -> ExitCode {
     let mut failures: Vec<String> = Vec::new();
     let mut skipped = 0u32;
     let mut skipped_seat = 0u32;
+    let mut skipped_edge = 0u32;
 
     // A proxy run authenticates as a tenant; a seat has no tenant auth. That
     // is the signal, and `--foreign` is the explicit form for a target that
@@ -6250,6 +6416,10 @@ fn main() -> ExitCode {
         }
         if not_a_seat && seat_only(case.family) {
             skipped_seat += 1;
+            continue;
+        }
+        if !not_a_seat && edge_only(case.family) {
+            skipped_edge += 1;
             continue;
         }
         let entry = per_family.entry(case.family).or_insert((0, 0));
@@ -6291,6 +6461,12 @@ fn main() -> ExitCode {
     );
     if skipped > 0 {
         println!("  ({skipped} flint-only case(s) skipped: no oracle on this target)");
+    }
+    if skipped_edge > 0 {
+        println!(
+            "  ({skipped_edge} edge-only case(s) skipped: subscriptions are held by the proxy, \
+             and a seat refuses them)"
+        );
     }
     if skipped_seat > 0 {
         println!(

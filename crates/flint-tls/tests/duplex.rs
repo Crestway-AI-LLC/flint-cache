@@ -139,3 +139,63 @@ fn writes_continue_while_a_read_is_blocked_over_mtls() {
     );
     assert_eq!(echoed, sent, "echo mismatch through the duplex split");
 }
+
+/// An ACCEPTED stream splits too (ADR-0052 D5): a seat writes a proxy's
+/// pub/sub messages from one thread while another waits on the proxy's next
+/// registration. The server's reader is parked first; its writer must get
+/// every frame out regardless, and the reader must still receive what the
+/// client sends afterwards.
+#[test]
+fn an_accepted_stream_splits_and_writes_while_its_reader_waits() {
+    let dir = std::env::temp_dir().join(format!("flint-tls-duplex-srv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ca, cert, key) = mint(&dir);
+    let scfg = flint_tls::server_config(&ca, &cert, &key).unwrap();
+    let ccfg = flint_tls::client_config(&ca, &cert, &key).unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+
+    let server = std::thread::spawn(move || {
+        let tcp = l.accept().unwrap().0;
+        let mut s = flint_tls::accept(tcp, &Some(scfg)).unwrap();
+        // The handshake, and one exchange, before the split, as a seat has
+        // read FLINTSUBSCRIBER before it splits the connection.
+        let mut hello = [0u8; 5];
+        s.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello, b"hello");
+        let (mut rd, wr) = s.into_duplex().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while got.len() < 3 {
+                match rd.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&chunk[..n]),
+                    Err(e) => panic!("server reader: {e}"),
+                }
+            }
+            got
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        for i in 0..K {
+            wr.append(&[i as u8; FRAME]).unwrap();
+            let _ = wr.flush().unwrap();
+        }
+        reader.join().unwrap()
+    });
+
+    let mut c = flint_tls::connect(&addr, &Some(ccfg)).unwrap();
+    c.write_all(b"hello").unwrap();
+    c.flush().unwrap();
+    let mut got = vec![0u8; K * FRAME];
+    c.read_exact(&mut got).unwrap();
+    let want: Vec<u8> = (0..K).flat_map(|i| vec![i as u8; FRAME]).collect();
+    assert_eq!(
+        got, want,
+        "the server's writer half, while its reader waited"
+    );
+    c.write_all(b"bye").unwrap();
+    c.flush().unwrap();
+    assert_eq!(server.join().unwrap(), b"bye");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -16,6 +16,7 @@ mod glob;
 mod heat;
 mod json_path;
 mod migrate;
+mod pubsub;
 mod repl_hub;
 mod script;
 mod write_lock;
@@ -4392,6 +4393,17 @@ fn serve(
                         stream.write_all(&out)?;
                         return flintsync(stream, rocks, hub, &args);
                     }
+                    // A proxy's subscriber connection (ADR-0052 D5): it
+                    // carries messages to the proxy from here on.
+                    if args
+                        .first()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSUBSCRIBER"))
+                    {
+                        flush_pending!();
+                        buf.drain(..consumed);
+                        stream.write_all(&out)?;
+                        return pubsub::serve_subscriber(stream, std::mem::take(&mut buf));
+                    }
                     if args
                         .first()
                         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTFULLSYNC"))
@@ -5181,6 +5193,9 @@ fn exec_transaction(
     let _inflight = (work.write && !ro).then(WriteInFlight::enter);
 
     let _all = write_lock::lock_all();
+    // A queued PUBLISH is heard once the transaction's writes commit, and
+    // not at all if they fail (ADR-0052 D5).
+    let held = pubsub::Deferral::begin();
     let batching = flint_storage::batch::BatchingKv::new(store);
     let mut replies = Vec::with_capacity(txn.queued.len());
     {
@@ -5217,6 +5232,7 @@ fn exec_transaction(
     {
         return Value::Error(format!("ERR transaction commit failed: {e}"));
     }
+    held.commit();
     Value::Array(Some(replies))
 }
 

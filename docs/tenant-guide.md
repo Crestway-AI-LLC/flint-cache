@@ -234,7 +234,10 @@ none of its writes (ADR-0051, ADR-0052). Blocking pops (`BLPOP`, `BRPOP`,
 an element within about 20 ms of its arrival (ADR-0052). A tenant placed
 on one pair, which your operator chooses when creating it, may also span
 slots in a transaction or a script, as rq and Sidekiq need; its size and
-throughput are then that pair's (ADR-0053). Not in v0: pub/sub, streams,
+throughput are then that pair's (ADR-0053). Pub/sub is served through the
+proxy, at most once as in Redis, with order kept per channel; sharded
+pub/sub and keyspace notifications are not (ADR-0052,
+`docs/command-support.md`). Not in v0: streams,
 and cross-slot multi-key operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
 splits per slot or per pair. `KEYS` is answered at the proxy, up to 100,000
 keys (`docs/command-support.md`, ADR-0050).

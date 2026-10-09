@@ -404,9 +404,11 @@ impl Stream {
     /// independent: a send jammed on a slow peer never stops the reader from
     /// draining inbound data — the drain_read lesson, made structural.
     ///
-    /// Client-role streams only. The one caller is the proxy's backend pool;
-    /// a `ServerTls` stream has no business being pooled, and refusing it
-    /// here is clearer than a runtime deadlock later.
+    /// Both roles. The proxy's backend pool splits the streams it dials. A
+    /// seat splits a proxy's pub/sub subscriber connection (ADR-0052 D5), an
+    /// accepted stream, so that a message published on another thread is
+    /// written at once while the connection's own thread waits for the
+    /// proxy's next registration.
     pub fn into_duplex(self) -> io::Result<(DuplexReader, DuplexWriter)> {
         match self {
             Stream::Plain(s) => {
@@ -425,28 +427,35 @@ impl Stream {
             }
             Stream::ClientTls(s) => {
                 let owned = *s;
-                let rsock = owned.sock.try_clone()?;
-                let state = Arc::new(std::sync::Mutex::new(TlsHalf {
-                    conn: owned.conn,
-                    out: Vec::new(),
-                }));
-                Ok((
-                    DuplexReader {
-                        sock: rsock,
-                        tls: Some(state.clone()),
-                    },
-                    DuplexWriter {
-                        out: Arc::new(std::sync::Mutex::new(Vec::new())),
-                        tls: Some(state),
-                        sock: Arc::new(std::sync::Mutex::new(owned.sock)),
-                    },
-                ))
+                Self::tls_duplex(rustls::Connection::Client(owned.conn), owned.sock)
             }
-            Stream::ServerTls(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "into_duplex is for client-role (dial-side) streams",
-            )),
+            Stream::ServerTls(s) => {
+                let owned = *s;
+                Self::tls_duplex(rustls::Connection::Server(owned.conn), owned.sock)
+            }
         }
+    }
+
+    fn tls_duplex(
+        conn: rustls::Connection,
+        sock: TcpStream,
+    ) -> io::Result<(DuplexReader, DuplexWriter)> {
+        let rsock = sock.try_clone()?;
+        let state = Arc::new(std::sync::Mutex::new(TlsHalf {
+            conn,
+            out: Vec::new(),
+        }));
+        Ok((
+            DuplexReader {
+                sock: rsock,
+                tls: Some(state.clone()),
+            },
+            DuplexWriter {
+                out: Arc::new(std::sync::Mutex::new(Vec::new())),
+                tls: Some(state),
+                sock: Arc::new(std::sync::Mutex::new(sock)),
+            },
+        ))
     }
 }
 
@@ -455,7 +464,7 @@ impl Stream {
 /// Every lock hold is memory-only — encrypt, decrypt, buffer — never a
 /// blocking socket call, which is the whole deadlock-freedom argument.
 struct TlsHalf {
-    conn: ClientConnection,
+    conn: rustls::Connection,
     out: Vec<u8>,
 }
 
@@ -472,6 +481,14 @@ impl DuplexReader {
     /// surface to the caller as exactly that.
     pub fn set_read_timeout(&self, d: Option<std::time::Duration>) -> io::Result<()> {
         self.sock.set_read_timeout(d)
+    }
+
+    /// Another handle on the socket, to shut the connection down from a
+    /// thread that must not wait for any lock of this split: a writer stuck
+    /// in a flush holds the socket-write lock that
+    /// [`DuplexWriter::shutdown`] takes.
+    pub fn socket_handle(&self) -> io::Result<TcpStream> {
+        self.sock.try_clone()
     }
 
     fn lock_tls(

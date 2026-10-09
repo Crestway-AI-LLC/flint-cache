@@ -732,7 +732,7 @@ fn to_lua(lua: &Lua, v: Value) -> mlua::Result<LuaValue> {
         Value::Boolean(b) => LuaValue::Number(if b { 1.0 } else { 0.0 }),
         Value::Bulk(Some(b)) => LuaValue::String(lua.create_string(b)?),
         Value::Bulk(None) | Value::Array(None) | Value::Null => LuaValue::Boolean(false),
-        Value::Array(Some(items)) | Value::Set(items) => array(lua, items)?,
+        Value::Array(Some(items)) | Value::Set(items) | Value::Push(items) => array(lua, items)?,
         Value::Double(d) => LuaValue::String(lua.create_string(fmt_double(d))?),
         Value::Map(pairs) => {
             let mut flat = Vec::with_capacity(pairs.len() * 2);

@@ -805,6 +805,82 @@ ops/s quota however long it waits, and its time is not counted in the
 tenant's latency histogram, where a two-second `BRPOP` would read as a
 two-second write.
 
+## Pub/sub (ADR-0052)
+
+`SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH` and
+`PUBSUB` (`CHANNELS`, `NUMSUB`, `NUMPAT`, `HELP`) work as in Redis, with
+Valkey's replies, in both protocols. Under RESP2 a subscribed connection
+takes only the subscription commands, `PING` and `QUIT`, and refuses the
+rest in Redis's words (which also name `RESET`, a command Flint does not
+serve). Under RESP3 messages arrive as pushes, and the connection serves
+every command. A
+tenant's channels are its own: another tenant's channel of the same name is
+another channel. Patterns match by Redis's glob, byte for byte (BUG-0244).
+
+You subscribe through the proxy, which holds the subscription. Each proxy
+keeps one connection to each pair's master and registers there how many of
+its clients hold each channel and pattern. A `PUBLISH` runs on one pair,
+either the one its channel hashes to or the one its transaction or script
+runs on. It reaches each subscriber, through any proxy, once. What that
+means:
+
+- **Delivery is at most once, as in Redis.** A seat that restarts, or a
+  master that changes, starts with no subscriptions. Each proxy registers
+  its clients' subscriptions again on its next connection; its clients stay
+  subscribed and are not told. Messages published in between are lost to
+  them, as they are to a Redis client that reconnects. In the drill a proxy
+  had registered again within half a second of a restarted seat answering.
+- **A message is as quick as Redis's.** From `PUBLISH` to the subscriber's
+  read, 0.05 ms at the median through a local proxy, against 0.12 ms on
+  Valkey 9.1 on the same machine (release builds, plaintext, 2,000 messages
+  one at a time).
+- **A confirmation means the subscription is in place.** The proxy answers
+  `SUBSCRIBE` once every master it can reach holds the subscription, so a
+  `PUBLISH` sent after the confirmation, through any proxy, reaches the
+  client. A master that cannot be reached is not waited for beyond 2 s; it
+  registers the subscription when its connection comes back.
+- **A `PUBLISH` inside `MULTI` or a script is heard when its writes
+  commit,** and not at all if they do not. A script that fails keeps none of
+  its writes in Flint (ADR-0051), and its publishes go with them; Redis has
+  already delivered them. Celery's result backend writes a result and
+  publishes it in one `MULTI`.
+- **The reply to `PUBLISH` counts every receiving client** of every proxy:
+  each subscriber of the channel once, and once more for each of its
+  patterns that matches, as Redis counts.
+- **Order is per channel.** Messages from one connection on one channel
+  arrive in the order they were sent. Messages on different channels may
+  not, because each channel publishes on its own pair; one Redis node
+  delivers everything in publish order. A `PUBLISH` inside a transaction runs
+  on the transaction's pair, so it may also arrive out of order with that
+  channel's other messages.
+- **A slow subscriber is disconnected** once 32 MiB of messages wait for it,
+  Redis's default hard `client-output-buffer-limit` for pub/sub. Flint has
+  no soft limit.
+- **`PUBSUB` answers for the whole tenant**, every proxy's clients included,
+  from any pair. `CHANNELS` lists in byte order, where Redis and Valkey use
+  their hash table's order.
+- **`UNSUBSCRIBE` and `PUNSUBSCRIBE` with no argument** confirm in the order
+  the channels and patterns were subscribed. Valkey does that for patterns
+  and uses its hash table's order for channels.
+
+Not served:
+
+- **Sharded pub/sub.** `SSUBSCRIBE`, `SUNSUBSCRIBE` and `SPUBLISH` are
+  refused with an error naming `SUBSCRIBE` and `PUBLISH`, and
+  `PUBSUB SHARDCHANNELS` and `SHARDNUMSUB` answer none.
+- **A subscription command inside `MULTI`.** It is refused, and the
+  transaction is discarded. Valkey queues it and answers its confirmation in
+  the `EXEC` reply.
+- **Subscribing at a seat.** A seat refuses `SUBSCRIBE` and names the proxy.
+- **Keyspace notifications** (`notify-keyspace-events`). Nothing is
+  published on `__keyspace@…__` or `__keyevent@…__`, so a pattern on them
+  hears nothing.
+
+Measured by `tools/pubsub_drill.sh` (two pairs, two proxies, a seat
+restart, a slow client) and by `tools/client_compat_drill.sh`, which runs
+redis-py's `PubSub` in both protocols, Celery 5.6.3 and asynq 0.26's task
+cancellation.
+
 ## Excluded by design
 
 - **Cross-slot multi-key commands** — the *cross-slot* form, not the
@@ -830,9 +906,7 @@ two-second write.
   still refused across slots. Either write those keys one at a time, or give
   the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
   that whole cache in one slot, on one pair.
-  Also **pub/sub** (out of v0 scope, ADR-0052: so Celery is not supported,
-  and rq's worker commands and asynq's task cancellation are unavailable),
-  **streams** (planned, ADR-0052),
+  Also **streams** (planned, ADR-0052),
   **RANDOMKEY**, and **`EVAL_RO`,
   `EVALSHA_RO`, `FUNCTION` and `FCALL`** (Redis 7's read-only scripts and
   functions; `EVAL` and `EVALSHA` are supported, see "Lua scripts").

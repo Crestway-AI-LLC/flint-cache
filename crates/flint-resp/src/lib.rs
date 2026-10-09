@@ -125,6 +125,11 @@ pub enum Value {
     /// to `[[m, ,s], [m, ,s], …]`. Only a dedicated variant can render
     /// both, which is why it exists alongside `Map`.
     ScorePairs(Vec<(Vec<u8>, f64)>),
+    /// Out-of-band data the server sends unasked: a pub/sub message
+    /// (ADR-0052 D5). RESP3 sends `>n`, which a client tells apart from a
+    /// reply; RESP2 has no such type and sends the same elements as `*n`,
+    /// which is what Redis does for a subscribed RESP2 client.
+    Push(Vec<Value>),
 }
 
 /// A double as Redis spells one (`d2string`): the RESP2 spelling of
@@ -558,6 +563,14 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
                 encode_proto(v, proto, out);
             }
         }
+        Value::Push(items) => {
+            out.push(if resp3_sel { b'>' } else { b'*' });
+            out.extend_from_slice(items.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            for item in items {
+                encode_proto(item, proto, out);
+            }
+        }
         Value::Set(items) => {
             out.push(if resp3_sel { b'~' } else { b'*' });
             out.extend_from_slice(items.len().to_string().as_bytes());
@@ -729,10 +742,10 @@ fn decode_at(input: &[u8], depth: usize) -> Result<Decoded, ProtocolError> {
             let data = input[header..header + len].to_vec();
             Ok(Decoded::Complete(Value::Bulk(Some(data)), total))
         }
-        // Aggregates. `*` and `~` carry one element per declared item; `%`
-        // carries two (a field and a value), which is the only structural
+        // Aggregates. `*`, `~` and `>` carry one element per declared item;
+        // `%` carries two (a field and a value), which is the only structural
         // difference between them on the wire.
-        b'*' | b'~' | b'%' => {
+        b'*' | b'~' | b'%' | b'>' => {
             let Some(line_end) = find_crlf(&input[1..]) else {
                 return Ok(Decoded::NeedMore);
             };
@@ -758,6 +771,7 @@ fn decode_at(input: &[u8], depth: usize) -> Result<Decoded, ProtocolError> {
             }
             let value = match type_byte {
                 b'~' => Value::Set(items),
+                b'>' => Value::Push(items),
                 // Consumed two at a time rather than cloned. `items` holds
                 // exactly `2 * len` elements by construction above, so the
                 // pairing is total and no element can be dropped; taking them
@@ -999,6 +1013,27 @@ mod tests {
         assert_eq!(decode(over.as_bytes()), Err(ProtocolError::BadLength));
         let at = format!("*{MAX_ARRAY_LEN}\r\n");
         assert_eq!(decode(at.as_bytes()), Ok(Decoded::NeedMore));
+    }
+
+    /// ADR-0052 D5: a pub/sub message is `>` to a RESP3 client and a plain
+    /// array to a RESP2 one, and the decoder reads `>` back as a push.
+    #[test]
+    fn a_push_is_its_own_type_in_resp3_and_an_array_in_resp2() {
+        let m = Value::Push(vec![
+            Value::Bulk(Some(b"message".to_vec())),
+            Value::Bulk(Some(b"ch".to_vec())),
+            Value::Bulk(Some(b"hi".to_vec())),
+        ]);
+        let three = enc(&m, Proto::Resp3);
+        assert_eq!(three, b">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$2\r\nhi\r\n");
+        assert_eq!(
+            enc(&m, Proto::Resp2),
+            b"*3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$2\r\nhi\r\n"
+        );
+        assert_eq!(
+            decode(&three).expect("decode"),
+            Decoded::Complete(m, three.len())
+        );
     }
 
     fn enc(v: &Value, p: Proto) -> Vec<u8> {

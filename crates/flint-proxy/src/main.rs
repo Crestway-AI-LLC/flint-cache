@@ -65,6 +65,7 @@ mod apool;
 mod cache;
 mod errors;
 mod latency;
+mod pubsub;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::rc::Rc;
@@ -817,6 +818,22 @@ impl Topology {
     /// spread by slot.
     fn placed_pair(&self, ns: &[u8]) -> Option<usize> {
         self.placed.read().ok()?.get(ns).copied()
+    }
+
+    /// Every pair's master, of every cluster, once each: where the pub/sub
+    /// links go (ADR-0052 D5).
+    fn all_masters(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in &self.clusters {
+            if let Ok(r) = c.routing.read() {
+                for m in r.masters.iter().flatten() {
+                    if !out.contains(m) {
+                        out.push(m.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Where a command naming no key goes: a placed tenant's own pair, where
@@ -1618,6 +1635,9 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         // read as one, it bound a transaction to the cursor's slot and was
         // sampled into the hot-key table as a read of key `0`.
         b"SCAN",
+        // Every master holds every subscription (ADR-0052 D5), so any one
+        // answers.
+        b"PUBSUB",
     ];
     if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return None;
@@ -2636,6 +2656,9 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
     let mut hotkey_tick: u32 = 0;
     // What `CLIENT` reports about this connection (BUG-0183).
     let mut client = ClientConn::new();
+    // This connection's channels and patterns (ADR-0052 D5), from its first
+    // SUBSCRIBE. Dropped with the connection, and its subscriptions with it.
+    let mut subscriber: Option<pubsub::Subscriber> = None;
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
@@ -2848,6 +2871,32 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
                 Value::Error(PROXY_LOADING.into())
             } else if args.first().is_some_and(|n| is_internal_only(n)) {
                 Value::Error("ERR admin commands are not available through the proxy".into())
+            } else if proto == flint_resp::Proto::Resp2
+                && subscriber.as_ref().is_some_and(|s| s.count() > 0)
+                && let Some(name) = args.first()
+                && !pubsub::allowed_while_subscribed(name)
+            {
+                // A RESP2 connection that holds a subscription reads only
+                // messages and confirmations, so Redis refuses anything else.
+                Value::Error(format!(
+                    "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / \
+                     QUIT / RESET are allowed in this context",
+                    String::from_utf8_lossy(name).to_ascii_lowercase()
+                ))
+            } else if proto == flint_resp::Proto::Resp2
+                && subscriber.as_ref().is_some_and(|s| s.count() > 0)
+                && args
+                    .first()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(b"PING"))
+            {
+                // And answers its PING as a message: `pong` and the argument.
+                match args.len() {
+                    1 | 2 => Value::Array(Some(vec![
+                        Value::Bulk(Some(b"pong".to_vec())),
+                        Value::Bulk(Some(args.get(1).cloned().unwrap_or_default())),
+                    ])),
+                    _ => Value::Error("ERR wrong number of arguments for 'ping' command".into()),
+                }
             } else {
                 match auth_step(
                     &topo,
@@ -2868,6 +2917,41 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
                         channel_deadline = Some(deadline);
                         channel_budget = Some(budget);
                         Value::Simple("OK".into())
+                    }
+                    // A subscription is this connection's, so the proxy holds
+                    // it (ADR-0052 D5). Inside MULTI it takes the
+                    // transaction's path, which refuses it.
+                    AuthStep::Proceed(ns)
+                        if !txn.open
+                            && let Some((kind, on)) =
+                                args.first().and_then(|n| pubsub::subscription_kind(n)) =>
+                    {
+                        if on && args.len() < 2 {
+                            Value::Error(format!(
+                                "ERR wrong number of arguments for '{}' command",
+                                String::from_utf8_lossy(&args[0]).to_ascii_lowercase()
+                            ))
+                        } else {
+                            let sub =
+                                subscriber.get_or_insert_with(|| pubsub::Subscriber::new(&ns));
+                            // What was published before this command goes
+                            // out before its confirmations: once a client
+                            // reads `unsubscribe`, nothing more arrives on
+                            // that channel.
+                            for m in sub.outbox.drain() {
+                                encode_proto(&m.frame(), proto, &mut out);
+                            }
+                            let mut frames = if on {
+                                sub.subscribe(kind, &args[1..]).await
+                            } else {
+                                sub.unsubscribe(kind, &args[1..])
+                            };
+                            let last = frames.pop().unwrap_or(Value::Null);
+                            for f in &frames {
+                                encode_proto(f, proto, &mut out);
+                            }
+                            last
+                        }
                     }
                     // CLIENT is about this connection to the proxy, so the
                     // proxy answers it (BUG-0183). Inside MULTI it takes
@@ -2969,7 +3053,40 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
         if std::mem::take(&mut read_ahead) {
             continue;
         }
-        let n = stream.read(&mut chunk).await?;
+        let n = match subscriber.as_ref() {
+            // A subscribed connection waits for its client and its messages
+            // at once, and writes each message as it comes.
+            Some(sub) => {
+                let outbox = Arc::clone(&sub.outbox);
+                loop {
+                    if outbox.overflowed() {
+                        // Redis closes a pub/sub client past its output
+                        // limit; buffering on would be unbounded.
+                        return Ok(());
+                    }
+                    let queued = outbox.drain();
+                    if !queued.is_empty() {
+                        out.clear();
+                        for m in &queued {
+                            encode_proto(&m.frame(), proto, &mut out);
+                        }
+                        // A client that stops reading stalls this write, and
+                        // is closed once it falls the limit behind rather
+                        // than held here for ever.
+                        tokio::select! {
+                            r = stream.write_all(&out) => r?,
+                            _ = outbox.cut_off() => return Ok(()),
+                        }
+                        out.clear();
+                    }
+                    tokio::select! {
+                        r = stream.read(&mut chunk) => break r?,
+                        _ = outbox.ready.notified() => {}
+                    }
+                }
+            }
+            None => stream.read(&mut chunk).await?,
+        };
         if n == 0 {
             return Ok(());
         }
@@ -3155,10 +3272,16 @@ async fn transaction_step(
             _ => Value::Simple("QUEUED".into()),
         });
     }
-    // Where a command must go, if it names a key at all.
-    let routed = route_key(args)
-        .map(slot_for_key)
-        .and_then(|s| topo.route(ns, s));
+    // Where a command must go, if it names a key at all. A channel is not a
+    // key (ADR-0052 D5): a PUBLISH runs wherever the transaction does, and
+    // picks the pair by its channel only when it is the first to choose.
+    let routed = if name.as_slice() == b"PUBLISH" && txn.addr.is_some() {
+        None
+    } else {
+        route_key(args)
+            .map(slot_for_key)
+            .and_then(|s| topo.route(ns, s))
+    };
 
     match name.as_slice() {
         b"WATCH" => {
@@ -3344,6 +3467,19 @@ async fn transaction_step(
                 format!(
                     "ERR {} inside a transaction would answer for one shard of this \
                      keyspace; send it outside MULTI",
+                    String::from_utf8_lossy(&name)
+                ),
+            ))
+        }
+        // A subscription is the connection's, not the transaction's, and
+        // what EXEC would answer for one is a confirmation, which the
+        // seat's transaction cannot give (ADR-0052 D5).
+        b"SUBSCRIBE" | b"PSUBSCRIBE" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" if txn.open => {
+            Some(refuse_in_txn(
+                backends,
+                txn,
+                format!(
+                    "ERR {} inside a transaction is not served; send it outside MULTI",
                     String::from_utf8_lossy(&name)
                 ),
             ))
@@ -5731,6 +5867,10 @@ fn main() -> std::io::Result<()> {
                 .unwrap_or(16)
         })
         .clamp(1, 64);
+    // Pub/sub's links to the masters (ADR-0052 D5), dialed once a client
+    // subscribes.
+    pubsub::HUB.start(Arc::clone(&topo))?;
+
     eprintln!(
         "flint-proxy listening on {bind}:{port} ({}, max-conns {max_conns}, {workers} workers)",
         if tls.is_some() { "TLS" } else { "plaintext" }

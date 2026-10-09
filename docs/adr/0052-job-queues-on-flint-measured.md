@@ -2,13 +2,11 @@
 
 Status: **ACCEPTED 2026-09-27** (Jeff: "go with your recommendation on
 ADR-0052"): Flint serves job queues, in the four stages below. Stages 1 (D1
-and D2) and 2 (D4) are built; see "As built" at the end. **Stage 3, pub/sub
-(D5), is STOPPED 2026-09-30** (Jeff: "stop pub/sub as out of scope"): the
-roadmap lists pub/sub as out of v0 scope, and no user has asked for it.
-**Stage 4, streams (D6) then `cjson` and `cmsgpack` (D3), is HELD
-2026-10-03** (Jeff: "Hold stage 4 until a tenant asks for rq or BullMQ
-till I revisit the situation"); see "Stage 4" at the end. The three plain
-commands the
+and D2), 2 (D4) and 3 (D5) are built; see "As built" at the end. Stage 3,
+pub/sub, was stopped on 2026-09-30 and stage 4 held on 2026-10-03; **Jeff
+reopened both on 2026-10-08** ("Ok. You can start with bitmaps, Batch A and
+then Pub/sub and streams."). Stage 3 is built; stage 4, streams (D6) then
+`cjson` and `cmsgpack` (D3), is next. The three plain commands the
 measurement found missing (`LMOVE`, `RPOPLPUSH`, `HINCRBYFLOAT`) were
 ordinary gaps and are fixed as BUG-0187.
 
@@ -408,10 +406,114 @@ The design this record chose held up against them: a channel hashed like a
 key keeps Celery's result transaction on one pair. The build had reached a
 seat-side broker and a RESP3 push frame; it is not in the repository.
 
-### Stage 4: D6 then D3, held (2026-10-03)
+### Stage 3: D5, pub/sub, built (2026-10-08)
 
-Not started. Jeff held it until a tenant asks for rq or BullMQ, or he
-revisits it. Those are the two libraries it serves: rq keeps results on a
+**Where it departs from D5(b).** D5(b) put a channel on one pair, as a key.
+As built, every pair's master holds every subscription of every proxy, and a
+`PUBLISH` runs on one pair. Two things forced it:
+
+- A `PUBLISH` inside a transaction runs on the transaction's pair, which its
+  keys choose. Celery gives its result key and channel one name, so they
+  share a slot, but nothing else promises that.
+- A pattern names no pair, so D5(b) already registered every pattern at
+  every pair.
+
+So a subscription change goes to every master, one small frame each, and a
+message goes from one. In the measured libraries a subscription changes no
+more often than a message is sent: Celery subscribes once per awaited
+result, which is published once.
+
+**At the seat** (`flint-server`, `pubsub.rs`):
+
+- **The broker.** One per process, by namespace. `FLINTSUBSCRIBER` turns a
+  connection into a proxy's subscriber connection. On it
+  `FLINTSUB`/`FLINTPSUB <ns> <name> <delta>` changes how many of that
+  proxy's clients hold a channel or pattern, answered with the new count.
+  Messages go out as `flintmessage` or `flintpmessage` frames, once per
+  proxy.
+- **Delivery is immediate.** The connection splits into a reader, its own
+  thread, and a writer thread woken by a condition variable. That uses
+  `flint-tls`'s duplex split (ADR-0020), extended to accepted streams. The
+  parked build polled every 2 ms instead: 2.5 ms from publish to receive,
+  where Valkey takes 0.12 ms. Now it is 0.05 ms through a local proxy.
+- **A connection 32 MiB behind is cut off**, by shutting its socket from the
+  publishing thread, so no lock a stuck writer holds is waited for.
+- **A `PUBLISH` inside `MULTI` or a script is held** until the writes around
+  it commit, and dropped if they do not.
+- **`PUBSUB` answers from the broker**, for the whole namespace.
+
+**At the proxy** (`flint-proxy`, `pubsub.rs`):
+
+- **Links.** One link per master, dialed when a client first subscribes and
+  closed 60 s after the last unsubscribes, so a client that subscribes per
+  result does not dial every master each time.
+- **Counts are reconciled, not relayed.** A link sends the difference
+  between the count the proxy holds now and the count it last registered. A
+  new connection starts from zero at the seat and registers everything,
+  which is the whole of restart and failover.
+- **Following the masters.** A supervisor checks the topology every 250 ms
+  and moves a link to a new master. A link pings each second and is dialed
+  again after 5 s of silence.
+- **Confirmations.** A `SUBSCRIBE` is confirmed once every reachable master
+  holds it, waiting at most 2 s.
+- **Clients.** RESP2 clients get Redis's subscribe mode and RESP3 clients
+  get pushes. A client 32 MiB behind is cut off, even while a write to it is
+  stalled.
+
+**Found while building: BUG-0244.** The scans' glob read a pattern with an
+unterminated `[` unlike Redis. The pub/sub glob, judged against Valkey on
+2.4 million random cases, is now the one matcher.
+
+**Verified.**
+
+- **Probe.** The same steps on Valkey 9.1 and through a two-pair Flint
+  proxy, three connections, in both protocols: subscribe, pattern and
+  publish replies, the RESP2 refusals, every `PUBSUB` form and error, a
+  transaction, 51 channels at once, binary names and globs. The one
+  difference is the order of a bare `UNSUBSCRIBE`'s confirmations (Valkey
+  uses its hash table's).
+- **Unit tests.** The seat broker's counts, delivery, overflow and held
+  publishes; the glob; the proxy's confirmations, delivery, cut-off and
+  RESP2 allow-list; the RESP3 push frame; an accepted TLS stream's duplex
+  split.
+- **Corpus.** A publisher's replies with no subscriber, on the Valkey
+  reference, the seat and the proxy, in both protocols.
+- **Drill.** `tools/pubsub_drill.sh` (CORE) runs two pairs and two proxies.
+  - Sixteen channels over both pairs: each message reaches each holder once.
+  - 200 channels each published to the instant its subscription was
+    confirmed, through the other proxy.
+  - A transaction publishing on its own pair's channel and on the other's,
+    and an aborted one.
+  - A script that publishes, and one that publishes and then fails.
+  - A client 48 MiB behind is cut off; a closed client's subscriptions
+    end.
+  - A seat restarted under live subscribers, which were registered again
+    0.20 s after it answered (the gate box's release build; 0.47 s for a
+    local debug build).
+- **Mutants**, each killed by the drill:
+  - links not registering again on a new connection;
+  - publishes not held in a script;
+  - no cut-off while a write is stalled;
+  - the seat's writer not woken;
+  - a transaction's `PUBLISH` routed by its channel;
+  - a confirmation sent before registration. This one passed the first
+    drill, which is why the 200 instant publishes are in it.
+- **Libraries**, through the proxy on a gate box, on the TLS fleet of
+  `tools/client_compat_drill.sh`, which the gate runs:
+
+| library | after stage 3 |
+|---|---|
+| Celery 5.6.3 | **works.** A task's result comes back, and the worker answers `ping` on its control channel. That holds with kombu's `global_keyprefix: '{celery}'` on a tenant across pairs, and unconfigured on a tenant placed on one pair (ADR-0053). Unconfigured on a tenant across pairs it still stops at a transaction across slots, as ADR-0053 measured |
+| asynq 0.26 | **works, cancellation included.** The inspector's `CancelProcessing` cancels a running task's context |
+| rq 2.8.0 | enqueue on a placed tenant, as before. Its worker still needs `LMOVE` across slots and streams (stage 4), so its command channel, though served, has no worker to reach yet |
+| redis-py 7.0.1 (8.1.0 locally) | its `PubSub` in both protocols, with patterns, `PUBSUB`, a transaction's `PUBLISH`, and one tenant's channels kept from another's |
+
+Each joined `client_compat_drill`, so it cannot regress silently.
+
+### Stage 4: D6 then D3, held (2026-10-03), reopened (2026-10-08)
+
+Not started. Jeff held it on 2026-10-03 until a tenant asked for rq or
+BullMQ, and reopened it on 2026-10-08, after stage 3. Those are the two libraries it serves: rq keeps results on a
 stream, and BullMQ's scripts need `cmsgpack`. ADR-0053's amendment (`LMOVE`
 and its relatives across slots, for rq's worker) is held with it, since rq
 needs both.

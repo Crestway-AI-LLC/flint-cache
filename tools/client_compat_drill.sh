@@ -552,8 +552,70 @@ def in_multi():
         b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n*-1\r\n$-1\r\n"
 check("inside MULTI a pop does not wait, and answers as Redis does", in_multi)
 
+print("== pub/sub (ADR-0052 D5)")
+def pubsub_round_trip(proto):
+    def run():
+        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
+                        protocol=proto)
+        p = c.pubsub()
+        p.subscribe("news")
+        p.psubscribe("ev:*")
+        got = [p.get_message(timeout=3) for _ in range(2)]
+        assert [m and m["type"] for m in got] == ["subscribe", "psubscribe"], got
+        # The publisher is another connection, through the same proxy.
+        assert r.publish("news", "hello") == 1
+        m = p.get_message(timeout=3)
+        assert m and (m["type"], m["channel"], m["data"]) == ("message", "news", "hello"), m
+        assert r.publish("ev:1", "x") == 1
+        m = p.get_message(timeout=3)
+        assert m and (m["type"], m["pattern"], m["channel"]) == ("pmessage", "ev:*", "ev:1"), m
+        assert [tuple(x) for x in r.pubsub_numsub("news")] == [("news", 1)], r.pubsub_numsub("news")
+        assert r.pubsub_numpat() == 1
+        p.unsubscribe("news")
+        p.punsubscribe("ev:*")
+        got = [p.get_message(timeout=3) for _ in range(2)]
+        assert [m and m["type"] for m in got] == ["unsubscribe", "punsubscribe"], got
+        assert r.publish("news", "after") == 0
+        p.close()
+        c.close()
+    return run
+check("redis-py PubSub, RESP2: subscribe, message, pattern, PUBSUB, unsubscribe",
+      pubsub_round_trip(2))
+check("redis-py PubSub, RESP3 (pushes)", pubsub_round_trip(3))
+def pubsub_tenants_apart():
+    j = redis.Redis(host="127.0.0.1", port=PORT, password="tok-jobs", decode_responses=True)
+    pj, pa = j.pubsub(), r.pubsub()
+    pj.subscribe("apart")
+    pa.subscribe("apart")
+    pj.get_message(timeout=3)
+    pa.get_message(timeout=3)
+    assert r.publish("apart", "acme") == 1, "another tenant's subscriber was counted"
+    assert j.publish("apart", "jobs") == 1
+    a = pa.get_message(timeout=3)
+    b = pj.get_message(timeout=3)
+    assert a and a["data"] == "acme" and b and b["data"] == "jobs", (a, b)
+    assert pa.get_message(timeout=0.5) is None and pj.get_message(timeout=0.5) is None
+    pj.close()
+    pa.close()
+check("a tenant hears its own channels only (one placed on a pair)", pubsub_tenants_apart)
+def pubsub_in_a_transaction():
+    # Celery's result backend: the result and its notice in one MULTI, the
+    # key and the channel one name.
+    p = r.pubsub()
+    p.subscribe("celery-task-meta-1")
+    p.get_message(timeout=3)
+    pipe = r.pipeline(transaction=True)
+    pipe.execute_command("SETEX", "celery-task-meta-1", 60, "{}")
+    pipe.publish("celery-task-meta-1", "{}")
+    assert pipe.execute() == [True, 1]
+    m = p.get_message(timeout=3)
+    assert m and m["data"] == "{}", m
+    p.close()
+    r.delete("celery-task-meta-1")
+check("PUBLISH inside MULTI is heard after EXEC (Celery's result)", pubsub_in_a_transaction)
+
 print("== commands we exclude by design still fail HONESTLY")
-check("SUBSCRIBE", lambda: r.pubsub().subscribe("c") or r.execute_command("SUBSCRIBE", "c"),
+check("SPUBLISH (sharded pub/sub)", lambda: r.execute_command("SPUBLISH", "c", "x"),
       expect_unsupported=True)
 
 def _fail():
@@ -703,6 +765,67 @@ sys.exit(0 if ok and q.count == 0 else 1)
 PYRQ
   [ $? -eq 0 ] || { echo "FAIL: rq on a placed tenant"; exit 1; }
   RAN="$RAN, rq (enqueue)"
+fi
+
+# ---------------------------------------------------------------------------
+# Celery 5.6.3 (ADR-0052 stage 3). A worker fetches with BRPOP (stage 2),
+# listens on its control channel with PSUBSCRIBE `/0.celery.pidbox`, and a
+# caller awaits a result on SUBSCRIBE `celery-task-meta-<id>`, which the
+# backend writes and publishes in one MULTI. kombu's transactions span slots,
+# so Celery runs where those are served: with `global_keyprefix: '{celery}'`
+# on any tenant, which puts every name in one slot, or unconfigured on a
+# tenant placed on one pair (ADR-0053).
+# ---------------------------------------------------------------------------
+CELERY_VENV=${FLINT_COMPAT_CELERY_VENV:-$FLINT_DRILL_ROOT/flint-compat-celery}
+celery_ready() { "$CELERY_VENV/bin/python" -c 'import celery' >/dev/null 2>&1; }
+if ! celery_ready; then
+  CELERY_BASE=""
+  for cand in python3.14 python3.13 python3.12 python3.11 python3; do
+    command -v "$cand" >/dev/null && { CELERY_BASE=$(command -v "$cand"); break; }
+  done
+  [ -n "$CELERY_BASE" ] && "$CELERY_BASE" -m venv "$CELERY_VENV" >/dev/null 2>&1 \
+    && "$CELERY_VENV/bin/pip" install -q "celery[redis]==5.6.3" >/dev/null 2>&1
+fi
+if ! celery_ready; then
+  echo "== celery: SKIP (could not install celery 5.6.3; offline?)"
+  SKIPPED="$SKIPPED celery"
+else
+  PORT=$PORT "$CELERY_VENV/bin/python" - <<'PYCELERY'
+import os, sys
+import celery
+from celery.contrib.testing.worker import start_worker
+PORT = int(os.environ["PORT"])
+print(f"== client: celery {celery.__version__}")
+fails = 0
+for label, token, prefix in [
+    ("global_keyprefix '{celery}', on a tenant across pairs", "tok-acme", "{celery}"),
+    ("unconfigured, on the placed tenant", "tok-jobs", None),
+]:
+    url = f"redis://:{token}@127.0.0.1:{PORT}/0"
+    app = celery.Celery("compat", broker=url, backend=url)
+    app.conf.broker_connection_retry_on_startup = False
+    if prefix:
+        app.conf.broker_transport_options = {"global_keyprefix": prefix}
+        app.conf.result_backend_transport_options = {"global_keyprefix": prefix}
+
+    @app.task
+    def add(a, b):
+        return a + b
+
+    try:
+        with start_worker(app, pool="solo", perform_ping_check=False, shutdown_timeout=5):
+            got = add.delay(2, 3).get(timeout=15)
+            pong = app.control.ping(timeout=3)
+        ok = got == 5 and len(pong) == 1
+        note = "" if ok else f"  result {got}, ping {pong}"
+    except Exception as e:
+        ok, note = False, f"  {type(e).__name__}: {str(e)[:240]}"
+    print(f"  {'ok ' if ok else 'FAIL'} {label}: a task's result, and a worker answering ping on its control channel{note}")
+    fails += 0 if ok else 1
+sys.exit(1 if fails else 0)
+PYCELERY
+  [ $? -eq 0 ] || { echo "FAIL: celery"; exit 1; }
+  RAN="$RAN, celery"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1485,15 +1608,47 @@ func main() {
 		atomic.AddInt32(&done, 1)
 		return nil
 	})
+	// Cancellation (ADR-0052 D5): the server subscribes to asynq:cancel,
+	// and the inspector's CancelProcessing publishes the task's id there.
+	started := make(chan string, 1)
+	cancelled := make(chan struct{}, 1)
+	mux.HandleFunc("long", func(ctx context.Context, t *asynq.Task) error {
+		id, _ := asynq.GetTaskID(ctx)
+		started <- id
+		select {
+		case <-ctx.Done():
+			cancelled <- struct{}{}
+			return ctx.Err()
+		case <-time.After(20 * time.Second):
+			return nil
+		}
+	})
 	if err := srv.Start(mux); err != nil {
 		say(false, "server start", "  "+err.Error())
 	} else {
 		for i := 0; i < 100 && atomic.LoadInt32(&done) < n; i++ {
 			time.Sleep(100 * time.Millisecond)
 		}
-		srv.Shutdown()
 		say(atomic.LoadInt32(&done) == n, fmt.Sprintf("the server processes all %d", n),
 			fmt.Sprintf("  processed %d", atomic.LoadInt32(&done)))
+		_, err := client.Enqueue(asynq.NewTask("long", nil), asynq.MaxRetry(0))
+		say(err == nil, "enqueue a long task", fmt.Sprintf("  %v", err))
+		select {
+		case id := <-started:
+			insp := asynq.NewInspector(opt)
+			err := insp.CancelProcessing(id)
+			say(err == nil, "cancel it", fmt.Sprintf("  %v", err))
+			select {
+			case <-cancelled:
+				say(true, "the running task is cancelled", "")
+			case <-time.After(5 * time.Second):
+				say(false, "the running task is cancelled", "  its context was not cancelled in 5 s")
+			}
+			insp.Close()
+		case <-time.After(10 * time.Second):
+			say(false, "the long task starts", "  not started in 10 s")
+		}
+		srv.Shutdown()
 	}
 	if fails > 0 {
 		fmt.Printf("\nFAIL: %d client-visible problem(s)\n", fails)

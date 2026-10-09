@@ -61,6 +61,10 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         // key, a cursor hashing to a handed-off slot answered -MOVED, and
         // inside a transaction it bound the transaction to its slot.
         b"SCAN",
+        // A channel is not a key (ADR-0052 D5): every pair holds every
+        // subscription, so a message may be published on any of them.
+        b"PUBLISH",
+        b"PUBSUB",
     ];
     if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return None;
@@ -136,6 +140,16 @@ pub fn queue_time_error(args: &[Vec<u8>], whole: bool) -> Option<Value> {
             return None;
         }
         return Dispatcher::crossslot(keys.first()?, &keys[1..]);
+    }
+    // Checked, never probed: the probe below dispatches for real, and a
+    // `PUBLISH` reaches subscribers, whatever store it runs against.
+    if let Some(name) = args.first() {
+        if name.eq_ignore_ascii_case(b"PUBLISH") {
+            return (args.len() != 3).then(|| arity_err("publish"));
+        }
+        if name.eq_ignore_ascii_case(b"PUBSUB") {
+            return (args.len() < 2).then(|| arity_err("pubsub"));
+        }
     }
     let probe = flint_storage::MemKv::new();
     let reply = Dispatcher::new(&probe, crate::commands::probe_clock).dispatch(args);
@@ -340,7 +354,7 @@ impl<'a> Dispatcher<'a> {
             b"EVAL" | b"EVALSHA" => {
                 flint_commands::eval_keys(args).is_some_and(|ks| ks.iter().any(|k| k.len() > max))
             }
-            b"SCRIPT" => false,
+            b"SCRIPT" | b"PUBLISH" | b"PUBSUB" => false,
             _ => args.get(1).is_some_and(|k| k.len() > max),
         }
     }
@@ -660,6 +674,21 @@ impl<'a> Dispatcher<'a> {
             // Redis 4.0 and still what Spring Session and ASP.NET Core's
             // IDistributedCache write every entry with.
             b"EVAL" | b"EVALSHA" => self.cmd_eval(args),
+            // Pub/sub (ADR-0052 D5). A tenant publishes on a seat, and
+            // subscribes only through a proxy, which subscribes here for it.
+            b"PUBLISH" => exact(args, 3, "publish", |a| {
+                Value::Integer(crate::pubsub::publish(&self.ns, &a[1], &a[2]))
+            }),
+            b"PUBSUB" => self.cmd_pubsub(args),
+            b"SUBSCRIBE" | b"PSUBSCRIBE" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" => err(
+                "ERR a seat serves subscriptions to proxies only: subscribe through the proxy \
+                 (ADR-0052)",
+            ),
+            // Sharded pub/sub is not served: its channels would be a second
+            // space beside these, and no measured client uses it.
+            b"SPUBLISH" | b"SSUBSCRIBE" | b"SUNSUBSCRIBE" => {
+                err("ERR sharded pub/sub is not served: use SUBSCRIBE and PUBLISH (ADR-0052)")
+            }
             b"TIME" => exact(args, 1, "time", |_| {
                 let us = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1834,6 +1863,8 @@ impl<'a> Dispatcher<'a> {
             return refusal;
         }
         let declared: std::collections::HashSet<Vec<u8>> = keys.iter().cloned().collect();
+        // The script's publishes go out with its writes, or not at all.
+        let held = crate::pubsub::Deferral::begin();
         let buffer = flint_storage::batch::BatchingKv::new(self.kv);
         let needs: std::cell::RefCell<Option<crate::script::Stray>> = Default::default();
         let call = |cmd: &[Vec<u8>]| -> Result<Value, crate::script::Abandon> {
@@ -1889,8 +1920,63 @@ impl<'a> Dispatcher<'a> {
                     }
                 }
             }
+            held.commit();
         }
         out.reply
+    }
+
+    /// `PUBSUB CHANNELS [pattern] | NUMSUB [channel ...] | NUMPAT | HELP`,
+    /// over this namespace (ADR-0052 D5), with Valkey's replies and errors.
+    /// Every pair holds all of a namespace's subscriptions, so any one of
+    /// them answers for all its clients. Sharded pub/sub is not served, so
+    /// its two questions answer none.
+    fn cmd_pubsub(&self, args: &[Vec<u8>]) -> Value {
+        let Some(sub) = args.get(1) else {
+            return arity_err("pubsub");
+        };
+        let broker = &crate::pubsub::BROKER;
+        let upper = sub.to_ascii_uppercase();
+        // A flat array of name and count, in both protocols, as Valkey
+        // answers.
+        let counts = |f: &dyn Fn(&[u8]) -> i64| {
+            Value::Array(Some(
+                args[2..]
+                    .iter()
+                    .flat_map(|c| [Value::Bulk(Some(c.clone())), Value::Integer(f(c))])
+                    .collect(),
+            ))
+        };
+        match upper.as_slice() {
+            b"CHANNELS" if args.len() <= 3 => Value::Array(Some(
+                broker
+                    .channels(&self.ns, args.get(2).map(Vec::as_slice))
+                    .into_iter()
+                    .map(|c| Value::Bulk(Some(c)))
+                    .collect(),
+            )),
+            b"NUMSUB" => counts(&|c| broker.numsub(&self.ns, c)),
+            b"NUMPAT" if args.len() == 2 => Value::Integer(broker.numpat(&self.ns)),
+            b"SHARDCHANNELS" if args.len() <= 3 => Value::Array(Some(Vec::new())),
+            b"SHARDNUMSUB" => counts(&|_| 0),
+            b"HELP" if args.len() == 2 => Value::Array(Some(
+                PUBSUB_HELP
+                    .iter()
+                    .map(|l| Value::Simple((*l).into()))
+                    .collect(),
+            )),
+            b"NUMPAT" | b"HELP" => Value::Error(format!(
+                "ERR wrong number of arguments for 'pubsub|{}' command",
+                String::from_utf8_lossy(&upper).to_ascii_lowercase()
+            )),
+            b"CHANNELS" | b"SHARDCHANNELS" => Value::Error(format!(
+                "ERR unknown subcommand or wrong number of arguments for '{}'. Try PUBSUB HELP.",
+                String::from_utf8_lossy(sub)
+            )),
+            _ => Value::Error(format!(
+                "ERR unknown subcommand '{}'. Try PUBSUB HELP.",
+                String::from_utf8_lossy(sub)
+            )),
+        }
     }
 
     /// `SCRIPT LOAD | EXISTS | FLUSH | KILL`, over this namespace's scripts.
@@ -4279,7 +4365,6 @@ fn scan_cursors() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Sc
     TABLE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-
 /// RedisBloom 8.2.8's bounds on a filter's parameters, and its words for a
 /// value outside them (BUG-0240).
 const BF_MAX_CAPACITY: i64 = 1 << 30;
@@ -4480,6 +4565,24 @@ fn randmember_args(args: &[Vec<u8>], word: &[u8]) -> Result<Option<(i64, bool)>,
 }
 
 /// An argument that should be a Redis integer and is not.
+/// `PUBSUB HELP`, as Valkey 9.1 and Redis 8.2 print it.
+const PUBSUB_HELP: &[&str] = &[
+    "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "CHANNELS [<pattern>]",
+    "    Return the currently active channels matching a <pattern> (default: '*').",
+    "NUMPAT",
+    "    Return number of subscriptions to patterns.",
+    "NUMSUB [<channel> ...]",
+    "    Return the number of subscribers for the specified channels, excluding",
+    "    pattern subscriptions(default: no channels).",
+    "SHARDCHANNELS [<pattern>]",
+    "    Return the currently active shard level channels matching a <pattern> (default: '*').",
+    "SHARDNUMSUB [<shardchannel> ...]",
+    "    Return the number of subscribers for the specified shard level channel(s)",
+    "HELP",
+    "    Print this help.",
+];
+
 const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
 
 /// SETBIT's and GETBIT's offset refusal, Valkey's words.
