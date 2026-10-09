@@ -21,6 +21,9 @@ use std::sync::Mutex;
 
 use crate::Kv;
 
+/// Buffered rows: a key, and its value or `None` for a delete.
+type Rows = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 pub struct BatchingKv<'a> {
     under: &'a dyn Kv,
     // key -> Some(value) (put) | None (delete). Final state per key; the
@@ -44,6 +47,90 @@ impl<'a> BatchingKv<'a> {
             .unwrap_or_default()
             .into_iter()
             .collect()
+    }
+
+    /// The buffered rows under `prefix` that `keep` admits, in the order the
+    /// scan visits keys. Copied out, so the lock is released before the
+    /// first visit; `None` if the lock is poisoned.
+    fn pending(
+        &self,
+        prefix: &[u8],
+        keep: impl Fn(&[u8]) -> bool,
+        descending: bool,
+    ) -> Option<Rows> {
+        let buf = self.buf.lock().ok()?;
+        let mut rows: Rows = buf
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix) && keep(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // The underlying store yields keys in order and the buffer, a
+        // HashMap, in none. Sorting here is what lets the two be merged in
+        // one pass instead of collected and re-sorted.
+        rows.sort_by(|a, b| {
+            if descending {
+                b.0.cmp(&a.0)
+            } else {
+                a.0.cmp(&b.0)
+            }
+        });
+        Some(rows)
+    }
+}
+
+/// Merges `pending`, sorted in the walk's order, into the underlying store's
+/// walk: a buffered key that comes before the walk's row is an insert the
+/// store has never seen, and is visited first; the same key in both is the
+/// buffer's, and a buffered delete means the row is gone; what the walk
+/// never reached comes last.
+fn merge(
+    pending: &[(Vec<u8>, Option<Vec<u8>>)],
+    descending: bool,
+    walk: impl FnOnce(&mut dyn FnMut(&[u8], &[u8]) -> bool),
+    visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+) {
+    let ahead = |b: &[u8], k: &[u8]| if descending { b > k } else { b < k };
+    let mut next = 0usize;
+    let mut stopped = false;
+    walk(&mut |k, v| {
+        while next < pending.len() && ahead(&pending[next].0, k) {
+            let (bk, bv) = &pending[next];
+            next += 1;
+            if let Some(val) = bv
+                && !visit(bk, val)
+            {
+                stopped = true;
+                return false;
+            }
+        }
+        if next < pending.len() && pending[next].0.as_slice() == k {
+            let (bk, bv) = &pending[next];
+            next += 1;
+            if let Some(val) = bv
+                && !visit(bk, val)
+            {
+                stopped = true;
+                return false;
+            }
+            return true;
+        }
+        if !visit(k, v) {
+            stopped = true;
+            return false;
+        }
+        true
+    });
+    if stopped {
+        return;
+    }
+    while next < pending.len() {
+        let (bk, bv) = &pending[next];
+        next += 1;
+        if let Some(val) = bv
+            && !visit(bk, val)
+        {
+            return;
+        }
     }
 }
 
@@ -94,71 +181,58 @@ impl Kv for BatchingKv<'_> {
     ///      overlay would inflict on itself, since a visitor that writes
     ///      takes this same lock.
     fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
-        let pending: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
-            let Ok(buf) = self.buf.lock() else {
-                return self.under.for_each_prefix(prefix, visit);
-            };
-            let mut rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = buf
-                .iter()
-                .filter(|(k, _)| k.starts_with(prefix))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            // The underlying store yields ascending keys; the buffer is a
-            // HashMap and yields none. Sorting here is what lets the two be
-            // merged in one pass instead of collected and re-sorted.
-            rows.sort_by(|a, b| a.0.cmp(&b.0));
-            rows
-        };
-        if pending.is_empty() {
-            return self.under.for_each_prefix(prefix, visit);
+        match self.pending(prefix, |_| true, false) {
+            Some(pending) if !pending.is_empty() => {
+                merge(
+                    &pending,
+                    false,
+                    |walk| self.under.for_each_prefix(prefix, walk),
+                    visit,
+                );
+            }
+            _ => self.under.for_each_prefix(prefix, visit),
         }
+    }
 
-        let mut next = 0usize;
-        let mut stopped = false;
-        self.under.for_each_prefix(prefix, &mut |k, v| {
-            // Buffered keys that sort before this one are inserts the store
-            // has never seen; they belong here, not appended at the end.
-            while next < pending.len() && pending[next].0.as_slice() < k {
-                let (bk, bv) = &pending[next];
-                next += 1;
-                if let Some(val) = bv
-                    && !visit(bk, val)
-                {
-                    stopped = true;
-                    return false;
-                }
-            }
-            // Same key in both: the buffer wins, and a buffered delete
-            // means the row is gone as far as this scan is concerned.
-            if next < pending.len() && pending[next].0.as_slice() == k {
-                let (bk, bv) = &pending[next];
-                next += 1;
-                if let Some(val) = bv
-                    && !visit(bk, val)
-                {
-                    stopped = true;
-                    return false;
-                }
-                return true;
-            }
-            if !visit(k, v) {
-                stopped = true;
-                return false;
-            }
-            true
-        });
-        if stopped {
-            return;
+    /// The same merge from a seek: the underlying store seeks past
+    /// `start_after` rather than walking the range from its start.
+    fn for_each_from(
+        &self,
+        prefix: &[u8],
+        start_after: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        let keep = |k: &[u8]| start_after.is_empty() || k > start_after;
+        match self.pending(prefix, keep, false) {
+            Some(pending) if !pending.is_empty() => merge(
+                &pending,
+                false,
+                |walk| self.under.for_each_from(prefix, start_after, walk),
+                visit,
+            ),
+            _ => self.under.for_each_from(prefix, start_after, visit),
         }
-        // Whatever sorts past the end of the underlying range.
-        while next < pending.len() {
-            let (bk, bv) = &pending[next];
-            next += 1;
-            if let Some(val) = bv
-                && !visit(bk, val)
-            {
-                return;
-            }
+    }
+
+    /// The same merge, descending: the underlying store walks backwards from
+    /// `start_before`, so a transaction's or a script's XREVRANGE and
+    /// ZREVRANGE read what they return, not the whole range (the default
+    /// body materialises it, BUG-0216).
+    fn for_each_before(
+        &self,
+        prefix: &[u8],
+        start_before: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        let keep = |k: &[u8]| start_before.is_empty() || k < start_before;
+        match self.pending(prefix, keep, true) {
+            Some(pending) if !pending.is_empty() => merge(
+                &pending,
+                true,
+                |walk| self.under.for_each_before(prefix, start_before, walk),
+                visit,
+            ),
+            _ => self.under.for_each_before(prefix, start_before, visit),
         }
     }
 
@@ -197,6 +271,9 @@ mod tests {
         assert_eq!(map.get(b"a".as_slice()), Some(&Some(b"2".to_vec())));
         assert_eq!(map.get(b"c".as_slice()), Some(&None));
     }
+
+    /// A scan, handed the visitor to call.
+    type Scan<'a> = dyn Fn(&mut dyn FnMut(&[u8], &[u8]) -> bool) + 'a;
 
     /// Every (key, value) a prefix scan yields, in the order it yielded them.
     fn scan(kv: &dyn Kv, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -251,6 +328,173 @@ mod tests {
         assert_eq!(b.scan_prefix(b"p:").len(), 5);
         // The underlying store is still untouched until commit.
         assert_eq!(under.count_prefix(b"p:"), 3);
+    }
+
+    /// The seeking scans against a model, the merged state as a sorted map:
+    /// random rows in the store, random buffered writes and deletes over
+    /// them, then every scan from a random bound, stopped after a random
+    /// count. The bounds land on stored keys, buffered keys and keys in
+    /// neither, so the strict "after" and "before" are exercised on each.
+    #[test]
+    fn seeking_scans_merge_the_buffer_as_a_model_does() {
+        use std::collections::BTreeMap;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let key = |i: u64| format!("p:{i:02}").into_bytes();
+        for _ in 0..300 {
+            let under = MemKv::new();
+            let mut model = BTreeMap::new();
+            for i in 0..30 {
+                if rand(2) == 0 {
+                    under.put(&key(i), b"under");
+                    model.insert(key(i), b"under".to_vec());
+                }
+            }
+            // Outside the prefix, in the store and in the buffer.
+            under.put(b"q:00", b"x");
+            let b = BatchingKv::new(&under);
+            b.put(b"o:99", b"x");
+            for _ in 0..rand(12) {
+                let k = key(rand(30));
+                if rand(3) == 0 {
+                    b.delete(&k);
+                    model.remove(&k);
+                } else {
+                    b.put(&k, b"buffered");
+                    model.insert(k, b"buffered".to_vec());
+                }
+            }
+            let bound = if rand(4) == 0 {
+                Vec::new()
+            } else {
+                key(rand(31))
+            };
+            let stop = 1 + rand(12) as usize;
+            let take = |scan: &Scan<'_>| {
+                let mut out = Vec::new();
+                scan(&mut |k, v| {
+                    out.push((k.to_vec(), v.to_vec()));
+                    out.len() < stop
+                });
+                out
+            };
+            let all: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+            let want_from: Vec<_> = all
+                .iter()
+                .filter(|(k, _)| bound.is_empty() || *k > bound)
+                .take(stop)
+                .cloned()
+                .collect();
+            let want_before: Vec<_> = all
+                .iter()
+                .rev()
+                .filter(|(k, _)| bound.is_empty() || *k < bound)
+                .take(stop)
+                .cloned()
+                .collect();
+            let want_prefix: Vec<_> = all.iter().take(stop).cloned().collect();
+            assert_eq!(
+                take(&|v| b.for_each_from(b"p:", &bound, v)),
+                want_from,
+                "from {bound:?}"
+            );
+            assert_eq!(
+                take(&|v| b.for_each_before(b"p:", &bound, v)),
+                want_before,
+                "before {bound:?}"
+            );
+            assert_eq!(take(&|v| b.for_each_prefix(b"p:", v)), want_prefix);
+        }
+    }
+
+    /// A store that counts the rows its scans hand out.
+    #[derive(Default)]
+    struct Counting {
+        inner: MemKv,
+        rows: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Counting {
+        fn counted<'a>(
+            &'a self,
+            visit: &'a mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) -> impl FnMut(&[u8], &[u8]) -> bool + 'a {
+            move |k, v| {
+                self.rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                visit(k, v)
+            }
+        }
+    }
+
+    impl Kv for Counting {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.inner.get(key)
+        }
+        fn put(&self, key: &[u8], value: &[u8]) {
+            self.inner.put(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> bool {
+            self.inner.delete(key)
+        }
+        fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+            self.inner.for_each_prefix(prefix, &mut self.counted(visit))
+        }
+        fn for_each_from(
+            &self,
+            prefix: &[u8],
+            start_after: &[u8],
+            visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) {
+            self.inner
+                .for_each_from(prefix, start_after, &mut self.counted(visit))
+        }
+        fn for_each_before(
+            &self,
+            prefix: &[u8],
+            start_before: &[u8],
+            visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) {
+            self.inner
+                .for_each_before(prefix, start_before, &mut self.counted(visit))
+        }
+        fn clear(&self) {
+            self.inner.clear()
+        }
+    }
+
+    /// BUG-0248: a seek through the overlay reads what it returns, not the
+    /// range. The trait's default bodies read all 5,000 rows.
+    #[test]
+    fn a_seek_through_the_overlay_reads_what_it_returns() {
+        let under = Counting::default();
+        for i in 0..5000 {
+            under.inner.put(format!("p:{i:05}").as_bytes(), b"u");
+        }
+        let b = BatchingKv::new(&under);
+        b.put(b"p:04990x", b"buffered");
+        let first = |scan: &Scan<'_>| {
+            let mut got = None;
+            scan(&mut |k, _| {
+                got = Some(k.to_vec());
+                false
+            });
+            got
+        };
+        assert_eq!(
+            first(&|v| b.for_each_before(b"p:", b"", v)),
+            Some(b"p:04999".to_vec())
+        );
+        assert_eq!(
+            first(&|v| b.for_each_from(b"p:", b"p:04990", v)),
+            Some(b"p:04990x".to_vec())
+        );
+        let rows = under.rows.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(rows <= 4, "two one-row seeks read {rows} rows");
     }
 
     #[test]

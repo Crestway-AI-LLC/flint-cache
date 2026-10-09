@@ -155,8 +155,9 @@ pub trait Kv: Send + Sync {
     /// The reverse sorted-set reads (ZREVRANGE, ZPOPMAX, ZREVRANGEBYSCORE)
     /// walk this, so the top of a large set costs what is read, not the set
     /// (BUG-0216). The default body materialises the prefix and walks it
-    /// backwards, which keeps every store correct, a buffering one included;
-    /// ordered stores override it with a real reverse seek.
+    /// backwards, which keeps every store correct; ordered stores override
+    /// it with a real reverse seek, and the write-batching overlay with its
+    /// buffer merged into the store's seek (BUG-0248).
     fn for_each_before(
         &self,
         prefix: &[u8],

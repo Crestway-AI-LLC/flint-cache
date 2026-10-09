@@ -45,7 +45,9 @@ all, so those allocated the set unadmitted.
 - `Kv::for_each_before`, the descending scan: RocksDB's reverse iterator,
   the in-memory store's reversed range, and a default body that walks the
   materialised prefix backwards, so every other store stays correct (the
-  write-batching one, which merges its buffer, takes the default).
+  write-batching one, which merges its buffer, takes the default). That left
+  these reads costing the whole set inside `MULTI` and scripts, which read
+  through the batching store: BUG-0248.
 - `ZSetStore::walk` reads rows in score order, either way, from a seek, and
   stops when told. Every sorted-set read goes through it: a score range
   seeks to its near bound and stops at its far one or at its LIMIT; a rank
