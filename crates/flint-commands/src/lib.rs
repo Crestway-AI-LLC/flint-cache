@@ -48,6 +48,14 @@ pub fn reduces_space(name: &[u8]) -> bool {
     )
 }
 
+/// Writes that never make a value larger, which a store out of room may
+/// still serve: `PFCOUNT`, which at most rewrites the eight bytes an HLL
+/// keeps its last count in. Redis serves it at `maxmemory` as a read.
+/// The quota and disk gates admit these beside [`reduces_space`].
+pub fn never_grows(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"PFCOUNT")
+}
+
 /// The blocking pops (ADR-0052 D4). A seat answers each without waiting, as
 /// Redis does inside `MULTI` or a script; the proxy makes a client wait, by
 /// running that form until one answers or the timeout passes.
@@ -172,6 +180,12 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"SETRANGE"
             | b"BITFIELD"
             | b"SETBIT"
+            // HyperLogLog. PFCOUNT is here because it may write: it keeps
+            // the count it computed in the HLL, as Redis does, which needs
+            // the key's write lock. See `never_grows`.
+            | b"PFADD"
+            | b"PFMERGE"
+            | b"PFCOUNT"
             // Writes its destination, args[2]; args[1] is the operator.
             | b"BITOP"
             | b"PSETEX"

@@ -24,6 +24,7 @@ pub mod disk;
 pub mod encoding;
 pub mod gc;
 pub mod hashes;
+pub mod hll;
 pub mod json;
 pub mod keyspace;
 pub mod lists;

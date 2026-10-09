@@ -230,6 +230,124 @@ const SEAT_SUBSCRIBE: &str =
 /// What sharded pub/sub is answered with, at a seat and through a proxy.
 const SHARDED: &str = "ERR sharded pub/sub is not served: use SUBSCRIBE and PUBLISH (ADR-0052)";
 
+/// HyperLogLog, byte for byte: an HLL is a string holding Redis's own
+/// format, so the bytes `GET` answers, as well as the counts, are what
+/// Valkey 9.1 and Redis 8.2 answer (both checked).
+fn hyperloglog() -> Case {
+    const HDR: &[u8] = b"HYLL\x01\0\0\0\0\0\0\0\0\0\0\x80";
+    let many =
+        |n: usize| -> Vec<Vec<u8>> { (0..n).map(|i| format!("e{i}").into_bytes()).collect() };
+    let pfadd = |key: &[u8], els: Vec<Vec<u8>>| {
+        let mut c = vec![b"PFADD".to_vec(), key.to_vec()];
+        c.extend(els);
+        (c, Expect::Int(1), 0)
+    };
+    let mut steps = vec![
+        // A new HLL: sparse, every register zero, its count marked stale.
+        s(&[b"PFADD", b"{hl}a"], Expect::Int(1)),
+        s(&[b"GET", b"{hl}a"], Expect::Bytes([HDR, b"\x7f\xff"].concat())),
+        s(&[b"PFADD", b"{hl}a"], Expect::Int(0)),
+        s(&[b"TYPE", b"{hl}a"], Expect::Simple("string")),
+        s(&[b"PFADD", b"{hl}a", b"a", b"b", b"c"], Expect::Int(1)),
+        s(
+            &[b"GET", b"{hl}a"],
+            Expect::Bytes([HDR, b"\x60\xf3\x80\x50\xb1\x84\x4b\xfb\x80\x42\x5a"].concat()),
+        ),
+        s(&[b"PFADD", b"{hl}a", b"a"], Expect::Int(0)),
+        s(&[b"PFCOUNT", b"{hl}a"], Expect::Int(3)),
+        s(&[b"PFADD", b"{hl}b", b"c", b"d"], Expect::Int(1)),
+        // Several keys: their union, a missing one empty.
+        s(&[b"PFCOUNT", b"{hl}a", b"{hl}b", b"{hl}none"], Expect::Int(4)),
+        s(&[b"PFMERGE", b"{hl}m", b"{hl}a", b"{hl}b"], Expect::Ok),
+        s(&[b"PFCOUNT", b"{hl}m"], Expect::Int(4)),
+        // PFCOUNT kept its count in the header, as Redis does.
+        s(
+            &[b"GET", b"{hl}m"],
+            Expect::Bytes(
+                b"HYLL\x01\0\0\0\x04\0\0\0\0\0\0\0\x5c\x7b\x80\x44\x76\x80\x50\xb1\x84\x4b\xfb\x80\x42\x5a"
+                    .to_vec(),
+            ),
+        ),
+        s(&[b"PFMERGE", b"{hl}e"], Expect::Ok),
+        s(&[b"PFCOUNT", b"{hl}e"], Expect::Int(0)),
+        // The TTL is kept.
+        s(&[b"EXPIRE", b"{hl}a", b"100"], Expect::Int(1)),
+        s(&[b"PFADD", b"{hl}a", b"z"], Expect::Int(1)),
+        s(&[b"TTL", b"{hl}a"], Expect::IntRange(99, 100)),
+    ];
+    // Past 3,000 bytes a sparse HLL turns dense: 12,304 bytes.
+    steps.push(pfadd(b"{hl}d", many(2000)));
+    steps.extend([
+        s(&[b"STRLEN", b"{hl}d"], Expect::Int(12_304)),
+        s(
+            &[b"GETRANGE", b"{hl}d", b"0", b"15"],
+            Expect::Str(b"HYLL\0\0\0\0\0\0\0\0\0\0\0\x80"),
+        ),
+        s(&[b"PFCOUNT", b"{hl}d"], Expect::Int(2000)),
+        s(
+            &[b"GETRANGE", b"{hl}d", b"0", b"15"],
+            Expect::Str(b"HYLL\0\0\0\0\xd0\x07\0\0\0\0\0\0"),
+        ),
+    ]);
+    steps.push(pfadd(b"{hl}s", many(200)));
+    steps.extend([
+        s(&[b"STRLEN", b"{hl}s"], Expect::Int(513)),
+        s(&[b"PFCOUNT", b"{hl}s"], Expect::Int(200)),
+        // A dense source makes the destination dense.
+        s(&[b"PFMERGE", b"{hl}x", b"{hl}s", b"{hl}d"], Expect::Ok),
+        s(&[b"STRLEN", b"{hl}x"], Expect::Int(12_304)),
+        s(&[b"PFCOUNT", b"{hl}x"], Expect::Int(2000)),
+        // A string that is not an HLL, another type, a corrupt HLL.
+        s(&[b"SET", b"{hl}str", b"hello"], Expect::Ok),
+        s(
+            &[b"PFADD", b"{hl}str", b"x"],
+            Expect::Err("WRONGTYPE Key is not a valid HyperLogLog string value."),
+        ),
+        s(
+            &[b"PFCOUNT", b"{hl}a", b"{hl}str"],
+            Expect::Err("WRONGTYPE Key is not a valid HyperLogLog string value."),
+        ),
+        s(
+            &[b"PFMERGE", b"{hl}a", b"{hl}str"],
+            Expect::Err("WRONGTYPE Key is not a valid HyperLogLog string value."),
+        ),
+        s(&[b"RPUSH", b"{hl}l", b"x"], Expect::Int(1)),
+        s(
+            &[b"PFADD", b"{hl}l", b"x"],
+            Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        ),
+        s(
+            &[
+                b"SET",
+                b"{hl}bad",
+                b"HYLL\x01\0\0\0\0\0\0\0\0\0\0\x80\x7f\xfe",
+            ],
+            Expect::Ok,
+        ),
+        s(
+            &[b"PFCOUNT", b"{hl}bad"],
+            Expect::Err("INVALIDOBJ Corrupted HLL object detected"),
+        ),
+        s(
+            &[b"PFADD"],
+            Expect::Err("ERR wrong number of arguments for 'pfadd' command"),
+        ),
+        s(
+            &[b"PFCOUNT"],
+            Expect::Err("ERR wrong number of arguments for 'pfcount' command"),
+        ),
+        s(
+            &[b"PFMERGE"],
+            Expect::Err("ERR wrong number of arguments for 'pfmerge' command"),
+        ),
+    ]);
+    Case {
+        family: "hyperloglog",
+        name: "hyperloglog: PFADD, PFCOUNT, PFMERGE in Redis's bytes",
+        steps,
+    }
+}
+
 /// ADR-0056: strings longer than 64 KiB, which a seat started with
 /// `--chunked-strings` stores in 32 KiB chunks. The reads and writes here
 /// cross chunk edges, a value grows from inline to chunked and shrinks back,
@@ -925,6 +1043,7 @@ fn corpus() -> Vec<Case> {
             ],
         },
         large_strings(),
+        hyperloglog(),
         // Streams (ADR-0052 D6), against Valkey 9.1. `~` trimming is not
         // here: Valkey trims whole internal nodes and Flint trims exactly
         // (a documented difference); only its argument errors are.

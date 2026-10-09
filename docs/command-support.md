@@ -237,6 +237,27 @@ BITCOUNT (BYTE, BIT), BITPOS (BYTE, BIT), BITOP (AND, OR, XOR, NOT, and Redis
 > Redis 8.2 added and Valkey 9.1 does not have, are served as Redis serves
 > them.
 
+**HyperLogLog**: PFADD, PFCOUNT, PFMERGE.
+
+> An HLL is a string holding Redis's own format, byte for byte: the same
+> hash, the same sparse and dense encodings (dense past 3,000 bytes, Redis's
+> default `hll-sparse-max-bytes`, which Flint does not let you change), and
+> the same estimator. So `PFCOUNT` answers what Redis and Valkey answer for
+> the same elements, and `GET` and `SET` move an HLL between them and Flint
+> unchanged. Checked against Valkey 9.1 and Redis 8.2 by a random
+> differential of every command, comparing every reply and every key's
+> bytes. A key's count is kept in its header, as Redis keeps it, so
+> `PFCOUNT` on one key may rewrite it: it runs on your pair's master, is
+> counted as a write, and is still served when your quota is full. Several
+> keys in one `PFCOUNT` or `PFMERGE` must share a slot (use a hash tag).
+>
+> Where a corrupt HLL is involved, two answers differ from Redis's. A
+> `PFADD` that meets corruption partway changes nothing in Flint, where
+> Redis keeps the registers it set before the error (and does not send them
+> to its replicas). Redis can also read one byte past the end of a corrupt
+> HLL, which it keeps only in memory; Flint reads it as zero, as a Redis
+> replica or a reload does. `PFDEBUG` and `PFSELFTEST` are not served.
+
 **Hashes**: HSET, HMSET, HSETNX, HGET, HMGET, HGETALL, HKEYS, HVALS, HDEL, HLEN,
 HEXISTS, HINCRBY, HINCRBYFLOAT, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES),
 HRANDFIELD (count, WITHVALUES).

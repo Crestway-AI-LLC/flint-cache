@@ -1266,7 +1266,11 @@ impl Topology {
         // path is the tenant deleting data, which must never be blocked by
         // the very state it cures. Shared with the server's disk gate. This
         // verdict applies to a channel's writes too (see `rate_exempt`).
-        if over && is_write && !flint_commands::reduces_space(name) {
+        if over
+            && is_write
+            && !flint_commands::reduces_space(name)
+            && !flint_commands::never_grows(name)
+        {
             self.stat_quota_write_shed_total
                 .fetch_add(1, Ordering::Relaxed);
             return Some(Value::Error(
@@ -6788,6 +6792,11 @@ mod route_tests {
             t.quota_gate(ns, b"GET", false, true).is_none(),
             "reads are served over-quota, channel or not"
         );
+        // PFCOUNT is a write that grows nothing (it may store its count in
+        // the HLL), so it is served over quota, as Redis serves it at
+        // maxmemory; PFADD is shed.
+        assert!(t.quota_gate(ns, b"PFCOUNT", true, false).is_none());
+        assert!(t.quota_gate(ns, b"PFADD", true, false).is_some());
 
         // rate=1, not over quota: now the ops/s bucket is the only gate.
         t.quota

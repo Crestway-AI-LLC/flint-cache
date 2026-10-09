@@ -641,6 +641,34 @@ impl<'a> Dispatcher<'a> {
             b"BITCOUNT" => self.cmd_bitcount(args),
             b"BITPOS" => self.cmd_bitpos(args),
             b"BITOP" => self.cmd_bitop(args),
+            // HyperLogLog, in Redis's format (`flint_storage::hll`). An HLL
+            // is a string: TYPE says so, and GET answers its bytes.
+            b"PFADD" => match args.get(1) {
+                Some(key) => reply(
+                    self.strings.pfadd(slot_for_key(key), key, &args[2..]),
+                    |changed| Value::Integer(changed as i64),
+                ),
+                None => arity_err("pfadd"),
+            },
+            b"PFCOUNT" => match args.get(1) {
+                Some(key) => match Self::crossslot(key, &args[2..]) {
+                    Some(e) => e,
+                    None => reply(self.strings.pfcount(slot_for_key(key), &args[1..]), |n| {
+                        Value::Integer(n as i64)
+                    }),
+                },
+                None => arity_err("pfcount"),
+            },
+            b"PFMERGE" => match args.get(1) {
+                Some(dst) => match Self::crossslot(dst, &args[2..]) {
+                    Some(e) => e,
+                    None => reply(
+                        self.strings.pfmerge(slot_for_key(dst), dst, &args[2..]),
+                        |()| Value::Simple("OK".into()),
+                    ),
+                },
+                None => arity_err("pfmerge"),
+            },
             b"SETRANGE" => exact(args, 4, "setrange", |a| match parse_i64(&a[2]) {
                 Ok(off) if off >= 0 => reply(
                     self.strings
@@ -4465,6 +4493,8 @@ fn store_err(e: StoreError) -> Value {
         StoreError::StreamExhausted => {
             err("ERR The stream has exhausted the last possible ID, unable to add more items")
         }
+        StoreError::NotHll => err("WRONGTYPE Key is not a valid HyperLogLog string value."),
+        StoreError::CorruptHll => err("INVALIDOBJ Corrupted HLL object detected"),
     }
 }
 
@@ -5422,6 +5452,53 @@ mod tests {
         );
         assert!(scan_all(&s, &[b"TYPE", b"json"]).is_empty());
         assert!(scan_all(&s, &[b"TYPE", b"bloom"]).is_empty());
+    }
+
+    /// HyperLogLog's several-key forms keep to one slot, refused at queue
+    /// time inside MULTI too (BUG-0181), and its writes keep to
+    /// max-value-bytes. PFCOUNT is a write, since it may store its count,
+    /// and one that grows nothing.
+    #[test]
+    fn hyperloglog_keys_share_a_slot_and_its_writes_keep_the_limits() {
+        let s = MemKv::new();
+        // `a` is slot 15495, `b` 3300.
+        for c in [
+            &[&b"PFCOUNT"[..], b"a", b"b"][..],
+            &[b"PFMERGE", b"a", b"b"],
+        ] {
+            assert!(
+                matches!(call(&s, c), Value::Error(e) if e.starts_with("CROSSSLOT")),
+                "{c:?}"
+            );
+            let queued: Vec<Vec<u8>> = c.iter().map(|p| p.to_vec()).collect();
+            assert!(queue_time_error(&queued, false).is_some(), "{c:?} in MULTI");
+        }
+        assert_eq!(call(&s, &[b"PFADD", b"{t}a", b"x"]), Value::Integer(1));
+        assert_eq!(call(&s, &[b"PFCOUNT", b"{t}a", b"{t}b"]), Value::Integer(1));
+        assert_eq!(
+            call(&s, &[b"PFMERGE", b"{t}b", b"{t}a"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            call(&s, &[b"TYPE", b"{t}b"]),
+            Value::Simple("string".into())
+        );
+        let small = Limits {
+            max_value_bytes: 8,
+            ..Default::default()
+        };
+        let d = Dispatcher::with_limits(&s, system_clock, small, DEFAULT_NS);
+        let run =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+        assert!(
+            matches!(run(&[b"PFADD", b"new", b"x"]), Value::Error(e) if e.contains("max-value-bytes"))
+        );
+        assert_eq!(call(&s, &[b"EXISTS", b"new"]), Value::Integer(0));
+        for name in [&b"PFADD"[..], b"pfmerge", b"PFCOUNT"] {
+            assert!(flint_commands::is_write_command(name), "{name:?}");
+        }
+        assert!(flint_commands::never_grows(b"pfcount"));
+        assert!(!flint_commands::never_grows(b"PFADD") && !flint_commands::never_grows(b"PFMERGE"));
     }
 
     /// ADR-0056: only a seat with `--chunked-strings` stores a long string

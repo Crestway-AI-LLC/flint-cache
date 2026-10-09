@@ -97,6 +97,11 @@ pub enum StoreError {
     StreamIdZero,
     /// XADD with `*` on a stream whose last ID is the largest there is.
     StreamExhausted,
+    /// A HyperLogLog command on a string that is not one (`hll.rs`).
+    NotHll,
+    /// An HLL whose registers cannot be read: its opcodes do not cover
+    /// exactly 16,384 registers.
+    CorruptHll,
 }
 
 /// ADR-0056: a string longer than this is stored in chunks, when the seat
@@ -284,6 +289,31 @@ impl<'a> StringStore<'a> {
     }
 
     /// The whole value of a live string.
+    /// A live string's whole value and its expiry, for the commands that
+    /// read, change and rewrite one (HyperLogLog, `hll.rs`).
+    pub(crate) fn value_and_expiry(
+        &self,
+        slot: u16,
+        key: &[u8],
+    ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
+        Ok(self.read_live(slot, key)?.map(|s| {
+            let expire_ms = match &s {
+                Stored::Inline(m) => m.expire_ms,
+                Stored::Chunked(c) => c.header.expire_ms,
+            };
+            (self.value_of(slot, key, s), expire_ms)
+        }))
+    }
+
+    /// Replace a string's value, keeping `expire_ms`.
+    pub(crate) fn store_value(&self, slot: u16, key: &[u8], payload: Vec<u8>, expire_ms: u64) {
+        self.put_value(slot, key, payload, expire_ms);
+    }
+
+    pub(crate) fn max_value_bytes(&self) -> u64 {
+        self.max_value_bytes
+    }
+
     fn value_of(&self, slot: u16, key: &[u8], stored: Stored) -> Vec<u8> {
         match stored {
             Stored::Inline(m) => m.payload,

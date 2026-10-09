@@ -4873,14 +4873,15 @@ impl<'a> Work<'a> {
         cmd.first().is_some_and(|n| commands::is_write_command(n))
     }
 
-    /// True only when EVERY write in the unit frees space. One growing
-    /// write is enough to put the whole unit behind the disk guard, because
-    /// the unit lands whole or not at all.
+    /// True only when EVERY write in the unit frees space, or at least
+    /// grows nothing (`PFCOUNT`). One growing write is enough to put the
+    /// whole unit behind the disk guard, because the unit lands whole or
+    /// not at all.
     fn frees_space(&self) -> bool {
-        self.cmds
-            .iter()
-            .filter(|c| Self::is_write(c))
-            .all(|c| c.first().is_some_and(|n| flint_commands::reduces_space(n)))
+        self.cmds.iter().filter(|c| Self::is_write(c)).all(|c| {
+            c.first()
+                .is_some_and(|n| flint_commands::reduces_space(n) || flint_commands::never_grows(n))
+        })
     }
 
     fn reads(&self) -> bool {
@@ -8732,6 +8733,12 @@ mod admission_tests {
         let mixed = [cmd(&["DEL", "a"]), cmd(&["SET", "b", "v"])];
         let m = unit(&mixed);
         assert!(!Work::new(&m).frees_space());
+        // PFCOUNT writes, but grows nothing: a full disk still serves it,
+        // as Redis serves it at maxmemory. PFADD grows.
+        let count = [cmd(&["PFCOUNT", "h"])];
+        assert!(Work::new(&unit(&count)).frees_space());
+        let add = [cmd(&["PFADD", "h", "x"])];
+        assert!(!Work::new(&unit(&add)).frees_space());
     }
 
     #[test]

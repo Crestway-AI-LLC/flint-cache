@@ -55,7 +55,9 @@ Three corollaries, each measured rather than assumed:
 `FLUSHALL` · `FLUSHDB` · `PERSIST` · `COPY … REPLACE` · `GETBIT` ·
 `BITCOUNT` · `BITPOS` · `SETBIT` (it answers the bit's old value, so the
 retry answers the new one) · `BITOP` whose destination is not one of its
-sources · `TOUCH` · `HRANDFIELD` · `ZRANDMEMBER`
+sources · `TOUCH` · `HRANDFIELD` · `ZRANDMEMBER` · `PFADD` (the retry
+answers 0) · `PFCOUNT` · `PFMERGE`, even into one of its sources: an HLL's
+register only ever takes the larger value
 
 **Absolute expiry**: `SET … EXAT`/`PXAT` · `EXPIREAT` ·
 `PEXPIREAT` (plain, or `XX`) · `GETEX EXAT`/`PXAT`/`PERSIST`
