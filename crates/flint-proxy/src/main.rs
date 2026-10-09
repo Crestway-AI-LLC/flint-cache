@@ -2858,6 +2858,10 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
             // any code that could forward them. Checked pre-auth
             // deliberately: an unauthenticated connection has no more
             // business naming a namespace than an authenticated one.
+            // A subscription command, which the proxy answers itself
+            // (ADR-0052 D5). Read here rather than in a match guard: an `if
+            // let` guard needs a newer Rust than the declared 1.89.
+            let subscription = args.first().and_then(|n| pubsub::subscription_kind(n));
             let reply = if !topo.ready.load(Ordering::Acquire)
                 && !args
                     .first()
@@ -2921,11 +2925,10 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
                     // A subscription is this connection's, so the proxy holds
                     // it (ADR-0052 D5). Inside MULTI it takes the
                     // transaction's path, which refuses it.
-                    AuthStep::Proceed(ns)
-                        if !txn.open
-                            && let Some((kind, on)) =
-                                args.first().and_then(|n| pubsub::subscription_kind(n)) =>
-                    {
+                    AuthStep::Proceed(ns) if !txn.open && subscription.is_some() => 'sub: {
+                        let Some((kind, on)) = subscription else {
+                            break 'sub Value::Null;
+                        };
                         if on && args.len() < 2 {
                             Value::Error(format!(
                                 "ERR wrong number of arguments for '{}' command",
