@@ -1451,7 +1451,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// BITCOUNT key [start [end [BYTE|BIT]]]. Valkey 9.1 takes a start
+    /// `BITCOUNT key [start [end [BYTE|BIT]]]`. Valkey 9.1 takes a start
     /// without an end (the end then being the last byte), where Redis 8.2
     /// answers a syntax error; Flint answers as Valkey.
     fn cmd_bitcount(&self, args: &[Vec<u8>]) -> Value {
@@ -1483,7 +1483,7 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
-    /// BITPOS key bit [start [end [BYTE|BIT]]]. Valkey reads the unit
+    /// `BITPOS key bit [start [end [BYTE|BIT]]]`. Valkey reads the unit
     /// before the end, so `BITPOS k 1 0 x WAT` is a syntax error rather
     /// than a bad integer.
     fn cmd_bitpos(&self, args: &[Vec<u8>]) -> Value {
@@ -1521,7 +1521,7 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
-    /// BITOP operation destkey key [key ...]. A missing source is an empty
+    /// `BITOP operation destkey key [key ...]`. A missing source is an empty
     /// string; the destination takes the result (any old value and TTL
     /// gone), or is deleted when the result is empty; the reply is its
     /// length. `DIFF`, `DIFF1`, `ANDOR` and `ONE` are Redis 8.2's, served
@@ -3938,7 +3938,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// HRANDFIELD key [count [WITHVALUES]]: Valkey's argument checks, then
+    /// `HRANDFIELD key [count [WITHVALUES]]`: Valkey's argument checks, then
     /// SRANDMEMBER's picking and its guard on what a negative count builds.
     fn cmd_hrandfield(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 2 {
@@ -3989,7 +3989,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// ZRANDMEMBER key [count [WITHSCORES]], as HRANDFIELD; the pairs are
+    /// `ZRANDMEMBER key [count [WITHSCORES]]`, as HRANDFIELD; the pairs are
     /// member/score pairs, which RESP3 nests with a double.
     fn cmd_zrandmember(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 2 {
