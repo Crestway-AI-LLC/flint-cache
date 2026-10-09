@@ -12,6 +12,7 @@
 
 mod commands;
 mod diskguard;
+mod glob;
 mod heat;
 mod json_path;
 mod migrate;

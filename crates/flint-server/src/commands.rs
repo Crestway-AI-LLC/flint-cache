@@ -3717,7 +3717,7 @@ impl<'a> Dispatcher<'a> {
             }
             // user key = envelope minus (prefix + 2 slot bytes).
             let user = &k[prefix.len() + 2..];
-            if pattern.is_none_or(|p| glob_match(p, user)) {
+            if pattern.is_none_or(|p| crate::glob::glob_match(p, user)) {
                 keys.push(Value::Bulk(Some(user.to_vec())));
             }
             true
@@ -3831,7 +3831,7 @@ impl<'a> Dispatcher<'a> {
                 _ => return err("ERR syntax error"),
             }
         }
-        let keep = |s: &[u8]| pattern.is_none_or(|p| glob_match(p, s));
+        let keep = |s: &[u8]| pattern.is_none_or(|p| crate::glob::glob_match(p, s));
         let items = match kind {
             ScanKind::Hash => match self.hashes.hgetall(slot, &args[1]) {
                 Ok(pairs) => pairs
@@ -4279,111 +4279,6 @@ fn scan_cursors() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Sc
     TABLE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Redis stringmatchlen-style glob over bytes: `*`, `?`, `[set]`/`[^set]`
-/// with `a-z` ranges, and `\` escapes. Iterative with single-star
-/// backtracking (globs have no nested quantifiers, so one backtrack point
-/// suffices).
-fn glob_match(pat: &[u8], s: &[u8]) -> bool {
-    let (mut p, mut i) = (0usize, 0usize);
-    let (mut star_p, mut star_i) = (usize::MAX, 0usize);
-    while i < s.len() {
-        let advanced = if p < pat.len() {
-            match pat[p] {
-                b'*' => {
-                    star_p = p;
-                    star_i = i;
-                    p += 1;
-                    continue;
-                }
-                b'?' => {
-                    p += 1;
-                    i += 1;
-                    true
-                }
-                b'[' => match class_match(pat, p, s[i]) {
-                    Some((true, next_p)) => {
-                        p = next_p;
-                        i += 1;
-                        true
-                    }
-                    _ => false,
-                },
-                b'\\' if p + 1 < pat.len() => {
-                    if pat[p + 1] == s[i] {
-                        p += 2;
-                        i += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                c => {
-                    if c == s[i] {
-                        p += 1;
-                        i += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-        } else {
-            false
-        };
-        if !advanced {
-            if star_p == usize::MAX {
-                return false;
-            }
-            // Backtrack: let the last '*' swallow one more input byte.
-            star_i += 1;
-            i = star_i;
-            p = star_p + 1;
-        }
-    }
-    while p < pat.len() && pat[p] == b'*' {
-        p += 1;
-    }
-    p == pat.len()
-}
-
-/// `[...]` class at `pat[open]` (which is '['): does `c` match, and where
-/// does the class end? None on an unterminated class (treated as no match,
-/// mirroring Redis's lenient parser).
-fn class_match(pat: &[u8], open: usize, c: u8) -> Option<(bool, usize)> {
-    let mut p = open + 1;
-    let negate = pat.get(p) == Some(&b'^');
-    if negate {
-        p += 1;
-    }
-    let mut hit = false;
-    let mut first = true;
-    while p < pat.len() {
-        match pat[p] {
-            b']' if !first => return Some((hit != negate, p + 1)),
-            b'\\' if p + 1 < pat.len() => {
-                if pat[p + 1] == c {
-                    hit = true;
-                }
-                p += 2;
-            }
-            lo if p + 2 < pat.len() && pat[p + 1] == b'-' && pat[p + 2] != b']' => {
-                let hi = pat[p + 2];
-                if (lo.min(hi)..=lo.max(hi)).contains(&c) {
-                    hit = true;
-                }
-                p += 3;
-            }
-            ch => {
-                if ch == c {
-                    hit = true;
-                }
-                p += 1;
-            }
-        }
-        first = false;
-    }
-    None
-}
 
 /// RedisBloom 8.2.8's bounds on a filter's parameters, and its words for a
 /// value outside them (BUG-0240).
