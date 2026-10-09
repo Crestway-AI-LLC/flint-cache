@@ -227,6 +227,25 @@ pub fn null_is_array(args: &[Vec<u8>]) -> bool {
         || is(b"BZPOPMAX")
         || (is(b"LPOP") || is(b"RPOP")) && args.len() == 3
         || (is(b"ZRANK") || is(b"ZREVRANK")) && args.len() == 4
+        // Streams (ADR-0052 D6): an XREAD that finds nothing, and an XRANGE
+        // asked for `COUNT 0`.
+        || is(b"XREAD")
+        || is(b"XRANGE")
+        || is(b"XREVRANGE")
+}
+
+/// XREAD's reply, as RESP2 spells it: a list of `[key, entries]` pairs,
+/// where RESP3 answers a map (ADR-0052 D6). Anything else is unchanged.
+pub fn xread_resp2(v: &Value) -> Value {
+    match v {
+        Value::Map(pairs) => Value::Array(Some(
+            pairs
+                .iter()
+                .map(|(k, e)| Value::Array(Some(vec![k.clone(), e.clone()])))
+                .collect(),
+        )),
+        other => other.clone(),
+    }
 }
 
 /// True for commands whose RESP3 reply carries [`Value::Resp3Nested`]'s

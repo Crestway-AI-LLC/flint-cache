@@ -231,6 +231,9 @@ thread_local! {
 impl Engine {
     fn build(ns: &[u8], memory_bytes: usize) -> mlua::Result<Engine> {
         let lua = sandbox(memory_bytes)?;
+        // cjson, cmsgpack, bit and struct (ADR-0052 D3), made read-only by
+        // the prelude with the rest.
+        crate::script_libs::install(&lua)?;
         let g = lua.globals();
         let xpcall: Function = g.raw_get("xpcall")?;
         let tostring: Function = g.raw_get("tostring")?;
@@ -486,12 +489,15 @@ fn execute(
 
     let result = lua.scope(|scope| {
         let abandon = &engine.abandon;
-        let rawcall =
-            scope.create_function(|lua, args: MultiValue| redis_call(lua, args, call, abandon))?;
+        // Both take their arguments packed into a table (`packed`), so a
+        // call with thousands of them holds one mlua reference, not one each.
+        let rawcall = scope.create_function(|lua, (args, n): (Table, usize)| {
+            redis_call(lua, &args, n, call, abandon)
+        })?;
         let raising = {
             let pending = Rc::clone(&engine.pending);
-            scope.create_function(move |lua, args: MultiValue| {
-                let reply = redis_call(lua, args, call, abandon)?;
+            scope.create_function(move |lua, (args, n): (Table, usize)| {
+                let reply = redis_call(lua, &args, n, call, abandon)?;
                 if let LuaValue::Table(t) = &reply
                     && let LuaValue::String(e) = t.raw_get::<LuaValue>("err")?
                 {
@@ -502,8 +508,12 @@ fn execute(
                 Ok(reply)
             })?
         };
-        engine.redis.raw_set("call", raising)?;
-        engine.redis.raw_set("pcall", rawcall)?;
+        engine
+            .redis
+            .raw_set("call", crate::script_libs::packed(lua, raising)?)?;
+        engine
+            .redis
+            .raw_set("pcall", crate::script_libs::packed(lua, rawcall)?)?;
         let (ok, value): (bool, LuaValue) = engine.xpcall.call((user, engine.handler.clone()))?;
         Ok((ok, if ok { Some(to_reply(&value, 0)) } else { None }))
     });
@@ -620,7 +630,7 @@ end
 local co = {}
 for k, v in pairs(coroutine) do co[k] = v end
 co.resume = function(...) return live(unwrap(coresume(...))) end
-for _, name in ipairs({ "string", "table", "math", "redis" }) do
+for _, name in ipairs({ "string", "table", "math", "redis", "cjson", "cmsgpack", "bit", "struct" }) do
   raw_rawset(_G, name, readonly(_G[name]))
 end
 raw_rawset(_G, "coroutine", readonly(co))
@@ -664,19 +674,20 @@ fn script_line(lua: &Lua) -> String {
 /// comes back as `{err = ...}`, which `redis.call` raises.
 fn redis_call(
     lua: &Lua,
-    args: MultiValue,
+    args: &Table,
+    n: usize,
     call: &Call<'_>,
     abandon: &Cell<bool>,
 ) -> mlua::Result<LuaValue> {
-    if args.is_empty() {
+    if n == 0 {
         return err_table(
             lua,
             "ERR Please specify at least one argument for this call",
         );
     }
-    let mut parts = Vec::with_capacity(args.len());
-    for a in args {
-        match a {
+    let mut parts = Vec::with_capacity(n);
+    for i in 1..=n {
+        match args.raw_get::<LuaValue>(i)? {
             LuaValue::String(s) => parts.push(s.as_bytes().to_vec()),
             LuaValue::Number(n) => parts.push(lua_number_arg(n)),
             // mlua hands an integral Lua 5.1 number over as an integer; it is

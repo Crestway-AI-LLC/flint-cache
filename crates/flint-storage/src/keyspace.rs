@@ -140,7 +140,8 @@ impl<'a> Keyspace<'a> {
             | ValueType::Set
             | ValueType::ZSet
             | ValueType::List
-            | ValueType::Bloom => {
+            | ValueType::Bloom
+            | ValueType::Stream => {
                 let Some(meta) = ComplexMeta::decode(&row) else {
                     return false;
                 };

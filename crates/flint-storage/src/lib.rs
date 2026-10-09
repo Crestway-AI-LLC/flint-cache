@@ -31,6 +31,7 @@ pub mod manifest;
 pub mod mem;
 pub mod migration;
 pub mod sets;
+pub mod streams;
 pub mod strings;
 pub mod watch;
 pub mod zsets;

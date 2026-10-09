@@ -737,10 +737,24 @@ by the conformance corpus. What Flint adds is the frame around a script:
   `redis`: `call`, `pcall`, `error_reply`, `status_reply`, `sha1hex`, `log`
   (a no-op), `setresp(2)`, `replicate_commands`, `set_repl`. **Not
   available:** `load`, `loadstring`, `dofile`, `loadfile`, `require`, `os`,
-  `io`, `debug`, `setfenv`, `getfenv`, `print`, and the `cjson`, `cmsgpack`,
-  `bit` and `struct` libraries Redis also loads; a script that uses one fails
-  with "nonexistent global variable". Globals and the libraries are
-  read-only, and a script's text compiles as text, never as bytecode.
+  `io`, `debug`, `setfenv`, `getfenv` and `print`; a script that uses one
+  fails with "nonexistent global variable". Globals and the libraries are
+  read-only, and a script's text compiles as text, never as bytecode. The
+  libraries and `redis` are read-only as empty stand-ins for the real
+  tables, so `pairs`, `next` and `rawget` find nothing in them, where Valkey
+  shows their functions (BUG-0247, open).
+- **`cjson`, `cmsgpack`, `bit` and `struct`**, the libraries Redis loads
+  into scripts (ADR-0052 D3), written in Rust, not the C ones Valkey ships,
+  whose parsers of tenant input have had memory-safety defects. Each
+  answers as Valkey's does, which the corpus checks call by call: its
+  errors, with the script's line (even when the script tail-calls) and the
+  function named as the script called it, and its limits, where Valkey's
+  Lua stack runs out: `cjson` nests 1,000 deep, `cmsgpack` unpacks 3,999
+  deep and 7,999 values at once, and packs 4,000 arguments. Two
+  differences. `cjson`'s settings (`encode_keep_buffer` and the rest)
+  answer their defaults and refuse to change, because they would outlive
+  the script on a state other scripts reuse. And an object's keys come in
+  Lua 5.1's order, which Redis 8.2 keeps and Valkey 9.1 does not.
   `redis.setresp(3)` is refused: a script sees replies in RESP2's shapes.
 - **What a script returns.** As upstream converts it, Redis 7's typed tables
   included: `{double=n}`, `{map={...}}` and `{set={...}}` answer a double, a
@@ -881,6 +895,39 @@ restart, a slow client) and by `tools/client_compat_drill.sh`, which runs
 redis-py's `PubSub` in both protocols, Celery 5.6.3 and asynq 0.26's task
 cancellation.
 
+## Streams (ADR-0052)
+
+`XADD`, `XLEN`, `XRANGE`, `XREVRANGE`, `XDEL`, `XTRIM` and `XREAD` work as in
+Redis, with Valkey 9.1's replies and errors in both protocols: IDs, `*` and
+`ms-*`, `NOMKSTREAM`, `MAXLEN` and `MINID` trimming, exclusive ranges with
+`(`, and `XREAD`'s `$` and `+`. `TYPE` answers `stream`. A stream's entries
+are rows on disk like a list's elements, so a stream can be far larger than
+memory, and `XREVRANGE … COUNT 1` reads one entry however long the stream is.
+
+- **Creating a stream needs your operator.** A seat creates one only when
+  its inventory says `streams on`; until then an `XADD` that would create a
+  stream is refused, and every command serves the streams that exist. It is
+  off by default in the release that introduced streams, so a fleet can roll
+  back below it until the first stream is made (see self-hosting.md).
+- **`XREAD BLOCK` waits at the proxy**, as the blocking pops do: an entry is
+  read within about 20 ms of its arrival, where Redis wakes the reader at
+  once. `$` and `+` mean where the stream stood when the command arrived. A
+  seat answers `XREAD` without waiting, `BLOCK` or not.
+- **`~` trims exactly**, up to `LIMIT` entries a call (10,000 when no
+  `LIMIT` is given, Valkey's default). Redis and Valkey trim whole internal
+  nodes, so they keep up to a node's worth (100 entries by default) more than
+  asked. Both keep at least what was asked, which is all `~` promises; a
+  client that counts what `XTRIM … ~` removed sees more removed here.
+- **`XREAD` over several streams needs them in one slot**, as every
+  multi-key command does: give their names one hash tag.
+- **Not yet served:** consumer groups (`XGROUP`, `XREADGROUP`, `XACK`,
+  `XPENDING`, `XCLAIM`, `XAUTOCLAIM`), `XINFO`, `XSETID`, and Redis 8.2's
+  `XDELEX` and `XACKDEL`. A stream already keeps the counters groups need.
+
+Checked by the corpus against Valkey through a seat and through the proxy
+in both protocols, and by `tools/client_compat_drill.sh` (redis-py, a
+blocking `XREAD` woken by another client's `XADD`).
+
 ## Excluded by design
 
 - **Cross-slot multi-key commands** — the *cross-slot* form, not the
@@ -906,7 +953,7 @@ cancellation.
   still refused across slots. Either write those keys one at a time, or give
   the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
   that whole cache in one slot, on one pair.
-  Also **streams** (planned, ADR-0052),
+  Also stream **consumer groups** (planned, ADR-0052),
   **RANDOMKEY**, and **`EVAL_RO`,
   `EVALSHA_RO`, `FUNCTION` and `FCALL`** (Redis 7's read-only scripts and
   functions; `EVAL` and `EVALSHA` are supported, see "Lua scripts").

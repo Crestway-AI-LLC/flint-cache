@@ -69,6 +69,7 @@ pair 127.0.0.1:7321,127.0.0.1:7322
 pair 127.0.0.1:7323,127.0.0.1:7324
 proxy 127.0.0.1:$PORT
 placed-tenants on
+streams on
 EOF
 
 echo "== bootstrap 2 pairs + tenant"
@@ -613,6 +614,48 @@ def pubsub_in_a_transaction():
     p.close()
     r.delete("celery-task-meta-1")
 check("PUBLISH inside MULTI is heard after EXEC (Celery's result)", pubsub_in_a_transaction)
+
+print("== streams (ADR-0052 D6)")
+def stream_calls(proto):
+    def run():
+        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
+                        protocol=proto)
+        k = f"ev{proto}"
+        c.delete(k)
+        a = c.xadd(k, {"type": "added", "n": "1"})
+        b = c.xadd(k, {"type": "done"}, maxlen=10, approximate=False)
+        assert c.xlen(k) == 2
+        assert [e[0] for e in c.xrange(k)] == [a, b]
+        assert c.xrevrange(k, count=1) == [(b, {"type": "done"})], c.xrevrange(k, count=1)
+        got = c.xread({k: "0"})
+        # redis-py hands RESP3's map back as a dict and RESP2's pairs as a list.
+        entries = got[k][0] if isinstance(got, dict) else got[0][1]
+        assert [e[0] for e in entries] == [a, b], got
+        assert c.xdel(k, a) == 1
+        assert c.xtrim(k, maxlen=0, approximate=False) == 1
+        c.close()
+    return run
+check("redis-py XADD, XRANGE, XREVRANGE, XREAD, XDEL, XTRIM, RESP2", stream_calls(2))
+check("redis-py the same, RESP3 (XREAD a map)", stream_calls(3))
+def xread_waits_for_an_entry():
+    import threading, time as _t
+    r.delete("evb")
+    r.xadd("evb", {"seed": "1"})
+    got = {}
+    def reader():
+        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True)
+        got["v"] = c.xread({"evb": "$"}, block=3000)
+        c.close()
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    _t.sleep(0.3)
+    new = r.xadd("evb", {"late": "1"})
+    t.join(5)
+    v = got.get("v")
+    entries = v["evb"][0] if isinstance(v, dict) else v[0][1]
+    assert [e[0] for e in entries] == [new], v
+    assert r.xread({"evb": "$"}, block=200) in (None, [], {}), "a timeout reads nothing"
+check("a blocking XREAD on $ takes the entry added while it waits", xread_waits_for_an_entry)
 
 print("== commands we exclude by design still fail HONESTLY")
 check("SPUBLISH (sharded pub/sub)", lambda: r.execute_command("SPUBLISH", "c", "x"),
@@ -1326,6 +1369,64 @@ JS
     (cd "$NODE_DIR" && FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$NODE" flexible.js)
     [ $? -eq 0 ] || { echo "FAIL: rate-limiter-flexible compatibility"; exit 1; }
     RAN="$RAN, rate-limiter-flexible"
+  fi
+
+  # -------------------------------------------------------------------------
+  # BullMQ 6.3.9 (ADR-0052 stage 4) on its documented cluster prefix, which
+  # puts every key in one slot. Its scripts unpack their options with
+  # `cmsgpack` (D3) and write the event stream with XADD (D6); its Worker
+  # waits with BZPOPMIN (D4), and QueueEvents reads the events with
+  # XREAD BLOCK, which waits at the proxy.
+  # -------------------------------------------------------------------------
+  if [ -d "$NODE_DIR/node_modules/ioredis" ] && [ ! -d "$NODE_DIR/node_modules/bullmq" ]; then
+    (cd "$NODE_DIR" && npm install bullmq@6.3.9 --silent >/dev/null 2>&1)
+  fi
+  if [ ! -d "$NODE_DIR/node_modules/bullmq" ]; then
+    echo "== bullmq: SKIP (could not install; offline?)"
+    SKIPPED="$SKIPPED bullmq"
+  else
+    echo "== client: bullmq $("$NODE" -e "console.log(JSON.parse(require('fs').readFileSync('$NODE_DIR/node_modules/bullmq/package.json','utf8')).version)"), prefix {bull}"
+    cat > "$NODE_DIR/bullmq.js" <<'JS'
+const { Queue, Worker, QueueEvents } = require("bullmq");
+const connection = { host: "127.0.0.1", port: Number(process.env.FLINT_PORT),
+                     password: process.env.FLINT_TOKEN, maxRetriesPerRequest: null };
+const prefix = "{bull}";
+let fails = 0;
+const say = (ok, name, note) => {
+  console.log(`  ${ok ? "ok " : "FAIL"} ${name}${ok || !note ? "" : "  " + note}`);
+  if (!ok) fails++;
+};
+(async () => {
+  const queue = new Queue("compat", { connection, prefix });
+  const events = new QueueEvents("compat", { connection, prefix });
+  const worker = new Worker("compat", async (job) => job.data.a + job.data.b,
+                            { connection, prefix });
+  try {
+    await events.waitUntilReady();
+    const job = await queue.add("sum", { a: 2, b: 3 });
+    const result = await job.waitUntilFinished(events, 15000);
+    say(result === 5, "a job is added, run by a Worker, and its result heard through QueueEvents",
+        `result ${result}`);
+    const counts = await queue.getJobCounts("completed", "failed");
+    say(counts.completed === 1 && counts.failed === 0, "one job completed, none failed",
+        JSON.stringify(counts));
+  } catch (e) {
+    say(false, "add, run and wait", String(e?.message ?? e).slice(0, 300));
+  }
+  await worker.close();
+  await events.close();
+  await queue.close();
+  if (fails) {
+    console.log(`\nFAIL: ${fails} BullMQ problem(s)`);
+    process.exit(1);
+  }
+  console.log("\nall BullMQ checks passed");
+  process.exit(0);
+})();
+JS
+    (cd "$NODE_DIR" && FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$NODE" bullmq.js)
+    [ $? -eq 0 ] || { echo "FAIL: bullmq compatibility"; exit 1; }
+    RAN="$RAN, bullmq"
   fi
 fi
 

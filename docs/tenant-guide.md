@@ -237,8 +237,9 @@ slots in a transaction or a script, as rq and Sidekiq need; its size and
 throughput are then that pair's (ADR-0053). Pub/sub is served through the
 proxy, at most once as in Redis, with order kept per channel; sharded
 pub/sub and keyspace notifications are not (ADR-0052,
-`docs/command-support.md`). Not in v0: streams,
-and cross-slot multi-key operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
+`docs/command-support.md`). Streams are served without consumer groups,
+once your operator has turned them on (ADR-0052). Not in v0:
+cross-slot multi-key operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
 splits per slot or per pair. `KEYS` is answered at the proxy, up to 100,000
 keys (`docs/command-support.md`, ADR-0050).
 

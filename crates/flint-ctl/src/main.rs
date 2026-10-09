@@ -128,6 +128,11 @@ struct Inventory {
     /// Off by default in the release that introduced it, because a release
     /// before it routes a placed tenant as a spread one.
     placed_tenants: bool,
+    /// `streams on`: start every data seat with `--streams`, which lets XADD
+    /// create a stream (ADR-0052 D6). Off by default in the release that
+    /// introduced streams, because a release before it reads a stream key as
+    /// no type at all.
+    streams: bool,
     /// Failure domain per HOST (`zone <host> <name>`): an availability zone
     /// on a cloud, a rack or a power domain on your own hardware.
     ///
@@ -400,6 +405,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "billing-retain-days" => inv.billing_retain_days = val.parse().ok(),
             "controller" => inv.controller = val == "on",
             "placed-tenants" => inv.placed_tenants = val == "on",
+            "streams" => inv.streams = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
             "admin-token" => inv.admin_token = Some(val.to_string()),
@@ -3280,6 +3286,9 @@ fn reload(inv: &Inventory) {
     if inv.async_queue_cap.is_some() {
         restart_only.push("async-queue-cap");
     }
+    if inv.streams {
+        restart_only.push("streams");
+    }
     if inv.ctl_poll_ms.is_some() || inv.ctl_confirm.is_some() {
         restart_only.push("controller timing (poll-ms/confirm)");
     }
@@ -3370,6 +3379,10 @@ fn node_tuning_args(inv: &Inventory, replicated: bool) -> Vec<String> {
     }
     if let Some(v) = inv.async_queue_cap {
         push("--async-queue-cap", v.to_string());
+    }
+    // A switch, with no value (ADR-0052 D6).
+    if inv.streams {
+        a.push("--streams".to_string());
     }
     a
 }
@@ -10477,6 +10490,28 @@ mod cp_seat_liveness_tests {
                     .any(|a| a == "--placed-tenants")
             );
             assert!(cp_seat_args(&on, i).iter().any(|a| a == "--placed-tenants"));
+        }
+    }
+
+    /// ADR-0052 D6: `streams on` reaches every data seat, master and replica
+    /// alike; without it a seat creates no stream.
+    #[test]
+    fn streams_on_reaches_every_data_seat() {
+        let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+                    cp 10.0.0.1:7500\npair 10.0.0.1:7001,10.0.0.2:7002\n";
+        let off = inv_from(base, "streams-off");
+        let on = inv_from(&format!("{base}streams on\n"), "streams-on");
+        for replicated in [true, false] {
+            assert!(
+                !node_tuning_args(&off, replicated)
+                    .iter()
+                    .any(|a| a == "--streams")
+            );
+            assert!(
+                node_tuning_args(&on, replicated)
+                    .iter()
+                    .any(|a| a == "--streams")
+            );
         }
     }
 

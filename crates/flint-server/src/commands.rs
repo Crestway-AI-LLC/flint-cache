@@ -16,6 +16,7 @@ use flint_storage::json::JsonStore;
 use flint_storage::keyspace::{Keyspace, RenameOutcome, Ttl};
 use flint_storage::lists::{ListStore, LsetOutcome};
 use flint_storage::sets::SetStore;
+use flint_storage::streams::StreamStore;
 use flint_storage::strings::{
     BitfieldKind, BitfieldOp, BitfieldOverflow, Clock, SetExpiry, SetOptions, SetOutcome,
     StoreError, StringStore, parse_redis_i64,
@@ -24,6 +25,8 @@ use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore, ZaddFlags, ZsetRows}
 
 /// The JSON commands ADR-0055 added.
 mod json;
+/// Streams (ADR-0052 D6).
+mod streams;
 
 /// True for commands that mutate the keyspace (rejected on replicas).
 /// Delegates to the SHARED classifier (flint-commands, ADR-0005 D1): the
@@ -83,6 +86,12 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     // BITOP's second argument is its operator; its key is the destination.
     if name.eq_ignore_ascii_case(b"BITOP") {
         return args.get(2).map(|k| k.as_slice());
+    }
+    // XREAD's keys follow STREAMS (ADR-0052 D6).
+    if name.eq_ignore_ascii_case(b"XREAD") {
+        return flint_commands::xread_keys(args)
+            .and_then(|k| k.first())
+            .map(|k| k.as_slice());
     }
     args.get(1).map(|k| k.as_slice())
 }
@@ -212,6 +221,11 @@ pub struct Limits {
     pub max_key_bytes: u64,
     /// A Lua script's time and memory (ADR-0051).
     pub script: crate::script::ScriptLimits,
+    /// Whether XADD may create a stream (`--streams`, ADR-0052 D6). Off by
+    /// default in the first release that serves streams, so a rollback to
+    /// the release before it never meets one; streams that exist are served
+    /// either way.
+    pub streams: bool,
 }
 
 impl Default for Limits {
@@ -220,6 +234,7 @@ impl Default for Limits {
             max_value_bytes: flint_storage::DEFAULT_MAX_VALUE_BYTES,
             max_key_bytes: flint_storage::DEFAULT_MAX_KEY_BYTES,
             script: crate::script::ScriptLimits::default(),
+            streams: false,
         }
     }
 }
@@ -243,6 +258,7 @@ pub struct Dispatcher<'a> {
     zsets: ZSetStore<'a>,
     json: JsonStore<'a>,
     bloom: BloomStore<'a>,
+    streams: StreamStore<'a>,
     kv: &'a dyn Kv,
     clock: Clock,
     limits: Limits,
@@ -281,6 +297,7 @@ impl<'a> Dispatcher<'a> {
             zsets: ZSetStore::with_max_value_bytes(kv, ns, clock, max),
             json: JsonStore::with_max_value_bytes(kv, ns, clock, max),
             bloom: BloomStore::with_max_value_bytes(kv, ns, clock, max),
+            streams: StreamStore::with_max_value_bytes(kv, ns, clock, max),
             kv,
             clock,
             limits,
@@ -355,6 +372,9 @@ impl<'a> Dispatcher<'a> {
                 flint_commands::eval_keys(args).is_some_and(|ks| ks.iter().any(|k| k.len() > max))
             }
             b"SCRIPT" | b"PUBLISH" | b"PUBSUB" => false,
+            b"XREAD" => {
+                flint_commands::xread_keys(args).is_some_and(|ks| ks.iter().any(|k| k.len() > max))
+            }
             _ => args.get(1).is_some_and(|k| k.len() > max),
         }
     }
@@ -680,6 +700,18 @@ impl<'a> Dispatcher<'a> {
                 Value::Integer(crate::pubsub::publish(&self.ns, &a[1], &a[2]))
             }),
             b"PUBSUB" => self.cmd_pubsub(args),
+            // Streams (ADR-0052 D6), in `commands/streams.rs`.
+            b"XADD" => self.cmd_xadd(args),
+            b"XLEN" => exact(args, 2, "xlen", |a| {
+                reply(self.streams.len(slot_for_key(&a[1]), &a[1]), |n| {
+                    Value::Integer(n as i64)
+                })
+            }),
+            b"XRANGE" => self.cmd_xrange(args, false),
+            b"XREVRANGE" => self.cmd_xrange(args, true),
+            b"XDEL" => self.cmd_xdel(args),
+            b"XTRIM" => self.cmd_xtrim(args),
+            b"XREAD" => self.cmd_xread(args),
             b"SUBSCRIBE" | b"PSUBSCRIBE" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" => err(
                 "ERR a seat serves subscriptions to proxies only: subscribe through the proxy \
                  (ADR-0052)",
@@ -4409,6 +4441,13 @@ fn store_err(e: StoreError) -> Value {
         StoreError::KeyExists => err("ERR item exists"),
         StoreError::BadParameter => err("ERR bad capacity or error rate"),
         StoreError::FilterFull => err("ERR non scaling filter is full"),
+        StoreError::StreamIdTooSmall => {
+            err("ERR The ID specified in XADD is equal or smaller than the target stream top item")
+        }
+        StoreError::StreamIdZero => err("ERR The ID specified in XADD must be greater than 0-0"),
+        StoreError::StreamExhausted => {
+            err("ERR The stream has exhausted the last possible ID, unable to add more items")
+        }
     }
 }
 
@@ -4863,8 +4902,9 @@ mod tests {
         // TYPE filter: only the hash.
         let got = scan_all(&s, &[b"TYPE", b"hash"]);
         assert_eq!(got, vec![b"h:1".to_vec()]);
-        // Unknown TYPE matches nothing, errors nothing.
-        assert!(scan_all(&s, &[b"TYPE", b"stream"]).is_empty());
+        // Unknown TYPE matches nothing, errors nothing. (A type Flint does
+        // not serve: `stream` was this probe until streams were.)
+        assert!(scan_all(&s, &[b"TYPE", b"vectorset"]).is_empty());
     }
 
     /// BITOP's four Redis 8.2 operators, which the corpus cannot hold

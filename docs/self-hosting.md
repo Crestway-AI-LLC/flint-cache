@@ -207,6 +207,7 @@ pair HOST:P,HOST:P[,HOST:P] # a replica set (master first); repeatable
 proxy HOST:P                # a routing proxy; repeatable
 controller on               # automatic failover supervision
 placed-tenants on           # allow `tenant add-on-pair` (ADR-0053; see section 4)
+streams on                  # let XADD create streams (ADR-0052; see section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
 admin-token <tok>           # gate the PROXY*/operator surface
@@ -1230,6 +1231,13 @@ Notes:
   default in this release, because a release before it would route a
   placed tenant as a spread one: once you place a tenant, do not roll this
   fleet back below this release (ADR-0053).
+- **Streams** (`XADD` and the rest, ADR-0052) are served on every seat,
+  but a seat creates a stream only when the inventory says `streams on`
+  (each data seat then runs with `--streams`). It is off by default in the
+  release that introduced streams, because a release before it reads a
+  stream key as having no type: once a tenant has created a stream, do not
+  roll this fleet back below this release. A tenant's `XADD` that would
+  create a stream is refused while it is off.
 
 ## 5. Rotating credentials & keys
 

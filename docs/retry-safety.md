@@ -72,6 +72,10 @@ table)
 **Documents and filters**: `JSON.SET` · `JSON.MSET` · `JSON.MERGE` ·
 `JSON.DEL` · `JSON.FORGET` · `JSON.CLEAR` · `BF.ADD` · `BF.MADD` · `BF.INSERT`
 
+**Streams**: `XDEL` (it answers how many were there, so the retry answers
+fewer) · `XTRIM` (exact: a second trim to the same bound removes nothing
+more)
+
 Re-applying reaches the same end state. **The reply may not match the
 first one**, and that is the trap inside this list rather than a footnote to
 it: `DEL`/`HDEL`/`SREM`/`ZREM` return a smaller count, `JSON.CLEAR` counts 0
@@ -99,6 +103,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `RENAME` `RENAMENX` | The retry answers `ERR no such key` — the source moved on the first attempt. The rename SUCCEEDED and the caller sees an error. |
 | `SMOVE` | The retry answers 0 — the member left the source on the first attempt. It moved, and the caller is told it did not. |
 | `BF.RESERVE` | The retry answers `ERR item exists`, same shape: created, reported as failed. |
+| `XADD` | With `*` or `ms-*`, the retry adds the entry a second time, under a new ID. With an explicit ID it answers `ERR The ID specified in XADD is equal or smaller than the target stream top item`: the entry was added, and the caller is told it was not. |
 | `PUBLISH` | Delivers the message again, so every subscriber hears it twice. A message is not state, and nothing converges. Give messages an id the consumer can dedupe on, or treat an ambiguous failure as delivered. |
 | `EVAL` `EVALSHA` (ADR-0051) | A script is exactly as retry-safe as what it does, so assume it is not. Measured cases: a lock release that succeeded answers 0 on the retry (redsync's -1, "already expired"), so the caller is told it did not hold the lock; a `redlock` acquire that succeeded answers 0, the `SET NX` hazard; an extend that adds to the TTL adds twice; django-redis's `incr` double-counts; a rate limiter's hit counts twice. A failed script keeps none of its writes, so retrying a script that FAILED is safe. |
 | `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` with `NX`, `GT` or `LT` | The retry meets the expiry the first call set: `NX` finds one, and `GT` and `LT` find the new instant no later, or no earlier, than itself. It answers 0: the expiry was set, and the caller is told it was not. |

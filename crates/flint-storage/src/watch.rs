@@ -310,7 +310,31 @@ mod tests {
         check("JSON.SET", b"j", v, &t);
         checked += 1;
 
-        assert_eq!(checked, 6, "every value type must be covered here");
+        // A stream's entries are subkey rows; every change rewrites its
+        // metadata row, XDEL and XTRIM included.
+        let streams = crate::streams::StreamStore::new(s.as_ref(), ns, system_clock);
+        let v = t.version(&meta(ns, slot, b"x"));
+        streams
+            .add(
+                slot,
+                b"x",
+                crate::streams::IdSpec::Auto,
+                &[b"f".to_vec(), b"v".to_vec()],
+                false,
+                None,
+            )
+            .expect("xadd");
+        check("XADD", b"x", v, &t);
+        let v = t.version(&meta(ns, slot, b"x"));
+        let id = streams
+            .last_id(slot, b"x")
+            .expect("last id")
+            .expect("a stream");
+        assert_eq!(streams.del(slot, b"x", &[id]), Ok(1));
+        check("XDEL", b"x", v, &t);
+        checked += 1;
+
+        assert_eq!(checked, 7, "every value type must be covered here");
 
         // And the second mutation of an EXISTING collection must move it
         // too — the first write creates metadata, which is the easy case.

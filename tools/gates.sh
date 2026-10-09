@@ -4155,9 +4155,10 @@ if want conformance; then
   # that port, which is not necessarily what we started.
   ( valkey-server --port 6390 --save '' --appendonly no --daemonize no \
       >"$LOGS/valkey.log" 2>&1 & echo $! >"$CDIR/oracle.pid" )
-  ( ./target/release/flint-server --port 6389 --engine mem \
+  # --streams: the corpus creates streams (ADR-0052 D6).
+  ( ./target/release/flint-server --port 6389 --engine mem --streams \
       >"$LOGS/conf-mem.log" 2>&1 & echo $! >"$CDIR/mem.pid" )
-  ( ./target/release/flint-server --port 6388 --engine rocks --data-dir "$CDIR/rocks" \
+  ( ./target/release/flint-server --port 6388 --engine rocks --data-dir "$CDIR/rocks" --streams \
       >"$LOGS/conf-rocks.log" 2>&1 & echo $! >"$CDIR/rocks.pid" )
   for p in 6390 6389 6388; do
     for _ in $(seq 1 100); do

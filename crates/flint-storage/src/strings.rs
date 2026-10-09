@@ -88,6 +88,12 @@ pub enum StoreError {
     /// A non-scaling filter is full, or a scaling one hit the chain cap
     /// (ADR-0016 D5). Refusing keeps the promised error rate true.
     FilterFull,
+    /// XADD with an ID at or below the stream's last (ADR-0052 D6).
+    StreamIdTooSmall,
+    /// XADD with the ID 0-0, which no entry may have.
+    StreamIdZero,
+    /// XADD with `*` on a stream whose last ID is the largest there is.
+    StreamExhausted,
 }
 
 pub struct StringStore<'a> {

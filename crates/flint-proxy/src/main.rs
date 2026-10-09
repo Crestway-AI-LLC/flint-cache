@@ -1657,6 +1657,12 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     if name.eq_ignore_ascii_case(b"BITOP") {
         return args.get(2).map(|k| k.as_slice());
     }
+    // XREAD's keys follow STREAMS (ADR-0052 D6).
+    if name.eq_ignore_ascii_case(b"XREAD") {
+        return flint_commands::xread_keys(args)
+            .and_then(|k| k.first())
+            .map(|k| k.as_slice());
+    }
     args.get(1).map(|k| k.as_slice())
 }
 
@@ -1715,7 +1721,20 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
             resp3: Box::new(v),
         };
     }
+    // XREAD answers a map under RESP3 and a list of pairs under RESP2, and
+    // flattening the map would interleave keys with entries (ADR-0052 D6).
+    if is_xread(args) && matches!(v, Value::Map(_)) {
+        return Value::ByProto {
+            resp2: Box::new(flint_resp::xread_resp2(&v)),
+            resp3: Box::new(v),
+        };
+    }
     v
+}
+
+fn is_xread(args: &[Vec<u8>]) -> bool {
+    args.first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"XREAD"))
 }
 
 /// Whether [`repair_reply`] changes this command's reply, so a transaction
@@ -1725,6 +1744,7 @@ fn needs_repair(args: &[Vec<u8>]) -> bool {
         .is_some_and(|n| flint_resp::resp3_nests_reply(n) || flint_resp::resp3_differs_in_kind(n))
         || flint_resp::bf_info_field(args)
         || flint_resp::hrandfield_withvalues(args)
+        || is_xread(args)
 }
 
 /// One queued command's item in EXEC's reply, put in the client's dialect
@@ -3015,6 +3035,7 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
             if let Some(ns) = authed_ns.as_deref()
                 && let Some(name) = args.first()
                 && !flint_commands::is_blocking_command(name)
+                && !flint_commands::xread_blocks(args)
             {
                 let is_write = flint_commands::is_write_command(name);
                 if is_write || flint_commands::is_read_command(name) {
@@ -3809,6 +3830,10 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
                 | b"BRPOPLPUSH"
         )
     {
+        return false;
+    }
+    // A blocking XREAD waits at the proxy as the pops do (ADR-0052 D6).
+    if flint_commands::xread_blocks(args) {
         return false;
     }
     // Multi-key DEL / UNLINK / EXISTS may have to be SPLIT across pairs
@@ -5181,6 +5206,122 @@ async fn blocking_pop(
     }
 }
 
+/// A blocking XREAD (ADR-0052 D6), waited out here as the blocking pops
+/// are: each attempt is a plain XREAD, which a seat answers at once.
+///
+/// `$` and `+` name where a stream stands when the command arrives. They
+/// are resolved to IDs before the first attempt, and every attempt asks for
+/// what follows those IDs: re-sent as `$`, an attempt would read only what
+/// came after IT, and an entry added between two attempts would be skipped.
+/// `$` becomes the newest entry's ID, which nothing newer than the last ID
+/// can precede; `+` the one before it, so the newest entry is read.
+async fn blocking_xread(
+    topo: &Arc<Topology>,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    idle: &mut dyn Idle,
+) -> Value {
+    let raw = encode_cmd(&args.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let Some(keys) = flint_commands::xread_keys(args) else {
+        // Malformed: the seat says how.
+        return forward(topo, backends, ns, args, &raw, false).await;
+    };
+    let n = keys.len();
+    let streams_at = args.len() - 2 * n - 1;
+    let mut block_ms: i64 = 0;
+    let mut attempt: Vec<Vec<u8>> = vec![args[0].clone()];
+    for opt in args[1..streams_at].chunks(2) {
+        if opt[0].eq_ignore_ascii_case(b"BLOCK") {
+            match std::str::from_utf8(&opt[1])
+                .ok()
+                .and_then(|t| t.parse::<i64>().ok())
+            {
+                Some(ms) if ms < 0 => return Value::Error("ERR timeout is negative".into()),
+                Some(ms) => block_ms = ms,
+                None => {
+                    return Value::Error("ERR timeout is not an integer or out of range".into());
+                }
+            }
+        } else {
+            attempt.extend(opt.iter().cloned());
+        }
+    }
+    attempt.push(b"STREAMS".to_vec());
+    attempt.extend(keys.iter().cloned());
+    for (key, id) in keys.iter().zip(&args[streams_at + 1 + n..]) {
+        let resolved = match id.as_slice() {
+            b"$" | b"+" => {
+                let probe = vec![
+                    b"XREVRANGE".to_vec(),
+                    key.clone(),
+                    b"+".to_vec(),
+                    b"-".to_vec(),
+                    b"COUNT".to_vec(),
+                    b"1".to_vec(),
+                ];
+                let frame = encode_cmd(&probe.iter().map(Vec::as_slice).collect::<Vec<_>>());
+                let newest = match forward(topo, backends, ns, &probe, &frame, false).await {
+                    Value::Array(Some(entries)) => {
+                        entries.into_iter().next().and_then(|e| match e {
+                            Value::Array(Some(mut parts)) if !parts.is_empty() => {
+                                match parts.swap_remove(0) {
+                                    Value::Bulk(Some(id)) => Some(id),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        })
+                    }
+                    Value::Error(e) => return Value::Error(e),
+                    _ => None,
+                };
+                match (newest, id.as_slice()) {
+                    (None, _) => b"0-0".to_vec(),
+                    (Some(newest), b"$") => newest,
+                    (Some(newest), _) => id_before(&newest),
+                }
+            }
+            _ => id.clone(),
+        };
+        attempt.push(resolved);
+    }
+    let frame = encode_cmd(&attempt.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let started = Instant::now();
+    let mut delay = BLOCK_POLL_FIRST;
+    loop {
+        match forward(topo, backends, ns, &attempt, &frame, false).await {
+            Value::Null | Value::Array(None) => {}
+            other => return other,
+        }
+        let mut wait = delay;
+        if block_ms > 0 {
+            let left = Duration::from_millis(block_ms as u64).saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Value::Array(None);
+            }
+            wait = wait.min(left.min(Duration::from_secs(1)));
+        }
+        if !idle.wait(wait).await {
+            return Value::Array(None);
+        }
+        delay = (delay * 2).min(BLOCK_POLL_MAX);
+    }
+}
+
+/// The stream ID just below `id` (`ms-seq`), for XREAD's `+`; `0-0` stays.
+fn id_before(id: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(id);
+    let parsed = text
+        .split_once('-')
+        .and_then(|(ms, seq)| Some((ms.parse::<u64>().ok()?, seq.parse::<u64>().ok()?)));
+    match parsed {
+        Some((ms, seq)) if seq > 0 => format!("{ms}-{}", seq - 1).into_bytes(),
+        Some((ms, _)) if ms > 0 => format!("{}-{}", ms - 1, u64::MAX).into_bytes(),
+        _ => b"0-0".to_vec(),
+    }
+}
+
 async fn handle(
     topo: &Arc<Topology>,
     backends: &mut Backends,
@@ -5244,6 +5385,10 @@ async fn handle(
         // `blocking_pop`.
         _ if flint_commands::is_blocking_command(&upper) => {
             blocking_pop(topo, backends, ns, args, raw, idle).await
+        }
+        // A blocking XREAD waits here too (ADR-0052 D6). See `blocking_xread`.
+        b"XREAD" if flint_commands::xread_blocks(args) => {
+            blocking_xread(topo, backends, ns, args, idle).await
         }
         // Group-wide aggregates fan out.
         b"DBSIZE" => {

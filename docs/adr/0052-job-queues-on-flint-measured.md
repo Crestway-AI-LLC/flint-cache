@@ -512,12 +512,137 @@ Each joined `client_compat_drill`, so it cannot regress silently.
 
 ### Stage 4: D6 then D3, held (2026-10-03), reopened (2026-10-08)
 
-Not started. Jeff held it on 2026-10-03 until a tenant asked for rq or
-BullMQ, and reopened it on 2026-10-08, after stage 3. Those are the two libraries it serves: rq keeps results on a
-stream, and BullMQ's scripts need `cmsgpack`. ADR-0053's amendment (`LMOVE`
-and its relatives across slots, for rq's worker) is held with it, since rq
-needs both.
+Jeff held it on 2026-10-03 until a tenant asked for rq or BullMQ, and
+reopened it on 2026-10-08, after stage 3. Those are the two libraries it
+serves: rq keeps results on a stream, and BullMQ's scripts need `cmsgpack`.
+ADR-0053's amendment (`LMOVE` and its relatives across slots, for rq's
+worker) comes with it, since rq needs both. Built in three parts: D6's first
+set and blocking `XREAD` (below), then D3, then the amendment.
 
-**What it means today:** rq and BullMQ are not served; each stops where the
-stage 2 table above records. Sidekiq and asynq (stages 1 and 2) are
-unaffected.
+#### D6: streams, first set (2026-10-09)
+
+**The two-release rule decided the rollout.** A stream is a new value type
+(7). A release from before it reads a stream key as having no type: `TYPE`
+answers `none` while `EXISTS` answers 1, and its typed stores answer
+WRONGTYPE. Every release must roll back (Jeff, 2026-09-23), so, as
+ADR-0053 did for placed tenants, this release reads streams everywhere and
+creates one only when the seat runs with `--streams` (inventory:
+`streams on`), off by default. The next release turns it on. An operator
+who turns it on now gives up rolling back below this release once a tenant
+has made a stream.
+
+- **Storage** (`flint-storage`, `streams.rs`):
+  - **The metadata row** is the collection row (version, entries, bytes)
+    plus the last ID ever given, the largest deleted ID and the number of
+    entries ever added. The last two are what Redis 7 keeps for consumer
+    groups' lag. They are written from the first release, so groups need no
+    second format change, and no second two-release rollout.
+  - **Entries** are subkey rows whose field is `0x00`, then the ID in
+    big-endian, so a scan walks them in ID order. Other row kinds a stream
+    may need later, a group or a pending entry, take other leading bytes.
+  - **Generic machinery works unchanged.** GC, `DEL`, expiry, slot
+    migration, backup, eviction, `FLINTKEYSIZE`, `WATCH`, `COPY` and
+    `RENAME` handle a stream with no stream code, because it is a collection
+    row and subkey rows like the others. `COPY` gained one match arm.
+  - **An emptied stream keeps its key**, as Redis's does, because its last
+    ID still bounds the next.
+- **Seat** (`commands/streams.rs`): `XADD`, `XLEN`, `XRANGE`, `XREVRANGE`,
+  `XDEL`, `XTRIM` and `XREAD`, parsed as Valkey parses them, so the same
+  wrong command fails with the same error first. `XREAD` answers at once,
+  `BLOCK` or not.
+- **Proxy:**
+  - **`XREAD BLOCK` waits as the blocking pops do.** `$` and `+` are
+    resolved to the newest entry's ID before the first attempt, by one
+    `XREVRANGE … COUNT 1` per such stream. Re-sent as `$`, each attempt
+    would have read only what followed IT, and an entry added between two
+    attempts would have been skipped.
+  - **XREAD's RESP3 map is rebuilt as RESP2's pairs**, inside `EXEC` too.
+- **Differences** (command-support.md lists them):
+  - `~` trims exactly, up to `LIMIT` (10,000 by default), where Valkey
+    trims whole internal nodes.
+  - A multi-stream `XREAD` needs one slot.
+  - Consumer groups, `XINFO` and `XSETID` are not yet served.
+
+**Verified** against Valkey 9.1.0 on the laptop:
+- **A probe of 88 calls per protocol** (RESP2 and RESP3) differs only where
+  documented: `~` trims exactly, and a two-slot `XREAD` is refused.
+- **A random differential of 40,000 commands** (four seeds, both protocols)
+  found one defect. `XRANGE … COUNT 0` answered the null array before it
+  looked the key up, so a key of another type answered nil where Valkey
+  answers WRONGTYPE, and a missing key nil where Valkey answers an empty
+  array. The key is looked up first now, and the corpus holds both.
+- **`XREAD BLOCK` through an authenticated proxy** matches Valkey step for
+  step in both protocols: a wake on `$` 0.3 s after the `XADD` that causes
+  it, a 0.5 s timeout answering nil, `BLOCK 0`, two streams in one slot,
+  `+`, a stream created while it is waited on, WRONGTYPE, and a negative
+  timeout.
+- **Reading the newest entry costs what it reads.** On 200,000 entries,
+  `XREVRANGE s + - COUNT 1` takes 0.25 ms plain, 0.29 ms in `MULTI` and
+  0.33 ms in a script (debug build, in memory; Valkey 0.12, 0.35 and
+  0.13 ms). In `MULTI` and scripts it took 68 ms until BUG-0248.
+- **The corpus** passes on a seat (206 cases), through the proxy (203) and
+  on Valkey (151 it shares), in both protocols. Redis clients' blocking
+  `XREAD` and BullMQ run in `client_compat_drill`.
+
+#### D3: the script libraries (2026-10-09)
+
+As D3 recommended (c): `cjson`, `cmsgpack`, `bit` and `struct` in Rust
+(`script_libs.rs`), behind the same read-only wrapping as the standard
+libraries.
+
+- **Each function is Rust behind a small C function**, which is what a
+  script calls. Only a C function can do what the libraries' C does here:
+  - **Name the script's line.** The first build raised errors from a Lua
+    wrapper with `error(message, 2)`. A script that tail-calls the function
+    (`return cjson.decode(s)`) loses its own frame to the wrapper, so its
+    line was gone. The C function raises after `luaL_where(L, 1)` as
+    `luaL_error` does, and argument errors go through `luaL_argerror`, which
+    names the function as the script called it (`'?'` under `pcall`).
+  - **Take and give thousands of values.** Rust holds an mlua reference for
+    each Lua string or table in hand. mlua has about 7,996 of them and
+    panics past that, where Valkey answers. So the C function packs the
+    arguments into one table, and the many results of `cmsgpack.unpack` and
+    `struct.unpack` come back the same way. `redis.call` and `redis.pcall`
+    had the same limit, and now take their arguments packed (BUG-0246).
+- **Nesting is walked on stacks of their own**, not by recursion. The first
+  build overflowed a connection thread's stack, and crashed the seat, at
+  1,000 levels of `cjson`; Valkey decodes MessagePack 3,999 deep. The slots
+  Valkey's C would hold on the Lua stack, whose limit is 8,000, are counted,
+  so a call fails at the depth and count Valkey's does, with its message.
+
+- **What they match, from Valkey 9.1, function by function:**
+  - `cjson`: `%.14g` numbers, `\/` and `\u00XX` escapes, sparse-array and
+    nesting refusals, lua-cjson's tokenizer errors with their character
+    positions, `strtod`'s acceptance of hex and `inf`, and `cjson.null`.
+  - `cmsgpack`: the narrowest integer encoding, float32 when exact, the
+    16-level nesting cutoff, and `unpack_one`/`unpack_limit`'s offsets.
+  - `bit`: LuaBitOp's rounding by its own trick.
+  - `struct`: lua-struct's sizes, alignment and errors.
+- **One deliberate difference:** `cjson`'s settings answer their defaults
+  and refuse changes, which would outlive the script on a shared state.
+
+**Verified** against Valkey 9.1.0, call by call: 128 ordinary calls across
+the four libraries, then their edges. Bisecting Valkey found where each runs
+out: `cjson` at 1,001 levels, `cmsgpack` at 4,000 levels and 8,000 values,
+`cmsgpack.pack` at 4,001 arguments, and `struct.unpack` at 7,998 results.
+Around 80 more calls covered errors from tail calls, `pcall` and method
+calls, LuaBitOp's argument order, lua-struct's nil marker, and nil and NaN
+map keys. Flint now agrees on all of them but two, both documented:
+- **an object's key order** (Lua 5.1's, as in Redis 8.2);
+- **listing a library table** (BUG-0247).
+
+The corpus holds 33 of those edges, and they pass on Valkey too.
+
+The first build failed three ways, each fixed before the push:
+- errors lost the script's line from a tail call;
+- 1,000-deep `cjson` crashed the seat;
+- `cmsgpack.pack` of 9,000 keys hit mlua's reference cap.
+
+Thirteen mutants, one per property (the error's level, the slot count, the
+5.1 stack check, LuaBitOp's order, the nil marker, the bare nil-key error,
+the argument and result limits, the overlay's merge and seeks, and
+`COUNT 0`'s order), were each killed by the check meant for it.
+
+#### ADR-0053's amendment
+
+Not started.

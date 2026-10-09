@@ -102,6 +102,14 @@ fn sd(parts: &[&[u8]], expect: Expect, delay_ms: u64) -> (Vec<Vec<u8>>, Expect, 
     (cmd(parts), expect, delay_ms)
 }
 
+/// A stream entry as XRANGE and XREAD answer it: `[id, [field, value, ...]]`.
+fn xentry(id: &'static [u8], fields: &[&'static [u8]]) -> Expect {
+    Expect::Arr(vec![
+        Expect::Str(id),
+        Expect::Arr(fields.iter().map(|f| Expect::Str(f)).collect()),
+    ])
+}
+
 fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
     parts.iter().map(|p| p.to_vec()).collect()
 }
@@ -702,6 +710,441 @@ fn corpus() -> Vec<Case> {
                 s(&[b"BITOP", b"WAT", b"{bo}d", b"{bo}a"], Expect::Err("ERR syntax error")),
                 s(&[b"RPUSH", b"{bo}l", b"x"], Expect::Int(1)),
                 s(&[b"BITOP", b"AND", b"{bo}d", b"{bo}a", b"{bo}l"], Expect::AnyError),
+            ],
+        },
+        // Streams (ADR-0052 D6), against Valkey 9.1. `~` trimming is not
+        // here: Valkey trims whole internal nodes and Flint trims exactly
+        // (a documented difference); only its argument errors are.
+        Case {
+            family: "streams",
+            name: "streams: XADD's IDs, NOMKSTREAM, XLEN, TYPE",
+            steps: vec![
+                s(&[b"XADD", b"xs", b"1-1", b"f", b"v"], Expect::Str(b"1-1")),
+                s(&[b"XADD", b"xs", b"1-1", b"f", b"v"], Expect::Err("ERR The ID specified in XADD is equal or smaller than the target stream top item")),
+                s(&[b"XADD", b"xs", b"1-0", b"f", b"v"], Expect::Err("ERR The ID specified in XADD is equal or smaller than the target stream top item")),
+                s(
+                    &[b"XADD", b"xs", b"0-0", b"f", b"v"],
+                    Expect::Err("ERR The ID specified in XADD must be greater than 0-0"),
+                ),
+                s(&[b"XADD", b"xs", b"1-*", b"a", b"1"], Expect::Str(b"1-2")),
+                s(&[b"XADD", b"xs", b"2-5", b"a", b"1", b"b", b"2"], Expect::Str(b"2-5")),
+                s(&[b"XADD", b"xs", b"2", b"a", b"1"], Expect::Err("ERR The ID specified in XADD is equal or smaller than the target stream top item")),
+                s(
+                    &[b"XADD", b"xs", b"3-0", b"a"],
+                    Expect::Err("ERR wrong number of arguments for 'xadd' command"),
+                ),
+                s(
+                    &[b"XADD", b"xs", b"*"],
+                    Expect::Err("ERR wrong number of arguments for 'xadd' command"),
+                ),
+                s(&[b"XADD", b"xs", b"abc", b"f", b"v"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XADD", b"xs", b"1-x", b"f", b"v"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XADD", b"xs", b"NOMKSTREAM", b"9-0", b"f", b"v"], Expect::Str(b"9-0")),
+                s(&[b"XADD", b"xnone", b"NOMKSTREAM", b"*", b"f", b"v"], Expect::Nil),
+                s(&[b"EXISTS", b"xnone"], Expect::Int(0)),
+                s(&[b"XLEN", b"xs"], Expect::Int(4)),
+                s(&[b"XLEN", b"xnone"], Expect::Int(0)),
+                s(&[b"TYPE", b"xs"], Expect::Simple("stream")),
+                s(
+                    &[b"XADD", b"xs", b"18446744073709551615-18446744073709551615", b"f", b"v"],
+                    Expect::Str(b"18446744073709551615-18446744073709551615"),
+                ),
+                s(
+                    &[b"XADD", b"xs", b"*", b"f", b"v"],
+                    Expect::Err(
+                        "ERR The stream has exhausted the last possible ID, unable to add more items",
+                    ),
+                ),
+                s(&[b"SET", b"xstr", b"v"], Expect::Ok),
+                s(&[b"XADD", b"xstr", b"*", b"f", b"v"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XLEN", b"xstr"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XRANGE", b"xstr", b"-", b"+"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+            ],
+        },
+        Case {
+            family: "streams",
+            name: "streams: XRANGE and XREVRANGE",
+            steps: vec![
+                s(&[b"XADD", b"xr", b"1-1", b"f", b"v"], Expect::Str(b"1-1")),
+                s(&[b"XADD", b"xr", b"1-2", b"a", b"1"], Expect::Str(b"1-2")),
+                s(&[b"XADD", b"xr", b"2-5", b"a", b"1", b"b", b"2"], Expect::Str(b"2-5")),
+                s(
+                    &[b"XRANGE", b"xr", b"-", b"+"],
+                    Expect::Arr(vec![
+                        xentry(b"1-1", &[b"f", b"v"]),
+                        xentry(b"1-2", &[b"a", b"1"]),
+                        xentry(b"2-5", &[b"a", b"1", b"b", b"2"]),
+                    ]),
+                ),
+                s(
+                    &[b"XRANGE", b"xr", b"-", b"+", b"COUNT", b"2"],
+                    Expect::Arr(vec![xentry(b"1-1", &[b"f", b"v"]), xentry(b"1-2", &[b"a", b"1"])]),
+                ),
+                s(
+                    &[b"XRANGE", b"xr", b"(1-1", b"2"],
+                    Expect::Arr(vec![
+                        xentry(b"1-2", &[b"a", b"1"]),
+                        xentry(b"2-5", &[b"a", b"1", b"b", b"2"]),
+                    ]),
+                ),
+                s(
+                    &[b"XRANGE", b"xr", b"1", b"1"],
+                    Expect::Arr(vec![xentry(b"1-1", &[b"f", b"v"]), xentry(b"1-2", &[b"a", b"1"])]),
+                ),
+                s(&[b"XRANGE", b"xr", b"+", b"-"], Expect::Arr(vec![])),
+                s(&[b"XRANGE", b"xr", b"-", b"+", b"COUNT", b"0"], Expect::NilArray),
+                // COUNT 0 is read after the key: a missing one is empty, and
+                // another type WRONGTYPE.
+                s(&[b"XRANGE", b"xnone", b"-", b"+", b"COUNT", b"0"], Expect::Arr(vec![])),
+                s(&[b"XREVRANGE", b"xnone", b"+", b"-", b"COUNT", b"-1"], Expect::Arr(vec![])),
+                s(&[b"SET", b"xstr", b"x"], Expect::Ok),
+                s(&[b"XRANGE", b"xstr", b"-", b"+", b"COUNT", b"0"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XREVRANGE", b"xstr", b"+", b"-", b"COUNT", b"-1"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XRANGE", b"xr", b"x", b"+"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XRANGE", b"xr", b"-", b"+", b"LIMIT", b"1"], Expect::Err("ERR syntax error")),
+                s(&[b"XRANGE", b"xnone", b"-", b"+"], Expect::Arr(vec![])),
+                s(
+                    &[b"XRANGE", b"xr"],
+                    Expect::Err("ERR wrong number of arguments for 'xrange' command"),
+                ),
+                s(
+                    &[b"XREVRANGE", b"xr", b"+", b"-", b"COUNT", b"1"],
+                    Expect::Arr(vec![xentry(b"2-5", &[b"a", b"1", b"b", b"2"])]),
+                ),
+                s(
+                    &[b"XREVRANGE", b"xr", b"2-5", b"(1-1"],
+                    Expect::Arr(vec![
+                        xentry(b"2-5", &[b"a", b"1", b"b", b"2"]),
+                        xentry(b"1-2", &[b"a", b"1"]),
+                    ]),
+                ),
+            ],
+        },
+        Case {
+            family: "streams",
+            name: "streams: XDEL and exact XTRIM",
+            steps: vec![
+                s(&[b"XADD", b"xt", b"MAXLEN", b"2", b"1-1", b"f", b"v"], Expect::Str(b"1-1")),
+                s(&[b"XADD", b"xt", b"MAXLEN", b"2", b"2-1", b"f", b"v"], Expect::Str(b"2-1")),
+                s(&[b"XADD", b"xt", b"MAXLEN", b"=", b"2", b"3-1", b"f", b"v"], Expect::Str(b"3-1")),
+                s(
+                    &[b"XRANGE", b"xt", b"-", b"+"],
+                    Expect::Arr(vec![xentry(b"2-1", &[b"f", b"v"]), xentry(b"3-1", &[b"f", b"v"])]),
+                ),
+                s(&[b"XADD", b"xt", b"MINID", b"3", b"4-1", b"f", b"v"], Expect::Str(b"4-1")),
+                s(&[b"XLEN", b"xt"], Expect::Int(2)),
+                s(
+                    &[b"XADD", b"xt", b"MAXLEN", b"-1", b"7-1", b"f", b"v"],
+                    Expect::Err("ERR The MAXLEN argument must be >= 0."),
+                ),
+                s(
+                    &[b"XADD", b"xt", b"LIMIT", b"10", b"7-1", b"f", b"v"],
+                    Expect::Err(
+                        "ERR syntax error, LIMIT cannot be used without specifying a trimming strategy",
+                    ),
+                ),
+                s(
+                    &[b"XADD", b"xt", b"MAXLEN", b"1", b"LIMIT", b"10", b"7-1", b"f", b"v"],
+                    Expect::Err("ERR syntax error, LIMIT cannot be used without the special ~ option"),
+                ),
+                s(
+                    &[b"XADD", b"xt", b"MAXLEN", b"1", b"MINID", b"1", b"7-1", b"f", b"v"],
+                    Expect::Err(
+                        "ERR syntax error, MAXLEN and MINID options at the same time are not compatible",
+                    ),
+                ),
+                s(&[b"XADD", b"xt", b"9-1", b"f", b"v"], Expect::Str(b"9-1")),
+                s(&[b"XADD", b"xt", b"10-1", b"f", b"v"], Expect::Str(b"10-1")),
+                s(&[b"XTRIM", b"xt", b"MAXLEN", b"1"], Expect::Int(3)),
+                s(&[b"XTRIM", b"xt", b"MINID", b"0"], Expect::Int(0)),
+                s(&[b"XTRIM", b"xt", b"FOO", b"1"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"XTRIM", b"xt"],
+                    Expect::Err("ERR wrong number of arguments for 'xtrim' command"),
+                ),
+                s(&[b"XTRIM", b"xnone", b"MAXLEN", b"1"], Expect::Int(0)),
+                s(&[b"XADD", b"xt", b"11-1", b"f", b"v"], Expect::Str(b"11-1")),
+                s(&[b"XADD", b"xt", b"12-1", b"f", b"v"], Expect::Str(b"12-1")),
+                s(&[b"XDEL", b"xt", b"11-1", b"99-9"], Expect::Int(1)),
+                s(&[b"XDEL", b"xt", b"11-1"], Expect::Int(0)),
+                s(&[b"XDEL", b"xt", b"x"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XDEL", b"xnone", b"1-1"], Expect::Int(0)),
+                s(&[b"XTRIM", b"xt", b"MINID", b"12"], Expect::Int(1)),
+                s(&[b"XRANGE", b"xt", b"-", b"+"], Expect::Arr(vec![xentry(b"12-1", &[b"f", b"v"])])),
+                // An emptied stream stays, and its last ID still bounds XADD.
+                s(&[b"XTRIM", b"xt", b"MAXLEN", b"0"], Expect::Int(1)),
+                s(&[b"EXISTS", b"xt"], Expect::Int(1)),
+                s(&[b"XADD", b"xt", b"12-1", b"f", b"v"], Expect::Err("ERR The ID specified in XADD is equal or smaller than the target stream top item")),
+            ],
+        },
+        Case {
+            family: "streams",
+            name: "streams: XREAD without waiting",
+            steps: vec![
+                s(&[b"XADD", b"{xr}1", b"1-1", b"a", b"1"], Expect::Str(b"1-1")),
+                s(&[b"XADD", b"{xr}1", b"2-1", b"a", b"2"], Expect::Str(b"2-1")),
+                s(&[b"XADD", b"{xr}2", b"1-1", b"b", b"1"], Expect::Str(b"1-1")),
+                s(
+                    &[b"XREAD", b"STREAMS", b"{xr}1", b"0"],
+                    Expect::Arr(vec![Expect::Arr(vec![
+                        Expect::Str(b"{xr}1"),
+                        Expect::Arr(vec![xentry(b"1-1", &[b"a", b"1"]), xentry(b"2-1", &[b"a", b"2"])]),
+                    ])]),
+                ),
+                s(
+                    &[b"XREAD", b"COUNT", b"1", b"STREAMS", b"{xr}1", b"{xr}2", b"0", b"0"],
+                    Expect::Arr(vec![
+                        Expect::Arr(vec![
+                            Expect::Str(b"{xr}1"),
+                            Expect::Arr(vec![xentry(b"1-1", &[b"a", b"1"])]),
+                        ]),
+                        Expect::Arr(vec![
+                            Expect::Str(b"{xr}2"),
+                            Expect::Arr(vec![xentry(b"1-1", &[b"b", b"1"])]),
+                        ]),
+                    ]),
+                ),
+                s(
+                    &[b"XREAD", b"STREAMS", b"{xr}1", b"{xr}2", b"1-1", b"1-1"],
+                    Expect::Arr(vec![Expect::Arr(vec![
+                        Expect::Str(b"{xr}1"),
+                        Expect::Arr(vec![xentry(b"2-1", &[b"a", b"2"])]),
+                    ])]),
+                ),
+                s(&[b"XREAD", b"STREAMS", b"{xr}1", b"$"], Expect::NilArray),
+                s(
+                    &[b"XREAD", b"STREAMS", b"{xr}1", b"+"],
+                    Expect::Arr(vec![Expect::Arr(vec![
+                        Expect::Str(b"{xr}1"),
+                        Expect::Arr(vec![xentry(b"2-1", &[b"a", b"2"])]),
+                    ])]),
+                ),
+                s(&[b"XREAD", b"STREAMS", b"xnone", b"0"], Expect::NilArray),
+                s(
+                    &[b"XREAD", b"STREAMS", b"{xr}1", b"{xr}2", b"0"],
+                    Expect::Err(
+                        "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' \
+                         must be specified.",
+                    ),
+                ),
+                s(&[b"XREAD", b"STREAMS", b"{xr}1", b"x"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XREAD", b"FOO", b"STREAMS", b"{xr}1", b"0"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"XREAD", b"BLOCK", b"-1", b"STREAMS", b"{xr}1", b"0"],
+                    Expect::Err("ERR timeout is negative"),
+                ),
+                // A BLOCK with entries to read answers at once; with none,
+                // after 10 ms, a null.
+                s(
+                    &[b"XREAD", b"BLOCK", b"10", b"STREAMS", b"{xr}2", b"0"],
+                    Expect::Arr(vec![Expect::Arr(vec![
+                        Expect::Str(b"{xr}2"),
+                        Expect::Arr(vec![xentry(b"1-1", &[b"b", b"1"])]),
+                    ])]),
+                ),
+                s(&[b"XREAD", b"BLOCK", b"10", b"STREAMS", b"{xr}1", b"$"], Expect::NilArray),
+                s(&[b"SET", b"{xr}s", b"v"], Expect::Ok),
+                s(&[b"XREAD", b"STREAMS", b"{xr}s", b"0"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+            ],
+        },
+        // The libraries Redis loads into scripts (ADR-0052 D3), in Rust
+        // here, against Valkey's C ones: each step's reply is Valkey 9.1's,
+        // captured. `cmsgpack.pack(2^63)` is left out: the C library's cast
+        // of 2^63 to int64 differs by CPU. So is an object's key order:
+        // Valkey 9.1's tables order keys differently from Lua 5.1's, which
+        // Redis 8.2 and Flint share.
+        Case {
+            family: "lua",
+            name: "the cjson library, as Valkey bundles it",
+            steps: vec![
+                s(&[b"EVAL", r#"return cjson.encode({1,2,3})"#.as_bytes(), b"0"], Expect::Str(b"[1,2,3]")),
+                s(&[b"EVAL", r#"return cjson.encode({a=1})"#.as_bytes(), b"0"], Expect::Str(b"{\"a\":1}")),
+                s(&[b"EVAL", r#"return cjson.encode({})"#.as_bytes(), b"0"], Expect::Str(b"{}")),
+                s(&[b"EVAL", r#"return cjson.encode({{}})"#.as_bytes(), b"0"], Expect::Str(b"[{}]")),
+                s(&[b"EVAL", r#"return cjson.encode('a/b\"c\\d')"#.as_bytes(), b"0"], Expect::Str(b"\"a\\/b\\\"c\\\\d\"")),
+                s(&[b"EVAL", r#"return cjson.encode('\0\1\8\9\10\12\13\31\127\128\255')"#.as_bytes(), b"0"], Expect::Str(b"\"\\u0000\\u0001\\b\\t\\n\\f\\r\\u001f\\u007f\x80\xff\"")),
+                s(&[b"EVAL", r#"return cjson.encode(1)"#.as_bytes(), b"0"], Expect::Str(b"1")),
+                s(&[b"EVAL", r#"return cjson.encode(0.1)"#.as_bytes(), b"0"], Expect::Str(b"0.1")),
+                s(&[b"EVAL", r#"return cjson.encode(-0)"#.as_bytes(), b"0"], Expect::Str(b"-0")),
+                s(&[b"EVAL", r#"return cjson.encode(1e20)"#.as_bytes(), b"0"], Expect::Str(b"1e+20")),
+                s(&[b"EVAL", r#"return cjson.encode(3.14159265358979)"#.as_bytes(), b"0"], Expect::Str(b"3.1415926535898")),
+                s(&[b"EVAL", r#"return cjson.encode(2^53)"#.as_bytes(), b"0"], Expect::Str(b"9.007199254741e+15")),
+                s(&[b"EVAL", r#"return cjson.encode(123456789012345)"#.as_bytes(), b"0"], Expect::Str(b"1.2345678901234e+14")),
+                s(&[b"EVAL", r#"return cjson.encode(1/3)"#.as_bytes(), b"0"], Expect::Str(b"0.33333333333333")),
+                s(&[b"EVAL", r#"return cjson.encode(-1.5e-7)"#.as_bytes(), b"0"], Expect::Str(b"-1.5e-07")),
+                s(&[b"EVAL", r#"return cjson.encode(1/0)"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise number: must not be NaN or Inf script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.encode(0/0)"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise number: must not be NaN or Inf script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.encode(true)"#.as_bytes(), b"0"], Expect::Str(b"true")),
+                s(&[b"EVAL", r#"return cjson.encode(nil)"#.as_bytes(), b"0"], Expect::Str(b"null")),
+                s(&[b"EVAL", r#"return cjson.encode(cjson.null)"#.as_bytes(), b"0"], Expect::Str(b"null")),
+                s(&[b"EVAL", r#"return cjson.encode({[1]=1,[3]=3})"#.as_bytes(), b"0"], Expect::Str(b"[1,null,3]")),
+                s(&[b"EVAL", r#"return cjson.encode({[1]=1,[20]=1})"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise table: excessively sparse array script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.encode({[1]=1,[11]=1})"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise table: excessively sparse array script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.encode({[2]=1})"#.as_bytes(), b"0"], Expect::Str(b"[null,1]")),
+                s(&[b"EVAL", r#"return cjson.encode({1,a=2})"#.as_bytes(), b"0"], Expect::Str(b"{\"1\":1,\"a\":2}")),
+                s(&[b"EVAL", r#"return cjson.encode({[1.5]=1})"#.as_bytes(), b"0"], Expect::Str(b"{\"1.5\":1}")),
+                s(&[b"EVAL", r#"return cjson.encode({[true]=1})"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise boolean: table key must be a number or string script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.encode({x={y={z={1,2}}}})"#.as_bytes(), b"0"], Expect::Str(b"{\"x\":{\"y\":{\"z\":[1,2]}}}")),
+                s(&[b"EVAL", r#"return cjson.encode({b=1,a=2,c=3,d={e=4}})"#.as_bytes(), b"0"], Expect::Str(b"{\"a\":2,\"d\":{\"e\":4},\"c\":3,\"b\":1}")),
+                s(&[b"EVAL", r#"local t = {} local cur = t for i=1,1001 do cur[1] = {} cur = cur[1] end return cjson.encode(t)"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise, excessive nesting (1001) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.encode({[-1]=1})"#.as_bytes(), b"0"], Expect::Str(b"{\"-1\":1}")),
+                s(&[b"EVAL", r#"return cjson.encode({[0]=1})"#.as_bytes(), b"0"], Expect::Str(b"{\"0\":1}")),
+                s(&[b"EVAL", r#"return cjson.encode('\226\130\172')"#.as_bytes(), b"0"], Expect::Str(b"\"\xe2\x82\xac\"")),
+                s(&[b"EVAL", r#"return cjson.encode(cjson.decode('[1,2,{"a":null,"b":[true,false]}]'))"#.as_bytes(), b"0"], Expect::Str(b"[1,2,{\"a\":null,\"b\":[true,false]}]")),
+                s(&[b"EVAL", r#"local v = cjson.decode('{"a":1.5e3,"b":"x\\u00e9\\ud83d\\ude00\\n"}') return {tostring(v.a), v.b}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Str(b"1500"), Expect::Str(b"x\xc3\xa9\xf0\x9f\x98\x80\x0a")])),
+                s(&[b"EVAL", r#"return type(cjson.decode('null'))"#.as_bytes(), b"0"], Expect::Str(b"userdata")),
+                s(&[b"EVAL", r#"return tostring(cjson.decode('null') == cjson.null)"#.as_bytes(), b"0"], Expect::Str(b"true")),
+                s(&[b"EVAL", r#"return cjson.decode('[1,2')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Expected comma or array end but found T_END at character 5 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.decode('{"a":}')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Expected value but found T_OBJ_END at character 6 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.decode('')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Expected value but found T_END at character 1 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.decode('nul')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Expected value but found invalid token at character 1 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.decode('"abc')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Expected value but found unexpected end of string at character 5 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.decode('[1] x')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Expected the end but found invalid token at character 5 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.decode(5)"#.as_bytes(), b"0"], Expect::Int(5)),
+                s(&[b"EVAL", r#"return tostring(cjson.decode('12345678901234567890'))"#.as_bytes(), b"0"], Expect::Str(b"1.2345678901235e+19")),
+                s(&[b"EVAL", r#"return tostring(cjson.decode('-0'))"#.as_bytes(), b"0"], Expect::Str(b"-0")),
+                s(&[b"EVAL", r#"return tostring(cjson.decode('1e400'))"#.as_bytes(), b"0"], Expect::Str(b"inf")),
+                s(&[b"EVAL", r#"return #cjson.decode('[]')"#.as_bytes(), b"0"], Expect::Int(0)),
+                s(&[b"EVAL", r#"return cjson.encode(cjson.decode('{}'))"#.as_bytes(), b"0"], Expect::Str(b"{}")),
+                s(&[b"EVAL", r#"return cjson.encode(cjson.decode('[]'))"#.as_bytes(), b"0"], Expect::Str(b"{}")),
+                s(&[b"EVAL", r#"return cjson.decode('"\\x"')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Expected value but found invalid escape code at character 2 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.decode('[0x10]')"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(16)])),
+                s(&[b"EVAL", r#"return tostring(cjson.decode(' 7 '))"#.as_bytes(), b"0"], Expect::Str(b"7")),
+            ],
+        },
+        Case {
+            family: "lua",
+            name: "the cmsgpack library, as Valkey bundles it",
+            steps: vec![
+                s(&[b"EVAL", r#"return cmsgpack.pack(1)"#.as_bytes(), b"0"], Expect::Str(b"\x01")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(-1)"#.as_bytes(), b"0"], Expect::Str(b"\xff")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(127)"#.as_bytes(), b"0"], Expect::Str(b"\x7f")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(128)"#.as_bytes(), b"0"], Expect::Str(b"\xcc\x80")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(255)"#.as_bytes(), b"0"], Expect::Str(b"\xcc\xff")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(256)"#.as_bytes(), b"0"], Expect::Str(b"\xcd\x01\x00")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(65536)"#.as_bytes(), b"0"], Expect::Str(b"\xce\x00\x01\x00\x00")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(2^32)"#.as_bytes(), b"0"], Expect::Str(b"\xcf\x00\x00\x00\x01\x00\x00\x00\x00")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(-32)"#.as_bytes(), b"0"], Expect::Str(b"\xe0")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(-33)"#.as_bytes(), b"0"], Expect::Str(b"\xd0\xdf")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(-129)"#.as_bytes(), b"0"], Expect::Str(b"\xd1\xff\x7f")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(-32769)"#.as_bytes(), b"0"], Expect::Str(b"\xd2\xff\xff\x7f\xff")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(-2^31-1)"#.as_bytes(), b"0"], Expect::Str(b"\xd3\xff\xff\xff\xff\x7f\xff\xff\xff")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(1.5)"#.as_bytes(), b"0"], Expect::Str(b"\xca?\xc0\x00\x00")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(0.1)"#.as_bytes(), b"0"], Expect::Str(b"\xcb?\xb9\x99\x99\x99\x99\x99\x9a")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(1/0)"#.as_bytes(), b"0"], Expect::Str(b"\xca\x7f\x80\x00\x00")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(-2^63)"#.as_bytes(), b"0"], Expect::Str(b"\xd3\x80\x00\x00\x00\x00\x00\x00\x00")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(2^64)"#.as_bytes(), b"0"], Expect::Str(b"\xca_\x80\x00\x00")),
+                s(&[b"EVAL", r#"return cmsgpack.pack('abc')"#.as_bytes(), b"0"], Expect::Str(b"\xa3abc")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(string.rep('x',32))"#.as_bytes(), b"0"], Expect::Str(b"\xd9 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(string.rep('x',256))"#.as_bytes(), b"0"], Expect::Str(b"\xda\x01\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(nil)"#.as_bytes(), b"0"], Expect::Str(b"\xc0")),
+                s(&[b"EVAL", r#"return cmsgpack.pack(true, false)"#.as_bytes(), b"0"], Expect::Str(b"\xc3\xc2")),
+                s(&[b"EVAL", r#"return cmsgpack.pack({1,2,3})"#.as_bytes(), b"0"], Expect::Str(b"\x93\x01\x02\x03")),
+                s(&[b"EVAL", r#"return cmsgpack.pack({a=1})"#.as_bytes(), b"0"], Expect::Str(b"\x81\xa1a\x01")),
+                s(&[b"EVAL", r#"return cmsgpack.pack({})"#.as_bytes(), b"0"], Expect::Str(b"\x90")),
+                s(&[b"EVAL", r#"return cmsgpack.pack({[1]=1,[3]=3})"#.as_bytes(), b"0"], Expect::Str(b"\x82\x01\x01\x03\x03")),
+                s(&[b"EVAL", r#"local t={} for i=1,16 do t[i]=i end return cmsgpack.pack(t)"#.as_bytes(), b"0"], Expect::Str(b"\xdc\x00\x10\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10")),
+                s(&[b"EVAL", r#"local t = {} local cur = t for i=1,20 do cur[1] = {} cur = cur[1] end return cmsgpack.pack(t)"#.as_bytes(), b"0"], Expect::Str(b"\x91\x91\x91\x91\x91\x91\x91\x91\x91\x91\x91\x91\x91\x91\x91\x91\xc0")),
+                s(&[b"EVAL", r#"return cmsgpack.pack()"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #0 to 'pack' (MessagePack pack needs input.) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return {cmsgpack.unpack(cmsgpack.pack(1, 'a', {1,2}, {x=1}))}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(1), Expect::Str(b"a"), Expect::Arr(vec![Expect::Int(1), Expect::Int(2)]), Expect::Arr(vec![])])),
+                s(&[b"EVAL", r#"local a = cmsgpack.unpack(cmsgpack.pack({x={y=2}})) return a.x.y"#.as_bytes(), b"0"], Expect::Int(2)),
+                s(&[b"EVAL", r#"return cmsgpack.unpack('\145')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Missing bytes in input. script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cmsgpack.unpack('\193')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Bad data format in input. script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cmsgpack.unpack('')"#.as_bytes(), b"0"], Expect::Nil),
+                s(&[b"EVAL", r#"return tostring(cmsgpack.unpack('\203\63\240\0\0\0\0\0\0'))"#.as_bytes(), b"0"], Expect::Str(b"1")),
+                s(&[b"EVAL", r#"return tostring(cmsgpack.unpack('\207\255\255\255\255\255\255\255\255'))"#.as_bytes(), b"0"], Expect::Str(b"-1")),
+                s(&[b"EVAL", r#"return tostring(cmsgpack.unpack('\211\128\0\0\0\0\0\0\0'))"#.as_bytes(), b"0"], Expect::Str(b"-9.2233720368548e+18")),
+                s(&[b"EVAL", r#"return cmsgpack.unpack('\196\3abc')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Bad data format in input. script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return {cmsgpack.unpack_one(cmsgpack.pack(1,2,3))}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(1), Expect::Int(1)])),
+                s(&[b"EVAL", r#"return {cmsgpack.unpack_one(cmsgpack.pack(1,2,3), 1)}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(2), Expect::Int(2)])),
+                s(&[b"EVAL", r#"return {cmsgpack.unpack_limit(cmsgpack.pack(1,2,3), 2)}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(2), Expect::Int(1), Expect::Int(2)])),
+                s(&[b"EVAL", r#"return {cmsgpack.unpack_limit(cmsgpack.pack(1,2,3), 2, 1)}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(-1), Expect::Int(2), Expect::Int(3)])),
+                s(&[b"EVAL", r#"return {cmsgpack.unpack(cmsgpack.pack(nil, 1))}"#.as_bytes(), b"0"], Expect::Arr(vec![])),
+                s(&[b"EVAL", r#"return {cmsgpack.unpack('\147\1\192\3')}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Arr(vec![Expect::Int(1)])])),
+            ],
+        },
+        Case {
+            family: "lua",
+            name: "the bit and struct libraries, as Valkey bundles them",
+            steps: vec![
+                s(&[b"EVAL", r#"return bit.band(0xff, 0x0f)"#.as_bytes(), b"0"], Expect::Int(15)),
+                s(&[b"EVAL", r#"return bit.bor(1, 2, 4)"#.as_bytes(), b"0"], Expect::Int(7)),
+                s(&[b"EVAL", r#"return bit.bxor(5, 3)"#.as_bytes(), b"0"], Expect::Int(6)),
+                s(&[b"EVAL", r#"return bit.bnot(0)"#.as_bytes(), b"0"], Expect::Int(-1)),
+                s(&[b"EVAL", r#"return bit.lshift(1, 31)"#.as_bytes(), b"0"], Expect::Int(-2147483648)),
+                s(&[b"EVAL", r#"return bit.rshift(-1, 28)"#.as_bytes(), b"0"], Expect::Int(15)),
+                s(&[b"EVAL", r#"return bit.arshift(-256, 4)"#.as_bytes(), b"0"], Expect::Int(-16)),
+                s(&[b"EVAL", r#"return bit.rol(1, 33)"#.as_bytes(), b"0"], Expect::Int(2)),
+                s(&[b"EVAL", r#"return bit.ror(1, 1)"#.as_bytes(), b"0"], Expect::Int(-2147483648)),
+                s(&[b"EVAL", r#"return bit.bswap(0x12345678)"#.as_bytes(), b"0"], Expect::Int(2018915346)),
+                s(&[b"EVAL", r#"return bit.tobit(2^32 + 1)"#.as_bytes(), b"0"], Expect::Int(1)),
+                s(&[b"EVAL", r#"return bit.tohex(255)"#.as_bytes(), b"0"], Expect::Str(b"000000ff")),
+                s(&[b"EVAL", r#"return bit.tohex(255, -4)"#.as_bytes(), b"0"], Expect::Str(b"00FF")),
+                s(&[b"EVAL", r#"return bit.tohex(-1, 2)"#.as_bytes(), b"0"], Expect::Str(b"ff")),
+                s(&[b"EVAL", r#"return bit.tobit(1.5)"#.as_bytes(), b"0"], Expect::Int(2)),
+                s(&[b"EVAL", r#"return bit.band()"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #1 to 'band' (number expected, got no value) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return bit.band('x')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #1 to 'band' (number expected, got string) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return struct.pack('>I2', 258)"#.as_bytes(), b"0"], Expect::Str(b"\x01\x02")),
+                s(&[b"EVAL", r#"return struct.pack('<i4', -2)"#.as_bytes(), b"0"], Expect::Str(b"\xfe\xff\xff\xff")),
+                s(&[b"EVAL", r#"return {struct.unpack('>I2', '\1\2')}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(258), Expect::Int(3)])),
+                s(&[b"EVAL", r#"return struct.size('>i4I2')"#.as_bytes(), b"0"], Expect::Int(6)),
+                s(&[b"EVAL", r#"return struct.pack('b', 300)"#.as_bytes(), b"0"], Expect::Str(b",")),
+                s(&[b"EVAL", r#"return struct.pack('s', 'ab')"#.as_bytes(), b"0"], Expect::Str(b"ab\x00")),
+                s(&[b"EVAL", r#"return {struct.unpack('c2', 'abcd')}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Str(b"ab"), Expect::Int(3)])),
+            ],
+        },
+        // The libraries at their edges, against Valkey's C: an error names
+        // the script's line even when the script tail-calls, and the
+        // function as the script called it; nesting and counts fail where
+        // Valkey's Lua stack runs out (8,000 slots), with its message.
+        Case {
+            family: "lua",
+            name: "the libraries at their limits, as Valkey's C reaches them",
+            steps: vec![
+                s(&[b"EVAL", r#"local ok, e = pcall(cjson.decode, '[1') return e"#.as_bytes(), b"0"], Expect::Str(b"Expected comma or array end but found T_END at character 3")),
+                s(&[b"EVAL", r#"local ok, e = pcall(function() return cjson.decode('[1') end) return e"#.as_bytes(), b"0"], Expect::Str(b"user_script:1: Expected comma or array end but found T_END at character 3")),
+                s(&[b"EVAL", r#"local ok, e = pcall(cjson.decode, {}) return e"#.as_bytes(), b"0"], Expect::Str(b"bad argument #1 to '?' (string expected, got table)")),
+                s(&[b"EVAL", r#"local d = cjson.decode return d({})"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #1 to 'd' (string expected, got table) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson:decode('1')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: calling 'decode' on bad self (expected 1 argument) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return bit.bor(1, 'x', 'y')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #3 to 'bor' (number expected, got string) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return bit.tohex(255, nil)"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #2 to 'tohex' (number expected, got nil) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return struct.pack('ii', 1)"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #3 to 'pack' (number expected, got nil) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return struct.pack('q')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #1 to 'pack' (invalid format option 'q') script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return {struct.unpack('c0', '\3abc')}"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: format 'c0' needs a previous size script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return {struct.unpack('bc0', '\3abcd')}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Str(b"abc"), Expect::Int(5)])),
+                s(&[b"EVAL", r#"return {struct.unpack('sc0', '2\0abcd')}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Str(b"ab"), Expect::Int(5)])),
+                s(&[b"EVAL", r#"return cjson.decode('\0a')"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: JSON parser does not support UTF-16 or UTF-32 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cjson.encode({[-1/0]=1})"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise number: must not be NaN or Inf script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return cmsgpack.unpack('\129\192\1')"#.as_bytes(), b"0"], Expect::Err("ERR table index is nil script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return type(cjson.decode(string.rep('[', 1000) .. string.rep(']', 1000)))"#.as_bytes(), b"0"], Expect::Str(b"table")),
+                s(&[b"EVAL", r#"return cjson.decode(string.rep('{"a":', 1001) .. '1' .. string.rep('}', 1001))"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Found too many nested data structures (1001) at character 5001 script: on @user_script:1.")),
+                s(&[b"EVAL", r#"local t = {} t[1] = t return cjson.encode(t)"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise, excessive nesting (1001) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return type(cmsgpack.unpack(string.rep('\145', 3999) .. '\1'))"#.as_bytes(), b"0"], Expect::Str(b"table")),
+                s(&[b"EVAL", r#"return type(cmsgpack.unpack(string.rep('\145', 4000) .. '\1'))"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: stack overflow (in function mp_decode_to_lua_array) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return type(cmsgpack.unpack(string.rep('\129\1', 3999) .. '\1'))"#.as_bytes(), b"0"], Expect::Str(b"table")),
+                s(&[b"EVAL", r#"return type(cmsgpack.unpack(string.rep('\129\1', 4000) .. '\1'))"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: stack overflow (too many return values at once; use unpack_one or unpack_limit instead.) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return type(cmsgpack.unpack(string.rep('\145', 4000)))"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: stack overflow (in function mp_decode_to_lua_array) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return type(cmsgpack.unpack(string.rep('\145', 3999)))"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Missing bytes in input. script: on @user_script:1.")),
+                s(&[b"EVAL", r#"local t = {cmsgpack.unpack(string.rep('\1', 7999))} return #t"#.as_bytes(), b"0"], Expect::Int(7999)),
+                s(&[b"EVAL", r#"local t = {cmsgpack.unpack(string.rep('\1', 8000))} return #t"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: stack overflow (too many return values at once; use unpack_one or unpack_limit instead.) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"local t = {cmsgpack.unpack_limit(string.rep('\1', 9000), 7999)} return #t"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: stack overflow (in function mp_unpack_full) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"local t = {} for i=1,4000 do t[i]='s' end return #cmsgpack.pack(unpack(t))"#.as_bytes(), b"0"], Expect::Int(8000)),
+                s(&[b"EVAL", r#"local t = {} for i=1,4001 do t[i]='s' end return #cmsgpack.pack(unpack(t))"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: bad argument #0 to 'pack' (Too many arguments for MessagePack pack.) script: on @user_script:1.")),
+                s(&[b"EVAL", r#"local t = {} for i=1,9000 do t['k'..i]=i end return #cmsgpack.pack(t)"#.as_bytes(), b"0"], Expect::Int(79514)),
+                s(&[b"EVAL", r#"return select('#', struct.unpack(string.rep('c1', 7997), string.rep('x', 9000)))"#.as_bytes(), b"0"], Expect::Int(7998)),
+                s(&[b"EVAL", r#"return select('#', struct.unpack(string.rep('c1', 7998), string.rep('x', 9000)))"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: stack overflow (too many results) script: on @user_script:1.")),
+                s(&[b"EVAL", b"local a = 1\nlocal b = 2\nreturn bit.band('x')", b"0"], Expect::Err("ERR user_script:3: bad argument #1 to 'band' (number expected, got string) script: on @user_script:3.")),
+            ],
+        },
+        // BUG-0246: `redis.call` took one mlua reference per argument, and
+        // ran out near 8,000; Lua's `unpack` stops at 7,997.
+        Case {
+            family: "lua",
+            name: "redis.call takes as many arguments as unpack gives",
+            steps: vec![
+                s(&[b"EVAL", r#"local t = {} for i=1,7997 do t[i]='{a}x'..i end return redis.call('DEL', unpack(t))"#.as_bytes(), b"1", b"{a}k"], Expect::Int(0)),
+                s(&[b"EVAL", r#"local t = {} for i=1,7997 do t[i]='{a}x'..i end return redis.pcall('DEL', unpack(t))"#.as_bytes(), b"1", b"{a}k"], Expect::Int(0)),
+                s(&[b"EVAL", r#"local t = {} for i=1,7997 do t[i]='{a}x'..i end return #redis.call('MGET', unpack(t))"#.as_bytes(), b"1", b"{a}k"], Expect::Int(7997)),
             ],
         },
         // A seat holds no client's subscription: a proxy does, and
@@ -6119,9 +6562,15 @@ impl Client {
         };
         // A one-field BF.INFO is a one-pair map under RESP3; RESP2's reply
         // is the value alone, in a one-element array (BUG-0239).
-        match flint_resp::bf_info_field(args) {
+        let v = match flint_resp::bf_info_field(args) {
             true => flint_resp::bf_info_field_resp2(&v),
             false => v,
+        };
+        // XREAD is a map under RESP3 and a list of pairs under RESP2
+        // (ADR-0052 D6).
+        match args.first() {
+            Some(n) if n.eq_ignore_ascii_case(b"XREAD") => flint_resp::xread_resp2(&v),
+            _ => v,
         }
     }
 

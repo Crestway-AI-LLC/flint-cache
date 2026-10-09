@@ -36,6 +36,9 @@ pub fn reduces_space(name: &[u8]) -> bool {
             | b"PEXPIRE"
             | b"EXPIREAT"
             | b"PEXPIREAT"
+            // A stream's entries go, its key stays (ADR-0052 D6).
+            | b"XDEL"
+            | b"XTRIM"
     )
 }
 
@@ -61,6 +64,42 @@ pub fn json_debug_key(args: &[Vec<u8>]) -> Option<Option<&[u8]>> {
         Some(sub) if sub.eq_ignore_ascii_case(b"MEMORY") => args.get(2).map(|k| k.as_slice()),
         _ => None,
     })
+}
+
+/// XREAD's keys (ADR-0052 D6): the first half of what follows `STREAMS`,
+/// the second half being their IDs. `None` when `args` is not an XREAD, or
+/// has no `STREAMS` or an odd count after it, which the seat refuses. The
+/// options before `STREAMS` each take one value, so a `STREAMS` among them
+/// is a value and not the keyword, as Redis reads it.
+pub fn xread_keys(args: &[Vec<u8>]) -> Option<&[Vec<u8>]> {
+    if !args.first()?.eq_ignore_ascii_case(b"XREAD") {
+        return None;
+    }
+    let mut i = 1;
+    while i < args.len() {
+        if args[i].eq_ignore_ascii_case(b"STREAMS") {
+            let rest = &args[i + 1..];
+            if rest.is_empty() || rest.len() % 2 == 1 {
+                return None;
+            }
+            return Some(&rest[..rest.len() / 2]);
+        }
+        i += 2;
+    }
+    None
+}
+
+/// Whether an XREAD asks to wait (`BLOCK`): only then does the proxy make
+/// its client wait, as for the blocking pops.
+pub fn xread_blocks(args: &[Vec<u8>]) -> bool {
+    let Some(keys) = xread_keys(args) else {
+        return false;
+    };
+    let options = args.len() - 2 * keys.len() - 1;
+    args[1..options]
+        .iter()
+        .step_by(2)
+        .any(|o| o.eq_ignore_ascii_case(b"BLOCK"))
 }
 
 /// Whether a `FLUSHALL` or `FLUSHDB` has arguments Redis accepts: none, or
@@ -188,6 +227,10 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"BF.MADD"
             | b"BF.RESERVE"
             | b"BF.INSERT"
+            // Streams (ADR-0052 D6).
+            | b"XADD"
+            | b"XDEL"
+            | b"XTRIM"
     )
 }
 
@@ -281,6 +324,10 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"BF.MEXISTS"
             | b"BF.CARD"
             | b"BF.INFO"
+            | b"XLEN"
+            | b"XRANGE"
+            | b"XREVRANGE"
+            | b"XREAD"
     )
 }
 

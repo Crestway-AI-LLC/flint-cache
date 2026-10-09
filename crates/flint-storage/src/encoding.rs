@@ -40,12 +40,16 @@ pub enum ValueType {
     /// it. Blocks materialize on first use, so an absent row reads as
     /// all-zero — which is already the right answer for "nothing here".
     Bloom = 6,
+    /// A stream (ADR-0052 D6): [`StreamMeta`] in the metadata row, and one
+    /// subkey row per entry, its field `0x00 | ms(8B BE) | seq(8B BE)` so the
+    /// rows sort in ID order.
+    Stream = 7,
 }
 
 impl ValueType {
     /// Every type, for a lookup by the name TYPE answers (SCAN's TYPE
     /// filter), so that name is spelled in one place (BUG-0241).
-    pub const ALL: [ValueType; 7] = [
+    pub const ALL: [ValueType; 8] = [
         Self::String,
         Self::Hash,
         Self::Set,
@@ -53,6 +57,7 @@ impl ValueType {
         Self::List,
         Self::Json,
         Self::Bloom,
+        Self::Stream,
     ];
 
     pub fn from_flags(flags: u8) -> Option<Self> {
@@ -64,6 +69,7 @@ impl ValueType {
             4 => Some(Self::List),
             5 => Some(Self::Json),
             6 => Some(Self::Bloom),
+            7 => Some(Self::Stream),
             _ => None,
         }
     }
@@ -83,6 +89,7 @@ impl ValueType {
             // TYPE recognises a filter (Jeff, 2026-10-08; ADR-0016 D7.1
             // answered `bloom` until then).
             Self::Bloom => "MBbloom--",
+            Self::Stream => "stream",
         }
     }
 }
@@ -582,6 +589,116 @@ impl ListMeta {
         })
     }
 }
+
+/// A stream entry's ID: milliseconds and a sequence number, ordered as
+/// the pair (ADR-0052 D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+pub struct StreamId {
+    pub ms: u64,
+    pub seq: u64,
+}
+
+impl StreamId {
+    pub const MIN: StreamId = StreamId { ms: 0, seq: 0 };
+    pub const MAX: StreamId = StreamId {
+        ms: u64::MAX,
+        seq: u64::MAX,
+    };
+
+    /// Big-endian, so byte order is ID order.
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&self.ms.to_be_bytes());
+        b[8..].copy_from_slice(&self.seq.to_be_bytes());
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        Some(Self {
+            ms: u64::from_be_bytes(b.get(..8)?.try_into().ok()?),
+            seq: u64::from_be_bytes(b.get(8..16)?.try_into().ok()?),
+        })
+    }
+
+    /// The next ID up, or `None` past the last.
+    pub fn next(self) -> Option<Self> {
+        match self.seq.checked_add(1) {
+            Some(seq) => Some(Self { ms: self.ms, seq }),
+            None => Some(Self {
+                ms: self.ms.checked_add(1)?,
+                seq: 0,
+            }),
+        }
+    }
+
+    /// The next ID down, or `None` below the first.
+    pub fn prev(self) -> Option<Self> {
+        match self.seq.checked_sub(1) {
+            Some(seq) => Some(Self { ms: self.ms, seq }),
+            None => Some(Self {
+                ms: self.ms.checked_sub(1)?,
+                seq: u64::MAX,
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.ms, self.seq)
+    }
+}
+
+/// A stream's metadata (ADR-0052 D6): `header | version | size | bytes |
+/// last_id(16B) | max_deleted_id(16B) | entries_added(8B BE)`.
+///
+/// `size` counts entries and `bytes` their fields and values. `last_id` is
+/// the last ID ever added, which a new entry must exceed even after it was
+/// deleted. `max_deleted_id` and `entries_added` are what Redis 7 keeps for
+/// consumer groups' lag; they are kept from the first release that writes a
+/// stream, so groups can come later without a second format change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamMeta {
+    pub base: ComplexMeta,
+    pub last_id: StreamId,
+    pub max_deleted_id: StreamId,
+    pub entries_added: u64,
+}
+
+impl StreamMeta {
+    pub fn new(version: u64) -> Self {
+        Self {
+            base: ComplexMeta::new(ValueType::Stream, version),
+            last_id: StreamId::MIN,
+            max_deleted_id: StreamId::MIN,
+            entries_added: 0,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.base.encode();
+        out.extend_from_slice(&self.last_id.to_bytes());
+        out.extend_from_slice(&self.max_deleted_id.to_bytes());
+        out.extend_from_slice(&self.entries_added.to_be_bytes());
+        out
+    }
+
+    pub fn decode(row: &[u8]) -> Option<Self> {
+        let base = ComplexMeta::decode(row)?;
+        let off = head_len(row[0]) + COMPLEX_TAIL_LEN;
+        let tail = row.get(off..off + 40)?;
+        Some(Self {
+            base,
+            last_id: StreamId::from_bytes(&tail[..16])?,
+            max_deleted_id: StreamId::from_bytes(&tail[16..32])?,
+            entries_added: u64::from_be_bytes(tail[32..40].try_into().ok()?),
+        })
+    }
+}
+
+/// The leading byte of a stream entry row's field; other kinds of row a
+/// stream may hold later (consumer groups) take other bytes.
+pub const STREAM_ENTRY_TAG: u8 = 0;
 
 /// Hash-algorithm id recorded in every Bloom filter's metadata row.
 ///

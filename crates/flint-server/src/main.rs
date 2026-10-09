@@ -19,6 +19,7 @@ mod migrate;
 mod pubsub;
 mod repl_hub;
 mod script;
+mod script_libs;
 mod write_lock;
 mod write_queue;
 
@@ -94,6 +95,9 @@ const ACCEPTED_FLAGS: &[&str] = &[
     "--rewind-snaps",
     "--script-memory-limit-mb",
     "--script-time-limit-ms",
+    // The one switch, which takes no value (ADR-0052 D6): XADD may create a
+    // stream.
+    "--streams",
     "--wal-fsync-ms",
     "--wal-headroom-seq",
     "--wal-size-limit-mb",
@@ -110,10 +114,10 @@ const ACCEPTED_FLAGS: &[&str] = &[
 /// --version early exits so those keep working, and before anything binds so
 /// a refusal costs nothing.
 ///
-/// Only `--`-prefixed tokens are inspected. Every accepted flag takes a value
-/// (they are all read through `arg()`, which returns the token after the
-/// name), and no value this binary takes begins with `--`: they are ports,
-/// paths, addresses, byte counts and engine names.
+/// Only `--`-prefixed tokens are inspected. Every accepted flag but
+/// `--streams` takes a value (read through `arg()`, which returns the token
+/// after the name), and no value this binary takes begins with `--`: they are
+/// ports, paths, addresses, byte counts and engine names.
 /// Leave NOW, without running anyone's static destructors.
 ///
 /// `std::process::exit` skips Rust destructors but still runs libc `atexit` /
@@ -3080,7 +3084,15 @@ fn main() -> std::io::Result<()> {
                 .map(|mb| mb << 20)
                 .unwrap_or(script::DEFAULT_MEMORY_LIMIT),
         },
+        // ADR-0052 D6: XADD creates a stream only when an operator says so,
+        // in the first release that serves streams; the next turns it on.
+        streams: std::env::args().any(|a| a == "--streams"),
     };
+    if limits.streams {
+        eprintln!(
+            "streams: on (XADD may create a stream; this fleet cannot roll back below this release while it holds one)"
+        );
+    }
     if limits.max_value_bytes != flint_storage::DEFAULT_MAX_VALUE_BYTES {
         eprintln!(
             "max-value-bytes: {}",
