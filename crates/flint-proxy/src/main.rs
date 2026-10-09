@@ -74,6 +74,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use flint_commands::REDIS_COMPAT_VERSION;
 use flint_resp::{Decoded, Value, decode, encode, encode_proto};
 use flint_slot::slot_for_key;
 
@@ -4632,11 +4633,6 @@ async fn scan_forward(
         keys,
     ]))
 }
-
-/// The Redis version `INFO` reports, as Valkey 9.1 reports it: the last Redis
-/// release Valkey forked from, frozen there so that clients gating features
-/// on it keep working (ADR-0052 D1).
-const REDIS_COMPAT_VERSION: &str = "7.2.4";
 
 /// `INFO [section ...]`, answered by the proxy itself (BUG-0176).
 ///

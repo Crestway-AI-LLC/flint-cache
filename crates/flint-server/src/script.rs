@@ -232,8 +232,9 @@ impl Engine {
     fn build(ns: &[u8], memory_bytes: usize) -> mlua::Result<Engine> {
         let lua = sandbox(memory_bytes)?;
         // cjson, cmsgpack, bit and struct (ADR-0052 D3), made read-only by
-        // the prelude with the rest.
-        crate::script_libs::install(&lua)?;
+        // the prelude with the rest; it records each read-only stand-in in
+        // `stand_ins`, which the libraries' encoders read through.
+        let stand_ins = crate::script_libs::install(&lua)?;
         let g = lua.globals();
         let xpcall: Function = g.raw_get("xpcall")?;
         let tostring: Function = g.raw_get("tostring")?;
@@ -299,6 +300,11 @@ impl Engine {
         ] {
             redis.raw_set(name, v)?;
         }
+        // The version the proxy's INFO reports, which scripts that gate on
+        // it read here (BUG-0247): "7.2.4", and 0x070204.
+        let version = flint_commands::REDIS_COMPAT_VERSION;
+        redis.raw_set("REDIS_VERSION", version)?;
+        redis.raw_set("REDIS_VERSION_NUM", version_num(version))?;
         // Upstream's arity check, raised as a call's error is, so the reply
         // names the script's line (BUG-0225). A Lua wrapper would lose it to
         // `return redis.sha1hex()`, a tail call that drops the script's frame.
@@ -320,7 +326,7 @@ impl Engine {
         lua.load(PRELUDE)
             .set_name("=flint")
             .set_mode(ChunkMode::Text)
-            .call::<()>((take_pending, is_dead))?;
+            .call::<()>((take_pending, is_dead, stand_ins))?;
         Ok(Engine {
             lua,
             ns: ns.to_vec(),
@@ -571,7 +577,7 @@ fn execute(
 /// private. `redis.call` and `redis.pcall` are not here: they borrow each
 /// call's store, and are put into `redis` for the call alone.
 const PRELUDE: &str = r#"
-local take_pending, is_dead = ...
+local take_pending, is_dead, protected = ...
 local error, type, rawget, tostring, pairs, ipairs = error, type, rawget, tostring, pairs, ipairs
 local setmetatable, getmetatable = setmetatable, getmetatable
 local rawpcall, rawxpcall, coresume, raw_rawset = pcall, xpcall, coroutine.resume, rawset
@@ -616,28 +622,64 @@ redis.breakpoint = function() return false end
 redis.debug = function() end
 
 -- Read-only views of the libraries and of redis: nothing one script does
--- to them survives into the next script on this state.
-local protected = {}
+-- to them survives into the next script on this state. Each is an empty
+-- stand-in that reads through to the table behind it; `protected` maps the
+-- stand-in to that table (and `_G` to true), and the libraries' encoders
+-- read it too.
 local function readonly(t)
   local p = setmetatable({}, {
     __index = t,
     __newindex = function() error("Attempt to modify a readonly table", 2) end,
     __metatable = false,
   })
-  protected[p] = true
+  protected[p] = t
   return p
 end
 local co = {}
 for k, v in pairs(coroutine) do co[k] = v end
 co.resume = function(...) return live(unwrap(coresume(...))) end
+-- Stand-ins come and go with `cjson.new`, so they are held weakly.
+setmetatable(protected, { __mode = "k" })
+-- lua-cjson's `new` makes another module; here each is another read-only
+-- stand-in for the one, whose settings are fixed anyway.
+local real_cjson = cjson
+raw_rawset(real_cjson, "new", function() return readonly(real_cjson) end)
 for _, name in ipairs({ "string", "table", "math", "redis", "cjson", "cmsgpack", "bit", "struct" }) do
   raw_rawset(_G, name, readonly(_G[name]))
 end
+-- Valkey's name for `redis`, which its scripts may use (`server.call`).
+raw_rawset(_G, "server", rawget(_G, "redis"))
 raw_rawset(_G, "coroutine", readonly(co))
 raw_rawset(_G, "pcall", function(...) return live(unwrap(rawpcall(...))) end)
 raw_rawset(_G, "xpcall", function(...) return live(discard(rawxpcall(...))) end)
+-- Valkey marks the real tables read-only in its patched Lua, so a script
+-- that lists one sees its functions (BUG-0247). These walk a stand-in as the
+-- table behind it, and never hand the script that table: `pairs` answers the
+-- stand-in as its state. A write to either is refused bare, as Valkey's
+-- interpreter refuses it.
+local rawnext, base_pairs, base_rawget = next, pairs, rawget
+local function behind(t)
+  local real = protected[t]
+  if type(real) == "table" then return real end
+  return t
+end
+local function next_through(t, k) return rawnext(behind(t), k) end
+raw_rawset(_G, "next", next_through)
+raw_rawset(_G, "pairs", function(t)
+  if type(protected[t]) == "table" then return next_through, t, nil end
+  return base_pairs(t)
+end)
+raw_rawset(_G, "rawget", function(t, k) return base_rawget(behind(t), k) end)
+raw_rawset(_G, "getmetatable", function(t)
+  if type(protected[t]) == "table" then return nil end
+  return getmetatable(t)
+end)
+raw_rawset(_G, "setmetatable", function(t, mt)
+  if protected[t] then error("Attempt to modify a readonly table", 0) end
+  return setmetatable(t, mt)
+end)
 raw_rawset(_G, "rawset", function(t, k, v)
-  if protected[t] then error("Attempt to modify a readonly table", 2) end
+  if protected[t] then error("Attempt to modify a readonly table", 0) end
   return raw_rawset(t, k, v)
 end)
 getmetatable("").__metatable = false
@@ -652,6 +694,15 @@ setmetatable(_G, {
   __metatable = false,
 })
 "#;
+
+/// `REDIS_VERSION_NUM`: a version's three numbers packed one byte each,
+/// as Redis packs them ("7.2.4" is 0x070204).
+fn version_num(version: &str) -> i64 {
+    version
+        .split('.')
+        .take(3)
+        .fold(0, |n, part| (n << 8) | part.parse::<i64>().unwrap_or(0))
+}
 
 /// The innermost frame of the script's own code, as Valkey reports it.
 fn script_line(lua: &Lua) -> String {
@@ -1246,5 +1297,18 @@ mod cost_probe {
             );
         }
         eprintln!("whole run:         {:?}/call", t.elapsed() / n);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// As Redis and Valkey pack it: Valkey 9.1 reports 459268 for "7.2.4",
+    /// and Redis 8.2.8 524808.
+    #[test]
+    fn version_num_packs_a_byte_per_number() {
+        assert_eq!(version_num("7.2.4"), 459_268);
+        assert_eq!(version_num("8.2.8"), 524_808);
     }
 }

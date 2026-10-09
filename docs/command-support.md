@@ -737,14 +737,20 @@ by the conformance corpus. What Flint adds is the frame around a script:
   script holds its keys' write locks only while it runs.
 - **The sandbox.** The base, `table`, `string` and `math` libraries, and
   `redis`: `call`, `pcall`, `error_reply`, `status_reply`, `sha1hex`, `log`
-  (a no-op), `setresp(2)`, `replicate_commands`, `set_repl`. **Not
-  available:** `load`, `loadstring`, `dofile`, `loadfile`, `require`, `os`,
-  `io`, `debug`, `setfenv`, `getfenv` and `print`; a script that uses one
-  fails with "nonexistent global variable". Globals and the libraries are
-  read-only, and a script's text compiles as text, never as bytecode. The
-  libraries and `redis` are read-only as empty stand-ins for the real
-  tables, so `pairs`, `next` and `rawget` find nothing in them, where Valkey
-  shows their functions (BUG-0247, open).
+  (a no-op), `setresp(2)`, `replicate_commands`, `set_repl`, the `LOG_*`
+  and `REPL_*` constants, and `REDIS_VERSION` and `REDIS_VERSION_NUM`
+  (`7.2.4`, the version `INFO` reports). `server` is the same table, as in
+  Valkey. **Not available:** `load`, `loadstring`, `dofile`, `loadfile`,
+  `require`, `os`, `io`, `debug`, `setfenv`, `getfenv` and `print`; a script
+  that uses one fails with "nonexistent global variable". Nor are
+  `redis.acl_check_cmd`, since Flint has no ACL users, or Valkey's
+  `SERVER_NAME` and `VALKEY_VERSION`, since Flint does not claim to be
+  Valkey. Globals and the libraries are read-only, and a script's text
+  compiles as text, never as bytecode. A library lists, walks and encodes as
+  Valkey's read-only tables do (`pairs`, `next`, `rawget`, `cjson.encode`),
+  and a write to one is refused with Valkey's message (BUG-0247). The string
+  metatable and the globals' stay hidden: `getmetatable('')` and
+  `getmetatable(_G)` are `false`, where Valkey shows them.
 - **`cjson`, `cmsgpack`, `bit` and `struct`**, the libraries Redis loads
   into scripts (ADR-0052 D3), written in Rust, not the C ones Valkey ships,
   whose parsers of tenant input have had memory-safety defects. Each

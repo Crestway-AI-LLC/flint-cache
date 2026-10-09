@@ -630,7 +630,8 @@ Around 80 more calls covered errors from tail calls, `pcall` and method
 calls, LuaBitOp's argument order, lua-struct's nil marker, and nil and NaN
 map keys. Flint now agrees on all of them but two, both documented:
 - **an object's key order** (Lua 5.1's, as in Redis 8.2);
-- **listing a library table** (BUG-0247).
+- **listing a library table** (BUG-0247, fixed since: the tables list as
+  Valkey's do).
 
 The corpus holds 33 of those edges, and they pass on Valkey too.
 

@@ -7478,6 +7478,62 @@ return nil"#;
         );
     }
 
+    /// BUG-0247: the libraries list and walk as the tables behind their
+    /// read-only stand-ins, and none of the ways in hands a script one of
+    /// those tables. Each escape below is refused, and the next script on
+    /// the same state finds the libraries as they were.
+    #[test]
+    fn listing_a_library_never_hands_out_the_table_behind_it() {
+        let s = MemKv::new();
+        assert_eq!(
+            ev(
+                &s,
+                &[
+                    "EVAL",
+                    "local n = 0 for k in pairs(cjson) do n = n + 1 end return n",
+                    "0"
+                ]
+            ),
+            Value::Integer(13)
+        );
+        for escape in [
+            "local f, t = pairs(cjson) rawset(t, 'encode', nil)",
+            "local f, t = pairs(cjson) setmetatable(t, nil)",
+            "rawset(cjson.new(), 'encode', nil)",
+            "getmetatable(cjson).__index.encode = nil",
+            "for k, v in pairs(redis) do if type(v) == 'table' then rawset(v, 'x', 1) end end error('no table')",
+            "for k, v in next, string do if type(v) == 'table' then rawset(v, 'x', 1) end end error('no table')",
+            "rawset(server, 'call', nil)",
+        ] {
+            assert!(
+                matches!(ev(&s, &["EVAL", escape, "0"]), Value::Error(_)),
+                "{escape}"
+            );
+        }
+        assert_eq!(
+            ev(
+                &s,
+                &[
+                    "EVAL",
+                    "return cjson.encode({1}) .. string.format('%d', 5)",
+                    "0"
+                ]
+            ),
+            Value::Bulk(Some(b"[1]5".to_vec()))
+        );
+        assert_eq!(
+            ev(
+                &s,
+                &[
+                    "EVAL",
+                    "return rawget(cjson, 'encode') == cjson.encode",
+                    "0"
+                ]
+            ),
+            Value::Integer(1)
+        );
+    }
+
     /// A Lua number handed to `redis.call` is spelled as Valkey 9.1 spells
     /// it (measured): integers within half of i64's range, else fpconv.
     #[test]

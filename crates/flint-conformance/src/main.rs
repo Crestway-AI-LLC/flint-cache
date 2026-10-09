@@ -1136,6 +1136,42 @@ fn corpus() -> Vec<Case> {
                 s(&[b"EVAL", b"local a = 1\nlocal b = 2\nreturn bit.band('x')", b"0"], Expect::Err("ERR user_script:3: bad argument #1 to 'band' (number expected, got string) script: on @user_script:3.")),
             ],
         },
+        // BUG-0247: the libraries and `redis` are read-only stand-ins, which
+        // list, walk and encode as the tables behind them, as Valkey's
+        // read-only tables do; writing to one is refused as Valkey refuses it.
+        // The `redis` table's count is left out: Flint does not claim to be
+        // Valkey (no SERVER_NAME, VALKEY_VERSION, VALKEY_VERSION_NUM), and
+        // serves no `acl_check_cmd`.
+        Case {
+            family: "lua",
+            name: "the libraries list and encode as Valkey's read-only tables do",
+            steps: vec![
+                s(&[b"EVAL", r#"local n=0 for k in pairs(cjson) do n=n+1 end return n"#.as_bytes(), b"0"], Expect::Int(13)),
+                s(&[b"EVAL", r#"local n=0 for k in pairs(cmsgpack) do n=n+1 end return n"#.as_bytes(), b"0"], Expect::Int(8)),
+                s(&[b"EVAL", r#"local n=0 for k in pairs(bit) do n=n+1 end return n"#.as_bytes(), b"0"], Expect::Int(12)),
+                s(&[b"EVAL", r#"local n=0 for k in pairs(struct) do n=n+1 end return n"#.as_bytes(), b"0"], Expect::Int(3)),
+                s(&[b"EVAL", r#"local n=0 for k in pairs(string) do n=n+1 end return n"#.as_bytes(), b"0"], Expect::Int(15)),
+                s(&[b"EVAL", r#"local n=0 for k in pairs(table) do n=n+1 end return n"#.as_bytes(), b"0"], Expect::Int(9)),
+                s(&[b"EVAL", r#"local n=0 for k in pairs(math) do n=n+1 end return n"#.as_bytes(), b"0"], Expect::Int(31)),
+                s(&[b"EVAL", r#"local n=0 for k in pairs(coroutine) do n=n+1 end return n"#.as_bytes(), b"0"], Expect::Int(6)),
+                s(&[b"EVAL", r#"local f, t, k = pairs(cjson) return {type(f), tostring(t == cjson), tostring(k)}"#.as_bytes(), b"0"], Expect::Arr(vec![Expect::Str(b"function"), Expect::Str(b"true"), Expect::Str(b"nil")])),
+                s(&[b"EVAL", r#"local n = 0 for k, v in next, cjson do n = n + 1 end return n"#.as_bytes(), b"0"], Expect::Int(13)),
+                s(&[b"EVAL", r#"return rawget(string, 'format') == string.format"#.as_bytes(), b"0"], Expect::Int(1)),
+                s(&[b"EVAL", r#"return type(getmetatable(cjson))"#.as_bytes(), b"0"], Expect::Str(b"nil")),
+                s(&[b"EVAL", r#"local ok, e = pcall(setmetatable, cjson, {}) return e"#.as_bytes(), b"0"], Expect::Str(b"Attempt to modify a readonly table")),
+                s(&[b"EVAL", r#"local ok, e = pcall(rawset, cjson, 'x', 1) return e"#.as_bytes(), b"0"], Expect::Str(b"Attempt to modify a readonly table")),
+                s(&[b"EVAL", r#"local ok, e = pcall(function() cjson.encode = 1 end) return e"#.as_bytes(), b"0"], Expect::Str(b"user_script:1: Attempt to modify a readonly table")),
+                s(&[b"EVAL", r#"return #cmsgpack.pack(cjson)"#.as_bytes(), b"0"], Expect::Int(205)),
+                s(&[b"EVAL", r#"return cjson.encode(bit)"#.as_bytes(), b"0"], Expect::Err("ERR user_script:1: Cannot serialise function: type not supported script: on @user_script:1.")),
+                s(&[b"EVAL", r#"return redis.REDIS_VERSION"#.as_bytes(), b"0"], Expect::Str(b"7.2.4")),
+                s(&[b"EVAL", r#"return redis.REDIS_VERSION_NUM"#.as_bytes(), b"0"], Expect::Int(459268)),
+                s(&[b"EVAL", r#"return server == redis"#.as_bytes(), b"0"], Expect::Int(1)),
+                s(&[b"EVAL", r#"return server.call('PING')"#.as_bytes(), b"0"], Expect::Simple("PONG")),
+                s(&[b"EVAL", r#"return cjson.new() == cjson"#.as_bytes(), b"0"], Expect::Nil),
+                s(&[b"EVAL", r#"return cjson.new().encode({1})"#.as_bytes(), b"0"], Expect::Str(b"[1]")),
+                s(&[b"EVAL", r#"return cmsgpack._DESCRIPTION"#.as_bytes(), b"0"], Expect::Str(b"MessagePack C implementation for Lua")),
+            ],
+        },
         // BUG-0246: `redis.call` took one mlua reference per argument, and
         // ran out near 8,000; Lua's `unpack` stops at 7,997.
         Case {

@@ -240,17 +240,28 @@ pub(crate) fn packed(lua: &Lua, inner: Function) -> mlua::Result<Function> {
 
 /// Install the functions as `__flint_libs` and build the libraries from
 /// them; the prelude then makes them read-only.
-pub fn install(lua: &Lua) -> mlua::Result<()> {
+///
+/// Answers the table of read-only stand-ins, empty here. The sandbox's
+/// prelude fills it (each stand-in to the table behind it), and `cjson` and
+/// `cmsgpack` encode a stand-in as the table behind it, as Valkey's encode
+/// its read-only tables (BUG-0247).
+pub fn install(lua: &Lua) -> mlua::Result<Table> {
     let raw = lua.create_table()?;
+    let stand_ins = lua.create_table()?;
     let add = |name: &str, f: Function| raw.raw_set(name, f);
     // lua-cjson walks an object with `lua_next`.
     let next: Function = lua.globals().raw_get("next")?;
+    let behind = stand_ins.clone();
     add(
         "cjson_encode",
-        lib_fn(lua, move |lua, a| cjson_encode(lua, a, &next))?,
+        lib_fn(lua, move |lua, a| cjson_encode(lua, a, &next, &behind))?,
     )?;
     add("cjson_decode", lib_fn(lua, cjson_decode)?)?;
-    add("cmsgpack_pack", lib_fn(lua, cmsgpack_pack)?)?;
+    let behind = stand_ins.clone();
+    add(
+        "cmsgpack_pack",
+        lib_fn(lua, move |lua, a| cmsgpack_pack(lua, a, &behind))?,
+    )?;
     add(
         "cmsgpack_unpack",
         lib_fn(lua, |lua, a| cmsgpack_unpack(lua, a, Unpack::All))?,
@@ -308,7 +319,15 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     lua.load(LIBS_PRELUDE)
         .set_name("=flint-libs")
         .call::<()>(())?;
-    Ok(())
+    Ok(stand_ins)
+}
+
+/// The table a read-only stand-in stands for, or `t` itself.
+fn behind(t: Table, stand_ins: &Table) -> mlua::Result<Table> {
+    Ok(match stand_ins.raw_get::<LuaValue>(&t)? {
+        LuaValue::Table(real) => real,
+        _ => t,
+    })
 }
 
 /// Builds the four libraries from the functions, then drops their table
@@ -349,6 +368,8 @@ cmsgpack = {
   unpack_limit = raw.cmsgpack_unpack_limit,
   _NAME = "cmsgpack",
   _VERSION = "lua-cmsgpack 0.4.0",
+  _COPYRIGHT = "Copyright (C) 2012, Redis Ltd.",
+  _DESCRIPTION = "MessagePack C implementation for Lua",
 }
 bit = {}
 for _, name in ipairs({ "tobit", "bnot", "band", "bor", "bxor", "lshift", "rshift",
@@ -598,12 +619,12 @@ fn strtod_full(s: &[u8]) -> Option<f64> {
 const ENCODE_MAX_DEPTH: usize = 1000;
 const DECODE_MAX_DEPTH: usize = 1000;
 
-fn cjson_encode(lua: &Lua, args: &Args, next: &Function) -> Answer {
+fn cjson_encode(lua: &Lua, args: &Args, next: &Function, stand_ins: &Table) -> Answer {
     if args.n != 1 {
         return Err(bad_arg(1, "expected 1 argument"));
     }
     let root = args.get(1)?.unwrap_or(LuaValue::Nil);
-    let out = json_encode(root, next)?;
+    let out = json_encode(root, next, stand_ins)?;
     one(LuaValue::String(lua.create_string(&out)?))
 }
 
@@ -619,13 +640,14 @@ enum Writing {
 
 /// lua-cjson's `json_append_data`, with the tables open at once on a stack
 /// of their own: at most 1,000, each an mlua reference with its key's.
-fn json_encode(root: LuaValue, next: &Function) -> Result<Vec<u8>, Fail> {
+fn json_encode(root: LuaValue, next: &Function, stand_ins: &Table) -> Result<Vec<u8>, Fail> {
     let mut out = Vec::new();
     let mut open: Vec<Writing> = Vec::new();
     let mut value = Some(root);
     loop {
         match value.take() {
             Some(LuaValue::Table(t)) => {
+                let t = behind(t, stand_ins)?;
                 let depth = open.len() + 1;
                 if depth > ENCODE_MAX_DEPTH {
                     return Err(format!("Cannot serialise, excessive nesting ({depth})").into());
@@ -1154,7 +1176,7 @@ fn object_key(json: &mut Json, t: &Token) -> Result<Vec<u8>, Fail> {
 
 const MSGPACK_MAX_NESTING: usize = 16;
 
-fn cmsgpack_pack(lua: &Lua, args: &Args) -> Answer {
+fn cmsgpack_pack(lua: &Lua, args: &Args, stand_ins: &Table) -> Answer {
     if args.n == 0 {
         return Err(bad_arg(0, "MessagePack pack needs input."));
     }
@@ -1164,7 +1186,12 @@ fn cmsgpack_pack(lua: &Lua, args: &Args) -> Answer {
     }
     let mut out = Vec::new();
     for i in 1..=args.n {
-        mp_encode(&args.get(i)?.unwrap_or(LuaValue::Nil), 0, &mut out)?;
+        mp_encode(
+            &args.get(i)?.unwrap_or(LuaValue::Nil),
+            0,
+            stand_ins,
+            &mut out,
+        )?;
     }
     one(LuaValue::String(lua.create_string(&out)?))
 }
@@ -1172,7 +1199,7 @@ fn cmsgpack_pack(lua: &Lua, args: &Args) -> Answer {
 /// lua-cmsgpack's `mp_encode_lua_type`. It recurses, but no deeper than
 /// the nesting limit, and walks a map twice, as the C does, rather than
 /// hold its pairs.
-fn mp_encode(v: &LuaValue, level: usize, out: &mut Vec<u8>) -> Result<(), Fail> {
+fn mp_encode(v: &LuaValue, level: usize, stand_ins: &Table, out: &mut Vec<u8>) -> Result<(), Fail> {
     match v {
         LuaValue::String(s) => {
             let b = s.as_bytes();
@@ -1207,12 +1234,13 @@ fn mp_encode(v: &LuaValue, level: usize, out: &mut Vec<u8>) -> Result<(), Fail> 
             }
         }
         LuaValue::Table(t) if level < MSGPACK_MAX_NESTING => {
+            let t = &behind(t.clone(), stand_ins)?;
             if mp_is_array(t)? {
                 let len = t.raw_len();
                 mp_header(len, 0x90, 0xdc, 0xdd, out);
                 for i in 1..=len {
                     let item: LuaValue = t.raw_get(i)?;
-                    mp_encode(&item, level + 1, out)?;
+                    mp_encode(&item, level + 1, stand_ins, out)?;
                 }
             } else {
                 let mut len = 0;
@@ -1223,8 +1251,8 @@ fn mp_encode(v: &LuaValue, level: usize, out: &mut Vec<u8>) -> Result<(), Fail> 
                 mp_header(len, 0x80, 0xde, 0xdf, out);
                 for pair in t.pairs::<LuaValue, LuaValue>() {
                     let (k, val) = pair?;
-                    mp_encode(&k, level + 1, out)?;
-                    mp_encode(&val, level + 1, out)?;
+                    mp_encode(&k, level + 1, stand_ins, out)?;
+                    mp_encode(&val, level + 1, stand_ins, out)?;
                 }
             }
         }

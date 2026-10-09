@@ -13,6 +13,12 @@
 
 pub mod scripts;
 
+/// The Redis version Flint reports, as Valkey 9.1 reports it: the last Redis
+/// release Valkey forked from, frozen there so that clients gating features
+/// on it keep working (ADR-0052 D1). The proxy's `INFO` and a script's
+/// `redis.REDIS_VERSION` both read it, so the two cannot disagree.
+pub const REDIS_COMPAT_VERSION: &str = "7.2.4";
+
 /// True when `name` can only SHRINK the keyspace.
 ///
 /// The one class of write that must stay allowed when the system is refusing
