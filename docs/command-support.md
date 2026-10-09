@@ -220,7 +220,7 @@ BITCOUNT (BYTE, BIT), BITPOS (BYTE, BIT), BITOP (AND, OR, XOR, NOT, and Redis
 > Redis 8.2's 0.12 ms; 1 MiB, 0.39 ms / 10 ms; 8 MiB, 0.84 ms / 16 ms;
 > 64 MiB, 5.6 ms / 85 ms. A bitmap written often past a megabyte or so (a
 > daily-active bitmap over 10 million user ids is 1.25 MiB) is better split
-> across several keys. BITOP's keys must share a slot (use a
+> across several keys. ADR-0056 proposes storing large strings in chunks. BITOP's keys must share a slot (use a
 > hash tag), as every multi-key command's must. Where Valkey 9.1 and Redis
 > 8.2 differ, one answer follows each: `BITCOUNT key start`
 > without an end counts to the end of the string, as Valkey answers (Redis
