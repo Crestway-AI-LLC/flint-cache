@@ -6221,6 +6221,7 @@ fn execute(
             limits,
             conn_ns,
         )
+        .whole(conn_txn.whole)
         .dispatch(args)
     }
 }
@@ -8916,6 +8917,80 @@ mod serve_tests {
             f[5],
             Value::Array(Some(vec![Value::Bulk(Some(b"1".to_vec()))]))
         );
+    }
+
+    /// ADR-0053's amendment over the wire: on a `FLINTWHOLE` connection the
+    /// four list moves span slots, as rq's worker needs (`LMOVE` from its
+    /// queue to the queue's intermediate list); without it each is refused,
+    /// as before, and nothing moves.
+    #[test]
+    fn a_whole_connections_list_moves_may_span_slots() {
+        let (addr, _serial) = spawn_server();
+        let send = |cmds: &[Vec<&str>]| {
+            let mut s = connect(addr);
+            let mut p = Vec::new();
+            for c in cmds {
+                let parts = c.iter().map(|x| Value::Bulk(Some(x.as_bytes().to_vec())));
+                encode(&Value::Array(Some(parts.collect())), &mut p);
+            }
+            s.write_all(&p).expect("send");
+            read_frames(&mut s, cmds.len())
+        };
+        let moves = |q: &'static str, i: &'static str| -> Vec<Vec<&'static str>> {
+            assert_ne!(
+                flint_slot::slot_for_key(q.as_bytes()),
+                flint_slot::slot_for_key(i.as_bytes())
+            );
+            vec![
+                vec!["RPUSH", q, "a", "b", "c", "d"],
+                vec!["LMOVE", q, i, "LEFT", "RIGHT"],
+                vec!["RPOPLPUSH", q, i],
+                vec!["BLMOVE", q, i, "LEFT", "RIGHT", "0.1"],
+                vec!["BRPOPLPUSH", q, i, "0.1"],
+                vec!["LRANGE", i, "0", "-1"],
+                vec!["LLEN", q],
+                // Queued in a transaction, as rq's worker does not but a
+                // client may: the queue-time check is the same rule.
+                vec!["RPUSH", q, "e"],
+                vec!["MULTI"],
+                vec!["LMOVE", q, i, "RIGHT", "LEFT"],
+                vec!["EXEC"],
+            ]
+        };
+        let bulk = |s: &str| Value::Bulk(Some(s.as_bytes().to_vec()));
+
+        let plain = send(&moves("rq:queue:p", "rq:queue:p:intermediate"));
+        for (n, reply) in plain[1..5].iter().enumerate() {
+            assert!(
+                matches!(reply, Value::Error(e) if e.starts_with("CROSSSLOT")),
+                "move {n} without FLINTWHOLE: {reply:?}"
+            );
+        }
+        assert_eq!(plain[5], Value::Array(Some(vec![])), "nothing moved");
+        assert_eq!(plain[6], Value::Integer(4));
+        assert!(
+            matches!(&plain[9], Value::Error(e) if e.starts_with("CROSSSLOT")),
+            "queued without FLINTWHOLE: {:?}",
+            plain[9]
+        );
+        assert!(matches!(&plain[10], Value::Error(e) if e.starts_with("EXECABORT")));
+
+        let mut cmds = vec![vec!["FLINTWHOLE"]];
+        cmds.extend(moves("rq:queue:w", "rq:queue:w:intermediate"));
+        let f = send(&cmds);
+        assert_eq!(f[0], Value::Simple("OK".into()));
+        assert_eq!(&f[2..6], &[bulk("a"), bulk("d"), bulk("b"), bulk("c")]);
+        assert_eq!(
+            f[6],
+            Value::Array(Some(vec![bulk("c"), bulk("d"), bulk("a"), bulk("b")]))
+        );
+        assert_eq!(f[7], Value::Integer(0));
+        assert_eq!(
+            f[10],
+            Value::Simple("QUEUED".into()),
+            "queued with FLINTWHOLE"
+        );
+        assert_eq!(f[11], Value::Array(Some(vec![bulk("e")])));
     }
 
     fn connect(addr: std::net::SocketAddr) -> TcpStream {

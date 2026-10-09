@@ -226,6 +226,25 @@ a re-plumbing. The other multi-key commands keep one slot until something
 measured needs them. It is built alongside ADR-0052's stage 4, since rq's
 worker needs both before it can finish a job.
 
+**Amendment built 2026-10-09.** On a connection marked `FLINTWHOLE`, the
+seat's `cmd_lmove` skips the one-slot check and reads and writes each key
+under its own slot. All four moves go through it, both when they run and in
+a transaction's queue-time check. Until now a placed tenant's plain commands
+did not carry the mark into the dispatcher at all, only its transactions
+and scripts did. They do now, which is also what lets its `XREAD` span
+slots. A move still takes the
+lock over every writer, as any write to two keys does (BUG-0188). The proxy
+needed nothing: it already sends a placed tenant's commands, and its
+blocking moves' attempts, to the one pair. Every other connection keeps the
+rule. Measured:
+- **Over the wire** (`a_whole_connections_list_moves_may_span_slots`): the
+  four moves between rq's queue and its intermediate list, which are in two
+  slots, are each refused without the mark and move nothing. With it they
+  move `a`, `d`, `b` and `c` in Valkey's order.
+- **rq 2.8.0's worker**, in `client_compat_drill` on a placed tenant: a
+  burst worker, forking a work horse per job as rq does, finishes all five
+  jobs. Their results are read back from their streams.
+
 **Not built.** Moving a placed tenant to another pair, whole. It stays on the
 pair it was created on, and that pair's size and throughput are its limit.
 The verification item "moving a one-pair tenant to another pair, under load"

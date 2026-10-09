@@ -560,7 +560,8 @@ has made a stream.
 - **Differences** (command-support.md lists them):
   - `~` trims exactly, up to `LIMIT` (10,000 by default), where Valkey
     trims whole internal nodes.
-  - A multi-stream `XREAD` needs one slot.
+  - A multi-stream `XREAD` needs one slot, except a placed tenant's
+    (ADR-0053).
   - Consumer groups, `XINFO` and `XSETID` are not yet served.
 
 **Verified** against Valkey 9.1.0 on the laptop:
@@ -643,6 +644,11 @@ Thirteen mutants, one per property (the error's level, the slot count, the
 the argument and result limits, the overlay's merge and seeks, and
 `COUNT 0`'s order), were each killed by the check meant for it.
 
-#### ADR-0053's amendment
+#### ADR-0053's amendment (2026-10-09)
 
-Not started.
+On a placed tenant, `LMOVE`, `RPOPLPUSH`, `BLMOVE` and `BRPOPLPUSH` may span
+slots: the seat reads and writes each key under its own slot when the
+connection carries `FLINTWHOLE`. That was the last thing rq's worker
+needed. In `client_compat_drill`, rq 2.8.0's burst worker on a placed tenant
+finishes every job and its results read back. The design and the
+measurements are in ADR-0053, under its amendment.

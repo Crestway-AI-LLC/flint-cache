@@ -262,6 +262,8 @@ BLMOVE, BRPOPLPUSH (see "Blocking commands").
 > LMOVE and RPOPLPUSH are **same-slot only**, like the set operations:
 > colocate source and destination with a hash tag or the move is refused
 > with `CROSSSLOT`. So are their blocking forms, BLMOVE and BRPOPLPUSH.
+> A tenant placed on one pair (ADR-0053) is the exception: its moves may
+> span slots, as rq's worker needs to take a job from its queue.
 
 **Sorted sets**: ZADD (NX, XX, GT, LT, CH, INCR), ZSCORE, ZMSCORE, ZINCRBY,
 ZREM, ZCARD, ZRANGE (BYSCORE, BYLEX, REV, LIMIT, WITHSCORES),
@@ -786,7 +788,7 @@ order they are given, or a null array at the timeout (`0` waits for ever).
 The keys of `BLPOP`, `BRPOP` and the sorted-set pops need not share a slot:
 the order is a priority across pairs, which is what Sidekiq's
 `BRPOP critical default low` relies on. `BLMOVE` and `BRPOPLPUSH` need their
-two keys in one slot, as `LMOVE` does.
+two keys in one slot, as `LMOVE` does, except on a tenant placed on one pair.
 
 The wait happens at the proxy, never on a seat, so a blocked client holds no
 seat connection or thread. The proxy tries each key in turn and, finding
@@ -919,7 +921,8 @@ memory, and `XREVRANGE … COUNT 1` reads one entry however long the stream is.
   asked. Both keep at least what was asked, which is all `~` promises; a
   client that counts what `XTRIM … ~` removed sees more removed here.
 - **`XREAD` over several streams needs them in one slot**, as every
-  multi-key command does: give their names one hash tag.
+  multi-key command does: give their names one hash tag. A tenant placed on
+  one pair (ADR-0053) may read streams in any slots.
 - **Not yet served:** consumer groups (`XGROUP`, `XREADGROUP`, `XACK`,
   `XPENDING`, `XCLAIM`, `XAUTOCLAIM`), `XINFO`, `XSETID`, and Redis 8.2's
   `XDELEX` and `XACKDEL`. A stream already keeps the counters groups need.

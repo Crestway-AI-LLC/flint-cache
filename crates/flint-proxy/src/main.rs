@@ -5144,8 +5144,9 @@ const BLOCK_POLL_MAX: Duration = Duration::from_millis(20);
 /// so the keys' order is a priority, as in Redis (Sidekiq's
 /// `BRPOP critical default low`), and keys on different pairs need no hash
 /// tag. A move has one source and is one attempt; the seat refuses a
-/// cross-slot one. The first round's attempts carry the command's own
-/// timeout, so the seat checks the arguments and any error returns at once.
+/// cross-slot one, except a placed tenant's (ADR-0053). The first round's
+/// attempts carry the command's own timeout, so the seat checks the
+/// arguments and any error returns at once.
 ///
 /// Between rounds the wait doubles from `BLOCK_POLL_FIRST` to
 /// `BLOCK_POLL_MAX`. At the timeout, or when the client leaves, the reply is

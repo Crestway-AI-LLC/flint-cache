@@ -161,7 +161,12 @@ pub fn queue_time_error(args: &[Vec<u8>], whole: bool) -> Option<Value> {
         }
     }
     let probe = flint_storage::MemKv::new();
-    let reply = Dispatcher::new(&probe, crate::commands::probe_clock).dispatch(args);
+    // `whole` reaches the probe for the list moves, which a placed tenant
+    // may queue across slots (ADR-0053's amendment); every other multi-key
+    // command checks its slots whatever the connection.
+    let reply = Dispatcher::new(&probe, crate::commands::probe_clock)
+        .whole(whole)
+        .dispatch(args);
     match &reply {
         // Both texts are produced in THIS file — `arity_err` and the
         // dispatcher's unknown-command arm — so matching them is matching
@@ -1740,42 +1745,45 @@ impl<'a> Dispatcher<'a> {
     }
 
     /// LMOVE / RPOPLPUSH (BUG-0187): pop from one end of `src`, push onto
-    /// one end of `dst`, answer the element. Both keys in one slot. Valkey's
-    /// order of checks: a missing source answers nil whatever `dst` is, then
-    /// the source's type, then the destination's, all before anything moves.
-    /// The destination is a second key, so `main` locks every writer for it,
-    /// as for any multi-key write (BUG-0188).
+    /// one end of `dst`, answer the element. Both keys in one slot, except on
+    /// a placed tenant's connection (`FLINTWHOLE`, ADR-0053's amendment),
+    /// whose keys all live on this pair: there each key is read and written
+    /// under its own slot, so rq's worker can move a job from its queue to a
+    /// list in another slot. Valkey's order of checks: a missing source
+    /// answers nil whatever `dst` is, then the source's type, then the
+    /// destination's, all before anything moves. The destination is a second
+    /// key, so `main` locks every writer for it, as for any multi-key write
+    /// (BUG-0188).
     fn cmd_lmove(&self, src: &[u8], dst: &[u8], from_left: bool, to_left: bool) -> Value {
-        if let Some(refusal) = Self::crossslot(src, std::slice::from_ref(&dst.to_vec())) {
+        if !self.whole
+            && let Some(refusal) = Self::crossslot(src, std::slice::from_ref(&dst.to_vec()))
+        {
             return refusal;
         }
-        let slot = slot_for_key(src);
-        match self.lists.llen(slot, src) {
+        let (from, to) = (slot_for_key(src), slot_for_key(dst));
+        match self.lists.llen(from, src) {
             Ok(0) => return Value::Bulk(None),
             Ok(_) => {}
             Err(e) => return store_err(e),
         }
         if src != dst
-            && let Err(e) = self.lists.llen(slot, dst)
+            && let Err(e) = self.lists.llen(to, dst)
         {
             return store_err(e);
         }
-        let v = match self.lists.pop(slot, src, from_left) {
+        let v = match self.lists.pop(from, src, from_left) {
             Ok(Some(v)) => v,
             Ok(None) => return Value::Bulk(None),
             Err(e) => return store_err(e),
         };
-        match self
-            .lists
-            .push(slot, dst, std::slice::from_ref(&v), to_left)
-        {
+        match self.lists.push(to, dst, std::slice::from_ref(&v), to_left) {
             Ok(_) => Value::Bulk(Some(v)),
             Err(e) => {
                 // The one refusal left is the value cap on `dst`: put the
                 // element back where it came from, so a refusal moves nothing.
                 let _ = self
                     .lists
-                    .push(slot, src, std::slice::from_ref(&v), from_left);
+                    .push(from, src, std::slice::from_ref(&v), from_left);
                 store_err(e)
             }
         }

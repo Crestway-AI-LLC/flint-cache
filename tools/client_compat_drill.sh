@@ -769,10 +769,11 @@ PY
 # ---------------------------------------------------------------------------
 # rq (ADR-0053). Every write rq makes is a transaction, over up to nine
 # slots, and its key names cannot carry a hash tag: it runs on a placed
-# tenant only. Enqueue is served. Its worker is not yet: it dequeues with
-# `LMOVE` from the queue to a second list in another slot, a multi-key
-# command, which keeps its one-slot rule, and it records a result in a
-# stream (ADR-0052 stage 4). Measured 2026-09-27; see ADR-0053 as built.
+# tenant only. Its worker dequeues with `LMOVE` from the queue to a second
+# list in another slot, which a placed tenant may do (ADR-0053's
+# amendment), listens for commands on pub/sub (ADR-0052 stage 3), and
+# records each result on a stream (stage 4), so a burst worker finishing
+# every job is the whole of rq on Flint.
 # ---------------------------------------------------------------------------
 RQ_VENV=${FLINT_COMPAT_RQ_VENV:-$FLINT_DRILL_ROOT/flint-compat-rq}
 rq_ready() { "$RQ_VENV/bin/python" -c 'import rq' >/dev/null 2>&1; }
@@ -803,11 +804,25 @@ ok = q.count == 5 and queued == ["queued"] * 5 and q.job_ids == [j.id for j in j
 print(f"  {'ok ' if ok else 'FAIL'} enqueue: 5 jobs, each queued, in order"
       f"{'' if ok else f'  count {q.count}, {queued}'}")
 q.empty()
-print(f"  {'ok ' if q.count == 0 else 'FAIL'} the queue empties (its script reaches every job's key)")
-sys.exit(0 if ok and q.count == 0 else 1)
+emptied = q.count == 0
+print(f"  {'ok ' if emptied else 'FAIL'} the queue empties (its script reaches every job's key)")
+# A real worker, forking a work horse per job, in burst mode: it takes each
+# job with LMOVE into the intermediate list, runs it, and records the result
+# on the job's stream.
+from rq import Worker
+jobs = [q.enqueue("operator.add", i, 1) for i in range(5)]
+Worker([q], connection=r).work(burst=True)
+for j in jobs:
+    j.refresh()
+statuses = [j.get_status() for j in jobs]
+results = [j.return_value() for j in jobs]
+worked = statuses == ["finished"] * 5 and results == [1, 2, 3, 4, 5] and q.count == 0
+print(f"  {'ok ' if worked else 'FAIL'} a burst worker finishes all five, results read back"
+      f"{'' if worked else f'  {statuses} {results} count {q.count}'}")
+sys.exit(0 if ok and emptied and worked else 1)
 PYRQ
   [ $? -eq 0 ] || { echo "FAIL: rq on a placed tenant"; exit 1; }
-  RAN="$RAN, rq (enqueue)"
+  RAN="$RAN, rq (enqueue, worker)"
 fi
 
 # ---------------------------------------------------------------------------
