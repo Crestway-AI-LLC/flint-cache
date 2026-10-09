@@ -2295,6 +2295,7 @@ fn auth_step(
         // null result could not be explained without re-reading the source —
         // which is why the ADR made instrumentation an acceptance gate rather
         // than a follow-up.
+        let (ps_links, ps_clients) = pubsub::HUB.gauges();
         let pool_batches = apool::BATCHES.load(Ordering::Relaxed);
         let pool_commands = apool::COMMANDS.load(Ordering::Relaxed);
         let pool_batch_mean = if pool_batches == 0 {
@@ -2308,7 +2309,7 @@ fn auth_step(
         // all — so a half-completed edge roll looked exactly like a
         // finished one.
         let info = format!(
-            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\nadmin_denied_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_inflight_max:{pool_inflight_max}\r\npool_dial_failures_total:{pool_dials}\r\ncert_days_remaining:{cdr}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\n",
+            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\nadmin_denied_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_inflight_max:{pool_inflight_max}\r\npool_dial_failures_total:{pool_dials}\r\npubsub_links:{ps_links}\r\npubsub_clients:{ps_clients}\r\npubsub_clients_cut_total:{ps_cut}\r\npubsub_link_redials_total:{ps_redials}\r\npubsub_messages_total:{ps_msgs}\r\ncert_days_remaining:{cdr}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -2325,6 +2326,14 @@ fn auth_step(
             pool_lanes = apool::LIVE_CONNS.load(Ordering::Relaxed),
             pool_inflight_max = apool::INFLIGHT_MAX.load(Ordering::Relaxed),
             pool_dials = apool::DIAL_FAILURES.load(Ordering::Relaxed),
+            // ADR-0052 pub/sub: links to masters and subscribed clients
+            // now; clients cut off 32 MiB behind, links dialed again, and
+            // messages handed to clients since start.
+            ps_links = ps_links,
+            ps_clients = ps_clients,
+            ps_cut = pubsub::CLIENTS_CUT_TOTAL.load(Ordering::Relaxed),
+            ps_redials = pubsub::LINK_REDIALS_TOTAL.load(Ordering::Relaxed),
+            ps_msgs = pubsub::MESSAGES_TOTAL.load(Ordering::Relaxed),
             build = build_version(),
             cdr = topo
                 .cert_path
@@ -3087,6 +3096,7 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
                     if outbox.overflowed() {
                         // Redis closes a pub/sub client past its output
                         // limit; buffering on would be unbounded.
+                        sub.log_cut_off(client.id, client.name.as_deref());
                         return Ok(());
                     }
                     let queued = outbox.drain();
@@ -3100,7 +3110,10 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
                         // than held here for ever.
                         tokio::select! {
                             r = stream.write_all(&out) => r?,
-                            _ = outbox.cut_off() => return Ok(()),
+                            _ = outbox.cut_off() => {
+                                sub.log_cut_off(client.id, client.name.as_deref());
+                                return Ok(());
+                            }
                         }
                         out.clear();
                     }

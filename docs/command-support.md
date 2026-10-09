@@ -886,7 +886,9 @@ means:
   channel's other messages.
 - **A slow subscriber is disconnected** once 32 MiB of messages wait for it,
   Redis's default hard `client-output-buffer-limit` for pub/sub. Flint has
-  no soft limit.
+  no soft limit. The proxy logs each disconnection with the client's id and
+  counts it (`pubsub_clients_cut_total`, BUG-0249), so your operator can
+  tell you when it happened.
 - **`PUBSUB` answers for the whole tenant**, every proxy's clients included,
   from any pair. `CHANNELS` lists in byte order, where Redis and Valkey use
   their hash table's order.

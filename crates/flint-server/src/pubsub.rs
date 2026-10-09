@@ -41,6 +41,11 @@ pub type SubId = u64;
 /// Redis's default hard limit for a pub/sub client.
 pub const OUTBOX_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Subscriber connections cut off for falling [`OUTBOX_LIMIT_BYTES`] behind
+/// since this seat started, `pubsub_links_cut_total` in `FLINTINFO`. Each is
+/// a proxy whose clients lost this seat's messages until it dialed again.
+pub static LINKS_CUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Channel subscriptions and pattern subscriptions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -70,14 +75,23 @@ impl Outbox {
         }
         let len = frame.len();
         if self.bytes.fetch_add(len, Ordering::Relaxed) + len > OUTBOX_LIMIT_BYTES {
-            self.overflowed.store(true, Ordering::Relaxed);
+            // Counted and said once, by whichever push got here first.
+            let first = !self.overflowed.swap(true, Ordering::Relaxed);
             self.lock().clear();
-            if let Some(sock) = self
-                .socket
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
+            let socket = self.socket.lock().unwrap_or_else(|e| e.into_inner());
+            if first {
+                LINKS_CUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let peer = socket
+                    .as_ref()
+                    .and_then(|s| s.peer_addr().ok())
+                    .map_or_else(|| "an unknown address".into(), |a| a.to_string());
+                eprintln!(
+                    "pubsub: cut off the subscriber link from {peer}, {} MiB behind (ADR-0052): \
+                     its proxy's clients lose this seat's messages until it dials again",
+                    OUTBOX_LIMIT_BYTES >> 20
+                );
+            }
+            if let Some(sock) = socket.as_ref() {
                 let _ = sock.shutdown(std::net::Shutdown::Both);
             }
             self.ready.notify_all();
@@ -570,11 +584,16 @@ mod tests {
         let (id, out) = b.register();
         b.adjust(id, b"t", Kind::Channel, b"c", 1);
         let big = vec![b'x'; OUTBOX_LIMIT_BYTES / 4];
+        let cut = LINKS_CUT_TOTAL.load(Ordering::Relaxed);
         for _ in 0..5 {
             b.publish(b"t", b"c", &big);
         }
         assert!(out.overflowed());
         assert!(out.drain().is_empty(), "what it held is released");
+        // Counted once, though later publishes reach it too. Other tests
+        // cut nothing off, so the global counter moves by exactly one.
+        b.publish(b"t", b"c", &big);
+        assert_eq!(LINKS_CUT_TOTAL.load(Ordering::Relaxed), cut + 1);
     }
 
     #[test]

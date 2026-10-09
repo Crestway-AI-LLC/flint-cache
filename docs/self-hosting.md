@@ -806,6 +806,22 @@ It emits `flint_up{instance,role}` / `flint_proxy_up{instance}` plus every
 numeric `FLINTINFO`/`PROXYSTATS` field as a gauge
 (`flint_lag_ms`, `flint_wal_fsync_ms`, `flint_proxy_cache_hits_total`, …).
 
+**Pub/sub** (ADR-0052, BUG-0249) delivers at most once, as Redis does, and
+these say when it did not deliver. From each proxy:
+- `flint_proxy_pubsub_links`: links connected to masters now, one per
+  master while any client subscribes;
+- `flint_proxy_pubsub_clients`: client connections holding a subscription;
+- `flint_proxy_pubsub_clients_cut_total`: clients disconnected 32 MiB
+  behind;
+- `flint_proxy_pubsub_link_redials_total`: link dials after a lost or
+  failed connection, one per attempt;
+- `flint_proxy_pubsub_messages_total`: messages handed to clients.
+
+From each seat, `flint_pubsub_links_cut_total` counts proxy links it cut off
+32 MiB behind. Every subscriber on that link loses the seat's messages until
+the proxy dials again. Each cut-off is also logged, at the end that made it,
+with "32 MiB behind" in the line.
+
 **Numeric is the whole filter, so a field that cannot be known still renders a
 number** (BUG-0095): `acked_seq`, `seq_lag` and `lag_ms` read **`-1`** when no
 replica is live, and `cert_days_remaining` reads **`-99999`** when no

@@ -52,7 +52,7 @@ done
 # Phase 1 runs with every seat up; phase 2 after seat 6523 is restarted by
 # the shell between the two calls, the subscribers held open across it by a
 # fifo-driven client.
-run() { python3 -I - "$@" <<'PY'
+run() { FLEET_SCOPE="$FLEET_SCOPE" python3 -I - "$@" <<'PY'
 import os, socket, sys, time
 
 class C:
@@ -105,6 +105,14 @@ class C:
 def fail(msg):
     print("FAIL: " + msg); sys.exit(1)
 
+def stats(port, cmd="PROXYSTATS"):
+    c = C(port); r = c.call([cmd]); c.k.close()
+    return {k: v for k, _, v in (l.partition(":") for l in r.decode().split("\r\n")) if v}
+
+def logged(name, text):
+    with open(os.environ["FLEET_SCOPE"] + name, errors="replace") as f:
+        return text in f.read()
+
 CH = ["chan:%d" % i for i in range(16)]
 
 def slot(key):
@@ -154,7 +162,21 @@ def round_trip(label, want_receivers=True):
     print("  [%s] 16 channels, %d on the second pair: each message once to each holder, across both proxies" % (label, on_b))
 
 if phase == "steady":
+    # The operator's view (OPS-0384): each proxy links to both masters,
+    # and holds one subscribed client.
+    for port in (6524, 6525):
+        deadline = time.time() + 5
+        while time.time() < deadline and stats(port).get("pubsub_links") != "2":
+            time.sleep(0.1)
+        st = stats(port)
+        if st.get("pubsub_links") != "2" or st.get("pubsub_clients") != "1":
+            fail("PROXYSTATS on %d: pubsub_links=%s pubsub_clients=%s, expected 2 and 1"
+                 % (port, st.get("pubsub_links"), st.get("pubsub_clients")))
     round_trip("steady")
+    # s1 got 16 messages and 7 pattern copies (chan:1, chan:10..15).
+    if int(stats(6524)["pubsub_messages_total"]) < 23:
+        fail("pubsub_messages_total on 6524 is %s after 23 deliveries" % stats(6524)["pubsub_messages_total"])
+    print("  [stats] pubsub_links 2 and pubsub_clients 1 on each proxy; messages counted")
     # A subscribe is answered once every master holds it, so a PUBLISH sent
     # the moment the confirmation arrives, through the OTHER proxy, reaches
     # the new subscriber. Answering first would lose some of these.
@@ -219,7 +241,33 @@ if phase == "steady":
         time.sleep(0.1)
     if pub.call(["PUBSUB", "NUMSUB", "flood"])[1] != 1:
         fail("a subscriber 48 MiB behind is still subscribed")
-    print("  [slow client] cut off past its 32 MiB, the reading one kept")
+    # And the operator can tell: one counted cut-off, at the slow client's
+    # proxy only, and a line in that proxy's log.
+    cut = (stats(6524).get("pubsub_clients_cut_total"), stats(6525).get("pubsub_clients_cut_total"))
+    if cut != ("1", "0"): fail("pubsub_clients_cut_total on 6524, 6525: %r, expected 1, 0" % (cut,))
+    if not logged("proxy-6524.log", "cut off, 32 MiB behind"):
+        fail("proxy 6524 cut a client off and logged nothing")
+    print("  [slow client] cut off past its 32 MiB, the reading one kept; counted and logged")
+    # A proxy link the seat cuts off: a subscriber connection, held here,
+    # that stops reading while 48 MiB is published on its channel.
+    link = C(6522); link.call(["FLINTSUBSCRIBER"])
+    link.k.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    if link.call(["FLINTSUB", "0", "lag", "1"]) != 1: fail("FLINTSUB was not registered")
+    seat = C(6522)
+    for i in range(48):
+        seat.call(["PUBLISH", "lag", blob])
+    deadline = time.time() + 10
+    while time.time() < deadline and stats(6522, "FLINTINFO").get("pubsub_links_cut_total") != "1":
+        time.sleep(0.1)
+    if stats(6522, "FLINTINFO").get("pubsub_links_cut_total") != "1":
+        fail("seat 6522 FLINTINFO pubsub_links_cut_total is %r after a link fell 48 MiB behind"
+             % stats(6522, "FLINTINFO").get("pubsub_links_cut_total"))
+    if not logged("server-6522.log", "cut off the subscriber link from"):
+        fail("seat 6522 cut a link off and logged nothing")
+    if stats(6523, "FLINTINFO").get("pubsub_links_cut_total") != "0":
+        fail("seat 6523 counted a cut-off it did not make")
+    link.k.close(); seat.k.close()
+    print("  [slow link] the seat cut off a subscriber link past 32 MiB; counted and logged")
     # The connections end; nothing of theirs stays registered.
     for c in (s1, s2, slow, fast): c.k.close()
     deadline = time.time() + 5
@@ -244,6 +292,13 @@ elif phase == "restart":
         fail("subscriptions on the restarted seat did not come back within 10 s")
     print("  [restart] links registered again %.2f s after the seat was back" % (time.time() - t0))
     round_trip("after restart")
+    # Each proxy lost its link to the restarted seat and dialed again.
+    for port in (6524, 6525):
+        st = stats(port)
+        if int(st.get("pubsub_link_redials_total", "0")) < 1 or st.get("pubsub_links") != "2":
+            fail("PROXYSTATS on %d after the restart: pubsub_link_redials_total=%s pubsub_links=%s"
+                 % (port, st.get("pubsub_link_redials_total"), st.get("pubsub_links")))
+    print("  [restart] each proxy counted its link dialed again, and holds both links")
 PY
 }
 

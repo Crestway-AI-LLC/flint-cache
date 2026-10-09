@@ -46,6 +46,19 @@ use crate::Topology;
 /// limit for a pub/sub client.
 pub(crate) const CLIENT_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Clients cut off for falling [`CLIENT_LIMIT_BYTES`] behind,
+/// `pubsub_clients_cut_total` in `PROXYSTATS`.
+pub(crate) static CLIENTS_CUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Times a link was dialed again after its connection failed or was lost,
+/// `pubsub_link_redials_total`. A seat that cut the link off for falling
+/// behind is among them; that seat logs and counts the cut-off itself.
+pub(crate) static LINK_REDIALS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Messages handed to clients' connections to write,
+/// `pubsub_messages_total`: one per client a message reaches.
+pub(crate) static MESSAGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// How long a link stays open after this proxy's last subscription ends.
 pub(crate) const LINK_IDLE: Duration = Duration::from_secs(60);
 
@@ -149,7 +162,10 @@ impl Outbox {
         }
         let size = m.size();
         if self.bytes.fetch_add(size, Ordering::Relaxed) + size > CLIENT_LIMIT_BYTES {
-            self.overflowed.store(true, Ordering::Relaxed);
+            // Counted once, by whichever push got here first.
+            if !self.overflowed.swap(true, Ordering::Relaxed) {
+                CLIENTS_CUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
             lock(&self.queue).clear();
         } else {
             lock(&self.queue).push_back(m);
@@ -177,6 +193,7 @@ impl Outbox {
         let taken: Vec<Arc<Message>> = lock(&self.queue).drain(..).collect();
         let size: usize = taken.iter().map(|m| m.size()).sum();
         self.bytes.fetch_sub(size, Ordering::Relaxed);
+        MESSAGES_TOTAL.fetch_add(taken.len() as u64, Ordering::Relaxed);
         taken
     }
 }
@@ -192,6 +209,8 @@ struct LinkState {
     /// Its last connection failed or was lost: a subscribe does not wait for
     /// it, and it registers everything when it connects again.
     failing: bool,
+    /// It holds a connection to the master now (`pubsub_links`).
+    connected: bool,
     wake: Arc<Notify>,
 }
 
@@ -291,6 +310,7 @@ impl Hub {
                     dirty: HashSet::new(),
                     synced: 0,
                     failing: false,
+                    connected: false,
                     wake: wake.clone(),
                 },
             );
@@ -379,6 +399,20 @@ impl Hub {
         }
     }
 
+    /// `(pubsub_links, pubsub_clients)` for `PROXYSTATS`: the links
+    /// connected to a master now, and the client connections holding at
+    /// least one subscription.
+    pub(crate) fn gauges(&self) -> (usize, usize) {
+        let st = self.lock();
+        let links = st.links.values().filter(|l| l.connected).count();
+        let clients: HashSet<u64> = st
+            .clients
+            .values()
+            .flat_map(|c| c.keys().copied())
+            .collect();
+        (links, clients.len())
+    }
+
     /// Hand a message from a master to every client holding `name`.
     fn deliver(&self, ns: &[u8], kind: Kind, name: &[u8], m: Message) {
         let st = self.lock();
@@ -416,12 +450,14 @@ impl Hub {
             let still = self.with_link(&addr, id, |st| {
                 if let Some(l) = st.links.get_mut(&addr) {
                     l.failing = true;
+                    l.connected = false;
                 }
             });
             self.progress.notify_waiters();
             if still.is_none() {
                 return;
             }
+            LINK_REDIALS_TOTAL.fetch_add(1, Ordering::Relaxed);
             eprintln!(
                 "[{}] pubsub link to {addr}: {err}; dialing again in {} ms",
                 crate::log_ms(),
@@ -467,6 +503,7 @@ impl Hub {
             if let Some(l) = st.links.get_mut(addr) {
                 l.dirty = keys;
                 l.failing = false;
+                l.connected = true;
             }
         });
         if started.is_none() {
@@ -824,6 +861,24 @@ impl Subscriber {
     }
 }
 
+impl Subscriber {
+    /// Say that this client was cut off for falling [`CLIENT_LIMIT_BYTES`]
+    /// behind: the one trace a tenant's lost messages leave. `id` and `name`
+    /// are the connection's, as `CLIENT ID` and `CLIENT SETNAME` know it.
+    pub(crate) fn log_cut_off(&self, id: u64, name: Option<&[u8]>) {
+        let name = name.map_or_else(String::new, |n| {
+            format!(" ({})", String::from_utf8_lossy(n))
+        });
+        eprintln!(
+            "[{}] pubsub: client {id}{name} of namespace {} cut off, {} MiB behind (ADR-0052): \
+             it was disconnected, and the messages queued for it were dropped",
+            crate::log_ms(),
+            String::from_utf8_lossy(&self.ns),
+            CLIENT_LIMIT_BYTES >> 20
+        );
+    }
+}
+
 impl Drop for Subscriber {
     fn drop(&mut self) {
         let channels = self.channels.all();
@@ -953,8 +1008,11 @@ mod tests {
             bulk(b"c"),
             bulk(b"no"),
         ]);
+        let handed = MESSAGES_TOTAL.load(Ordering::Relaxed);
         let got_a: Vec<Value> = a.outbox.drain().iter().map(|m| m.frame()).collect();
         let got_b: Vec<Value> = b.outbox.drain().iter().map(|m| m.frame()).collect();
+        // Other tests drain too, so at least these two.
+        assert!(MESSAGES_TOTAL.load(Ordering::Relaxed) >= handed + 2);
         assert_eq!(
             got_a,
             vec![Value::Push(vec![bulk(b"message"), bulk(b"c"), bulk(b"hi")])]
@@ -968,8 +1026,9 @@ mod tests {
                 bulk(b"ho")
             ])]
         );
+        let cut = CLIENTS_CUT_TOTAL.load(Ordering::Relaxed);
         let big = vec![b'x'; CLIENT_LIMIT_BYTES / 4];
-        for _ in 0..5 {
+        for _ in 0..6 {
             HUB.message(vec![
                 bulk(b"flintmessage"),
                 bulk(b"deliver-test"),
@@ -980,6 +1039,9 @@ mod tests {
         assert!(a.outbox.overflowed());
         assert!(a.outbox.drain().is_empty(), "what it held is released");
         assert!(!b.outbox.overflowed());
+        // Counted once, though a message reached it after the cut too. No
+        // other test cuts a client off, so the counter moves by one.
+        assert_eq!(CLIENTS_CUT_TOTAL.load(Ordering::Relaxed), cut + 1);
     }
 
     #[test]

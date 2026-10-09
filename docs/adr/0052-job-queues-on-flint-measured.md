@@ -487,6 +487,12 @@ unterminated `[` unlike Redis. The pub/sub glob, judged against Valkey on
   - A script that publishes, and one that publishes and then fails.
   - A client 48 MiB behind is cut off; a closed client's subscriptions
     end.
+  - Since BUG-0249 (2026-10-09), the operator's view too. Each proxy
+    reports both links and its one subscribed client, and counts messages.
+    The slow client's cut-off is counted once, at its proxy only, and
+    logged. A subscriber link held by the drill that stops reading is cut
+    off by its seat, which counts and logs it. After the seat restart,
+    each proxy has counted a redial and holds both links again.
   - A seat restarted under live subscribers, which were registered again
     0.20 s after it answered (the gate box's release build; 0.47 s for a
     local debug build).
