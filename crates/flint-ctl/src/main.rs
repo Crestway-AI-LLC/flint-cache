@@ -133,6 +133,11 @@ struct Inventory {
     /// introduced streams, because a release before it reads a stream key as
     /// no type at all.
     streams: bool,
+    /// `chunked-strings on`: start every data seat with `--chunked-strings`,
+    /// which stores a string longer than 64 KiB in chunks (ADR-0056 D4). Off
+    /// by default in the release that introduced them, because a release
+    /// before it reads a chunked string as no type at all.
+    chunked_strings: bool,
     /// Failure domain per HOST (`zone <host> <name>`): an availability zone
     /// on a cloud, a rack or a power domain on your own hardware.
     ///
@@ -406,6 +411,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "controller" => inv.controller = val == "on",
             "placed-tenants" => inv.placed_tenants = val == "on",
             "streams" => inv.streams = val == "on",
+            "chunked-strings" => inv.chunked_strings = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
             "admin-token" => inv.admin_token = Some(val.to_string()),
@@ -3289,6 +3295,9 @@ fn reload(inv: &Inventory) {
     if inv.streams {
         restart_only.push("streams");
     }
+    if inv.chunked_strings {
+        restart_only.push("chunked-strings");
+    }
     if inv.ctl_poll_ms.is_some() || inv.ctl_confirm.is_some() {
         restart_only.push("controller timing (poll-ms/confirm)");
     }
@@ -3383,6 +3392,10 @@ fn node_tuning_args(inv: &Inventory, replicated: bool) -> Vec<String> {
     // A switch, with no value (ADR-0052 D6).
     if inv.streams {
         a.push("--streams".to_string());
+    }
+    // A switch, with no value (ADR-0056 D4).
+    if inv.chunked_strings {
+        a.push("--chunked-strings".to_string());
     }
     a
 }
@@ -10511,6 +10524,28 @@ mod cp_seat_liveness_tests {
                 node_tuning_args(&on, replicated)
                     .iter()
                     .any(|a| a == "--streams")
+            );
+        }
+    }
+
+    /// ADR-0056 D4: `chunked-strings on` reaches every data seat, master and
+    /// replica alike; without it a seat stores every string inline.
+    #[test]
+    fn chunked_strings_on_reaches_every_data_seat() {
+        let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+                    cp 10.0.0.1:7500\npair 10.0.0.1:7001,10.0.0.2:7002\n";
+        let off = inv_from(base, "chunked-off");
+        let on = inv_from(&format!("{base}chunked-strings on\n"), "chunked-on");
+        for replicated in [true, false] {
+            assert!(
+                !node_tuning_args(&off, replicated)
+                    .iter()
+                    .any(|a| a == "--chunked-strings")
+            );
+            assert!(
+                node_tuning_args(&on, replicated)
+                    .iter()
+                    .any(|a| a == "--chunked-strings")
             );
         }
     }

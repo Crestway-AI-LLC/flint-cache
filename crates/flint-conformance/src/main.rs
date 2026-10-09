@@ -230,6 +230,218 @@ const SEAT_SUBSCRIBE: &str =
 /// What sharded pub/sub is answered with, at a seat and through a proxy.
 const SHARDED: &str = "ERR sharded pub/sub is not served: use SUBSCRIBE and PUBLISH (ADR-0052)";
 
+/// ADR-0056: strings longer than 64 KiB, which a seat started with
+/// `--chunked-strings` stores in 32 KiB chunks. The reads and writes here
+/// cross chunk edges, a value grows from inline to chunked and shrinks back,
+/// and every expected reply is computed from a model of the bytes, so the
+/// case says the same thing against Valkey as against a seat.
+fn large_strings() -> Case {
+    const EDGE: usize = 32 * 1024;
+    fn bit(m: &[u8], off: usize) -> i64 {
+        m.get(off >> 3)
+            .map_or(0, |b| i64::from((b >> (7 - (off & 7))) & 1))
+    }
+    fn ones(m: &[u8]) -> i64 {
+        m.iter().map(|b| i64::from(b.count_ones())).sum()
+    }
+    fn bits(m: &[u8], off: usize, n: usize) -> u64 {
+        (off..off + n).fold(0, |v, i| v << 1 | bit(m, i) as u64)
+    }
+    fn put_bits(m: &mut [u8], off: usize, n: usize, v: u64) {
+        for i in 0..n {
+            let (byte, mask) = ((off + i) >> 3, 0x80u8 >> ((off + i) & 7));
+            if v >> (n - 1 - i) & 1 == 1 {
+                m[byte] |= mask;
+            } else {
+                m[byte] &= !mask;
+            }
+        }
+    }
+    let num = |v: usize| v.to_string().into_bytes();
+    let bytes = |v: &[u8]| Expect::Bytes(v.to_vec());
+    let mut m: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let mut steps = vec![
+        s(&[b"SET", b"{lg}a", &m], Expect::Ok),
+        s(&[b"STRLEN", b"{lg}a"], Expect::Int(200_000)),
+        s(&[b"TYPE", b"{lg}a"], Expect::Simple("string")),
+        s(&[b"GET", b"{lg}a"], bytes(&m)),
+        s(
+            &[b"GETRANGE", b"{lg}a", &num(EDGE - 8), &num(EDGE + 7)],
+            bytes(&m[EDGE - 8..EDGE + 8]),
+        ),
+        s(
+            &[b"GETRANGE", b"{lg}a", b"-5", b"-1"],
+            bytes(&m[m.len() - 5..]),
+        ),
+    ];
+    // SETRANGE across the second chunk edge.
+    let at = 2 * EDGE - 6;
+    m[at..at + 12].copy_from_slice(b"XXXXXXXXXXXX");
+    steps.push(s(
+        &[b"SETRANGE", b"{lg}a", &num(at), b"XXXXXXXXXXXX"],
+        Expect::Int(200_000),
+    ));
+    steps.push(s(
+        &[b"GETRANGE", b"{lg}a", &num(at - 2), &num(at + 13)],
+        bytes(&m[at - 2..at + 14]),
+    ));
+    m.extend_from_slice(b"tail");
+    steps.push(s(
+        &[b"APPEND", b"{lg}a", b"tail"],
+        Expect::Int(m.len() as i64),
+    ));
+    // A bit in the fourth chunk.
+    let off = (3 * EDGE + 100) * 8 + 3;
+    steps.push(s(
+        &[b"SETBIT", b"{lg}a", &num(off), b"1"],
+        Expect::Int(bit(&m, off)),
+    ));
+    m[off >> 3] |= 0x80 >> (off & 7);
+    steps.push(s(&[b"GETBIT", b"{lg}a", &num(off)], Expect::Int(1)));
+    steps.push(s(
+        &[b"GETBIT", b"{lg}a", &num(off + 1)],
+        Expect::Int(bit(&m, off + 1)),
+    ));
+    steps.push(s(&[b"BITCOUNT", b"{lg}a"], Expect::Int(ones(&m))));
+    steps.push(s(
+        &[b"BITCOUNT", b"{lg}a", &num(EDGE - 3), &num(EDGE + 2)],
+        Expect::Int(ones(&m[EDGE - 3..EDGE + 3])),
+    ));
+    let (lo, hi) = (EDGE * 8 - 5, EDGE * 8 + 4);
+    steps.push(s(
+        &[b"BITCOUNT", b"{lg}a", &num(lo), &num(hi), b"BIT"],
+        Expect::Int((lo..=hi).map(|i| bit(&m, i)).sum()),
+    ));
+    // A run of set bits across the fourth edge: BITPOS 0 looks past it.
+    let run = 4 * EDGE - 3;
+    m[run..run + 6].fill(0xff);
+    steps.push(s(
+        &[b"SETRANGE", b"{lg}a", &num(run), &[0xff; 6]],
+        Expect::Int(m.len() as i64),
+    ));
+    let first_zero = (run * 8..).find(|&i| bit(&m, i) == 0).expect("a zero bit");
+    steps.push(s(
+        &[b"BITPOS", b"{lg}a", b"0", &num(run)],
+        Expect::Int(first_zero as i64),
+    ));
+    let first_one = (EDGE * 8 - 1..)
+        .find(|&i| bit(&m, i) == 1)
+        .expect("a set bit");
+    steps.push(s(
+        &[
+            b"BITPOS",
+            b"{lg}a",
+            b"1",
+            &num(EDGE * 8 - 1),
+            &num(EDGE * 8 + 64),
+            b"BIT",
+        ],
+        Expect::Int(if first_one <= EDGE * 8 + 64 {
+            first_one as i64
+        } else {
+            -1
+        }),
+    ));
+    // BITFIELD across the first edge.
+    let fo = EDGE * 8 - 13;
+    let next = (bits(&m, fo, 32) + 7) & 0xffff_ffff;
+    let got = bits(&m, EDGE * 8 - 8, 16);
+    steps.push(s(
+        &[
+            b"BITFIELD",
+            b"{lg}a",
+            b"GET",
+            b"u16",
+            &num(EDGE * 8 - 8),
+            b"INCRBY",
+            b"u32",
+            &num(fo),
+            b"7",
+        ],
+        Expect::Arr(vec![Expect::Int(got as i64), Expect::Int(next as i64)]),
+    ));
+    put_bits(&mut m, fo, 32, next);
+    steps.push(s(
+        &[b"GETRANGE", b"{lg}a", &num(EDGE - 3), &num(EDGE + 2)],
+        bytes(&m[EDGE - 3..EDGE + 3]),
+    ));
+    steps.extend([
+        s(
+            &[b"INCR", b"{lg}a"],
+            Expect::Err("ERR value is not an integer or out of range"),
+        ),
+        s(
+            &[b"INCRBYFLOAT", b"{lg}a", b"1"],
+            Expect::Err("ERR value is not a valid float"),
+        ),
+        s(
+            &[b"LPUSH", b"{lg}a", b"x"],
+            Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        ),
+        // The keyspace commands carry every chunk.
+        s(&[b"COPY", b"{lg}a", b"{lg}b"], Expect::Int(1)),
+        s(&[b"GET", b"{lg}b"], bytes(&m)),
+        s(&[b"RENAME", b"{lg}b", b"{lg}c"], Expect::Ok),
+        s(&[b"EXISTS", b"{lg}b"], Expect::Int(0)),
+        s(&[b"STRLEN", b"{lg}c"], Expect::Int(m.len() as i64)),
+        s(&[b"GETEX", b"{lg}c", b"EX", b"100"], bytes(&m)),
+        s(&[b"TTL", b"{lg}c"], Expect::IntRange(99, 100)),
+        s(&[b"GETDEL", b"{lg}c"], bytes(&m)),
+        s(&[b"EXISTS", b"{lg}c"], Expect::Int(0)),
+        // BITOP reads a large source and writes a large destination.
+        s(
+            &[b"BITOP", b"NOT", b"{lg}d", b"{lg}a"],
+            Expect::Int(m.len() as i64),
+        ),
+        s(
+            &[b"GET", b"{lg}d"],
+            Expect::Bytes(m.iter().map(|b| !b).collect()),
+        ),
+        // A sparse bitmap.
+        s(&[b"SETBIT", b"{lg}s", b"8000000", b"1"], Expect::Int(0)),
+        s(&[b"STRLEN", b"{lg}s"], Expect::Int(1_000_001)),
+        s(&[b"BITCOUNT", b"{lg}s"], Expect::Int(1)),
+        s(&[b"BITPOS", b"{lg}s", b"1"], Expect::Int(8_000_000)),
+        s(
+            &[b"GETRANGE", b"{lg}s", b"999999", b"1000000"],
+            Expect::Str(b"\x00\x80"),
+        ),
+        // Growth past 64 KiB, by APPEND and by SETRANGE on a missing key.
+        s(&[b"SET", b"{lg}g", &[b'g'; 60_000]], Expect::Ok),
+        s(&[b"APPEND", b"{lg}g", &[b'h'; 10_000]], Expect::Int(70_000)),
+        s(
+            &[b"GETRANGE", b"{lg}g", b"59998", b"60001"],
+            Expect::Str(b"gghh"),
+        ),
+        s(
+            &[b"SETRANGE", b"{lg}h", b"100000", b"x"],
+            Expect::Int(100_001),
+        ),
+        s(
+            &[b"GETRANGE", b"{lg}h", b"99998", b"100000"],
+            Expect::Str(b"\x00\x00x"),
+        ),
+        // And back: a short value replaces a large one.
+        s(
+            &[b"SET", b"{lg}g", b"small", b"GET"],
+            Expect::Bytes([[b'g'; 60_000].as_slice(), &[b'h'; 10_000]].concat()),
+        ),
+        s(
+            &[b"MGET", b"{lg}g", b"{lg}h"],
+            Expect::Arr(vec![
+                Expect::Str(b"small"),
+                Expect::Bytes([vec![0u8; 100_000], b"x".to_vec()].concat()),
+            ]),
+        ),
+        s(&[b"STRLEN", b"{lg}g"], Expect::Int(5)),
+    ]);
+    Case {
+        family: "strings",
+        name: "large strings, across chunk edges (ADR-0056)",
+        steps,
+    }
+}
+
 fn corpus() -> Vec<Case> {
     let big = vec![0xABu8; 1024];
     vec![
@@ -712,6 +924,7 @@ fn corpus() -> Vec<Case> {
                 s(&[b"BITOP", b"AND", b"{bo}d", b"{bo}a", b"{bo}l"], Expect::AnyError),
             ],
         },
+        large_strings(),
         // Streams (ADR-0052 D6), against Valkey 9.1. `~` trimming is not
         // here: Valkey trims whole internal nodes and Flint trims exactly
         // (a documented difference); only its argument errors are.
@@ -6771,9 +6984,21 @@ fn matches(expect: &Expect, got: &Value, proto: Proto) -> bool {
 
 fn render(args: &[Vec<u8>]) -> String {
     args.iter()
-        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .map(|a| match a.len() {
+            // A large payload (ADR-0056) is named by its length.
+            n if n > 256 => format!("<{n} bytes>"),
+            _ => String::from_utf8_lossy(a).into_owned(),
+        })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// A reply or expectation, cut short enough to read in a failure line.
+fn clip(text: String) -> String {
+    match text.char_indices().nth(600) {
+        Some((at, _)) => format!("{}... ({} chars)", &text[..at], text.len()),
+        None => text,
+    }
 }
 
 fn main() -> ExitCode {
@@ -6982,11 +7207,11 @@ fn run_case(ep: &Endpoint, case: &Case, proto: Proto) -> std::io::Result<Option<
         let got = client.call(args)?;
         if !matches(expect, &got, proto) {
             return Ok(Some(format!(
-                "step {}: `{}` expected {:?}, got {:?}",
+                "step {}: `{}` expected {}, got {}",
                 step_no + 1,
                 render(args),
-                expect,
-                got
+                clip(format!("{expect:?}")),
+                clip(format!("{got:?}"))
             )));
         }
         if *delay_ms > 0 {

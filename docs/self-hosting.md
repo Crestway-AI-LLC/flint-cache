@@ -208,6 +208,7 @@ proxy HOST:P                # a routing proxy; repeatable
 controller on               # automatic failover supervision
 placed-tenants on           # allow `tenant add-on-pair` (ADR-0053; see section 4)
 streams on                  # let XADD create streams (ADR-0052; see section 4)
+chunked-strings on          # store strings over 64 KiB in chunks (ADR-0056; section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
 admin-token <tok>           # gate the PROXY*/operator surface
@@ -1238,6 +1239,18 @@ Notes:
   stream key as having no type: once a tenant has created a stream, do not
   roll this fleet back below this release. A tenant's `XADD` that would
   create a stream is refused while it is off.
+- **Large strings in chunks** (ADR-0056): every seat reads a string stored
+  in 32 KiB chunks, but a seat stores one that way only when the inventory
+  says `chunked-strings on` (each data seat then runs with
+  `--chunked-strings`). With it, a write to a string longer than 64 KiB
+  (SETBIT, SETRANGE, APPEND, BITFIELD) writes only the chunks it changes,
+  and GETBIT, GETRANGE and a ranged BITCOUNT or BITPOS read only theirs;
+  without it, such a write rewrites the whole string. It is off by default
+  in the release that introduced it, because a release before it reads a
+  chunked string as having no type: once a seat has stored one, do not roll
+  this fleet back below this release. Nothing is refused while it is off:
+  a string already in chunks is still written in place, until a `SET`
+  replaces it with one stored whole.
 
 ## 5. Rotating credentials & keys
 

@@ -8,7 +8,10 @@
 //! replicates; wall clocks don't).
 
 use crate::Kv;
-use crate::encoding::{Cf, MetaHeader, StringMeta, ValueType, envelope};
+use crate::encoding::{
+    Cf, ComplexMeta, MetaHeader, StringMeta, ValueType, VersionGen, envelope, subkey_envelope,
+    subkey_prefix,
+};
 
 pub type Clock = fn() -> u64;
 
@@ -96,11 +99,39 @@ pub enum StoreError {
     StreamExhausted,
 }
 
+/// ADR-0056: a string longer than this is stored in chunks, when the seat
+/// writes them (`--chunked-strings`).
+pub const INLINE_MAX: usize = 64 * 1024;
+/// ADR-0056: the bytes one chunk row holds.
+pub const CHUNK_BYTES: usize = 32 * 1024;
+
 pub struct StringStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
     clock: Clock,
     max_value_bytes: u64,
+    /// Whether a write may store a string in chunks (ADR-0056 D4). A
+    /// chunked string is read, and changed in place, either way.
+    chunked_writes: bool,
+    /// The longest string stored inline when `chunked_writes` is on.
+    inline_max: usize,
+    /// The bytes per chunk row.
+    chunk: usize,
+}
+
+/// A live string as stored: inline in its metadata row, or in chunks.
+enum Stored {
+    Inline(StringMeta),
+    Chunked(ComplexMeta),
+}
+
+impl Stored {
+    fn len(&self) -> u64 {
+        match self {
+            Stored::Inline(m) => m.payload.len() as u64,
+            Stored::Chunked(c) => c.bytes,
+        }
+    }
 }
 
 impl<'a> StringStore<'a> {
@@ -115,11 +146,35 @@ impl<'a> StringStore<'a> {
             ns: ns.to_vec(),
             clock,
             max_value_bytes: if max == 0 { u64::MAX } else { max },
+            chunked_writes: false,
+            inline_max: INLINE_MAX,
+            chunk: CHUNK_BYTES,
         }
+    }
+
+    /// Let writes store a string longer than [`INLINE_MAX`] in chunks
+    /// (ADR-0056 D4).
+    pub fn chunked(mut self, writes: bool) -> Self {
+        self.chunked_writes = writes;
+        self
+    }
+
+    /// Smaller limits, so tests reach every chunk boundary with short
+    /// strings.
+    #[cfg(test)]
+    fn with_chunks(mut self, inline_max: usize, chunk: usize) -> Self {
+        self.chunked_writes = true;
+        self.inline_max = inline_max;
+        self.chunk = chunk;
+        self
     }
 
     fn meta_key(&self, slot: u16, key: &[u8]) -> Vec<u8> {
         envelope(Cf::Metadata, &self.ns, slot, key)
+    }
+
+    fn chunk_key(&self, slot: u16, key: &[u8], version: u64, i: u64) -> Vec<u8> {
+        subkey_envelope(&self.ns, slot, key, version, &(i as u32).to_be_bytes())
     }
 
     /// Live header of ANY type (for SET's existence/KEEPTTL semantics).
@@ -134,8 +189,9 @@ impl<'a> StringStore<'a> {
         Some(header)
     }
 
-    /// Live string row; WRONGTYPE if the key holds another type.
-    fn read_live(&self, slot: u16, key: &[u8]) -> Result<Option<StringMeta>, StoreError> {
+    /// Live string, inline or chunked; WRONGTYPE if the key holds another
+    /// type.
+    fn read_live(&self, slot: u16, key: &[u8]) -> Result<Option<Stored>, StoreError> {
         let mk = self.meta_key(slot, key);
         // BORROW THE ROW, COPY ONLY THE PAYLOAD. `kv.get` allocated the whole
         // row and copied it out of the block cache, and then
@@ -152,7 +208,7 @@ impl<'a> StringStore<'a> {
             Undecodable,
             Expired,
             WrongType,
-            Live(Box<StringMeta>),
+            Live(Box<Stored>),
         }
         let mut outcome = Row::Missing;
         let now = (self.clock)();
@@ -165,12 +221,16 @@ impl<'a> StringStore<'a> {
                 outcome = Row::Expired;
                 return;
             }
-            if header.value_type() != Some(ValueType::String) {
-                outcome = Row::WrongType;
-                return;
-            }
-            outcome = match StringMeta::decode(row) {
-                Some(m) => Row::Live(Box::new(m)),
+            let stored = match header.value_type() {
+                Some(ValueType::String) => StringMeta::decode(row).map(Stored::Inline),
+                Some(ValueType::ChunkedString) => ComplexMeta::decode(row).map(Stored::Chunked),
+                _ => {
+                    outcome = Row::WrongType;
+                    return;
+                }
+            };
+            outcome = match stored {
+                Some(s) => Row::Live(Box::new(s)),
                 None => Row::Undecodable,
             };
         });
@@ -181,7 +241,152 @@ impl<'a> StringStore<'a> {
                 Ok(None)
             }
             Row::WrongType => Err(StoreError::WrongType),
-            Row::Live(m) => Ok(Some(*m)),
+            Row::Live(s) => Ok(Some(*s)),
+        }
+    }
+
+    /// Bytes `[from, to)` of a chunked string, read from only the chunks
+    /// they cover, in one ordered scan; zeros where no chunk row holds them.
+    fn read_chunked(&self, slot: u16, key: &[u8], c: &ComplexMeta, from: u64, to: u64) -> Vec<u8> {
+        let to = to.min(c.bytes);
+        if from >= to {
+            return Vec::new();
+        }
+        let mut out = vec![0u8; (to - from) as usize];
+        let size = self.chunk as u64;
+        let (first, last) = (from / size, (to - 1) / size);
+        let prefix = subkey_prefix(&self.ns, slot, key, c.version);
+        let after = if first == 0 {
+            Vec::new()
+        } else {
+            self.chunk_key(slot, key, c.version, first - 1)
+        };
+        self.kv.for_each_from(&prefix, &after, &mut |k, v| {
+            let Some(i) = k
+                .get(prefix.len()..)
+                .and_then(|f| <[u8; 4]>::try_from(f).ok())
+                .map(|f| u64::from(u32::from_be_bytes(f)))
+            else {
+                return true;
+            };
+            if i > last {
+                return false;
+            }
+            let base = i * size;
+            let (lo, hi) = (base.max(from), (base + v.len() as u64).min(to));
+            if lo < hi {
+                out[(lo - from) as usize..(hi - from) as usize]
+                    .copy_from_slice(&v[(lo - base) as usize..(hi - base) as usize]);
+            }
+            true
+        });
+        out
+    }
+
+    /// The whole value of a live string.
+    fn value_of(&self, slot: u16, key: &[u8], stored: Stored) -> Vec<u8> {
+        match stored {
+            Stored::Inline(m) => m.payload,
+            Stored::Chunked(c) => self.read_chunked(slot, key, &c, 0, c.bytes),
+        }
+    }
+
+    /// Store a whole value, replacing the key: inline, or in chunks under a
+    /// new version when writes may chunk and it is longer than the inline
+    /// limit (ADR-0056 D2). A replaced chunked string's rows are orphans
+    /// for the sweeper, as a deleted collection's are.
+    fn put_value(&self, slot: u16, key: &[u8], payload: Vec<u8>, expire_ms: u64) {
+        let now = (self.clock)();
+        if !(self.chunked_writes && payload.len() > self.inline_max) {
+            let meta = StringMeta::new(payload, expire_ms, now);
+            self.kv.put(&self.meta_key(slot, key), &meta.encode());
+            return;
+        }
+        let mut meta = ComplexMeta::new(ValueType::ChunkedString, VersionGen::next(now));
+        meta.header.expire_ms = expire_ms;
+        for (i, part) in payload.chunks(self.chunk).enumerate() {
+            // A chunk of zeros is the same as no chunk: a sparse bitmap
+            // stores only the chunks it has set bits in.
+            if part.iter().any(|&b| b != 0) {
+                self.kv
+                    .put(&self.chunk_key(slot, key, meta.version, i as u64), part);
+            }
+        }
+        meta.bytes = payload.len() as u64;
+        meta.size = payload.len().div_ceil(self.chunk) as u32;
+        meta.touch(now);
+        // Metadata LAST: until it lands the key holds its old value, and a
+        // crash leaves unreachable chunks for the sweeper.
+        self.kv.put(&self.meta_key(slot, key), &meta.encode());
+    }
+
+    /// What an in-place write (APPEND, SETRANGE, SETBIT, BITFIELD) works
+    /// on, for a string that will be at least `need` bytes long: the chunks
+    /// when it is chunked or is about to be, else the inline value.
+    fn target(&self, slot: u16, key: &[u8], need: u64) -> Result<Target<'_, 'a>, StoreError> {
+        let existing = self.read_live(slot, key)?;
+        let chunk_now = self.chunked_writes && need > self.inline_max as u64;
+        Ok(match existing {
+            Some(Stored::Chunked(meta)) => Target::Chunked(self.view(slot, key, meta, false)),
+            Some(Stored::Inline(m)) if chunk_now => {
+                // Rewritten once, into chunks, then changed in place.
+                let mut meta =
+                    ComplexMeta::new(ValueType::ChunkedString, VersionGen::next((self.clock)()));
+                meta.header.expire_ms = m.expire_ms;
+                for (i, part) in m.payload.chunks(self.chunk).enumerate() {
+                    if part.iter().any(|&b| b != 0) {
+                        self.kv
+                            .put(&self.chunk_key(slot, key, meta.version, i as u64), part);
+                    }
+                }
+                meta.bytes = m.payload.len() as u64;
+                Target::Chunked(self.view(slot, key, meta, true))
+            }
+            None if chunk_now => {
+                let meta =
+                    ComplexMeta::new(ValueType::ChunkedString, VersionGen::next((self.clock)()));
+                Target::Chunked(self.view(slot, key, meta, true))
+            }
+            Some(Stored::Inline(m)) => {
+                Target::Inline(self.inline(slot, key, m.payload, m.expire_ms, false))
+            }
+            None => Target::Inline(self.inline(slot, key, Vec::new(), 0, true)),
+        })
+    }
+
+    fn inline<'s>(
+        &'s self,
+        slot: u16,
+        key: &[u8],
+        payload: Vec<u8>,
+        expire_ms: u64,
+        dirty: bool,
+    ) -> InlineView<'s, 'a> {
+        InlineView {
+            store: self,
+            slot,
+            key: key.to_vec(),
+            payload,
+            expire_ms,
+            dirty,
+        }
+    }
+
+    fn view<'s>(
+        &'s self,
+        slot: u16,
+        key: &[u8],
+        meta: ComplexMeta,
+        dirty: bool,
+    ) -> ChunkView<'s, 'a> {
+        ChunkView {
+            store: self,
+            slot,
+            key: key.to_vec(),
+            meta,
+            chunks: std::collections::BTreeMap::new(),
+            changed: std::collections::BTreeSet::new(),
+            dirty,
         }
     }
 
@@ -208,8 +413,9 @@ impl<'a> StringStore<'a> {
         // The skipped call also lazily deletes an EXPIRED row, and dropping
         // that is safe here and only here: it deletes meta_key(slot, key) and
         // the put below writes that same key, so the overwrite subsumes the
-        // delete. Orphaned subkeys of a displaced complex type are the GC
-        // sweeper's job either way — SET never cleaned those up.
+        // delete. Orphaned subkeys of a displaced complex type, or of a
+        // displaced chunked string, are the GC sweeper's job either way —
+        // SET never cleaned those up.
         let needs_existing = opts.nx || opts.xx || matches!(opts.expiry, SetExpiry::Keep);
         let existing = if needs_existing {
             self.read_live_header(slot, key)
@@ -224,19 +430,22 @@ impl<'a> StringStore<'a> {
             SetExpiry::Keep => existing.map(|h| h.expire_ms).unwrap_or(0),
             SetExpiry::AtMs(at) => at,
         };
-        let meta = StringMeta::new(value.to_vec(), expire_ms, (self.clock)());
-        self.kv.put(&self.meta_key(slot, key), &meta.encode());
+        self.put_value(slot, key, value.to_vec(), expire_ms);
         Ok(SetOutcome::Done)
     }
 
     pub fn get(&self, slot: u16, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self.read_live(slot, key)?.map(|m| m.payload))
+        Ok(self
+            .read_live(slot, key)?
+            .map(|s| self.value_of(slot, key, s)))
     }
 
     /// GETDEL: return the value and delete the key atomically (one node, one
     /// slot). WRONGTYPE if the key holds a non-string (read_live checks type).
     pub fn get_del(&self, slot: u16, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let existing = self.read_live(slot, key)?.map(|m| m.payload);
+        let existing = self
+            .read_live(slot, key)?
+            .map(|s| self.value_of(slot, key, s));
         if existing.is_some() {
             self.kv.delete(&self.meta_key(slot, key));
         }
@@ -257,30 +466,42 @@ impl<'a> StringStore<'a> {
         key: &[u8],
         expiry: SetExpiry,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let Some(mut meta) = self.read_live(slot, key)? else {
+        let Some(stored) = self.read_live(slot, key)? else {
             return Ok(None);
         };
         let new_expire = match expiry {
             // GETEX with no option is a plain GET: the TTL is untouched,
             // which is NOT the same as clearing it.
-            SetExpiry::Keep => return Ok(Some(meta.payload)),
+            SetExpiry::Keep => return Ok(Some(self.value_of(slot, key, stored))),
             SetExpiry::AtMs(at) => at,
             // PERSIST.
             SetExpiry::Clear => 0,
         };
-        if new_expire != meta.expire_ms {
-            meta.expire_ms = new_expire;
-            self.kv.put(&self.meta_key(slot, key), &meta.encode());
+        // The TTL changes and the write stamp does not: an expiry is a
+        // touch, not a write, for either form.
+        match &stored {
+            Stored::Inline(m) if new_expire != m.expire_ms => {
+                let mut row = m.encode();
+                MetaHeader::write_expire(&mut row, new_expire);
+                self.kv.put(&self.meta_key(slot, key), &row);
+            }
+            Stored::Chunked(c) if new_expire != c.header.expire_ms => {
+                let mut c = *c;
+                c.header.expire_ms = new_expire;
+                self.kv.put(&self.meta_key(slot, key), &c.encode());
+            }
+            _ => {}
         }
-        Ok(Some(meta.payload))
+        Ok(Some(self.value_of(slot, key, stored)))
     }
 
     /// INCRBY/DECRBY. Creates the key at 0. Preserves TTL.
     pub fn incr_by(&self, slot: u16, key: &[u8], delta: i64) -> Result<i64, StoreError> {
-        let existing = self.read_live(slot, key)?;
-        let (current, expire_ms) = match &existing {
+        let (current, expire_ms) = match self.read_live(slot, key)? {
             None => (0i64, 0u64),
-            Some(m) => {
+            // Longer than 64 KiB is not an integer, unread (ADR-0056 D3).
+            Some(Stored::Chunked(_)) => return Err(StoreError::NotInteger),
+            Some(Stored::Inline(m)) => {
                 let n = parse_redis_i64(&m.payload).ok_or(StoreError::NotInteger)?;
                 (n, m.expire_ms)
             }
@@ -295,10 +516,11 @@ impl<'a> StringStore<'a> {
     /// representation — Redis's LD_STR_HUMAN shape (`%.17f`, trailing zeros
     /// then a bare dot trimmed), which is also what lands in the value.
     pub fn incr_by_float(&self, slot: u16, key: &[u8], delta: f64) -> Result<Vec<u8>, StoreError> {
-        let existing = self.read_live(slot, key)?;
-        let (current, expire_ms) = match &existing {
+        let (current, expire_ms) = match self.read_live(slot, key)? {
             None => (0f64, 0u64),
-            Some(m) => {
+            // Redis reads no float longer than 5 KiB (ADR-0056 D3).
+            Some(Stored::Chunked(_)) => return Err(StoreError::NotFloat),
+            Some(Stored::Inline(m)) => {
                 let s = std::str::from_utf8(&m.payload).map_err(|_| StoreError::NotFloat)?;
                 // Redis does not read a stored `nan` as a float, so the
                 // value is the error, not the sum (BUG-0219).
@@ -320,27 +542,24 @@ impl<'a> StringStore<'a> {
         Ok(repr)
     }
 
-    /// APPEND: returns new length. Creates the key. Preserves TTL.
+    /// APPEND: returns new length. Creates the key. Preserves TTL. A
+    /// chunked string writes only its tail.
     pub fn append(&self, slot: u16, key: &[u8], suffix: &[u8]) -> Result<usize, StoreError> {
-        let existing = self.read_live(slot, key)?;
-        let (mut payload, expire_ms) = match existing {
-            None => (Vec::new(), 0),
-            Some(m) => (m.payload, m.expire_ms),
-        };
+        let len = self.read_live(slot, key)?.map_or(0, |s| s.len());
         // The incremental hole SET's check can't close: repeated APPENDs
         // must not build a value past the cap (Valkey checkStringLength).
-        if (payload.len() + suffix.len()) as u64 > self.max_value_bytes {
+        let end = len + suffix.len() as u64;
+        if end > self.max_value_bytes {
             return Err(StoreError::ValueTooLarge);
         }
-        payload.extend_from_slice(suffix);
-        let len = payload.len();
-        let meta = StringMeta::new(payload, expire_ms, (self.clock)());
-        self.kv.put(&self.meta_key(slot, key), &meta.encode());
-        Ok(len)
+        let mut target = self.target(slot, key, end)?;
+        target.write(len, suffix);
+        target.finish();
+        Ok(end as usize)
     }
 
     pub fn strlen(&self, slot: u16, key: &[u8]) -> Result<usize, StoreError> {
-        Ok(self.read_live(slot, key)?.map_or(0, |m| m.payload.len()))
+        Ok(self.read_live(slot, key)?.map_or(0, |s| s.len() as usize))
     }
 
     /// GETRANGE: inclusive `[start, end]` with negatives from the end,
@@ -352,7 +571,7 @@ impl<'a> StringStore<'a> {
         start: i64,
         end: i64,
     ) -> Result<Vec<u8>, StoreError> {
-        let Some(m) = self.read_live(slot, key)? else {
+        let Some(stored) = self.read_live(slot, key)? else {
             return Ok(Vec::new());
         };
         // Redis's rules (BUG-0214), which are not LRANGE's: two negative
@@ -362,14 +581,17 @@ impl<'a> StringStore<'a> {
         if start < 0 && end < 0 && start > end {
             return Ok(Vec::new());
         }
-        let len = m.payload.len() as i64;
+        let len = stored.len() as i64;
         let norm = |i: i64| if i < 0 { len + i } else { i };
         let from = norm(start).max(0);
         let to = norm(end).max(0).min(len - 1);
         if len == 0 || from > to {
             return Ok(Vec::new());
         }
-        Ok(m.payload[from as usize..=(to as usize)].to_vec())
+        Ok(match stored {
+            Stored::Inline(m) => m.payload[from as usize..=(to as usize)].to_vec(),
+            Stored::Chunked(c) => self.read_chunked(slot, key, &c, from as u64, to as u64 + 1),
+        })
     }
 
     /// SETRANGE: overwrite `patch` at `offset`, zero-padding any gap;
@@ -383,27 +605,20 @@ impl<'a> StringStore<'a> {
         offset: u64,
         patch: &[u8],
     ) -> Result<usize, StoreError> {
-        let existing = self.read_live(slot, key)?;
         if patch.is_empty() {
-            return Ok(existing.map_or(0, |m| m.payload.len()));
+            return Ok(self.read_live(slot, key)?.map_or(0, |s| s.len() as usize));
         }
-        let (mut payload, expire_ms) = match existing {
-            None => (Vec::new(), 0),
-            Some(m) => (m.payload, m.expire_ms),
-        };
         let end = offset + patch.len() as u64;
         if end > self.max_value_bytes {
+            // Valkey checks the type before the size.
+            self.read_live(slot, key)?;
             return Err(StoreError::ValueTooLarge);
         }
-        let end = end as usize;
-        if payload.len() < end {
-            payload.resize(end, 0);
-        }
-        payload[offset as usize..end].copy_from_slice(patch);
-        let len = payload.len();
-        let meta = StringMeta::new(payload, expire_ms, (self.clock)());
-        self.kv.put(&self.meta_key(slot, key), &meta.encode());
-        Ok(len)
+        let mut target = self.target(slot, key, end)?;
+        target.write(offset, patch);
+        let len = target.len();
+        target.finish();
+        Ok(len as usize)
     }
 
     /// BITFIELD (BUG-0192): run `ops` in order over the string as a bit
@@ -421,35 +636,39 @@ impl<'a> StringStore<'a> {
         key: &[u8],
         ops: &[BitfieldOp],
     ) -> Result<Vec<Option<i64>>, StoreError> {
-        let existing = self.read_live(slot, key)?;
         let highest = ops
             .iter()
             .filter(|op| !matches!(op.kind, BitfieldKind::Get))
             .map(|op| op.offset + u64::from(op.bits) - 1)
             .max();
         let Some(highest) = highest else {
-            let payload = existing.map(|m| m.payload).unwrap_or_default();
-            return Ok(ops.iter().map(|op| Some(op.read(&payload))).collect());
+            // Reads only: nothing is created, and a chunked string reads
+            // just the chunks the fields fall in.
+            let Some(stored) = self.read_live(slot, key)? else {
+                return Ok(ops.iter().map(|_| Some(0)).collect());
+            };
+            let mut target = match stored {
+                Stored::Inline(m) => {
+                    Target::Inline(self.inline(slot, key, m.payload, m.expire_ms, false))
+                }
+                Stored::Chunked(c) => Target::Chunked(self.view(slot, key, c, false)),
+            };
+            return Ok(ops.iter().map(|op| Some(op.read(&mut target))).collect());
         };
         let need = (highest >> 3) + 1;
         if need > self.max_value_bytes {
+            self.read_live(slot, key)?;
             return Err(StoreError::ValueTooLarge);
         }
-        let (mut payload, expire_ms, mut dirty) = match existing {
-            None => (Vec::new(), 0, true),
-            Some(m) => (m.payload, m.expire_ms, false),
-        };
-        if (payload.len() as u64) < need {
-            payload.resize(need as usize, 0);
-            dirty = true;
-        }
+        let mut target = self.target(slot, key, need)?;
+        target.grow(need);
         let mut replies = Vec::with_capacity(ops.len());
         for op in ops {
             let reply = match op.kind {
-                BitfieldKind::Get => Some(op.read(&payload)),
+                BitfieldKind::Get => Some(op.read(&mut target)),
                 BitfieldKind::Set(value, overflow) | BitfieldKind::IncrBy(value, overflow) => {
                     let incr = matches!(op.kind, BitfieldKind::IncrBy(..));
-                    let old = op.read(&payload);
+                    let old = op.read(&mut target);
                     let (new, overflowed) = if op.signed {
                         let (from, by) = if incr { (old, value) } else { (value, 0) };
                         match signed_overflow(from, by, op.bits, overflow) {
@@ -470,18 +689,14 @@ impl<'a> StringStore<'a> {
                     if overflowed && overflow == BitfieldOverflow::Fail {
                         None
                     } else {
-                        write_bits(&mut payload, op.offset, op.bits, new as u64);
-                        dirty |= op.read(&payload) != old;
+                        write_bits(&mut target, op.offset, op.bits, new as u64);
                         Some(if incr { new } else { old })
                     }
                 }
             };
             replies.push(reply);
         }
-        if dirty {
-            let meta = StringMeta::new(payload, expire_ms, (self.clock)());
-            self.kv.put(&self.meta_key(slot, key), &meta.encode());
-        }
+        target.finish();
         Ok(replies)
     }
 
@@ -489,40 +704,38 @@ impl<'a> StringStore<'a> {
     /// and answer its old value. The string grows with zeros to cover the
     /// bit, the key is created if missing, and the TTL is kept. As in
     /// Valkey, a bit that already holds `on` in a string long enough writes
-    /// nothing.
+    /// nothing. A chunked string reads and writes one chunk.
     pub fn setbit(&self, slot: u16, key: &[u8], offset: u64, on: bool) -> Result<bool, StoreError> {
-        let byte = (offset >> 3) as usize;
-        if byte as u64 + 1 > self.max_value_bytes {
+        let byte = offset >> 3;
+        if byte + 1 > self.max_value_bytes {
+            self.read_live(slot, key)?;
             return Err(StoreError::ValueTooLarge);
         }
-        let (mut payload, expire_ms, mut dirty) = match self.read_live(slot, key)? {
-            None => (Vec::new(), 0, true),
-            Some(m) => (m.payload, m.expire_ms, false),
-        };
-        if payload.len() <= byte {
-            payload.resize(byte + 1, 0);
-            dirty = true;
-        }
+        let mut target = self.target(slot, key, byte + 1)?;
+        target.grow(byte + 1);
         let mask = 1u8 << (7 - (offset & 7));
-        let old = payload[byte] & mask != 0;
+        let current = target.byte(byte);
+        let old = current & mask != 0;
         if old != on {
-            payload[byte] ^= mask;
-            dirty = true;
+            target.set_byte(byte, current ^ mask);
         }
-        if dirty {
-            let meta = StringMeta::new(payload, expire_ms, (self.clock)());
-            self.kv.put(&self.meta_key(slot, key), &meta.encode());
-        }
+        target.finish();
         Ok(old)
     }
 
     /// GETBIT: the bit at `offset`; zero past the end and for a missing key.
     pub fn getbit(&self, slot: u16, key: &[u8], offset: u64) -> Result<bool, StoreError> {
-        let Some(m) = self.read_live(slot, key)? else {
-            return Ok(false);
+        let byte = offset >> 3;
+        let value = match self.read_live(slot, key)? {
+            None => 0,
+            Some(Stored::Inline(m)) => m.payload.get(byte as usize).copied().unwrap_or(0),
+            Some(Stored::Chunked(c)) => self
+                .read_chunked(slot, key, &c, byte, byte + 1)
+                .first()
+                .copied()
+                .unwrap_or(0),
         };
-        let byte = m.payload.get((offset >> 3) as usize).copied().unwrap_or(0);
-        Ok(byte & (1 << (7 - (offset & 7))) != 0)
+        Ok(value & (1 << (7 - (offset & 7))) != 0)
     }
 
     /// BITCOUNT: the set bits in the string, or in `range`
@@ -533,10 +746,11 @@ impl<'a> StringStore<'a> {
         key: &[u8],
         range: Option<(i64, i64, bool)>,
     ) -> Result<u64, StoreError> {
-        let Some(m) = self.read_live(slot, key)? else {
-            return Ok(0);
-        };
-        Ok(bitcount_of(&m.payload, range))
+        Ok(match self.read_live(slot, key)? {
+            None => 0,
+            Some(Stored::Inline(m)) => bitcount_of(&m.payload, range),
+            Some(Stored::Chunked(c)) => bitcount_in(&self.source(slot, key, c), range),
+        })
     }
 
     /// BITPOS: the first bit equal to `bit` in the string, or in `range`
@@ -548,12 +762,290 @@ impl<'a> StringStore<'a> {
         bit: bool,
         range: Option<(i64, Option<i64>, bool)>,
     ) -> Result<i64, StoreError> {
-        // A missing key is an endless run of zeros (Valkey's
-        // `bitposCommand`), whatever the range asked.
-        let Some(m) = self.read_live(slot, key)? else {
-            return Ok(if bit { -1 } else { 0 });
-        };
-        Ok(bitpos_of(&m.payload, bit, range))
+        Ok(match self.read_live(slot, key)? {
+            // A missing key is an endless run of zeros (Valkey's
+            // `bitposCommand`), whatever the range asked.
+            None => {
+                if bit {
+                    -1
+                } else {
+                    0
+                }
+            }
+            Some(Stored::Inline(m)) => bitpos_of(&m.payload, bit, range),
+            Some(Stored::Chunked(c)) => bitpos_in(&self.source(slot, key, c), bit, range),
+        })
+    }
+
+    fn source(&self, slot: u16, key: &[u8], meta: ComplexMeta) -> ChunkSource<'_, 'a> {
+        ChunkSource {
+            store: self,
+            slot,
+            key: key.to_vec(),
+            meta,
+        }
+    }
+}
+
+/// A string's bytes as the bit-counting commands read them: its length,
+/// and any window of it. A chunked string reads a window from only the
+/// chunks it covers (ADR-0056 D3).
+trait ByteSource {
+    fn len(&self) -> u64;
+    /// Bytes `[from, to]`, inclusive, both inside the string.
+    fn window(&self, from: u64, to: u64) -> std::borrow::Cow<'_, [u8]>;
+}
+
+impl ByteSource for [u8] {
+    fn len(&self) -> u64 {
+        <[u8]>::len(self) as u64
+    }
+    fn window(&self, from: u64, to: u64) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(&self[from as usize..=to as usize])
+    }
+}
+
+/// A chunked string, as a [`ByteSource`].
+struct ChunkSource<'s, 'a> {
+    store: &'s StringStore<'a>,
+    slot: u16,
+    key: Vec<u8>,
+    meta: ComplexMeta,
+}
+
+impl ByteSource for ChunkSource<'_, '_> {
+    fn len(&self) -> u64 {
+        self.meta.bytes
+    }
+    fn window(&self, from: u64, to: u64) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Owned(self.store.read_chunked(
+            self.slot,
+            &self.key,
+            &self.meta,
+            from,
+            to + 1,
+        ))
+    }
+}
+
+/// A string's bytes as the in-place writers change them, a byte at a time:
+/// zero past the end, and the string grown by writing past it.
+trait BitBuf {
+    fn byte(&mut self, i: u64) -> u8;
+    fn set_byte(&mut self, i: u64, v: u8);
+}
+
+/// What an in-place write changes: an inline value, or a chunked string's
+/// chunks.
+enum Target<'s, 'a> {
+    Inline(InlineView<'s, 'a>),
+    Chunked(ChunkView<'s, 'a>),
+}
+
+/// An inline string being changed in place.
+struct InlineView<'s, 'a> {
+    store: &'s StringStore<'a>,
+    slot: u16,
+    key: Vec<u8>,
+    payload: Vec<u8>,
+    expire_ms: u64,
+    /// The value must be written back: it changed, or it is new.
+    dirty: bool,
+}
+
+impl InlineView<'_, '_> {
+    fn finish(self) {
+        if self.dirty {
+            let meta = StringMeta::new(self.payload, self.expire_ms, (self.store.clock)());
+            self.store
+                .kv
+                .put(&self.store.meta_key(self.slot, &self.key), &meta.encode());
+        }
+    }
+}
+
+impl BitBuf for InlineView<'_, '_> {
+    fn byte(&mut self, i: u64) -> u8 {
+        self.payload.get(i as usize).copied().unwrap_or(0)
+    }
+    fn set_byte(&mut self, i: u64, v: u8) {
+        let i = i as usize;
+        if self.payload.len() <= i {
+            self.payload.resize(i + 1, 0);
+            self.dirty = true;
+        }
+        if self.payload[i] != v {
+            self.payload[i] = v;
+            self.dirty = true;
+        }
+    }
+}
+
+/// A chunked string being changed in place: the chunks it touches, loaded
+/// on first use, written back with its metadata row.
+struct ChunkView<'s, 'a> {
+    store: &'s StringStore<'a>,
+    slot: u16,
+    key: Vec<u8>,
+    meta: ComplexMeta,
+    chunks: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// The chunks a write changed.
+    changed: std::collections::BTreeSet<u64>,
+    /// The metadata row must be written: the string grew or changed, or it
+    /// is newly chunked.
+    dirty: bool,
+}
+
+impl ChunkView<'_, '_> {
+    /// Chunk `i`, a full chunk's bytes, zeros where its row has none.
+    fn chunk(&mut self, i: u64) -> &mut Vec<u8> {
+        let size = self.store.chunk;
+        let (store, slot, key, version) = (self.store, self.slot, &self.key, self.meta.version);
+        self.chunks.entry(i).or_insert_with(|| {
+            let mut c = store
+                .kv
+                .get(&store.chunk_key(slot, key, version, i))
+                .unwrap_or_default();
+            c.resize(size, 0);
+            c
+        })
+    }
+
+    /// Write back the changed chunks, each cut at the string's end, and then
+    /// the metadata row, stamped, so WATCH sees the change (ADR-0056 D3).
+    fn finish(mut self) {
+        if !self.dirty && self.changed.is_empty() {
+            return;
+        }
+        let size = self.store.chunk as u64;
+        let len = self.meta.bytes;
+        for &i in &self.changed {
+            let Some(c) = self.chunks.get(&i) else {
+                continue;
+            };
+            let span = len.saturating_sub(i * size).min(size) as usize;
+            self.store.kv.put(
+                &self
+                    .store
+                    .chunk_key(self.slot, &self.key, self.meta.version, i),
+                &c[..span],
+            );
+        }
+        self.meta.size = len.div_ceil(size) as u32;
+        let now = (self.store.clock)();
+        self.meta.touch(now);
+        self.store.kv.put(
+            &self.store.meta_key(self.slot, &self.key),
+            &self.meta.encode(),
+        );
+    }
+}
+
+impl BitBuf for ChunkView<'_, '_> {
+    fn byte(&mut self, i: u64) -> u8 {
+        if i >= self.meta.bytes {
+            return 0;
+        }
+        let size = self.store.chunk as u64;
+        self.chunk(i / size)[(i % size) as usize]
+    }
+    fn set_byte(&mut self, i: u64, v: u8) {
+        if i >= self.meta.bytes {
+            self.meta.bytes = i + 1;
+            self.dirty = true;
+        }
+        let size = self.store.chunk as u64;
+        let byte = &mut self.chunk(i / size)[(i % size) as usize];
+        if *byte != v {
+            *byte = v;
+            self.changed.insert(i / size);
+        }
+    }
+}
+
+impl BitBuf for Target<'_, '_> {
+    fn byte(&mut self, i: u64) -> u8 {
+        match self {
+            Target::Inline(v) => v.byte(i),
+            Target::Chunked(v) => v.byte(i),
+        }
+    }
+    fn set_byte(&mut self, i: u64, b: u8) {
+        match self {
+            Target::Inline(v) => v.set_byte(i, b),
+            Target::Chunked(v) => v.set_byte(i, b),
+        }
+    }
+}
+
+impl Target<'_, '_> {
+    fn len(&self) -> u64 {
+        match self {
+            Target::Inline(v) => v.payload.len() as u64,
+            Target::Chunked(v) => v.meta.bytes,
+        }
+    }
+
+    /// Grow to at least `len` bytes with zeros.
+    fn grow(&mut self, len: u64) {
+        match self {
+            Target::Inline(v) => {
+                if (v.payload.len() as u64) < len {
+                    v.payload.resize(len as usize, 0);
+                    v.dirty = true;
+                }
+            }
+            Target::Chunked(v) => {
+                if v.meta.bytes < len {
+                    v.meta.bytes = len;
+                    v.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Write `bytes` at `at`, growing with zeros to reach it. Always a
+    /// write, as APPEND and SETRANGE always were, even of the same bytes:
+    /// the metadata row is rewritten, though a chunk whose bytes are
+    /// unchanged is not.
+    fn write(&mut self, at: u64, bytes: &[u8]) {
+        match self {
+            Target::Inline(v) => {
+                let end = at as usize + bytes.len();
+                if v.payload.len() < end {
+                    v.payload.resize(end, 0);
+                }
+                v.payload[at as usize..end].copy_from_slice(bytes);
+                v.dirty = true;
+            }
+            Target::Chunked(v) => {
+                let size = v.store.chunk as u64;
+                let mut done = 0usize;
+                while done < bytes.len() {
+                    let pos = at + done as u64;
+                    let (i, off) = (pos / size, (pos % size) as usize);
+                    let n = (size as usize - off).min(bytes.len() - done);
+                    let (part, from) = (&bytes[done..done + n], &mut v.chunk(i)[off..off + n]);
+                    if from != part {
+                        from.copy_from_slice(part);
+                        v.changed.insert(i);
+                    }
+                    done += n;
+                }
+                let end = at + bytes.len() as u64;
+                if end > v.meta.bytes {
+                    v.meta.bytes = end;
+                }
+                v.dirty = true;
+            }
+        }
+    }
+
+    fn finish(self) {
+        match self {
+            Target::Inline(v) => v.finish(),
+            Target::Chunked(v) => v.finish(),
+        }
     }
 }
 
@@ -582,8 +1074,18 @@ fn bit_at(payload: &[u8], i: u64) -> bool {
 /// BITCOUNT over a string, as Valkey 9.1 counts: `range` is `start`, `end`
 /// and whether they count bits rather than bytes.
 pub fn bitcount_of(payload: &[u8], range: Option<(i64, i64, bool)>) -> u64 {
+    bitcount_in(payload, range)
+}
+
+/// [`bitcount_of`] over any [`ByteSource`], reading only the window it
+/// counts.
+fn bitcount_in(src: &(impl ByteSource + ?Sized), range: Option<(i64, i64, bool)>) -> u64 {
+    let popcount = |bytes: &[u8]| bytes.iter().map(|b| u64::from(b.count_ones())).sum::<u64>();
     let Some((start, end, bits)) = range else {
-        return payload.iter().map(|b| u64::from(b.count_ones())).sum();
+        return match src.len() {
+            0 => 0,
+            n => popcount(&src.window(0, n - 1)),
+        };
     };
     // Two negative indexes in the wrong order count nothing, BEFORE
     // clamping. Clamped, `-4 -5` on three bytes is `[0, 0]`, the first
@@ -591,29 +1093,37 @@ pub fn bitcount_of(payload: &[u8], range: Option<(i64, i64, bool)>) -> u64 {
     if start < 0 && end < 0 && start > end {
         return 0;
     }
-    let len = payload.len() as i64 * if bits { 8 } else { 1 };
+    let len = src.len() as i64 * if bits { 8 } else { 1 };
     let (start, end) = bit_window(len, start, end);
     if start > end {
         return 0;
     }
-    let popcount = |bytes: &[u8]| bytes.iter().map(|b| u64::from(b.count_ones())).sum::<u64>();
     if !bits {
-        return popcount(&payload[start as usize..=end as usize]);
+        return popcount(&src.window(start as u64, end as u64));
     }
     // Whole bytes, less the bits of the first before `start` and of the
     // last after `end` (bit 0 being a byte's high bit).
-    let (first, last) = ((start >> 3) as usize, (end >> 3) as usize);
-    let before = payload[first] & !(0xffu8 >> (start & 7));
-    let after = payload[last] & (0xffu16 >> ((end & 7) + 1)) as u8;
-    popcount(&payload[first..=last])
-        - u64::from(before.count_ones())
-        - u64::from(after.count_ones())
+    let (first, last) = ((start >> 3) as u64, (end >> 3) as u64);
+    let window = src.window(first, last);
+    let before = window[0] & !(0xffu8 >> (start & 7));
+    let after = window[window.len() - 1] & (0xffu16 >> ((end & 7) + 1)) as u8;
+    popcount(&window) - u64::from(before.count_ones()) - u64::from(after.count_ones())
 }
 
 /// BITPOS over a string that exists, as Valkey 9.1 searches: `range` is
 /// `start`, the `end` if one was given, and whether they count bits.
 pub fn bitpos_of(payload: &[u8], bit: bool, range: Option<(i64, Option<i64>, bool)>) -> i64 {
-    let len = payload.len() as i64;
+    bitpos_in(payload, bit, range)
+}
+
+/// [`bitpos_of`] over any [`ByteSource`], reading only the window it
+/// searches.
+fn bitpos_in(
+    src: &(impl ByteSource + ?Sized),
+    bit: bool,
+    range: Option<(i64, Option<i64>, bool)>,
+) -> i64 {
+    let len = src.len() as i64;
     let (start, end, bits, end_given) = match range {
         None => (0, len - 1, false, false),
         Some((start, end, bits)) => {
@@ -634,16 +1144,18 @@ pub fn bitpos_of(payload: &[u8], bit: bool, range: Option<(i64, Option<i64>, boo
     };
     // A byte at a time; only the partial first and last bytes need their
     // bits looked at one by one, and a whole byte of the other value is
-    // skipped.
+    // skipped. The window's bytes start at byte `lo >> 3`.
+    let base = lo >> 3;
+    let window = src.window(base, hi >> 3);
     let skip = if bit { 0x00 } else { 0xff };
     let found = ((lo >> 3)..=(hi >> 3)).find_map(|j| {
         let whole = j * 8 >= lo && j * 8 + 7 <= hi;
-        if whole && payload[j as usize] == skip {
+        if whole && window[(j - base) as usize] == skip {
             return None;
         }
         (j * 8..j * 8 + 8)
             .filter(|&i| i >= lo && i <= hi)
-            .find(|&i| bit_at(payload, i) == bit)
+            .find(|&i| bit_at(&window, i - base * 8) == bit)
     });
     match found {
         Some(i) => i as i64,
@@ -735,13 +1247,13 @@ pub struct BitfieldOp {
 }
 
 impl BitfieldOp {
-    /// The field's value in `payload`, sign-extended when signed. Bits past
-    /// the end of `payload` read as zero.
-    fn read(&self, payload: &[u8]) -> i64 {
+    /// The field's value in `buf`, sign-extended when signed. Bits past
+    /// its end read as zero.
+    fn read(&self, buf: &mut dyn BitBuf) -> i64 {
         let mut v = 0u64;
         for i in 0..u64::from(self.bits) {
             let bit = self.offset + i;
-            let byte = payload.get((bit >> 3) as usize).copied().unwrap_or(0);
+            let byte = buf.byte(bit >> 3);
             v = (v << 1) | u64::from((byte >> (7 - (bit & 7))) & 1);
         }
         if self.signed && self.bits < 64 && v & (1 << (self.bits - 1)) != 0 {
@@ -751,19 +1263,15 @@ impl BitfieldOp {
     }
 }
 
-/// Store the low `bits` bits of `value` at bit `offset`; `payload` already
+/// Store the low `bits` bits of `value` at bit `offset`; `buf` already
 /// covers them.
-fn write_bits(payload: &mut [u8], offset: u64, bits: u32, value: u64) {
+fn write_bits(buf: &mut dyn BitBuf, offset: u64, bits: u32, value: u64) {
     for i in 0..u64::from(bits) {
         let bit = offset + i;
         let set = (value >> (u64::from(bits) - 1 - i)) & 1 == 1;
         let mask = 1u8 << (7 - (bit & 7));
-        let byte = &mut payload[(bit >> 3) as usize];
-        if set {
-            *byte |= mask;
-        } else {
-            *byte &= !mask;
-        }
+        let byte = buf.byte(bit >> 3);
+        buf.set_byte(bit >> 3, if set { byte | mask } else { byte & !mask });
     }
 }
 
@@ -858,6 +1366,14 @@ mod tests {
     use crate::MemKv;
     use crate::hashes::HashStore;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A live inline string's row.
+    fn inline_of(s: &StringStore, slot: u16, key: &[u8]) -> StringMeta {
+        match s.read_live(slot, key) {
+            Ok(Some(Stored::Inline(m))) => m,
+            other => panic!("not a live inline string: {}", other.is_ok()),
+        }
+    }
 
     macro_rules! test_clock {
         ($static_name:ident, $fn_name:ident, $initial:expr) => {
@@ -1103,7 +1619,7 @@ mod tests {
         )
         .expect("set");
         assert_eq!(s.incr_by_float(1, b"t1", 1.0), Ok(b"2.5".to_vec()));
-        let m = s.read_live(1, b"t1").expect("read").expect("live");
+        let m = inline_of(&s, 1, b"t1");
         assert_eq!(m.expire_ms, 2_000_000);
     }
 
@@ -1180,7 +1696,7 @@ mod tests {
         )
         .expect("set");
         assert_eq!(s.setbit(1, b"t", 0, true), Ok(false));
-        let m = s.read_live(1, b"t").expect("read").expect("live");
+        let m = inline_of(&s, 1, b"t");
         assert_eq!((m.payload, m.expire_ms), (vec![0x80], 2_000_000));
         // Clearing a clear bit inside the string writes nothing: with the
         // clock moved on, a rewritten row would carry a new write stamp.
@@ -1302,7 +1818,7 @@ mod tests {
         )
         .expect("set");
         assert_eq!(s.setrange(1, b"k3", 0, b"H"), Ok(5));
-        let m = s.read_live(1, b"k3").expect("read").expect("live");
+        let m = inline_of(&s, 1, b"k3");
         assert_eq!(m.expire_ms, 2_000_000);
         // The cap is enforced on the extended length.
         let capped = StringStore::with_max_value_bytes(&kv, b"t", now, 8);
@@ -1331,5 +1847,447 @@ mod tests {
             Ok(SetOutcome::Done)
         );
         assert_eq!(s.get(1, b"h"), Ok(Some(b"now-a-string".to_vec())));
+    }
+
+    test_clock!(CHUNK_NOW, chunk_now, 5_000_000);
+
+    /// ADR-0056: random runs of every string command, on a store that
+    /// chunks past 16 bytes in 8-byte chunks and on one that never chunks,
+    /// answer the same, reply for reply, and leave the same values, which
+    /// the sweeper does not disturb. The small sizes put every chunk edge
+    /// within reach of short strings.
+    #[test]
+    fn chunked_strings_answer_as_inline_ones_do() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut chunked_seen = 0;
+        for run in 0..250 {
+            let (kv_a, kv_b) = (MemKv::new(), MemKv::new());
+            let plain = StringStore::new(&kv_a, b"t", chunk_now);
+            let chunked = StringStore::new(&kv_b, b"t", chunk_now).with_chunks(16, 8);
+            let (ks_a, ks_b) = (
+                crate::keyspace::Keyspace::new(&kv_a, b"t", chunk_now),
+                crate::keyspace::Keyspace::new(&kv_b, b"t", chunk_now),
+            );
+            let keys: [&[u8]; 2] = [b"a", b"b"];
+            for step in 0..60 {
+                let key = keys[rand(2) as usize];
+                let bytes = |rand: &mut dyn FnMut(u64) -> u64, n: u64| -> Vec<u8> {
+                    (0..n)
+                        .map(|_| [0u8, 0, 0x5a, 0xff, 1, 0x80][rand(6) as usize])
+                        .collect()
+                };
+                let what = rand(17);
+                let ctx = format!("run {run} step {step} op {what} key {key:?}");
+                match what {
+                    0 => {
+                        let n = rand(48);
+                        let v = bytes(&mut rand, n);
+                        assert_eq!(
+                            plain.set(1, key, &v, SetOptions::default()),
+                            chunked.set(1, key, &v, SetOptions::default()),
+                            "{ctx}"
+                        );
+                    }
+                    1 => {
+                        let n = 1 + rand(20);
+                        let v = bytes(&mut rand, n);
+                        assert_eq!(
+                            plain.append(1, key, &v),
+                            chunked.append(1, key, &v),
+                            "{ctx}"
+                        );
+                    }
+                    2 => {
+                        let (at, n) = (rand(60), rand(20));
+                        let v = bytes(&mut rand, n);
+                        assert_eq!(
+                            plain.setrange(1, key, at, &v),
+                            chunked.setrange(1, key, at, &v),
+                            "{ctx}"
+                        );
+                    }
+                    3 => {
+                        let (a, b) = (rand(140) as i64 - 70, rand(140) as i64 - 70);
+                        assert_eq!(
+                            plain.getrange(1, key, a, b),
+                            chunked.getrange(1, key, a, b),
+                            "{ctx}"
+                        );
+                    }
+                    4 => {
+                        let (at, on) = (rand(500), rand(2) == 1);
+                        assert_eq!(
+                            plain.setbit(1, key, at, on),
+                            chunked.setbit(1, key, at, on),
+                            "{ctx}"
+                        );
+                    }
+                    5 => {
+                        let at = rand(520);
+                        assert_eq!(
+                            plain.getbit(1, key, at),
+                            chunked.getbit(1, key, at),
+                            "{ctx}"
+                        );
+                    }
+                    6 => {
+                        let range = (rand(3) > 0)
+                            .then(|| (rand(140) as i64 - 70, rand(140) as i64 - 70, rand(2) == 1));
+                        assert_eq!(
+                            plain.bitcount(1, key, range),
+                            chunked.bitcount(1, key, range),
+                            "{ctx} {range:?}"
+                        );
+                    }
+                    7 => {
+                        let bit = rand(2) == 1;
+                        let range = (rand(3) > 0).then(|| {
+                            let end = (rand(2) == 1).then(|| rand(140) as i64 - 70);
+                            (rand(140) as i64 - 70, end, rand(2) == 1)
+                        });
+                        assert_eq!(
+                            plain.bitpos(1, key, bit, range),
+                            chunked.bitpos(1, key, bit, range),
+                            "{ctx} {bit} {range:?}"
+                        );
+                    }
+                    8 => {
+                        let ops: Vec<BitfieldOp> = (0..1 + rand(3))
+                            .map(|_| {
+                                let signed = rand(2) == 1;
+                                let bits = 1 + rand(if signed { 64 } else { 63 }) as u32;
+                                let overflow = [
+                                    BitfieldOverflow::Wrap,
+                                    BitfieldOverflow::Sat,
+                                    BitfieldOverflow::Fail,
+                                ][rand(3) as usize];
+                                let v = rand(1000) as i64 - 500;
+                                let kind = match rand(3) {
+                                    0 => BitfieldKind::Get,
+                                    1 => BitfieldKind::Set(v, overflow),
+                                    _ => BitfieldKind::IncrBy(v, overflow),
+                                };
+                                BitfieldOp {
+                                    signed,
+                                    bits,
+                                    offset: rand(400),
+                                    kind,
+                                }
+                            })
+                            .collect();
+                        assert_eq!(
+                            plain.bitfield(1, key, &ops),
+                            chunked.bitfield(1, key, &ops),
+                            "{ctx} {ops:?}"
+                        );
+                    }
+                    9 => assert_eq!(plain.strlen(1, key), chunked.strlen(1, key), "{ctx}"),
+                    10 => {
+                        if rand(4) == 0 {
+                            assert_eq!(plain.get_del(1, key), chunked.get_del(1, key), "{ctx}");
+                        }
+                    }
+                    11 => {
+                        let e = match rand(3) {
+                            0 => SetExpiry::Keep,
+                            1 => SetExpiry::Clear,
+                            _ => SetExpiry::AtMs(9_000_000),
+                        };
+                        assert_eq!(plain.getex(1, key, e), chunked.getex(1, key, e), "{ctx}");
+                        assert_eq!(
+                            ks_a.expire_time_ms(1, key),
+                            ks_b.expire_time_ms(1, key),
+                            "{ctx}"
+                        );
+                    }
+                    12 => assert_eq!(
+                        plain.incr_by(1, key, 3),
+                        chunked.incr_by(1, key, 3),
+                        "{ctx}"
+                    ),
+                    13 => {
+                        let (src, dst) = (keys[rand(2) as usize], keys[rand(2) as usize]);
+                        assert_eq!(
+                            ks_a.copy(1, src, dst, true),
+                            ks_b.copy(1, src, dst, true),
+                            "{ctx}"
+                        );
+                    }
+                    14 => {
+                        let (src, dst) = (keys[rand(2) as usize], keys[rand(2) as usize]);
+                        assert_eq!(
+                            ks_a.rename(1, src, dst, false),
+                            ks_b.rename(1, src, dst, false),
+                            "{ctx}"
+                        );
+                    }
+                    15 => {
+                        if rand(4) == 0 {
+                            assert_eq!(ks_a.del(1, key), ks_b.del(1, key), "{ctx}");
+                        }
+                    }
+                    _ => {
+                        assert_eq!(
+                            ks_a.expire_at(1, key, 8_000_000),
+                            ks_b.expire_at(1, key, 8_000_000),
+                            "{ctx}"
+                        );
+                    }
+                }
+                for k in keys {
+                    assert_eq!(plain.get(1, k), chunked.get(1, k), "{ctx} then GET {k:?}");
+                    let names =
+                        |ks: &crate::keyspace::Keyspace| ks.value_type(1, k).map(|t| t.name());
+                    assert_eq!(names(&ks_a), names(&ks_b), "{ctx} then TYPE {k:?}");
+                    if ks_b.value_type(1, k) == Some(ValueType::ChunkedString) {
+                        chunked_seen += 1;
+                    }
+                }
+            }
+            // The sweeper keeps every live chunk, and reclaims the rest.
+            crate::gc::sweep(&kv_b, chunk_now(), &crate::gc::unguarded);
+            for k in keys {
+                assert_eq!(
+                    plain.get(1, k),
+                    chunked.get(1, k),
+                    "run {run} after the sweep"
+                );
+            }
+        }
+        assert!(
+            chunked_seen > 1000,
+            "only {chunked_seen} chunked observations"
+        );
+    }
+
+    /// The rows a store holds, keys and values.
+    fn rows(kv: &MemKv) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        kv.scan_prefix(b"").into_iter().collect()
+    }
+
+    /// A store that records the bytes each write puts and the rows each
+    /// read touches.
+    struct Recording {
+        inner: MemKv,
+        puts: std::sync::Mutex<Vec<usize>>,
+        read: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Recording {
+        fn new() -> Self {
+            Recording {
+                inner: MemKv::new(),
+                puts: Default::default(),
+                read: Default::default(),
+            }
+        }
+        /// The value sizes put, and the rows read, since the last call.
+        fn take(&self) -> (Vec<usize>, usize) {
+            let puts = std::mem::take(&mut *self.puts.lock().expect("lock"));
+            (
+                puts,
+                self.read.swap(0, std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        fn counted<'a>(
+            &'a self,
+            visit: &'a mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) -> impl FnMut(&[u8], &[u8]) -> bool + 'a {
+            move |k, v| {
+                self.read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                visit(k, v)
+            }
+        }
+    }
+
+    impl Kv for Recording {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get(key)
+        }
+        fn put(&self, key: &[u8], value: &[u8]) {
+            self.puts.lock().expect("lock").push(value.len());
+            self.inner.put(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> bool {
+            self.inner.delete(key)
+        }
+        fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+            self.inner.for_each_prefix(prefix, &mut self.counted(visit))
+        }
+        fn for_each_from(
+            &self,
+            prefix: &[u8],
+            start_after: &[u8],
+            visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) {
+            self.inner
+                .for_each_from(prefix, start_after, &mut self.counted(visit))
+        }
+        fn for_each_before(
+            &self,
+            prefix: &[u8],
+            start_before: &[u8],
+            visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) {
+            self.inner
+                .for_each_before(prefix, start_before, &mut self.counted(visit))
+        }
+        fn clear(&self) {
+            self.inner.clear()
+        }
+    }
+
+    /// ADR-0056 D3: SETBIT, SETRANGE and APPEND on an 8 MiB chunked string
+    /// put one chunk and the metadata row, and GETBIT, GETRANGE and STRLEN
+    /// read a chunk or two, where an inline string reads and writes all of
+    /// it.
+    #[test]
+    fn a_write_to_a_chunked_string_writes_its_chunks_only() {
+        let kv = Recording::new();
+        let s = StringStore::new(&kv, b"t", chunk_now).chunked(true);
+        let big = vec![0x5au8; 8 * 1024 * 1024];
+        s.set(1, b"bm", &big, SetOptions::default()).expect("set");
+        assert_eq!(
+            kv.take().0.len(),
+            1 + big.len() / CHUNK_BYTES,
+            "a row per chunk"
+        );
+        let small = |puts: &[usize]| puts.iter().all(|&n| n <= CHUNK_BYTES);
+        // 0x5a is 0b0101_1010: bit 0 of each byte is clear.
+        assert_eq!(s.setbit(1, b"bm", 5_000_000, true), Ok(false));
+        let (puts, read) = kv.take();
+        assert!(
+            puts.len() == 2 && small(&puts),
+            "one chunk and the meta row: {puts:?}"
+        );
+        assert!(read <= 3, "{read} rows read");
+        // A SETBIT that changes nothing writes nothing.
+        assert_eq!(s.setbit(1, b"bm", 5_000_000, true), Ok(true));
+        assert_eq!(kv.take().0, Vec::<usize>::new());
+        s.setrange(1, b"bm", 1_000_000, b"hello").expect("setrange");
+        let (puts, read) = kv.take();
+        assert!(puts.len() == 2 && small(&puts), "{puts:?}");
+        assert!(read <= 3, "{read} rows read");
+        // The same bytes again: a write to WATCH, so the metadata row is
+        // rewritten, and the chunk, unchanged, is not.
+        s.setrange(1, b"bm", 1_000_000, b"hello").expect("setrange");
+        let (puts, _) = kv.take();
+        assert!(
+            puts.len() == 1 && small(&puts),
+            "the meta row only: {puts:?}"
+        );
+        // A BITFIELD SET of the value already there changes nothing, and
+        // writes nothing, as before chunks.
+        let same = BitfieldOp {
+            signed: false,
+            bits: 8,
+            offset: 2_000_000 * 8,
+            kind: BitfieldKind::Set(0x5a, BitfieldOverflow::Wrap),
+        };
+        assert_eq!(s.bitfield(1, b"bm", &[same]), Ok(vec![Some(0x5a)]));
+        assert_eq!(kv.take().0, Vec::<usize>::new());
+        s.append(1, b"bm", b"!").expect("append");
+        let (puts, _) = kv.take();
+        assert_eq!(
+            puts.len(),
+            2,
+            "the new tail chunk and the meta row: {puts:?}"
+        );
+        assert!(
+            puts.contains(&1),
+            "a chunk ends where the string does: {puts:?}"
+        );
+        assert_eq!(s.strlen(1, b"bm"), Ok(big.len() + 1));
+        assert_eq!(kv.take().1, 1, "STRLEN reads the meta row only");
+        assert_eq!(
+            s.getrange(1, b"bm", 1_000_000, 1_000_004),
+            Ok(b"hello".to_vec())
+        );
+        assert!(kv.take().1 <= 3);
+        assert_eq!(s.getrange(1, b"bm", -2, -1), Ok(b"Z!".to_vec()));
+        assert!(kv.take().1 <= 4, "the last two chunks");
+        assert_eq!(s.getbit(1, b"bm", 5_000_000), Ok(true));
+        assert!(kv.take().1 <= 3);
+    }
+
+    /// A sparse bitmap stores only the chunks it has bits in: a bit set at
+    /// offset 100 million makes a 12.5 MB string of two rows, not 12.5 MB of
+    /// zeros.
+    #[test]
+    fn a_sparse_bitmap_stores_only_its_set_chunks() {
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", chunk_now).chunked(true);
+        assert_eq!(s.setbit(1, b"dau", 100_000_000, true), Ok(false));
+        assert_eq!(s.strlen(1, b"dau"), Ok(12_500_001));
+        assert_eq!(rows(&kv).len(), 2, "the metadata row and one chunk");
+        assert_eq!(s.bitcount(1, b"dau", None), Ok(1));
+        assert_eq!(s.bitpos(1, b"dau", true, None), Ok(100_000_000));
+        assert_eq!(s.getbit(1, b"dau", 99_999_999), Ok(false));
+        // A SET of zeros with one byte set stores one chunk, as SETBIT does.
+        let kv3 = MemKv::new();
+        let z = StringStore::new(&kv3, b"t", chunk_now).chunked(true);
+        let mut zeros = vec![0u8; 1 << 20];
+        zeros[(1 << 20) - 1] = 1;
+        z.set(1, b"z", &zeros, SetOptions::default()).expect("set");
+        assert_eq!(rows(&kv3).len(), 2, "the metadata row and the last chunk");
+        assert_eq!(z.get(1, b"z"), Ok(Some(zeros)));
+        // Chunked past 64 KiB, and not at it.
+        let ks = crate::keyspace::Keyspace::new(&kv, b"t", chunk_now);
+        for (key, len, kind) in [
+            (b"at".as_slice(), INLINE_MAX, ValueType::String),
+            (b"past", INLINE_MAX + 1, ValueType::ChunkedString),
+        ] {
+            s.set(1, key, &vec![1; len], SetOptions::default())
+                .expect("set");
+            assert_eq!(ks.value_type(1, key), Some(kind), "SET of {len}");
+            s.set(1, key, b"", SetOptions::default()).expect("set");
+            s.setrange(1, key, len as u64 - 1, b"x").expect("setrange");
+            assert_eq!(ks.value_type(1, key), Some(kind), "SETRANGE to {len}");
+        }
+        // Off by default: the same write stores the zeros inline.
+        let kv2 = MemKv::new();
+        let off = StringStore::new(&kv2, b"t", chunk_now);
+        off.setbit(1, b"dau", 1_000_000, true).expect("setbit");
+        assert_eq!(rows(&kv2).len(), 1, "inline when chunked writes are off");
+    }
+
+    /// A chunked string is a string to every client, and the sweeper keeps
+    /// its chunks while it lives and reclaims them once it is replaced or
+    /// deleted (ADR-0056 D1, D5).
+    #[test]
+    fn a_chunked_string_is_a_string_and_its_chunks_live_as_long_as_it() {
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", chunk_now).chunked(true);
+        let ks = crate::keyspace::Keyspace::new(&kv, b"t", chunk_now);
+        let v: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        s.set(1, b"k", &v, SetOptions::default()).expect("set");
+        assert_eq!(ks.value_type(1, b"k"), Some(ValueType::ChunkedString));
+        assert_eq!(ks.value_type(1, b"k").map(|t| t.name()), Some("string"));
+        assert_eq!(ks.key_stat(1, b"k").map(|k| k.size_bytes), Some(200_000));
+        let report = crate::gc::sweep(&kv, chunk_now(), &crate::gc::unguarded);
+        assert_eq!(report.orphan_rows, 0);
+        assert_eq!(s.get(1, b"k"), Ok(Some(v.clone())));
+        // Replaced by a short value: inline, and the chunks are orphans.
+        s.set(1, b"k", b"short", SetOptions::default())
+            .expect("set");
+        assert_eq!(ks.value_type(1, b"k"), Some(ValueType::String));
+        let report = crate::gc::sweep(&kv, chunk_now(), &crate::gc::unguarded);
+        assert_eq!(report.orphan_rows, 7, "200,000 bytes in 32 KiB chunks");
+        assert_eq!(s.get(1, b"k"), Ok(Some(b"short".to_vec())));
+        // INCR refuses a chunked string unread.
+        s.set(1, b"k", &v, SetOptions::default()).expect("set");
+        assert_eq!(s.incr_by(1, b"k", 1), Err(StoreError::NotInteger));
+        assert_eq!(s.incr_by_float(1, b"k", 1.0), Err(StoreError::NotFloat));
+        assert!(ks.del(1, b"k"));
+        let report = crate::gc::sweep(&kv, chunk_now(), &crate::gc::unguarded);
+        assert_eq!(report.orphan_rows, 7);
+        assert_eq!(rows(&kv).len(), 0);
     }
 }

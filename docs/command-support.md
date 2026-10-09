@@ -212,16 +212,25 @@ and `u1`-`u63`, `#n` offsets), BITFIELD_RO (BUG-0192), SETBIT, GETBIT,
 BITCOUNT (BYTE, BIT), BITPOS (BYTE, BIT), BITOP (AND, OR, XOR, NOT, and Redis
 8.2's DIFF, DIFF1, ANDOR and ONE).
 
-> Bitmaps are strings, kept whole in one row like every string. A write to
-> one bit (SETBIT, like SETRANGE and BITFIELD) rewrites the string, and a
-> read of one bit (GETBIT) reads it, so their cost grows with the string's
-> size where Redis's does not. Measured on the RocksDB engine (a laptop,
-> 2026-10-08), SETBIT p50 / p99: up to 64 KiB, 0.04 ms / 0.12 ms, as fast as
-> Redis 8.2's 0.12 ms; 1 MiB, 0.39 ms / 10 ms; 8 MiB, 0.84 ms / 16 ms;
-> 64 MiB, 5.6 ms / 85 ms. A bitmap written often past a megabyte or so (a
+> Bitmaps are strings. A string longer than 64 KiB can be stored in 32 KiB
+> chunks (ADR-0056), when the operator turns on `chunked-strings` (see
+> self-hosting.md). A write to a few bits or bytes (SETBIT, SETRANGE,
+> APPEND, BITFIELD) then writes only the chunks it changes. A read of a few
+> (GETBIT, GETRANGE, a ranged BITCOUNT or BITPOS) reads only theirs, and
+> STRLEN reads none. Measured on the RocksDB engine (a laptop, 2026-10-09),
+> SETBIT p50 / p99 is 0.04-0.05 ms / 0.12-0.18 ms at every size from 64 KiB
+> to 64 MiB, against Redis 8.2's 0.02-0.03 ms / 0.04-0.20 ms.
+>
+> Without chunks, which is the default in this release, a string is kept
+> whole in one row. A write to one bit rewrites the string, so its cost
+> grows with the string's size: SETBIT p50 / p99 is 0.21 ms / 4 ms at
+> 1 MiB, 1.1 ms / 28 ms at 8 MiB, and 162 ms / 967 ms at 64 MiB. On a fleet
+> without chunks, a bitmap written often past a megabyte or so (a
 > daily-active bitmap over 10 million user ids is 1.25 MiB) is better split
-> across several keys. ADR-0056 proposes storing large strings in chunks. BITOP's keys must share a slot (use a
-> hash tag), as every multi-key command's must. Where Valkey 9.1 and Redis
+> across several keys.
+>
+> BITOP's keys must share a slot (use a hash tag), as every multi-key
+> command's must. Where Valkey 9.1 and Redis
 > 8.2 differ, one answer follows each: `BITCOUNT key start`
 > without an end counts to the end of the string, as Valkey answers (Redis
 > 8.2 refuses it); and BITOP's `DIFF`, `DIFF1`, `ANDOR` and `ONE`, which

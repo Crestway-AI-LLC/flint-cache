@@ -44,12 +44,22 @@ pub enum ValueType {
     /// subkey row per entry, its field `0x00 | ms(8B BE) | seq(8B BE)` so the
     /// rows sort in ID order.
     Stream = 7,
+    /// A string longer than 64 KiB, in chunks (ADR-0056): a [`ComplexMeta`]
+    /// whose `bytes` is the string's length, and one subkey row per 32 KiB
+    /// chunk, its field the chunk's index (4B BE). A string to every
+    /// client: TYPE answers `string`. Its own type rather than an encoding
+    /// of type 0 so that a release from before it reads one as no type at
+    /// all, never as a string whose value is its metadata.
+    ChunkedString = 8,
 }
 
 impl ValueType {
     /// Every type, for a lookup by the name TYPE answers (SCAN's TYPE
     /// filter), so that name is spelled in one place (BUG-0241).
-    pub const ALL: [ValueType; 8] = [
+    /// `String` comes before `ChunkedString`, which shares its name, so a
+    /// lookup by name finds `String`; compare names, not types, to match
+    /// both.
+    pub const ALL: [ValueType; 9] = [
         Self::String,
         Self::Hash,
         Self::Set,
@@ -58,6 +68,7 @@ impl ValueType {
         Self::Json,
         Self::Bloom,
         Self::Stream,
+        Self::ChunkedString,
     ];
 
     pub fn from_flags(flags: u8) -> Option<Self> {
@@ -70,6 +81,7 @@ impl ValueType {
             5 => Some(Self::Json),
             6 => Some(Self::Bloom),
             7 => Some(Self::Stream),
+            8 => Some(Self::ChunkedString),
             _ => None,
         }
     }
@@ -90,6 +102,7 @@ impl ValueType {
             // answered `bloom` until then).
             Self::Bloom => "MBbloom--",
             Self::Stream => "stream",
+            Self::ChunkedString => "string",
         }
     }
 }

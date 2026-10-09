@@ -65,6 +65,9 @@ const ACCEPTED_FLAGS: &[&str] = &[
     "--async-queue-cap",
     "--async-writes",
     "--bind",
+    // A switch, which takes no value (ADR-0056 D4): a write may store a
+    // string longer than 64 KiB in chunks.
+    "--chunked-strings",
     "--data-dir",
     "--disk-min-free-bytes",
     "--disk-min-free-pct",
@@ -95,7 +98,7 @@ const ACCEPTED_FLAGS: &[&str] = &[
     "--rewind-snaps",
     "--script-memory-limit-mb",
     "--script-time-limit-ms",
-    // The one switch, which takes no value (ADR-0052 D6): XADD may create a
+    // A switch, which takes no value (ADR-0052 D6): XADD may create a
     // stream.
     "--streams",
     "--wal-fsync-ms",
@@ -3087,7 +3090,15 @@ fn main() -> std::io::Result<()> {
         // ADR-0052 D6: XADD creates a stream only when an operator says so,
         // in the first release that serves streams; the next turns it on.
         streams: std::env::args().any(|a| a == "--streams"),
+        // ADR-0056 D4: likewise, a write stores a long string in chunks only
+        // when an operator says so, in the first release that reads them.
+        chunked_strings: std::env::args().any(|a| a == "--chunked-strings"),
     };
+    if limits.chunked_strings {
+        eprintln!(
+            "chunked-strings: on (strings over 64 KiB are stored in chunks; this fleet cannot roll back below this release while it holds one)"
+        );
+    }
     if limits.streams {
         eprintln!(
             "streams: on (XADD may create a stream; this fleet cannot roll back below this release while it holds one)"

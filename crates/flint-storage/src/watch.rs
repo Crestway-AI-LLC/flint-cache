@@ -334,7 +334,46 @@ mod tests {
         check("XDEL", b"x", v, &t);
         checked += 1;
 
-        assert_eq!(checked, 7, "every value type must be covered here");
+        // A chunked string's bytes are subkey rows (ADR-0056); every write
+        // to it rewrites its metadata row, a single changed chunk included.
+        let chunked = StringStore::new(s.as_ref(), ns, system_clock).chunked(true);
+        let big = vec![0u8; crate::strings::INLINE_MAX + 1];
+        let v = t.version(&meta(ns, slot, b"big"));
+        chunked
+            .set(slot, b"big", &big, SetOptions::default())
+            .expect("set");
+        check("SET (chunked)", b"big", v, &t);
+        let v = t.version(&meta(ns, slot, b"big"));
+        assert_eq!(chunked.setbit(slot, b"big", 7, true), Ok(false));
+        check("SETBIT (chunked)", b"big", v, &t);
+        let v = t.version(&meta(ns, slot, b"big"));
+        chunked
+            .setrange(slot, b"big", 40_000, b"x")
+            .expect("setrange");
+        check("SETRANGE (chunked)", b"big", v, &t);
+        let v = t.version(&meta(ns, slot, b"big"));
+        chunked.append(slot, b"big", b"y").expect("append");
+        check("APPEND (chunked)", b"big", v, &t);
+        // SETRANGE and APPEND are writes whatever bytes they carry, as in
+        // Redis: the same bytes again, or none, still move the stripe.
+        let v = t.version(&meta(ns, slot, b"big"));
+        chunked
+            .setrange(slot, b"big", 40_000, b"x")
+            .expect("setrange");
+        check("SETRANGE (chunked, same bytes)", b"big", v, &t);
+        let v = t.version(&meta(ns, slot, b"big"));
+        chunked.append(slot, b"big", b"").expect("append");
+        check("APPEND (chunked, nothing)", b"big", v, &t);
+        let plain = StringStore::new(s.as_ref(), ns, system_clock);
+        let v = t.version(&meta(ns, slot, b"str"));
+        plain.setrange(slot, b"str", 0, b"v").expect("setrange");
+        check("SETRANGE (same bytes)", b"str", v, &t);
+        let v = t.version(&meta(ns, slot, b"str"));
+        plain.append(slot, b"str", b"").expect("append");
+        check("APPEND (nothing)", b"str", v, &t);
+        checked += 1;
+
+        assert_eq!(checked, 8, "every value type must be covered here");
 
         // And the second mutation of an EXISTING collection must move it
         // too — the first write creates metadata, which is the easy case.

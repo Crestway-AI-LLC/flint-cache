@@ -4155,10 +4155,12 @@ if want conformance; then
   # that port, which is not necessarily what we started.
   ( valkey-server --port 6390 --save '' --appendonly no --daemonize no \
       >"$LOGS/valkey.log" 2>&1 & echo $! >"$CDIR/oracle.pid" )
-  # --streams: the corpus creates streams (ADR-0052 D6).
-  ( ./target/release/flint-server --port 6389 --engine mem --streams \
+  # --streams: the corpus creates streams (ADR-0052 D6). --chunked-strings:
+  # its large strings are stored in chunks (ADR-0056 D4).
+  ( ./target/release/flint-server --port 6389 --engine mem --streams --chunked-strings \
       >"$LOGS/conf-mem.log" 2>&1 & echo $! >"$CDIR/mem.pid" )
-  ( ./target/release/flint-server --port 6388 --engine rocks --data-dir "$CDIR/rocks" --streams \
+  ( ./target/release/flint-server --port 6388 --engine rocks --data-dir "$CDIR/rocks" \
+      --streams --chunked-strings \
       >"$LOGS/conf-rocks.log" 2>&1 & echo $! >"$CDIR/rocks.pid" )
   for p in 6390 6389 6388; do
     for _ in $(seq 1 100); do
@@ -4166,6 +4168,12 @@ if want conformance; then
       sleep 0.1
     done
   done
+  # The corpus passes whether a seat stores large strings in chunks or not,
+  # so ask each seat: it says so at startup when the switch took (ADR-0056).
+  step "conformance mem seat chunks" conf-mem-chunked \
+    grep -q '^chunked-strings: on' "$LOGS/conf-mem.log"
+  step "conformance rocks seat chunks" conf-rocks-chunked \
+    grep -q '^chunked-strings: on' "$LOGS/conf-rocks.log"
   step "conformance oracle" conf-oracle \
     ./target/release/flint-conformance --target 127.0.0.1:6390 --reference
   step "conformance mem" conf-mem-run \

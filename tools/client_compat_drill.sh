@@ -70,6 +70,7 @@ pair 127.0.0.1:7323,127.0.0.1:7324
 proxy 127.0.0.1:$PORT
 placed-tenants on
 streams on
+chunked-strings on
 EOF
 
 echo "== bootstrap 2 pairs + tenant"

@@ -135,13 +135,16 @@ impl<'a> Keyspace<'a> {
             // its blocks are subkey rows under the same versioned prefix,
             // so the generic rekey below moves them. Its metadata tail
             // rides along untouched because this arm patches the row rather
-            // than rebuilding it.
+            // than rebuilding it. So does a chunked string (ADR-0056 D5),
+            // whose chunks are its subkey rows: copied as a string's one
+            // row, the copy would have a length and no bytes.
             ValueType::Hash
             | ValueType::Set
             | ValueType::ZSet
             | ValueType::List
             | ValueType::Bloom
-            | ValueType::Stream => {
+            | ValueType::Stream
+            | ValueType::ChunkedString => {
                 let Some(meta) = ComplexMeta::decode(&row) else {
                     return false;
                 };

@@ -231,6 +231,11 @@ pub struct Limits {
     /// the release before it never meets one; streams that exist are served
     /// either way.
     pub streams: bool,
+    /// Whether a write may store a string longer than 64 KiB in chunks
+    /// (`--chunked-strings`, ADR-0056 D4). Off by default in the first
+    /// release that reads chunked strings, for the same reason as `streams`;
+    /// chunked strings that exist are read and written either way.
+    pub chunked_strings: bool,
 }
 
 impl Default for Limits {
@@ -240,6 +245,7 @@ impl Default for Limits {
             max_key_bytes: flint_storage::DEFAULT_MAX_KEY_BYTES,
             script: crate::script::ScriptLimits::default(),
             streams: false,
+            chunked_strings: false,
         }
     }
 }
@@ -295,7 +301,8 @@ impl<'a> Dispatcher<'a> {
         let max = limits.max_value_bytes;
         Self {
             keyspace: Keyspace::new(kv, ns, clock),
-            strings: StringStore::with_max_value_bytes(kv, ns, clock, max),
+            strings: StringStore::with_max_value_bytes(kv, ns, clock, max)
+                .chunked(limits.chunked_strings),
             hashes: HashStore::with_max_value_bytes(kv, ns, clock, max),
             sets: SetStore::with_max_value_bytes(kv, ns, clock, max),
             lists: ListStore::with_max_value_bytes(kv, ns, clock, max),
@@ -3836,8 +3843,10 @@ impl<'a> Dispatcher<'a> {
             if h.is_expired(now) {
                 return true;
             }
+            // By name: a chunked string is a string (ADR-0056).
             if let Some(want) = type_filter
-                && flint_storage::encoding::ValueType::from_flags(h.flags) != Some(want)
+                && flint_storage::encoding::ValueType::from_flags(h.flags).map(|t| t.name())
+                    != Some(want.name())
             {
                 return true;
             }
@@ -5413,6 +5422,38 @@ mod tests {
         );
         assert!(scan_all(&s, &[b"TYPE", b"json"]).is_empty());
         assert!(scan_all(&s, &[b"TYPE", b"bloom"]).is_empty());
+    }
+
+    /// ADR-0056: only a seat with `--chunked-strings` stores a long string
+    /// in chunks, and a chunked string is a string to TYPE and to SCAN's
+    /// TYPE filter, which compared type numbers before.
+    #[test]
+    fn a_chunked_string_is_a_string_to_type_and_scan() {
+        use flint_storage::encoding::ValueType;
+        let s = MemKv::new();
+        let on = Limits {
+            chunked_strings: true,
+            ..Default::default()
+        };
+        let d = Dispatcher::with_limits(&s, system_clock, on, DEFAULT_NS);
+        let big = vec![b'x'; 100_000];
+        let run =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+        assert_eq!(run(&[b"SET", b"big", &big]), Value::Simple("OK".into()));
+        call(&s, &[b"SET", b"small", b"v"]);
+        call(&s, &[b"RPUSH", b"list", b"e"]);
+        let stored = |key: &[u8]| {
+            Keyspace::new(&s, DEFAULT_NS, system_clock).value_type(slot_for_key(key), key)
+        };
+        assert_eq!(stored(b"big"), Some(ValueType::ChunkedString));
+        assert_eq!(call(&s, &[b"TYPE", b"big"]), Value::Simple("string".into()));
+        assert_eq!(call(&s, &[b"GET", b"big"]), Value::Bulk(Some(big.clone())));
+        let mut strings = scan_all(&s, &[b"TYPE", b"string"]);
+        strings.sort();
+        assert_eq!(strings, vec![b"big".to_vec(), b"small".to_vec()]);
+        // Without the flag, the same write stores the string whole.
+        call(&s, &[b"SET", b"whole", &big]);
+        assert_eq!(stored(b"whole"), Some(ValueType::String));
     }
 
     /// The classifier is what keeps a write off a replica, so the family's
