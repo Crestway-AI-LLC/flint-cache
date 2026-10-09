@@ -206,8 +206,25 @@ through the proxy across all shard pairs as one cursor stream (redis-cli
 GET, GETDEL, GETEX (EX, PX, EXAT, PXAT, PERSIST), GETSET, MSET, MGET,
 APPEND, STRLEN, GETRANGE, SETRANGE, INCR, DECR, INCRBY, DECRBY,
 INCRBYFLOAT, BITFIELD (GET, SET, INCRBY, OVERFLOW WRAP/SAT/FAIL, `i1`-`i64`
-and `u1`-`u63`, `#n` offsets), BITFIELD_RO (BUG-0192). The other bit
-commands (SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP) are not served yet.
+and `u1`-`u63`, `#n` offsets), BITFIELD_RO (BUG-0192), SETBIT, GETBIT,
+BITCOUNT (BYTE, BIT), BITPOS (BYTE, BIT), BITOP (AND, OR, XOR, NOT, and Redis
+8.2's DIFF, DIFF1, ANDOR and ONE).
+
+> Bitmaps are strings, kept whole in one row like every string. A write to
+> one bit (SETBIT, like SETRANGE and BITFIELD) rewrites the string, and a
+> read of one bit (GETBIT) reads it, so their cost grows with the string's
+> size where Redis's does not. Measured on the RocksDB engine (a laptop,
+> 2026-10-08), SETBIT p50 / p99: up to 64 KiB, 0.04 ms / 0.12 ms, as fast as
+> Redis 8.2's 0.12 ms; 1 MiB, 0.39 ms / 10 ms; 8 MiB, 0.84 ms / 16 ms;
+> 64 MiB, 5.6 ms / 85 ms. A bitmap written often past a megabyte or so (a
+> daily-active bitmap over 10 million user ids is 1.25 MiB) is better split
+> across several keys. BITOP's keys must share a slot (use a
+> hash tag), as every multi-key command's must. Where Valkey 9.1 and Redis
+> 8.2 differ, one answer follows each: `BITCOUNT key start`
+> without an end counts to the end of the string, as Valkey answers (Redis
+> 8.2 refuses it); and BITOP's `DIFF`, `DIFF1`, `ANDOR` and `ONE`, which
+> Redis 8.2 added and Valkey 9.1 does not have, are served as Redis serves
+> them.
 
 **Hashes**: HSET, HMSET, HSETNX, HGET, HMGET, HGETALL, HKEYS, HVALS, HDEL, HLEN,
 HEXISTS, HINCRBY, HINCRBYFLOAT, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).

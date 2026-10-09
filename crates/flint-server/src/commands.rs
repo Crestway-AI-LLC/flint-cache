@@ -76,6 +76,10 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     if let Some(key) = flint_commands::json_debug_key(args) {
         return key;
     }
+    // BITOP's second argument is its operator; its key is the destination.
+    if name.eq_ignore_ascii_case(b"BITOP") {
+        return args.get(2).map(|k| k.as_slice());
+    }
     args.get(1).map(|k| k.as_slice())
 }
 
@@ -548,6 +552,34 @@ impl<'a> Dispatcher<'a> {
             }),
             b"BITFIELD" => self.cmd_bitfield(args, "bitfield", false),
             b"BITFIELD_RO" => self.cmd_bitfield(args, "bitfield_ro", true),
+            // Bitmaps, in Valkey 9.1's words and order: each argument is
+            // read before the key is.
+            b"SETBIT" => exact(args, 4, "setbit", |a| {
+                let Some(offset) = bit_offset(&a[2]) else {
+                    return err(BIT_OFFSET);
+                };
+                let on = match parse_i64(&a[3]) {
+                    Ok(0) => false,
+                    Ok(1) => true,
+                    _ => return err("ERR bit is not an integer or out of range"),
+                };
+                reply(
+                    self.strings.setbit(slot_for_key(&a[1]), &a[1], offset, on),
+                    |old| Value::Integer(old as i64),
+                )
+            }),
+            b"GETBIT" => exact(args, 3, "getbit", |a| {
+                let Some(offset) = bit_offset(&a[2]) else {
+                    return err(BIT_OFFSET);
+                };
+                reply(
+                    self.strings.getbit(slot_for_key(&a[1]), &a[1], offset),
+                    |bit| Value::Integer(bit as i64),
+                )
+            }),
+            b"BITCOUNT" => self.cmd_bitcount(args),
+            b"BITPOS" => self.cmd_bitpos(args),
+            b"BITOP" => self.cmd_bitop(args),
             b"SETRANGE" => exact(args, 4, "setrange", |a| match parse_i64(&a[2]) {
                 Ok(off) if off >= 0 => reply(
                     self.strings
@@ -1376,6 +1408,130 @@ impl<'a> Dispatcher<'a> {
             },
             Err(e) => store_err(e),
         }
+    }
+
+    /// BITCOUNT key [start [end [BYTE|BIT]]]. Valkey 9.1 takes a start
+    /// without an end (the end then being the last byte), where Redis 8.2
+    /// answers a syntax error; Flint answers as Valkey.
+    fn cmd_bitcount(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 {
+            return arity_err("bitcount");
+        }
+        let range = match args.len() {
+            2 => None,
+            3..=5 => {
+                let Ok(start) = parse_i64(&args[2]) else {
+                    return err(NOT_AN_INTEGER);
+                };
+                let end = match args.get(3).map(|a| parse_i64(a)) {
+                    None => -1,
+                    Some(Ok(end)) => end,
+                    Some(Err(_)) => return err(NOT_AN_INTEGER),
+                };
+                let Some(bits) = bit_unit(args.get(4)) else {
+                    return err("ERR syntax error");
+                };
+                Some((start, end, bits))
+            }
+            _ => return err("ERR syntax error"),
+        };
+        reply(
+            self.strings
+                .bitcount(slot_for_key(&args[1]), &args[1], range),
+            |n| Value::Integer(n as i64),
+        )
+    }
+
+    /// BITPOS key bit [start [end [BYTE|BIT]]]. Valkey reads the unit
+    /// before the end, so `BITPOS k 1 0 x WAT` is a syntax error rather
+    /// than a bad integer.
+    fn cmd_bitpos(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 3 {
+            return arity_err("bitpos");
+        }
+        let bit = match parse_i64(&args[2]) {
+            Ok(0) => false,
+            Ok(1) => true,
+            Ok(_) => return err("ERR The bit argument must be 1 or 0."),
+            Err(_) => return err(NOT_AN_INTEGER),
+        };
+        let range = match args.len() {
+            3 => None,
+            4..=6 => {
+                let Ok(start) = parse_i64(&args[3]) else {
+                    return err(NOT_AN_INTEGER);
+                };
+                let Some(bits) = bit_unit(args.get(5)) else {
+                    return err("ERR syntax error");
+                };
+                let end = match args.get(4).map(|a| parse_i64(a)) {
+                    None => None,
+                    Some(Ok(end)) => Some(end),
+                    Some(Err(_)) => return err(NOT_AN_INTEGER),
+                };
+                Some((start, end, bits))
+            }
+            _ => return err("ERR syntax error"),
+        };
+        reply(
+            self.strings
+                .bitpos(slot_for_key(&args[1]), &args[1], bit, range),
+            Value::Integer,
+        )
+    }
+
+    /// BITOP operation destkey key [key ...]. A missing source is an empty
+    /// string; the destination takes the result (any old value and TTL
+    /// gone), or is deleted when the result is empty; the reply is its
+    /// length. `DIFF`, `DIFF1`, `ANDOR` and `ONE` are Redis 8.2's, served
+    /// as it serves them; Valkey 9.1 answers a syntax error for them.
+    fn cmd_bitop(&self, args: &[Vec<u8>]) -> Value {
+        use flint_storage::strings::BitOp;
+        if args.len() < 4 {
+            return arity_err("bitop");
+        }
+        let (dst, sources) = (&args[2], &args[3..]);
+        if let Some(e) = Self::crossslot(dst, sources) {
+            return e;
+        }
+        let name = args[1].to_ascii_uppercase();
+        let op = match name.as_slice() {
+            b"AND" => BitOp::And,
+            b"OR" => BitOp::Or,
+            b"XOR" => BitOp::Xor,
+            b"NOT" => BitOp::Not,
+            b"DIFF" => BitOp::Diff,
+            b"DIFF1" => BitOp::Diff1,
+            b"ANDOR" => BitOp::AndOr,
+            b"ONE" => BitOp::One,
+            _ => return err("ERR syntax error"),
+        };
+        if op == BitOp::Not && sources.len() != 1 {
+            return err("ERR BITOP NOT must be called with a single source key.");
+        }
+        if matches!(op, BitOp::Diff | BitOp::Diff1 | BitOp::AndOr) && sources.len() < 2 {
+            return err(&format!(
+                "ERR BITOP {} must be called with at least two source keys.",
+                String::from_utf8_lossy(&name)
+            ));
+        }
+        let slot = slot_for_key(dst);
+        // Every source is read before the destination is touched: it may
+        // be one of them.
+        let mut values = Vec::with_capacity(sources.len());
+        for k in sources {
+            match self.strings.get(slot, k) {
+                Ok(v) => values.push(v.unwrap_or_default()),
+                Err(e) => return store_err(e),
+            }
+        }
+        let result = flint_storage::strings::bitop_of(op, &values);
+        if result.is_empty() {
+            self.keyspace.del(slot, dst);
+        } else if let Err(e) = self.strings.set(slot, dst, &result, SetOptions::default()) {
+            return store_err(e);
+        }
+        Value::Integer(result.len() as i64)
     }
 
     /// `BITFIELD key [GET type offset] [OVERFLOW WRAP|SAT|FAIL]
@@ -4247,6 +4403,31 @@ fn parse_block_timeout(raw: &[u8]) -> Result<f64, Value> {
 
 /// An integer argument, read as Redis reads one (BUG-0213): `01` and `+1`
 /// are not integers.
+/// An argument that should be a Redis integer and is not.
+const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
+
+/// SETBIT's and GETBIT's offset refusal, Valkey's words.
+const BIT_OFFSET: &str = "ERR bit offset is not an integer or out of range";
+
+/// A bit offset as Valkey reads one: a Redis integer, not negative, and
+/// inside a 512 MiB string.
+fn bit_offset(raw: &[u8]) -> Option<u64> {
+    let v = parse_i64(raw).ok()?;
+    u64::try_from(v)
+        .ok()
+        .filter(|&v| v <= flint_storage::strings::MAX_BIT_OFFSET)
+}
+
+/// BITCOUNT's and BITPOS's unit: `None` for neither word; absent is BYTE.
+fn bit_unit(arg: Option<&Vec<u8>>) -> Option<bool> {
+    match arg {
+        None => Some(false),
+        Some(u) if u.eq_ignore_ascii_case(b"BIT") => Some(true),
+        Some(u) if u.eq_ignore_ascii_case(b"BYTE") => Some(false),
+        Some(_) => None,
+    }
+}
+
 fn parse_i64(raw: &[u8]) -> Result<i64, ()> {
     parse_redis_i64(raw).ok_or(())
 }
@@ -4505,6 +4686,45 @@ mod tests {
         assert_eq!(got, vec![b"h:1".to_vec()]);
         // Unknown TYPE matches nothing, errors nothing.
         assert!(scan_all(&s, &[b"TYPE", b"stream"]).is_empty());
+    }
+
+    /// BITOP's four Redis 8.2 operators, which the corpus cannot hold
+    /// (Valkey 9.1 refuses them): their refusals in Redis's words, ONE with
+    /// a single source, and the slot rule every multi-key command keeps.
+    #[test]
+    fn bitop_serves_redis_8_2_operators_and_keeps_one_slot() {
+        let s = MemKv::new();
+        call(&s, &[b"SET", b"{b}a", b"\xff\xf0"]);
+        call(&s, &[b"SET", b"{b}b", b"\x0f"]);
+        for op in [&b"DIFF"[..], b"diff1", b"ANDOR"] {
+            let upper = String::from_utf8_lossy(op).to_ascii_uppercase();
+            assert_eq!(
+                call(&s, &[b"BITOP", op, b"{b}d", b"{b}a"]),
+                Value::Error(format!(
+                    "ERR BITOP {upper} must be called with at least two source keys."
+                ))
+            );
+        }
+        assert_eq!(
+            call(&s, &[b"BITOP", b"DIFF", b"{b}d", b"{b}a", b"{b}b"]),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            call(&s, &[b"GET", b"{b}d"]),
+            Value::Bulk(Some(vec![0xf0, 0xf0]))
+        );
+        assert_eq!(
+            call(&s, &[b"BITOP", b"ONE", b"{b}d", b"{b}b"]),
+            Value::Integer(1)
+        );
+        assert!(matches!(
+            call(&s, &[b"BITOP", b"AND", b"{b}d", b"{x}a"]),
+            Value::Error(e) if e.starts_with("CROSSSLOT")
+        ));
+        assert_eq!(
+            call(&s, &[b"BITOP", b"AND", b"{b}d"]),
+            arity_err("bitop")
+        );
     }
 
     /// The RESP surface of the Bloom family, in the shapes a RedisBloom
@@ -6995,6 +7215,13 @@ return nil"#;
     fn a_keyspace_scan_names_no_key() {
         let a = |p: &[&str]| p.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
         assert_eq!(command_key(&a(&["SCAN", "0"])), None);
+        // BITOP's second argument is its operator; its key is the
+        // destination, which the write lock, the slot owner and a
+        // transaction's slot are taken from.
+        assert_eq!(
+            command_key(&a(&["BITOP", "AND", "{t}dst", "{t}src"])),
+            Some(&b"{t}dst"[..])
+        );
         assert_eq!(command_key(&a(&["scan", "17", "MATCH", "k*"])), None);
         assert_eq!(command_key(&a(&["HSCAN", "h", "0"])), Some(&b"h"[..]));
         assert_eq!(command_key(&a(&["ZSCAN", "z", "0"])), Some(&b"z"[..]));

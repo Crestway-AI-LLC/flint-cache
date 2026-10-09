@@ -478,6 +478,223 @@ impl<'a> StringStore<'a> {
         }
         Ok(replies)
     }
+
+    /// SETBIT: set bit `offset` (bit 0 is the high bit of the first byte)
+    /// and answer its old value. The string grows with zeros to cover the
+    /// bit, the key is created if missing, and the TTL is kept. As in
+    /// Valkey, a bit that already holds `on` in a string long enough writes
+    /// nothing.
+    pub fn setbit(&self, slot: u16, key: &[u8], offset: u64, on: bool) -> Result<bool, StoreError> {
+        let byte = (offset >> 3) as usize;
+        if byte as u64 + 1 > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        let (mut payload, expire_ms, mut dirty) = match self.read_live(slot, key)? {
+            None => (Vec::new(), 0, true),
+            Some(m) => (m.payload, m.expire_ms, false),
+        };
+        if payload.len() <= byte {
+            payload.resize(byte + 1, 0);
+            dirty = true;
+        }
+        let mask = 1u8 << (7 - (offset & 7));
+        let old = payload[byte] & mask != 0;
+        if old != on {
+            payload[byte] ^= mask;
+            dirty = true;
+        }
+        if dirty {
+            let meta = StringMeta::new(payload, expire_ms, (self.clock)());
+            self.kv.put(&self.meta_key(slot, key), &meta.encode());
+        }
+        Ok(old)
+    }
+
+    /// GETBIT: the bit at `offset`; zero past the end and for a missing key.
+    pub fn getbit(&self, slot: u16, key: &[u8], offset: u64) -> Result<bool, StoreError> {
+        let Some(m) = self.read_live(slot, key)? else {
+            return Ok(false);
+        };
+        let byte = m.payload.get((offset >> 3) as usize).copied().unwrap_or(0);
+        Ok(byte & (1 << (7 - (offset & 7))) != 0)
+    }
+
+    /// BITCOUNT: the set bits in the string, or in `range`
+    /// (`start`, `end`, in bits when the flag is set, else bytes).
+    pub fn bitcount(
+        &self,
+        slot: u16,
+        key: &[u8],
+        range: Option<(i64, i64, bool)>,
+    ) -> Result<u64, StoreError> {
+        let Some(m) = self.read_live(slot, key)? else {
+            return Ok(0);
+        };
+        Ok(bitcount_of(&m.payload, range))
+    }
+
+    /// BITPOS: the first bit equal to `bit` in the string, or in `range`
+    /// (`start`, an `end` if one was given, in bits when the flag is set).
+    pub fn bitpos(
+        &self,
+        slot: u16,
+        key: &[u8],
+        bit: bool,
+        range: Option<(i64, Option<i64>, bool)>,
+    ) -> Result<i64, StoreError> {
+        // A missing key is an endless run of zeros (Valkey's
+        // `bitposCommand`), whatever the range asked.
+        let Some(m) = self.read_live(slot, key)? else {
+            return Ok(if bit { -1 } else { 0 });
+        };
+        Ok(bitpos_of(&m.payload, bit, range))
+    }
+}
+
+/// The largest bit offset Redis takes: one inside a 512 MiB string, its
+/// `proto-max-bulk-len`. A larger one is refused as not an offset at all,
+/// before any value-size cap is consulted.
+pub const MAX_BIT_OFFSET: u64 = 512 * 1024 * 1024 * 8 - 1;
+
+/// Clamp an inclusive `[start, end]` window over `len` units, negatives
+/// counting from the end, as Valkey's bit commands do: both clamped below
+/// at 0, `end` above at `len - 1`. Empty when `start > end`.
+fn bit_window(len: i64, start: i64, end: i64) -> (i64, i64) {
+    let start = if start < 0 { len + start } else { start };
+    let end = if end < 0 { len + end } else { end };
+    let (start, end) = (start.max(0), end.max(0));
+    (start, if end >= len { len - 1 } else { end })
+}
+
+/// Whether bit `i` of `payload` is set; zero past the end.
+fn bit_at(payload: &[u8], i: u64) -> bool {
+    payload
+        .get((i >> 3) as usize)
+        .is_some_and(|b| b & (1 << (7 - (i & 7))) != 0)
+}
+
+/// BITCOUNT over a string, as Valkey 9.1 counts: `range` is `start`, `end`
+/// and whether they count bits rather than bytes.
+pub fn bitcount_of(payload: &[u8], range: Option<(i64, i64, bool)>) -> u64 {
+    let Some((start, end, bits)) = range else {
+        return payload.iter().map(|b| u64::from(b.count_ones())).sum();
+    };
+    // Two negative indexes in the wrong order count nothing, BEFORE
+    // clamping. Clamped, `-4 -5` on three bytes is `[0, 0]`, the first
+    // byte, which is what BITPOS (without this check) does search.
+    if start < 0 && end < 0 && start > end {
+        return 0;
+    }
+    let len = payload.len() as i64 * if bits { 8 } else { 1 };
+    let (start, end) = bit_window(len, start, end);
+    if start > end {
+        return 0;
+    }
+    let popcount = |bytes: &[u8]| bytes.iter().map(|b| u64::from(b.count_ones())).sum::<u64>();
+    if !bits {
+        return popcount(&payload[start as usize..=end as usize]);
+    }
+    // Whole bytes, less the bits of the first before `start` and of the
+    // last after `end` (bit 0 being a byte's high bit).
+    let (first, last) = ((start >> 3) as usize, (end >> 3) as usize);
+    let before = payload[first] & !(0xffu8 >> (start & 7));
+    let after = payload[last] & (0xffu16 >> ((end & 7) + 1)) as u8;
+    popcount(&payload[first..=last])
+        - u64::from(before.count_ones())
+        - u64::from(after.count_ones())
+}
+
+/// BITPOS over a string that exists, as Valkey 9.1 searches: `range` is
+/// `start`, the `end` if one was given, and whether they count bits.
+pub fn bitpos_of(payload: &[u8], bit: bool, range: Option<(i64, Option<i64>, bool)>) -> i64 {
+    let len = payload.len() as i64;
+    let (start, end, bits, end_given) = match range {
+        None => (0, len - 1, false, false),
+        Some((start, end, bits)) => {
+            let units = if bits { len * 8 } else { len };
+            let (s, e) = bit_window(units, start, end.unwrap_or(units - 1));
+            (s, e, bits, end.is_some())
+        }
+    };
+    // An empty window holds neither a 0 nor a 1, and an empty string is
+    // one (it answers -1 for either bit, where a missing key answers 0).
+    if start > end {
+        return -1;
+    }
+    let (lo, hi) = if bits {
+        (start as u64, end as u64)
+    } else {
+        (start as u64 * 8, end as u64 * 8 + 7)
+    };
+    // A byte at a time; only the partial first and last bytes need their
+    // bits looked at one by one, and a whole byte of the other value is
+    // skipped.
+    let skip = if bit { 0x00 } else { 0xff };
+    let found = ((lo >> 3)..=(hi >> 3)).find_map(|j| {
+        let whole = j * 8 >= lo && j * 8 + 7 <= hi;
+        if whole && payload[j as usize] == skip {
+            return None;
+        }
+        (j * 8..j * 8 + 8)
+            .filter(|&i| i >= lo && i <= hi)
+            .find(|&i| bit_at(payload, i) == bit)
+    });
+    match found {
+        Some(i) => i as i64,
+        // Looking for a 0 with no end given, the string reads as padded
+        // with zeros on the right: the first bit past it.
+        None if !bit && !end_given => hi as i64 + 1,
+        None => -1,
+    }
+}
+
+/// BITOP's operators: Valkey's four, and Redis 8.2's `DIFF`, `DIFF1`,
+/// `ANDOR` and `ONE`, which Valkey 9.1 does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitOp {
+    And,
+    Or,
+    Xor,
+    Not,
+    /// The first source's bits that are in none of the others.
+    Diff,
+    /// The others' bits that are not in the first.
+    Diff1,
+    /// The first source's bits that are also in any of the others.
+    AndOr,
+    /// The bits set in exactly one source.
+    One,
+}
+
+/// BITOP's result over its sources, a missing one being an empty string:
+/// as long as the longest, each shorter one padded with zeros.
+pub fn bitop_of(op: BitOp, sources: &[Vec<u8>]) -> Vec<u8> {
+    let len = sources.iter().map(Vec::len).max().unwrap_or(0);
+    let byte = |s: &Vec<u8>, j: usize| s.get(j).copied().unwrap_or(0);
+    (0..len)
+        .map(|j| {
+            let first = sources.first().map_or(0, |s| byte(s, j));
+            let rest = || sources[1..].iter().map(|s| byte(s, j));
+            match op {
+                BitOp::And => rest().fold(first, |a, b| a & b),
+                BitOp::Or => rest().fold(first, |a, b| a | b),
+                BitOp::Xor => rest().fold(first, |a, b| a ^ b),
+                BitOp::Not => !first,
+                BitOp::Diff => first & !rest().fold(0, |a, b| a | b),
+                BitOp::Diff1 => !first & rest().fold(0, |a, b| a | b),
+                BitOp::AndOr => first & rest().fold(0, |a, b| a | b),
+                BitOp::One => {
+                    let (mut once, mut more) = (0u8, 0u8);
+                    for s in sources {
+                        let b = byte(s, j);
+                        more |= once & b;
+                        once ^= b;
+                    }
+                    once & !more
+                }
+            }
+        })
+        .collect()
 }
 
 /// What `OVERFLOW` sets for the `SET` and `INCRBY` after it (BUG-0192).
@@ -882,6 +1099,101 @@ mod tests {
         assert_eq!(s.incr_by_float(1, b"t1", 1.0), Ok(b"2.5".to_vec()));
         let m = s.read_live(1, b"t1").expect("read").expect("live");
         assert_eq!(m.expire_ms, 2_000_000);
+    }
+
+    /// Bitmaps, against answers read from Valkey 9.1 (and, for BITOP's
+    /// four Redis-only operators, Redis 8.2) on the same strings.
+    #[test]
+    fn bitmaps_answer_as_the_reference_servers_do() {
+        let a: &[u8] = &[0xff, 0xf0, 0x00];
+        let b: &[u8] = &[0x0f, 0x0f];
+        let s6: &[u8] = b"foobar";
+        assert_eq!(bitcount_of(a, None), 12);
+        assert_eq!(bitcount_of(a, Some((1, 10, true))), 10);
+        assert_eq!(bitcount_of(a, Some((-5, -1, true))), 0);
+        // Two negative indexes the wrong way round: nothing, though the
+        // clamped window would be the first byte.
+        assert_eq!(bitcount_of(a, Some((-4, -5, false))), 0);
+        assert_eq!(bitcount_of(a, Some((0, -1, false))), 12);
+        assert_eq!(bitcount_of(s6, Some((1, 1, false))), 6);
+        assert_eq!(bitcount_of(s6, Some((5, 30, true))), 17);
+        assert_eq!(bitcount_of(b"", Some((0, -1, true))), 0);
+
+        assert_eq!(bitpos_of(a, false, None), 12);
+        assert_eq!(bitpos_of(a, true, None), 0);
+        assert_eq!(bitpos_of(a, false, Some((0, Some(-1), true))), 12);
+        assert_eq!(bitpos_of(a, true, Some((2, None, false))), -1);
+        // No end given: a 0 is found just past the string.
+        assert_eq!(bitpos_of(a, false, Some((2, None, false))), 16);
+        assert_eq!(bitpos_of(a, false, Some((0, Some(1), false))), 12);
+        // An end given: a range of ones holds no 0.
+        assert_eq!(bitpos_of(a, false, Some((0, Some(0), false))), -1);
+        // An empty string holds neither bit (a missing key is all zeros).
+        assert_eq!(bitpos_of(b"", false, None), -1);
+        assert_eq!(bitpos_of(b"", true, None), -1);
+        // BITPOS has no wrong-way-round check: `-4 -5` clamps to byte 0.
+        assert_eq!(bitpos_of(a, true, Some((-4, Some(-5), false))), 0);
+        assert_eq!(bitpos_of(a, false, Some((-4, Some(-5), false))), -1);
+        assert_eq!(bitpos_of(b, true, Some((3, Some(12), true))), 4);
+        assert_eq!(bitpos_of(s6, false, Some((3, Some(12), true))), 3);
+
+        let srcs = vec![a.to_vec(), b.to_vec(), s6.to_vec()];
+        let hex = |v: Vec<u8>| v.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex(bitop_of(BitOp::And, &srcs)), "060000000000");
+        assert_eq!(hex(bitop_of(BitOp::Or, &srcs)), "ffff6f626172");
+        assert_eq!(hex(bitop_of(BitOp::Xor, &srcs)), "96906f626172");
+        assert_eq!(hex(bitop_of(BitOp::Not, &srcs[..1])), "000fff");
+        assert_eq!(hex(bitop_of(BitOp::Diff, &srcs)), "909000000000");
+        assert_eq!(hex(bitop_of(BitOp::Diff1, &srcs)), "000f6f626172");
+        assert_eq!(hex(bitop_of(BitOp::AndOr, &srcs)), "6f6000000000");
+        assert_eq!(hex(bitop_of(BitOp::One, &srcs)), "90906f626172");
+        assert!(bitop_of(BitOp::Or, &[vec![], vec![]]).is_empty());
+    }
+
+    /// SETBIT grows the string, keeps its TTL, answers the old bit, and
+    /// writes nothing when the bit already holds the value.
+    #[test]
+    fn setbit_grows_keeps_the_ttl_and_skips_a_no_op() {
+        test_clock!(NOW, now, 1_000_000);
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", now);
+        assert_eq!(s.setbit(1, b"k", 9, true), Ok(false));
+        assert_eq!(s.get(1, b"k"), Ok(Some(vec![0x00, 0x40])));
+        assert_eq!(s.setbit(1, b"k", 9, true), Ok(true));
+        assert_eq!(s.getbit(1, b"k", 9), Ok(true));
+        assert_eq!(s.getbit(1, b"k", 1000), Ok(false));
+        assert_eq!(s.getbit(1, b"missing", 0), Ok(false));
+        s.set(
+            1,
+            b"t",
+            b"\x00",
+            SetOptions {
+                expiry: SetExpiry::AtMs(2_000_000),
+                ..Default::default()
+            },
+        )
+        .expect("set");
+        assert_eq!(s.setbit(1, b"t", 0, true), Ok(false));
+        let m = s.read_live(1, b"t").expect("read").expect("live");
+        assert_eq!((m.payload, m.expire_ms), (vec![0x80], 2_000_000));
+        // Clearing a clear bit inside the string writes nothing: with the
+        // clock moved on, a rewritten row would carry a new write stamp.
+        let before = kv.get(&s.meta_key(1, b"k"));
+        NOW.store(1_500_000, Ordering::Relaxed);
+        assert_eq!(s.setbit(1, b"k", 0, false), Ok(false));
+        assert_eq!(kv.get(&s.meta_key(1, b"k")), before);
+        assert_eq!(s.setbit(1, b"k", 0, true), Ok(false));
+        assert_ne!(
+            kv.get(&s.meta_key(1, b"k")),
+            before,
+            "a real change is written"
+        );
+        let capped = StringStore::with_max_value_bytes(&kv, b"t", now, 8);
+        assert_eq!(
+            capped.setbit(1, b"big", 64, true),
+            Err(StoreError::ValueTooLarge)
+        );
+        assert_eq!(capped.setbit(1, b"big", 63, true), Ok(false));
     }
 
     #[test]

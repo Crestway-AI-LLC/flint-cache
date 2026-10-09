@@ -1633,6 +1633,10 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     if let Some(key) = flint_commands::json_debug_key(args) {
         return key;
     }
+    // BITOP's second argument is its operator; it routes by its destination.
+    if name.eq_ignore_ascii_case(b"BITOP") {
+        return args.get(2).map(|k| k.as_slice());
+    }
     args.get(1).map(|k| k.as_slice())
 }
 
@@ -4196,6 +4200,14 @@ fn cache_invalidate_written(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) {
                 topo.cache.invalidate(ns, k);
             }
         }
+        // BITOP op dst src...: the destination, args[2]. The default arm
+        // would drop args[1], the operator, and leave a cached destination
+        // serving its value from before the BITOP.
+        b"BITOP" => {
+            if let Some(k) = args.get(2) {
+                topo.cache.invalidate(ns, k);
+            }
+        }
         // RENAME / RENAMENX: BOTH keys change — the source ceases to
         // exist and the destination takes its value. Dropping only one
         // leaves the other answering from before the rename, so a
@@ -6310,6 +6322,25 @@ mod route_tests {
             AuthStep::Reply(Value::Map(_))
         ));
         assert_eq!(proto, flint_resp::Proto::Resp3);
+    }
+
+    /// BITOP's key is its destination, `args[2]`; `args[1]` is the
+    /// operator. It routes by the destination, and a BITOP through this
+    /// proxy drops the destination's near-cache entry, not one named after
+    /// the operator, which would leave the destination serving its value
+    /// from before the BITOP.
+    #[test]
+    fn bitop_routes_and_invalidates_by_its_destination() {
+        let bitop = ["BITOP", "AND", "{t}dst", "{t}src"].map(|p| p.as_bytes().to_vec());
+        assert_eq!(route_key(&bitop), Some(&b"{t}dst"[..]));
+        let mut t = topo(vec![vec!["a:1".into()]], vec![Some("a:1".into())]);
+        t.cache = cache::ProxyCache::new(60_000, 1 << 20);
+        for k in [&b"{t}dst"[..], b"AND"] {
+            t.cache.put(b"ns", k, b"v");
+        }
+        cache_invalidate_written(&t, b"ns", &bitop);
+        assert_eq!(t.cache.get(b"ns", b"{t}dst"), None);
+        assert_eq!(t.cache.get(b"ns", b"AND"), Some(b"v".to_vec()));
     }
 
     fn two_pair_topo() -> Topology {
