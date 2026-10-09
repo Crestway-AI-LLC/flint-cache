@@ -1677,6 +1677,15 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
             resp3: Box::new(v),
         };
     }
+    // HRANDFIELD ... WITHVALUES nests each field with its value under
+    // RESP3 and interleaves them under RESP2; nothing in the nested reply
+    // says it was pairs, so the command says so.
+    if flint_resp::hrandfield_withvalues(args) {
+        return Value::ByProto {
+            resp2: Box::new(flint_resp::flatten_pairs(&v)),
+            resp3: Box::new(v),
+        };
+    }
     // A one-field BF.INFO is a one-pair map under RESP3 and the bare value
     // in a one-element array under RESP2; flattening the map would give
     // two elements (BUG-0239).
@@ -1695,6 +1704,7 @@ fn needs_repair(args: &[Vec<u8>]) -> bool {
     args.first()
         .is_some_and(|n| flint_resp::resp3_nests_reply(n) || flint_resp::resp3_differs_in_kind(n))
         || flint_resp::bf_info_field(args)
+        || flint_resp::hrandfield_withvalues(args)
 }
 
 /// One queued command's item in EXEC's reply, put in the client's dialect
@@ -3665,7 +3675,7 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
     // Multi-key DEL / UNLINK / EXISTS may have to be SPLIT across pairs
     // (BUG-0179), which only `handle` does. Staged, the whole command would
     // go to its first key's pair, the bug this exists to fix.
-    if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS") && args.len() > 2 {
+    if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS" | b"TOUCH") && args.len() > 2 {
         return false;
     }
     // Likewise an MGET whose keys span slots (ADR-0048): `handle` splits it
@@ -4213,7 +4223,8 @@ fn cache_invalidate_written(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) {
         // leaves the other answering from before the rename, so a
         // cached source would resurrect a key that is now gone. LMOVE
         // and RPOPLPUSH change both keys too.
-        b"RENAME" | b"RENAMENX" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH" => {
+        b"RENAME" | b"RENAMENX" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH"
+        | b"SMOVE" => {
             for k in args[1..].iter().take(2) {
                 topo.cache.invalidate(ns, k);
             }
@@ -5079,7 +5090,8 @@ async fn handle(
         b"KEYS" => keys_forward(topo, backends, ns, args).await,
         // Multi-key DEL / UNLINK / EXISTS: split by owning pair when the
         // keys span more than one (BUG-0179). See `split_by_owner`.
-        b"DEL" | b"UNLINK" | b"EXISTS" if args.len() > 2 => {
+        // TOUCH counts as EXISTS does, so it splits the same way.
+        b"DEL" | b"UNLINK" | b"EXISTS" | b"TOUCH" if args.len() > 2 => {
             split_by_owner(topo, backends, ns, args, raw, read_replica).await
         }
         // An MGET across slots: one MGET per slot, reassembled in the
@@ -7384,6 +7396,19 @@ mod repair_tests {
         let refused = Value::Error("ERR not found".into());
         let e = repair_reply(&args(&[b"BF.INFO", b"k", b"CAPACITY"]), refused.clone());
         assert_eq!(wire(&e, Proto::Resp2), wire(&refused, Proto::Resp2));
+
+        // HRANDFIELD's pairs arrive nested; a RESP2 client is owed them
+        // interleaved.
+        let pairs = Value::Array(Some(vec![Value::Array(Some(vec![
+            Value::Bulk(Some(b"f".to_vec())),
+            Value::Bulk(Some(b"v".to_vec())),
+        ]))]));
+        let h = repair_reply(&args(&[b"HRANDFIELD", b"h", b"1", b"withvalues"]), pairs);
+        assert_eq!(wire(&h, Proto::Resp2), b"*2\r\n$1\r\nf\r\n$1\r\nv\r\n");
+        assert_eq!(
+            wire(&h, Proto::Resp3),
+            b"*1\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
+        );
 
         let added = repair_reply(&args(&[b"BF.ADD", b"k", b"x"]), Value::Boolean(true));
         assert_eq!(wire(&added, Proto::Resp2), b":1\r\n");

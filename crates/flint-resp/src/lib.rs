@@ -267,6 +267,34 @@ pub fn bf_info_field(args: &[Vec<u8>]) -> bool {
     args.len() == 3 && args[0].eq_ignore_ascii_case(b"BF.INFO")
 }
 
+/// True for `HRANDFIELD key count WITHVALUES`, whose RESP3 reply nests each
+/// field with its value (`*2 *2 $f $v ...`) where RESP2 interleaves them.
+/// Unlike a sorted set's pairs, which carry a double and decode back to
+/// [`Value::ScorePairs`], two strings in an array say nothing about being a
+/// pair, so the command has to.
+pub fn hrandfield_withvalues(args: &[Vec<u8>]) -> bool {
+    args.len() == 4
+        && args[0].eq_ignore_ascii_case(b"HRANDFIELD")
+        && args[3].eq_ignore_ascii_case(b"WITHVALUES")
+}
+
+/// The RESP2 spelling of a RESP3 array of pairs: interleaved. Anything else
+/// (an error) passes through.
+pub fn flatten_pairs(resp3_reply: &Value) -> Value {
+    match resp3_reply {
+        Value::Array(Some(items)) => Value::Array(Some(
+            items
+                .iter()
+                .flat_map(|pair| match pair {
+                    Value::Array(Some(p)) => p.clone(),
+                    other => vec![other.clone()],
+                })
+                .collect(),
+        )),
+        other => other.clone(),
+    }
+}
+
 /// Rebuild a one-field `BF.INFO`'s RESP2 reply from its RESP3 map: the value
 /// alone, in a one-element array. Anything else (an error) passes through.
 pub fn bf_info_field_resp2(resp3_reply: &Value) -> Value {

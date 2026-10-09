@@ -129,6 +129,11 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"SETBIT"
             // Writes its destination, args[2]; args[1] is the operator.
             | b"BITOP"
+            | b"PSETEX"
+            | b"LPUSHX"
+            | b"RPUSHX"
+            // Writes both of its keys (BUG-0188's rule applies).
+            | b"SMOVE"
             | b"FLUSHALL"
             | b"FLUSHDB"
             | b"HSET"
@@ -222,6 +227,9 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"GETBIT"
             | b"BITCOUNT"
             | b"BITPOS"
+            | b"TOUCH"
+            | b"HRANDFIELD"
+            | b"ZRANDMEMBER"
             | b"HSTRLEN"
             | b"HGET"
             | b"HGETALL"

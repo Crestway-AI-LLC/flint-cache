@@ -66,7 +66,9 @@ see below).
 
 **Keyspace**: DEL, UNLINK, EXISTS, TYPE, EXPIRE, PEXPIRE, EXPIREAT,
 PEXPIREAT (each with NX, XX, GT, LT), TTL, PTTL, EXPIRETIME, PEXPIRETIME,
-PERSIST, COPY (REPLACE, DB 0), RENAME, RENAMENX.
+PERSIST, COPY (REPLACE, DB 0), RENAME, RENAMENX, TOUCH (it counts the keys
+that exist, across slots as EXISTS does; Flint keeps no access time, so the
+"touch" itself changes nothing).
 
 > COPY is **same-slot only**, for the same reason as the set operations: the
 > destination is written into the node's local rows, so a destination in a
@@ -202,7 +204,7 @@ v8.2.8 has (ADR-0055).
 through the proxy across all shard pairs as one cursor stream (redis-cli
 `--scan`, RedisInsight, and client iterators work as-is).
 
-**Strings**: SET (NX, XX, EX, PX, EXAT, PXAT, KEEPTTL, GET), SETNX, SETEX,
+**Strings**: SET (NX, XX, EX, PX, EXAT, PXAT, KEEPTTL, GET), SETNX, SETEX, PSETEX,
 GET, GETDEL, GETEX (EX, PX, EXAT, PXAT, PERSIST), GETSET, MSET, MGET,
 APPEND, STRLEN, GETRANGE, SETRANGE, INCR, DECR, INCRBY, DECRBY,
 INCRBYFLOAT, BITFIELD (GET, SET, INCRBY, OVERFLOW WRAP/SAT/FAIL, `i1`-`i64`
@@ -227,7 +229,8 @@ BITCOUNT (BYTE, BIT), BITPOS (BYTE, BIT), BITOP (AND, OR, XOR, NOT, and Redis
 > them.
 
 **Hashes**: HSET, HMSET, HSETNX, HGET, HMGET, HGETALL, HKEYS, HVALS, HDEL, HLEN,
-HEXISTS, HINCRBY, HINCRBYFLOAT, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
+HEXISTS, HINCRBY, HINCRBYFLOAT, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES),
+HRANDFIELD (count, WITHVALUES).
 
 > HKEYS and HVALS were implemented and served from the first release and
 > were missing from this list until 2026-09-05, so the matrix under-reported
@@ -238,7 +241,7 @@ HEXISTS, HINCRBY, HINCRBYFLOAT, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
 
 **Sets**: SADD, SREM, SISMEMBER, SMISMEMBER, SMEMBERS, SCARD, SPOP,
 SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF,
-SINTERSTORE, SUNIONSTORE, SDIFFSTORE.
+SINTERSTORE, SUNIONSTORE, SDIFFSTORE, SMOVE (same slot).
 
 > SINTER / SUNION / SDIFF are **same-slot only**, exactly as in Redis
 > Cluster: colocate the keys with a hash tag (`SINTER {u1}:a {u1}:b`) or the
@@ -252,7 +255,7 @@ SINTERSTORE, SUNIONSTORE, SDIFFSTORE.
 > ZUNIONSTORE accepts a plain set at score 1. That asymmetry is upstream's,
 > not ours.
 
-**Lists**: LPUSH, RPUSH, LPOP and RPOP (with a count), LLEN, LRANGE, LINDEX, LSET, LTRIM,
+**Lists**: LPUSH, RPUSH, LPUSHX, RPUSHX, LPOP and RPOP (with a count), LLEN, LRANGE, LINDEX, LSET, LTRIM,
 LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN), LMOVE, RPOPLPUSH, BLPOP, BRPOP,
 BLMOVE, BRPOPLPUSH (see "Blocking commands").
 
@@ -267,7 +270,8 @@ bounds, ±inf), ZRANGEBYLEX, ZREVRANGEBYLEX (LIMIT, exclusive bounds,
 `-`/`+`), ZLEXCOUNT, ZREMRANGEBYLEX (exclusive bounds, `-`/`+`; no LIMIT,
 as upstream), ZRANK, ZREVRANK (WITHSCORE), ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
 ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT), ZUNIONSTORE, ZINTERSTORE (WEIGHTS,
-AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands").
+AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands"),
+ZRANDMEMBER (count, WITHSCORES).
 
 > ZUNIONSTORE / ZINTERSTORE are **same-slot only**, and the rule covers the
 > destination as well as the inputs — these write, so a destination in an
@@ -625,6 +629,12 @@ Smaller ones, which the corpus does not list:
   RedisJSON's text comes from its parser generator (`Error occurred on
   position 7, …`); the refusals this list describes keep texts of their
   own; and so do the deliberate ones above.
+- **`SRANDMEMBER`, `HRANDFIELD` and `ZRANDMEMBER` with a negative count
+  are refused past the seat's `max-value-bytes`**, the same estimate for
+  each (the count times the mean entry, plus 64 bytes an element).
+  `HRANDFIELD key -9223372036854775807` asks Redis 8.2 for nine quintillion
+  fields; it tried to build that reply and was killed for memory when the
+  differential sent it on 2026-10-08.
 - **`SRANDMEMBER key <negative count>` is refused past the seat's
   `max-value-bytes`** (512 MiB by default), estimated as the count times the
   set's mean member size plus 64 bytes a member. A negative count repeats

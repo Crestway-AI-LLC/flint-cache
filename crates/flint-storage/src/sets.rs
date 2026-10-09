@@ -255,13 +255,12 @@ impl<'a> SetStore<'a> {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let mut members = self.smembers(slot, key)?;
+        let members = self.smembers(slot, key)?;
+        let take = count.min(members.len() as u64) as i64;
+        let members = random_pick(members, take);
         if members.is_empty() {
-            return Ok(Vec::new());
+            return Ok(members);
         }
-        let take = (count.min(members.len() as u64)) as usize;
-        partial_shuffle(&mut members, take);
-        members.truncate(take);
         self.srem(slot, key, &members)?;
         Ok(members)
     }
@@ -275,29 +274,59 @@ impl<'a> SetStore<'a> {
         key: &[u8],
         count: i64,
     ) -> Result<Vec<Vec<u8>>, StoreError> {
-        let mut members = self.smembers(slot, key)?;
-        if members.is_empty() {
-            return Ok(Vec::new());
+        Ok(random_pick(self.smembers(slot, key)?, count))
+    }
+
+    /// SMOVE: move `member` from `src` to `dst`; whether it moved.
+    ///
+    /// In Valkey's order: a missing source answers false before either
+    /// key's type is looked at; then another type at either key is
+    /// WRONGTYPE; one key for both is a membership test. The member is
+    /// added to the destination BEFORE it leaves the source, so a
+    /// destination refused for its size leaves it where it was.
+    pub fn smove(
+        &self,
+        slot: u16,
+        src: &[u8],
+        dst: &[u8],
+        member: &[u8],
+    ) -> Result<bool, StoreError> {
+        if self.read_meta(slot, src)?.is_none() {
+            return Ok(false);
         }
-        if count >= 0 {
-            let take = (count as usize).min(members.len());
-            partial_shuffle(&mut members, take);
-            members.truncate(take);
-            Ok(members)
-        } else {
-            Ok((0..count.unsigned_abs())
-                .map(|_| members[(rand_u64() as usize) % members.len()].clone())
-                .collect())
+        self.read_meta(slot, dst)?;
+        if !self.sismember(slot, src, member)? {
+            return Ok(false);
         }
+        if src == dst {
+            return Ok(true);
+        }
+        self.sadd(slot, dst, &[member.to_vec()])?;
+        self.srem(slot, src, &[member.to_vec()])?;
+        Ok(true)
     }
 }
 
-/// Fisher–Yates over the first `take` positions — enough shuffle for a
-/// bounded pick, no full-vector cost.
-fn partial_shuffle(v: &mut [Vec<u8>], take: usize) {
-    for i in 0..take.min(v.len().saturating_sub(1)) {
-        let j = i + (rand_u64() as usize) % (v.len() - i);
-        v.swap(i, j);
+/// A random selection, as the RANDMEMBER family picks: for a count of 0 or
+/// more, up to that many DISTINCT items; for a negative one, exactly
+/// `|count|`, repeats allowed. Fisher–Yates over the first positions only,
+/// so a small pick from a large set does not shuffle all of it.
+pub fn random_pick<T: Clone>(mut items: Vec<T>, count: i64) -> Vec<T> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    if count >= 0 {
+        let take = (count.unsigned_abs()).min(items.len() as u64) as usize;
+        for i in 0..take.min(items.len() - 1) {
+            let j = i + (rand_u64() as usize) % (items.len() - i);
+            items.swap(i, j);
+        }
+        items.truncate(take);
+        items
+    } else {
+        (0..count.unsigned_abs())
+            .map(|_| items[(rand_u64() as usize) % items.len()].clone())
+            .collect()
     }
 }
 

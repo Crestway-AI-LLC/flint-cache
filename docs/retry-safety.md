@@ -55,9 +55,9 @@ Three corollaries, each measured rather than assumed:
 `FLUSHALL` · `FLUSHDB` · `PERSIST` · `COPY … REPLACE` · `GETBIT` ·
 `BITCOUNT` · `BITPOS` · `SETBIT` (it answers the bit's old value, so the
 retry answers the new one) · `BITOP` whose destination is not one of its
-sources
+sources · `TOUCH` · `HRANDFIELD` · `ZRANDMEMBER`
 
-**Absolute expiry**: `SETEX` · `SET … EXAT`/`PXAT` · `EXPIREAT` ·
+**Absolute expiry**: `SET … EXAT`/`PXAT` · `EXPIREAT` ·
 `PEXPIREAT` (plain, or `XX`) · `GETEX EXAT`/`PXAT`/`PERSIST`
 
 **Collections**: `HSET` · `HMSET` · `HDEL` · `SADD` · `SREM` · `ZADD` (plain,
@@ -87,7 +87,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `BITFIELD` with `INCRBY` | Double-counts, as `INCRBY` does; Sidekiq's metrics flush is this shape. A `BITFIELD` of only `GET` and `SET` converges, but a retried `SET` answers the value the first attempt wrote, not the one before it. |
 | `BITOP` `ZUNIONSTORE` `ZINTERSTORE` whose destination is also a source | The retry applies the operation to its own result. Measured on Valkey 9.1: `BITOP XOR d d x` sent twice gives `d` back unchanged, and `ZUNIONSTORE zd 2 zd zx` adds `zx`'s scores a second time (1, then 2, then 3). `BITOP AND`/`OR` and the set `STORE`s into a source converge. |
 | `APPEND` `JSON.ARRAPPEND` `JSON.STRAPPEND` | Double-appends. |
-| `LPUSH` `RPUSH` | Double-pushes. |
+| `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` | Double-pushes. |
 | `LINSERT` `JSON.ARRINSERT` | Double-inserts: `a b` becomes `a x x b`. |
 | `LPOP` `RPOP` `SPOP` `ZPOPMIN` `ZPOPMAX` `BLPOP` `BRPOP` `BZPOPMIN` `BZPOPMAX` `JSON.ARRPOP` | Destroys an EXTRA element — silent data loss. `SPOP` on `{a,b,c}` returns `c`, then the retry returns `b` and two members are gone. |
 | `LMOVE` `RPOPLPUSH` `BLMOVE` `BRPOPLPUSH` | Moves an EXTRA element. A worker taking one job from a queue takes two, and the reply names only the second, so the first sits in the destination list unclaimed. On one list (a rotation) it rotates twice. |
@@ -97,10 +97,11 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `GETDEL` | The first returns the value and the retry returns nil, so a retrying reader loses the only copy it was handed. |
 | `COPY` (without `REPLACE`) | Returns 0 on the retry: the copy exists, and the caller is told it does not. |
 | `RENAME` `RENAMENX` | The retry answers `ERR no such key` — the source moved on the first attempt. The rename SUCCEEDED and the caller sees an error. |
+| `SMOVE` | The retry answers 0 — the member left the source on the first attempt. It moved, and the caller is told it did not. |
 | `BF.RESERVE` | The retry answers `ERR item exists`, same shape: created, reported as failed. |
 | `EVAL` `EVALSHA` (ADR-0051) | A script is exactly as retry-safe as what it does, so assume it is not. Measured cases: a lock release that succeeded answers 0 on the retry (redsync's -1, "already expired"), so the caller is told it did not hold the lock; a `redlock` acquire that succeeded answers 0, the `SET NX` hazard; an extend that adds to the TTL adds twice; django-redis's `incr` double-counts; a rate limiter's hit counts twice. A failed script keeps none of its writes, so retrying a script that FAILED is safe. |
 | `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` with `NX`, `GT` or `LT` | The retry meets the expiry the first call set: `NX` finds one, and `GT` and `LT` find the new instant no later, or no earlier, than itself. It answers 0: the expiry was set, and the caller is told it was not. |
-| `EXPIRE` `PEXPIRE` `SET … EX/PX` `GETEX EX/PX` (relative TTL) | Retry recomputes from a later clock, extending the TTL. Use the absolute `EXPIREAT`/`PEXPIREAT`/`EXAT`/`PXAT` forms for retry safety. |
+| `EXPIRE` `PEXPIRE` `SET … EX/PX` `SETEX` `PSETEX` `GETEX EX/PX` (relative TTL) | Retry recomputes from a later clock, extending the TTL. Use the absolute `EXPIREAT`/`PEXPIREAT`/`EXAT`/`PXAT` forms for retry safety. (`SETEX` was listed as an absolute expiry until 2026-10-08; its TTL counts from now, as `SET … EX` does.) |
 
 Note the shape shared by the last five rows: **the write landed and the retry
 reports failure.** That is more dangerous than a visible error, because the

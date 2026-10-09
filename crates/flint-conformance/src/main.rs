@@ -689,6 +689,128 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "strings",
+            name: "PSETEX sets a value with a TTL in milliseconds",
+            steps: vec![
+                s(&[b"PSETEX", b"px", b"100000", b"v"], Expect::Ok),
+                s(&[b"GET", b"px"], Expect::Str(b"v")),
+                s(&[b"PTTL", b"px"], Expect::IntRange(90_000, 100_000)),
+                s(
+                    &[b"PSETEX", b"px", b"0", b"v"],
+                    Expect::Err("ERR invalid expire time in 'psetex' command"),
+                ),
+                s(
+                    &[b"PSETEX", b"px", b"-5", b"v"],
+                    Expect::Err("ERR invalid expire time in 'psetex' command"),
+                ),
+                s(
+                    &[b"PSETEX", b"px", b"x", b"v"],
+                    Expect::Err("ERR value is not an integer or out of range"),
+                ),
+                s(&[b"PSETEX", b"px", b"100"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "keyspace",
+            name: "TOUCH counts the keys that exist, as EXISTS does",
+            steps: vec![
+                s(&[b"SET", b"t1", b"a"], Expect::Ok),
+                s(&[b"SET", b"t2", b"b"], Expect::Ok),
+                s(&[b"TOUCH", b"t1", b"t2", b"t3", b"t1"], Expect::Int(3)),
+                s(&[b"TOUCH", b"t3"], Expect::Int(0)),
+                s(&[b"TOUCH"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "LPUSHX and RPUSHX push only onto a list that exists",
+            steps: vec![
+                s(&[b"LPUSHX", b"lx", b"a"], Expect::Int(0)),
+                s(&[b"EXISTS", b"lx"], Expect::Int(0)),
+                s(&[b"RPUSH", b"lx", b"a"], Expect::Int(1)),
+                s(&[b"LPUSHX", b"lx", b"b", b"c"], Expect::Int(3)),
+                s(&[b"RPUSHX", b"lx", b"d"], Expect::Int(4)),
+                s(
+                    &[b"LRANGE", b"lx", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"c"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"a"),
+                        Expect::Str(b"d"),
+                    ]),
+                ),
+                s(&[b"SET", b"lxs", b"v"], Expect::Ok),
+                s(&[b"RPUSHX", b"lxs", b"a"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"LPUSHX", b"lx"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "sets",
+            name: "SMOVE moves a member, in upstream's order of checks",
+            steps: vec![
+                s(&[b"SADD", b"{sm}a", b"x", b"y"], Expect::Int(2)),
+                s(&[b"SADD", b"{sm}b", b"z"], Expect::Int(1)),
+                s(&[b"SMOVE", b"{sm}a", b"{sm}b", b"x"], Expect::Int(1)),
+                s(&[b"SMOVE", b"{sm}a", b"{sm}b", b"nope"], Expect::Int(0)),
+                s(&[b"SMEMBERS", b"{sm}a"], Expect::UnorderedStrs(vec![b"y"])),
+                s(&[b"SMEMBERS", b"{sm}b"], Expect::UnorderedStrs(vec![b"x", b"z"])),
+                // One key for both is a membership test.
+                s(&[b"SMOVE", b"{sm}a", b"{sm}a", b"y"], Expect::Int(1)),
+                s(&[b"SMOVE", b"{sm}a", b"{sm}a", b"nope"], Expect::Int(0)),
+                // A source emptied by the move is gone.
+                s(&[b"SMOVE", b"{sm}a", b"{sm}c", b"y"], Expect::Int(1)),
+                s(&[b"EXISTS", b"{sm}a"], Expect::Int(0)),
+                s(&[b"SMEMBERS", b"{sm}c"], Expect::UnorderedStrs(vec![b"y"])),
+                s(&[b"SET", b"{sm}s", b"v"], Expect::Ok),
+                s(&[b"SMOVE", b"{sm}b", b"{sm}s", b"nope"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                // A missing source answers 0 before any type is checked.
+                s(&[b"SMOVE", b"{sm}none", b"{sm}s", b"z"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "HRANDFIELD picks fields, in upstream's words",
+            steps: vec![
+                s(&[b"HSET", b"hr", b"f1", b"v1", b"f2", b"v2", b"f3", b"v3"], Expect::Int(3)),
+                s(&[b"HRANDFIELD", b"hr", b"5"], Expect::UnorderedStrs(vec![b"f1", b"f2", b"f3"])),
+                s(
+                    &[b"HRANDFIELD", b"hr", b"5", b"WITHVALUES"],
+                    Expect::UnorderedPairs(vec![(b"f1", b"v1"), (b"f2", b"v2"), (b"f3", b"v3")]),
+                ),
+                s(&[b"HRANDFIELD", b"hr", b"0"], Expect::Arr(vec![])),
+                s(&[b"HRANDFIELD", b"hr", b"-2"], Expect::AnyArray),
+                s(&[b"HRANDFIELD", b"hrnone"], Expect::Nil),
+                s(&[b"HRANDFIELD", b"hrnone", b"3"], Expect::Arr(vec![])),
+                s(&[b"HRANDFIELD", b"hr", b"2", b"WAT"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"HRANDFIELD", b"hr", b"x"],
+                    Expect::Err("ERR value is not an integer or out of range"),
+                ),
+                s(
+                    &[b"HRANDFIELD", b"hr", b"-4611686018427387905", b"WITHVALUES"],
+                    Expect::Err("ERR value is out of range"),
+                ),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "ZRANDMEMBER picks members, in upstream's words",
+            steps: vec![
+                s(&[b"ZADD", b"zr", b"1", b"a", b"2.5", b"b"], Expect::Int(2)),
+                s(&[b"ZRANDMEMBER", b"zr", b"5"], Expect::UnorderedStrs(vec![b"a", b"b"])),
+                s(
+                    &[b"ZRANDMEMBER", b"zr", b"5", b"WITHSCORES"],
+                    Expect::UnorderedPairs(vec![(b"a", b"1"), (b"b", b"2.5")]),
+                ),
+                s(&[b"ZRANDMEMBER", b"zr", b"0"], Expect::Arr(vec![])),
+                s(&[b"ZRANDMEMBER", b"zrnone"], Expect::Nil),
+                s(&[b"ZRANDMEMBER", b"zrnone", b"2"], Expect::Arr(vec![])),
+                s(&[b"ZRANDMEMBER", b"zr", b"2", b"WITHVALUES"], Expect::Err("ERR syntax error")),
+                s(&[b"SET", b"zrs", b"v"], Expect::Ok),
+                s(&[b"ZRANDMEMBER", b"zrs", b"1"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+            ],
+        },
+        Case {
             family: "keyspace",
             name: "del returns removal count",
             steps: vec![
@@ -5824,6 +5946,11 @@ impl Client {
                 flint_resp::json_numincrby_resp2(&v, args.get(2).map(|p| p.as_slice()))
             }
             _ => v,
+        };
+        // HRANDFIELD ... WITHVALUES nests its pairs under RESP3.
+        let v = match flint_resp::hrandfield_withvalues(args) {
+            true => flint_resp::flatten_pairs(&v),
+            false => v,
         };
         // A one-field BF.INFO is a one-pair map under RESP3; RESP2's reply
         // is the value alone, in a one-element array (BUG-0239).

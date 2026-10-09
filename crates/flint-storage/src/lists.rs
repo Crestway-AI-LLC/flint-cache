@@ -130,6 +130,21 @@ impl<'a> ListStore<'a> {
         Ok((meta.tail - meta.head) as u64)
     }
 
+    /// LPUSHX/RPUSHX: push only onto a list that exists. A missing key
+    /// answers 0 and is not created; another type is WRONGTYPE.
+    pub fn push_existing(
+        &self,
+        slot: u16,
+        key: &[u8],
+        values: &[Vec<u8>],
+        left: bool,
+    ) -> Result<u64, StoreError> {
+        if self.read_meta(slot, key)?.is_none() {
+            return Ok(0);
+        }
+        self.push(slot, key, values, left)
+    }
+
     /// LPOP/RPOP (single).
     pub fn pop(&self, slot: u16, key: &[u8], left: bool) -> Result<Option<Vec<u8>>, StoreError> {
         let Some(mut meta) = self.read_meta(slot, key)? else {

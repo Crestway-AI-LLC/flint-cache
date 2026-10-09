@@ -480,6 +480,21 @@ impl<'a> Dispatcher<'a> {
                     Err(e) => e,
                 }
             }),
+            b"PSETEX" => exact(args, 4, "psetex", |a| {
+                match string_expiry(b"PX", &a[2], (self.clock)(), "psetex") {
+                    Ok(at) => {
+                        let opts = SetOptions {
+                            expiry: SetExpiry::AtMs(at),
+                            ..Default::default()
+                        };
+                        match self.strings.set(slot_for_key(&a[1]), &a[1], &a[3], opts) {
+                            Ok(_) => Value::Simple("OK".into()),
+                            Err(e) => store_err(e),
+                        }
+                    }
+                    Err(e) => e,
+                }
+            }),
             b"GET" => exact(args, 2, "get", |a| {
                 reply(self.strings.get(slot_for_key(&a[1]), &a[1]), Value::Bulk)
             }),
@@ -881,11 +896,33 @@ impl<'a> Dispatcher<'a> {
             }
             b"SPOP" => self.cmd_spop(args),
             b"SRANDMEMBER" => self.cmd_srandmember(args),
+            b"SMOVE" => exact(args, 4, "smove", |a| {
+                if let Some(e) = Self::crossslot(&a[1], &a[2..3]) {
+                    return e;
+                }
+                reply(
+                    self.sets.smove(slot_for_key(&a[1]), &a[1], &a[2], &a[3]),
+                    |moved| Value::Integer(moved as i64),
+                )
+            }),
+            b"HRANDFIELD" => self.cmd_hrandfield(args),
+            b"ZRANDMEMBER" => self.cmd_zrandmember(args),
             b"HSCAN" => self.cmd_scan_typed(args, ScanKind::Hash),
             b"SSCAN" => self.cmd_scan_typed(args, ScanKind::Set),
             b"ZSCAN" => self.cmd_scan_typed(args, ScanKind::ZSet),
 
             // lists
+            b"LPUSHX" | b"RPUSHX" => {
+                let left = name.eq_ignore_ascii_case(b"LPUSHX");
+                if args.len() < 3 {
+                    return arity_err(if left { "lpushx" } else { "rpushx" });
+                }
+                reply(
+                    self.lists
+                        .push_existing(slot_for_key(&args[1]), &args[1], &args[2..], left),
+                    |n| Value::Integer(n as i64),
+                )
+            }
             b"LPUSH" | b"RPUSH" => {
                 if args.len() < 3 {
                     return arity_err(if name.eq_ignore_ascii_case(b"LPUSH") {
@@ -1112,6 +1149,10 @@ impl<'a> Dispatcher<'a> {
                 multi_key(args, "del", |k| self.keyspace.del(slot_for_key(k), k))
             }
             b"EXISTS" => multi_key(args, "exists", |k| self.keyspace.exists(slot_for_key(k), k)),
+            // TOUCH counts the keys that exist, as EXISTS does. Redis also
+            // marks them used for its LRU; Flint keeps no access time to
+            // mark, so that half does nothing here.
+            b"TOUCH" => multi_key(args, "touch", |k| self.keyspace.exists(slot_for_key(k), k)),
             b"TYPE" => exact(args, 2, "type", |a| {
                 match self.keyspace.value_type(slot_for_key(&a[1]), &a[1]) {
                     Some(t) => Value::Simple(t.name().into()),
@@ -3897,6 +3938,122 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
+    /// HRANDFIELD key [count [WITHVALUES]]: Valkey's argument checks, then
+    /// SRANDMEMBER's picking and its guard on what a negative count builds.
+    fn cmd_hrandfield(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 {
+            return arity_err("hrandfield");
+        }
+        let count = match randmember_args(args, b"WITHVALUES") {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        let slot = slot_for_key(&args[1]);
+        let pairs = match self.hashes.hgetall(slot, &args[1]) {
+            Ok(p) => p,
+            Err(e) => return store_err(e),
+        };
+        let Some((n, with)) = count else {
+            // No count: one field, or nil for a missing key.
+            let mut pick = flint_storage::sets::random_pick(pairs, 1);
+            return Value::Bulk(pick.pop().map(|(f, _)| f));
+        };
+        if let Some(e) = self.randmember_guard("HRANDFIELD", &pairs, n, with, |(f, v)| {
+            (f.len() + v.len()) as u64
+        }) {
+            return e;
+        }
+        let picks = flint_storage::sets::random_pick(pairs, n);
+        if !with {
+            return Value::Array(Some(
+                picks
+                    .into_iter()
+                    .map(|(f, _)| Value::Bulk(Some(f)))
+                    .collect(),
+            ));
+        }
+        // RESP2 interleaves field and value; RESP3 nests each pair, as
+        // Redis answers (the proxy rebuilds the first from the second:
+        // `flint_resp::hrandfield_withvalues_resp2`).
+        let flat = picks
+            .iter()
+            .flat_map(|(f, v)| [Value::Bulk(Some(f.clone())), Value::Bulk(Some(v.clone()))])
+            .collect();
+        let nested = picks
+            .into_iter()
+            .map(|(f, v)| Value::Array(Some(vec![Value::Bulk(Some(f)), Value::Bulk(Some(v))])))
+            .collect();
+        Value::ByProto {
+            resp2: Box::new(Value::Array(Some(flat))),
+            resp3: Box::new(Value::Array(Some(nested))),
+        }
+    }
+
+    /// ZRANDMEMBER key [count [WITHSCORES]], as HRANDFIELD; the pairs are
+    /// member/score pairs, which RESP3 nests with a double.
+    fn cmd_zrandmember(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 {
+            return arity_err("zrandmember");
+        }
+        let count = match randmember_args(args, b"WITHSCORES") {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        let slot = slot_for_key(&args[1]);
+        let members = match self.zsets.zrange(slot, &args[1], 0, -1) {
+            Ok(m) => m,
+            Err(e) => return store_err(e),
+        };
+        let Some((n, with)) = count else {
+            let mut pick = flint_storage::sets::random_pick(members, 1);
+            return Value::Bulk(pick.pop().map(|(m, _)| m));
+        };
+        if let Some(e) = self.randmember_guard("ZRANDMEMBER", &members, n, with, |(m, _)| {
+            m.len() as u64 + 8
+        }) {
+            return e;
+        }
+        let picks = flint_storage::sets::random_pick(members, n);
+        if with {
+            Value::ScorePairs(picks)
+        } else {
+            Value::Array(Some(
+                picks
+                    .into_iter()
+                    .map(|(m, _)| Value::Bulk(Some(m)))
+                    .collect(),
+            ))
+        }
+    }
+
+    /// Refuse a negative-count HRANDFIELD or ZRANDMEMBER whose reply would
+    /// pass the seat's max-value-bytes, as SRANDMEMBER is refused
+    /// (BUG-0218): a negative count repeats entries, so `-2000000000000`
+    /// asks for two trillion of them. Redis 8.2 builds such a reply and was
+    /// killed for memory doing it on 2026-10-08.
+    fn randmember_guard<T>(
+        &self,
+        name: &str,
+        items: &[T],
+        n: i64,
+        with: bool,
+        size: impl Fn(&T) -> u64,
+    ) -> Option<Value> {
+        if n >= 0 || items.is_empty() {
+            return None;
+        }
+        let mean = items.iter().map(&size).sum::<u64>() / items.len() as u64;
+        let per = mean + REPLY_ELEMENT_BYTES * if with { 2 } else { 1 };
+        let bytes = n.unsigned_abs().saturating_mul(per);
+        (bytes > self.reply_ceiling()).then(|| {
+            err(&format!(
+                "ERR {name} with count {n} would build a reply of about {bytes} bytes, past \
+                 this server's limit of {} (max-value-bytes); ask for fewer",
+                self.reply_ceiling()
+            ))
+        })
+    }
+
     /// Bytes `SRANDMEMBER key count` builds for a negative `count`: each of
     /// `|count|` members at the set's mean size, plus what a reply element
     /// costs in memory (`REPLY_ELEMENT_BYTES`). 0 for a missing key.
@@ -4403,6 +4560,30 @@ fn parse_block_timeout(raw: &[u8]) -> Result<f64, Value> {
 
 /// An integer argument, read as Redis reads one (BUG-0213): `01` and `+1`
 /// are not integers.
+/// HRANDFIELD's and ZRANDMEMBER's count and pairs flag (`word`, WITHVALUES
+/// or WITHSCORES), read as Valkey reads them, before the key: `None` when
+/// no count is given.
+fn randmember_args(args: &[Vec<u8>], word: &[u8]) -> Result<Option<(i64, bool)>, Value> {
+    if args.len() < 3 {
+        return Ok(None);
+    }
+    let n = match parse_i64(&args[2]) {
+        // The bound is symmetric, so i64::MIN is out of it.
+        Ok(i64::MIN) => return Err(err(OUT_OF_SYMMETRIC_RANGE)),
+        Ok(n) => n,
+        Err(_) => return Err(err(NOT_AN_INTEGER)),
+    };
+    if args.len() > 4 || (args.len() == 4 && !args[3].eq_ignore_ascii_case(word)) {
+        return Err(err("ERR syntax error"));
+    }
+    let with = args.len() == 4;
+    // With pairs the reply has twice the entries, so half the bound.
+    if with && !(-(i64::MAX / 2)..=i64::MAX / 2).contains(&n) {
+        return Err(err("ERR value is out of range"));
+    }
+    Ok(Some((n, with)))
+}
+
 /// An argument that should be a Redis integer and is not.
 const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
 
@@ -4721,9 +4902,98 @@ mod tests {
             call(&s, &[b"BITOP", b"AND", b"{b}d", b"{x}a"]),
             Value::Error(e) if e.starts_with("CROSSSLOT")
         ));
+        assert_eq!(call(&s, &[b"BITOP", b"AND", b"{b}d"]), arity_err("bitop"));
+    }
+
+    /// Batch A (Jeff, 2026-10-08): what the corpus cannot hold because
+    /// the oracle answers otherwise or it is a Flint bound.
+    #[test]
+    fn batch_a_commands_keep_flints_bounds() {
+        let s = MemKv::new();
+        // PSETEX past the clock's range is refused, as SET PX is
+        // (BUG-0213); macOS builds of Valkey and Redis answer OK.
         assert_eq!(
-            call(&s, &[b"BITOP", b"AND", b"{b}d"]),
-            arity_err("bitop")
+            call(&s, &[b"PSETEX", b"p", b"9223372036854775807", b"v"]),
+            err("ERR invalid expire time in 'psetex' command")
+        );
+        // SMOVE adds to the destination before it removes from the
+        // source, so a destination refused for its size keeps nothing
+        // and loses nothing.
+        let small = Limits {
+            max_value_bytes: 8,
+            ..Default::default()
+        };
+        let d = Dispatcher::with_limits(&s, system_clock, small, b"ns");
+        let run =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+        run(&[b"SADD", b"{m}dst", b"1234567"]);
+        run(&[b"SADD", b"{m}src", b"ab"]);
+        assert!(matches!(
+            run(&[b"SMOVE", b"{m}src", b"{m}dst", b"ab"]),
+            Value::Error(_)
+        ));
+        assert_eq!(run(&[b"SISMEMBER", b"{m}src", b"ab"]), Value::Integer(1));
+        assert_eq!(run(&[b"SISMEMBER", b"{m}dst", b"ab"]), Value::Integer(0));
+        assert!(matches!(
+            call(&s, &[b"SMOVE", b"{m}a", b"{x}b", b"m"]),
+            Value::Error(e) if e.starts_with("CROSSSLOT")
+        ));
+        // A negative count whose reply would pass max-value-bytes is
+        // refused, as SRANDMEMBER's is (BUG-0218). Against a 1 KiB limit,
+        // so that without the guard this builds 100 entries and fails the
+        // assertion, rather than trying to build two trillion.
+        call(&s, &[b"HSET", b"h", b"f", b"v"]);
+        let tiny = Limits {
+            max_value_bytes: 1024,
+            ..Default::default()
+        };
+        let t = Dispatcher::with_limits(&s, system_clock, tiny, b"ns2");
+        let run2 =
+            |parts: &[&[u8]]| t.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+        run2(&[b"HSET", b"h", b"f", b"v"]);
+        run2(&[b"ZADD", b"z", b"1", b"m"]);
+        for (cmd, key) in [(&b"HRANDFIELD"[..], &b"h"[..]), (b"ZRANDMEMBER", b"z")] {
+            assert!(matches!(
+                run2(&[cmd, key, b"-100"]),
+                Value::Error(e) if e.contains("max-value-bytes")
+            ));
+            assert!(matches!(run2(&[cmd, key, b"-10"]), Value::Array(Some(v)) if v.len() == 10));
+        }
+        assert_eq!(
+            call(&s, &[b"HRANDFIELD", b"h", b"-9223372036854775808"]),
+            err(OUT_OF_SYMMETRIC_RANGE)
+        );
+    }
+
+    /// HRANDFIELD's and ZRANDMEMBER's pairs on the wire: RESP2 interleaves
+    /// them, RESP3 nests each, a score as a double.
+    #[test]
+    fn randmember_pairs_take_each_protocols_shape() {
+        let s = MemKv::new();
+        call(&s, &[b"HSET", b"h", b"f", b"v"]);
+        call(&s, &[b"ZADD", b"z", b"1.5", b"m"]);
+        let h = call(&s, &[b"HRANDFIELD", b"h", b"1", b"WITHVALUES"]);
+        assert_eq!(wire(&h, Proto::Resp2), b"*2\r\n$1\r\nf\r\n$1\r\nv\r\n");
+        assert_eq!(
+            wire(&h, Proto::Resp3),
+            b"*1\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
+        );
+        let z = call(&s, &[b"ZRANDMEMBER", b"z", b"-2", b"WITHSCORES"]);
+        assert_eq!(
+            wire(&z, Proto::Resp2),
+            b"*4\r\n$1\r\nm\r\n$3\r\n1.5\r\n$1\r\nm\r\n$3\r\n1.5\r\n"
+        );
+        assert_eq!(
+            wire(&z, Proto::Resp3),
+            b"*2\r\n*2\r\n$1\r\nm\r\n,1.5\r\n*2\r\n$1\r\nm\r\n,1.5\r\n"
+        );
+        assert_eq!(
+            wire(&call(&s, &[b"HRANDFIELD", b"none"]), Proto::Resp3),
+            b"_\r\n"
+        );
+        assert_eq!(
+            wire(&call(&s, &[b"HRANDFIELD", b"none"]), Proto::Resp2),
+            b"$-1\r\n"
         );
     }
 

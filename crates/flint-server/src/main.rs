@@ -4778,7 +4778,7 @@ fn transaction_control(
     // A placed tenant's transaction may span slots (ADR-0053, `FLINTWHOLE`).
     let keys: Vec<&[u8]> = if whole {
         Vec::new()
-    } else if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS") {
+    } else if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS" | b"TOUCH") {
         args[1..].iter().map(|k| k.as_slice()).collect()
     } else {
         commands::command_key(args).into_iter().collect()
@@ -5327,9 +5327,8 @@ fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
         b"MSET" => args.len() > 3,
         b"JSON.MSET" => args.len() > 4 && args[1..].chunks(3).any(|t| t[0] != args[1]),
         b"DEL" | b"UNLINK" => args.len() > 2,
-        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH" => {
-            two_keys()
-        }
+        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH"
+        | b"SMOVE" => two_keys(),
         // A pop from the first of several keys that holds an element: any
         // of them may be written (ADR-0052 D4).
         b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" => args.len() > 3,
