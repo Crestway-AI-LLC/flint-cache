@@ -154,6 +154,49 @@ pub const REPL_TAIL_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const WAL_WALK_RETRIES: u32 = 2;
 const WAL_WALK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// The pauses before a walk that ended in a WAL gap is walked again, from
+/// scratch; the gap is believed only when every walk finds it (BUG-0252).
+///
+/// A gap is the verdict that sends a replica to a full re-seed ("this link
+/// can never resume"), and on the playground a master gave it twice to a
+/// replica streaming a few sequences behind, each time within a second of a
+/// snapshot rolling the WAL to a new file. The span was there: the replica,
+/// restarted, was served it at once. Whatever the walk missed at the roll,
+/// a walk a moment later does not.
+///
+/// As with [`retrying_walk`], **a re-walk can only turn a transient verdict
+/// into a success; it cannot turn a real gap into a pass**: every walk makes
+/// every check, and a WAL that cannot reach the cursor fails them all. The
+/// cost is paid only on the gap path: 1.75 s in all, under the 3 s a replica
+/// waits for its master before it stops serving reads.
+const WAL_GAP_RECHECK_PAUSES_MS: [u64; 4] = [50, 200, 500, 1000];
+
+/// Runs `walk`, and again after each pause while it ends in a WAL gap
+/// (BUG-0252). Returns its last result, and the first gap's reason when a
+/// later walk succeeded. Any other error is returned at once: only a gap is
+/// a verdict a moment can change.
+fn rewalk_on_gap<T>(
+    pauses: &[u64],
+    mut walk: impl FnMut() -> Result<T, ReplError>,
+) -> (Result<T, ReplError>, Option<String>) {
+    let mut first_gap = None;
+    for ms in pauses {
+        match walk() {
+            Err(ReplError::WalGap(why)) => {
+                first_gap.get_or_insert(why);
+                std::thread::sleep(std::time::Duration::from_millis(*ms));
+            }
+            other => {
+                let recovered = if other.is_ok() { first_gap } else { None };
+                return (other, recovered);
+            }
+        }
+    }
+    let last = walk();
+    let recovered = if last.is_ok() { first_gap } else { None };
+    (last, recovered)
+}
+
 /// RocksDB's wording when a WAL file is deleted while a walk is listing and
 /// stat'ing them. Matched on the message because the crate hands back an
 /// opaque error with no kind to switch on: `IO error: No such file or
@@ -222,7 +265,39 @@ impl RocksKv {
     /// Batches are never split, so the result is always applied/shipped
     /// whole; the caller resumes from the last batch's `last_seq` on its
     /// next poll and converges without any extra signal.
+    ///
+    /// A walk that ends in a gap is walked again, from scratch, before the gap
+    /// is believed (BUG-0252): see `WAL_GAP_RECHECK_PAUSES_MS`.
     pub fn updates_since_budgeted(
+        &self,
+        last_applied: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<ReplBatch>, ReplError> {
+        // What the WAL held when the first walk saw a gap, kept for the line
+        // below: a gap that a moment cures is the one whose cause is not yet
+        // known, and the files are the evidence.
+        let mut seen = None;
+        let (result, recovered) = rewalk_on_gap(&WAL_GAP_RECHECK_PAUSES_MS, || {
+            let walk = self.walk_since_budgeted(last_applied, max_bytes);
+            if seen.is_none() && matches!(walk, Err(ReplError::WalGap(_))) {
+                seen = Some(self.wal_files_note());
+            }
+            walk
+        });
+        if let Some(why) = recovered {
+            // Rare, and the evidence that this path is needed: one line per
+            // recovered walk.
+            eprintln!(
+                "WAL walk from seq {last_applied} saw a gap that a re-walk did not ({why}; {}): \
+                 serving it (BUG-0252)",
+                seen.unwrap_or_default()
+            );
+        }
+        result
+    }
+
+    /// One walk of [`Self::updates_since_budgeted`], and its verdict.
+    fn walk_since_budgeted(
         &self,
         last_applied: u64,
         max_bytes: usize,
@@ -355,11 +430,23 @@ impl RocksKv {
         if let Some(first) = raw_first
             && first > last_applied + 1
         {
-            return Err(ReplError::WalGap(format!(
-                "oldest retained batch starts at {first}, past the {} needed                  (latest is {})",
-                last_applied + 1,
-                self.db().latest_sequence_number()
-            )));
+            // AN INTERIOR CURSOR MEETS THIS BRANCH TOO (BUG-0252), the
+            // non-empty twin of BUG-0050's: the walk skips the batch the
+            // cursor rests in and offers the next. So ask, as the empty shape
+            // asks: a retained batch covering the cursor and ending where the
+            // offered span begins is the data, not a hole, and it is served
+            // first so the cursor lands on a real batch end.
+            if let Some(covering) = self.batch_covering(last_applied)?
+                && covering.last_seq + 1 == first
+            {
+                out.insert(0, covering);
+            } else {
+                return Err(ReplError::WalGap(format!(
+                    "oldest retained batch starts at {first}, past the {} needed                  (latest is {})",
+                    last_applied + 1,
+                    self.db().latest_sequence_number()
+                )));
+            }
         }
         // THE THIRD SHAPE, AND THE ONE NEITHER CHECK ABOVE CAN SEE (BUG-0082).
         // Both of them ask where the span STARTS. Neither says anything about
@@ -785,6 +872,222 @@ mod tests {
     /// `set_last_applied` arranges via `snap_to_batch_end`) or one past the
     /// follower's tail, which refuses honestly. This test pins both edges so
     /// that constraint cannot be removed by accident.
+    /// BUG-0252: a cursor INSIDE a batch, with a later batch retained, is
+    /// served from the batch it rests in. The walk offers only the later
+    /// batch, which read as "oldest retained batch starts past the needed",
+    /// a false full re-seed; BUG-0050 had fixed only the empty-walk shape.
+    #[test]
+    fn an_interior_cursor_with_later_batches_is_served_not_refused() {
+        let d = TempDir::new("interiorlater");
+        let kv = RocksKv::open(&d.0).expect("open");
+        let write = |keys: &[&str]| {
+            let mut wb = WriteBatch::default();
+            for k in keys {
+                wb.put(k.as_bytes(), b"v");
+            }
+            kv.db().write(wb).expect("write");
+        };
+        write(&["a1", "a2", "a3", "a4", "a5"]); // seqs 1..=5
+        write(&["b1", "b2", "b3"]); // seqs 6..=8
+        let batches = kv
+            .updates_since(3)
+            .expect("an interior cursor is not a gap");
+        let spans: Vec<(u64, u64)> = batches.iter().map(|b| (b.first_seq, b.last_seq)).collect();
+        assert_eq!(
+            spans,
+            vec![(4, 5), (6, 8)],
+            "the rest of the cursor's batch, then the next"
+        );
+        let keys: Vec<&[u8]> = batches
+            .iter()
+            .flat_map(|b| b.ops.iter())
+            .map(|op| match op {
+                ReplOp::Put { key, .. } | ReplOp::Delete { key } => key.as_slice(),
+            })
+            .collect();
+        assert_eq!(keys, [&b"a4"[..], b"a5", b"b1", b"b2", b"b3"]);
+    }
+
+    /// BUG-0252: a gap one walk sees and the next does not is served; a gap
+    /// every walk sees is refused after them all; any other error is
+    /// returned at once.
+    #[test]
+    fn a_gap_is_believed_only_when_every_walk_finds_it() {
+        let gap = || ReplError::WalGap("hole".into());
+        let mut calls = 0;
+        let (r, recovered) = rewalk_on_gap(&[0, 0, 0], || {
+            calls += 1;
+            if calls == 1 { Err(gap()) } else { Ok(calls) }
+        });
+        assert!(matches!(r, Ok(2)), "{r:?}");
+        assert_eq!(recovered.as_deref(), Some("hole"));
+
+        let mut calls = 0;
+        let (r, recovered) = rewalk_on_gap(&[0, 0, 0], || -> Result<(), _> {
+            calls += 1;
+            Err(gap())
+        });
+        assert!(matches!(r, Err(ReplError::WalGap(_))), "{r:?}");
+        assert_eq!(
+            (calls, recovered),
+            (4, None),
+            "every pause, then the last walk"
+        );
+
+        let mut calls = 0;
+        let (r, _) = rewalk_on_gap(&[0, 0, 0], || -> Result<(), _> {
+            calls += 1;
+            Err(ReplError::Storage("io".into()))
+        });
+        assert!(matches!(r, Err(ReplError::Storage(_))), "{r:?}");
+        assert_eq!(calls, 1, "only a gap is walked again");
+
+        let (r, recovered) = rewalk_on_gap(&[0, 0, 0], || Ok::<_, ReplError>(7));
+        assert!(matches!(r, Ok(7)) && recovered.is_none());
+    }
+
+    /// BUG-0252's harness, run by hand: a tailer polling from batch ends
+    /// while checkpoints, which flush and roll the WAL as FLINTSNAPSHOT does,
+    /// run back to back, with writers and the WAL fsync tick going. Every
+    /// verdict must be a span, never a gap. `OPS0386_SECS` (default 10),
+    /// `OPS0386_CKPT_US` (pause between checkpoints, default 500),
+    /// `OPS0386_FSYNC_MS` (default 2), `OPS0386_WRITERS` (default 4).
+    ///
+    /// Measured 2026-10-10 with a single walk per poll, before the re-walk:
+    /// 9,245 rolls on macOS and 16,878 on Linux (XFS) without the playground's
+    /// two shapes; the Linux run met one false gap of BUG-0162's shape (a
+    /// stat of an archived segment deleted underneath, past that fix's two
+    /// retries), which the re-walk now covers. Ignored because it is a
+    /// measurement: the suite should not spend ten seconds on it.
+    #[test]
+    #[ignore]
+    fn checkpoint_rolls_never_make_a_tailer_see_a_gap() {
+        let md = TempDir::new("b252");
+        let master = RocksKv::open(&md.0).expect("open");
+        let snaps = TempDir::new("b252snaps");
+        std::fs::create_dir_all(&snaps.0).expect("snaps");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let secs: u64 = std::env::var("OPS0386_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let gaps = std::sync::Mutex::new(Vec::<String>::new());
+        let polls = std::sync::atomic::AtomicU64::new(0);
+        let rolls = std::sync::atomic::AtomicU64::new(0);
+        let fsync_ms: u64 = std::env::var("OPS0386_FSYNC_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let writers: u64 = std::env::var("OPS0386_WRITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        std::thread::scope(|sc| {
+            for w in 0..writers {
+                let (master, stop) = (&master, &stop);
+                sc.spawn(move || {
+                    let s = StringStore::new(master, b"ns", system_clock);
+                    let mut i = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        s.set(
+                            1,
+                            format!("k{w}-{}", i % 5000).as_bytes(),
+                            b"value",
+                            SetOptions::default(),
+                        )
+                        .expect("set");
+                        i += 1;
+                        if i.is_multiple_of(16) {
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                        }
+                    }
+                });
+            }
+            sc.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    master.flush_wal_sync().expect("fsync");
+                    std::thread::sleep(std::time::Duration::from_millis(fsync_ms));
+                }
+            });
+            sc.spawn(|| {
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let dest = snaps.0.join(format!("c{n}"));
+                    master.checkpoint_to(&dest).expect("checkpoint");
+                    let _ = std::fs::remove_dir_all(&dest);
+                    n += 1;
+                    rolls.store(n, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_micros(
+                        std::env::var("OPS0386_CKPT_US")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(500),
+                    ));
+                }
+            });
+            sc.spawn(|| {
+                let mut cursor = master.db().latest_sequence_number();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    match master.updates_since_budgeted(cursor, REPL_TAIL_BUDGET_BYTES) {
+                        Ok(batches) => {
+                            if batches.is_empty() {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            for b in batches {
+                                assert_eq!(b.first_seq, cursor + 1, "contiguity");
+                                cursor = b.last_seq;
+                            }
+                        }
+                        Err(e) => {
+                            // What the walk could have read: each WAL file's
+                            // number and size, live and archived, newest last.
+                            let list = |dir: &std::path::Path| {
+                                let mut v: Vec<(String, u64)> = std::fs::read_dir(dir)
+                                    .map(|it| {
+                                        it.flatten()
+                                            .filter(|e| {
+                                                e.file_name().to_string_lossy().ends_with(".log")
+                                            })
+                                            .map(|e| {
+                                                (
+                                                    e.file_name().to_string_lossy().into_owned(),
+                                                    e.metadata().map(|m| m.len()).unwrap_or(0),
+                                                )
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                v.sort();
+                                v.into_iter().rev().take(3).collect::<Vec<_>>()
+                            };
+                            gaps.lock().expect("lock").push(format!(
+                                "cursor {cursor}: {e:?}; live {:?}; archive {:?}",
+                                list(&md.0),
+                                list(&md.0.join("archive"))
+                            ));
+                            // Resume from the next poll, as a rejoin would retry.
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let gaps = gaps.into_inner().expect("gaps");
+        eprintln!(
+            "polls={} rolls={} gaps={}",
+            polls.load(std::sync::atomic::Ordering::Relaxed),
+            rolls.load(std::sync::atomic::Ordering::Relaxed),
+            gaps.len()
+        );
+        for g in gaps.iter().take(8) {
+            eprintln!("  {g}");
+        }
+        assert!(gaps.is_empty(), "{} false WAL gaps", gaps.len());
+    }
+
     #[test]
     fn translating_an_interior_seq_moves_forward_past_it() {
         let d = TempDir::new("b82interior");

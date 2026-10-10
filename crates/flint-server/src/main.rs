@@ -7424,6 +7424,13 @@ fn flintsync(
                         // fact it failed to read.
                         None => "archive state could not be read on the master".to_string(),
                     };
+                    // The master's own record of it: the replica prints the
+                    // refusal as its FATAL, and this side used to say nothing
+                    // (BUG-0252).
+                    eprintln!(
+                        "replica refused at seq {cursor}: WALGAP {e} ({held}; {})",
+                        kv.wal_files_note()
+                    );
                     out.clear();
                     encode(
                         &Value::Error(format!("WALGAP full sync required: {e} ({held})")),

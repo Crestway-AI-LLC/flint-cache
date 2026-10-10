@@ -726,6 +726,38 @@ impl RocksKv {
         archive_span_at(&self.path.join("archive"))
     }
 
+    /// The newest WAL files, live and archived, as `name:bytes`: what a walk
+    /// could have read, for the line a WAL-gap verdict leaves (BUG-0252). A
+    /// directory that will not list says so rather than reading as empty.
+    pub fn wal_files_note(&self) -> String {
+        let newest = |dir: &Path| -> String {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return "unreadable".into();
+            };
+            let mut files: Vec<(String, u64)> = rd
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("log"))
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    (name, e.metadata().map(|m| m.len()).unwrap_or(0))
+                })
+                .collect();
+            files.sort();
+            let shown: Vec<String> = files
+                .iter()
+                .rev()
+                .take(3)
+                .map(|(n, b)| format!("{n}:{b}"))
+                .collect();
+            format!("{} of {}", shown.join(" "), files.len())
+        };
+        format!(
+            "live WAL {}; archive {}",
+            newest(&self.path),
+            newest(&self.path.join("archive"))
+        )
+    }
+
     /// Fsync the WAL — one group commit covering everything appended since
     /// the last call. Ordinary writes go to the WAL unsynced (OS page cache:
     /// zero acked loss across process crash/restart, proven by the chaos
