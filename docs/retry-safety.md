@@ -65,13 +65,17 @@ first source (removing the same members twice removes nothing more) ·
 `PEXPIREAT` (plain, or `XX`) · `GETEX EXAT`/`PXAT`/`PERSIST`
 
 **Collections**: `HSET` · `HMSET` · `HDEL` · `SADD` · `SREM` · `ZADD` (plain,
-or with `XX`, `GT`, `LT` or `CH`) · `ZREM` ·
+or with `XX`, `GT`, `LT` or `CH`) · `GEOADD` (plain, or with `XX` or `CH`) ·
+`ZREM` ·
 `LSET` (absolute index, absolute value) · `LREM key 0 m` ·
 `ZREMRANGEBYSCORE` · `ZREMRANGEBYLEX` · the `STORE` variants
 (`ZUNIONSTORE`, `ZINTERSTORE`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`),
 which overwrite their destination; the set ones even when the destination is
 one of their sources, the sorted-set ones only when it is not (see the next
-table)
+table) · `GEOSEARCHSTORE` and `GEORADIUS`/`GEORADIUSBYMEMBER` with `STORE`,
+even into their source (the points a search keeps are found again), and with
+`STOREDIST` when the destination is not the source · `GEORADIUS` and
+`GEORADIUSBYMEMBER` without a `STORE`, which only read
 
 **Documents and filters**: `JSON.SET` · `JSON.MSET` · `JSON.MERGE` ·
 `JSON.DEL` · `JSON.FORGET` · `JSON.CLEAR` · `BF.ADD` · `BF.MADD` · `BF.INSERT`
@@ -101,7 +105,8 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `LMOVE` `RPOPLPUSH` `BLMOVE` `BRPOPLPUSH` | Moves an EXTRA element. A worker taking one job from a queue takes two, and the reply names only the second, so the first sits in the destination list unclaimed. On one list (a rotation) it rotates twice. |
 | `LTRIM` `ZREMRANGEBYRANK` `LREM key <n≠0> m` `JSON.ARRTRIM` | Position- or count-addressed, so the retry cuts a DIFFERENT set. `LTRIM 1 2` twice on `a b c d` leaves `c`. Also silent data loss. |
 | `JSON.TOGGLE` | The retry flips the value back. The toggle the caller was told about is undone, and the second reply names the value it started from. |
-| `SET … NX` `SETNX` `HSETNX` `ZADD … NX` | If the first succeeded but the ack was lost, the retry sees the key present and returns 0/nil, so the caller wrongly believes it failed. The classic lock hazard. |
+| `GEOSEARCHSTORE … STOREDIST` `GEORADIUS … STOREDIST` whose destination is its source | The retry reads the stored distances as positions. Measured on Valkey 9.1: `GEOSEARCHSTORE k k FROMLONLAT 15 37 BYRADIUS 200 km STOREDIST` over Palermo and Catania stores 2, and sent again finds none and deletes `k`. With `STORE` the same retry keeps what the first kept, `COUNT` included. |
+| `SET … NX` `SETNX` `HSETNX` `ZADD … NX` `GEOADD … NX` | If the first succeeded but the ack was lost, the retry sees the key present and returns 0/nil, so the caller wrongly believes it failed. The classic lock hazard. |
 | `GETDEL` | The first returns the value and the retry returns nil, so a retrying reader loses the only copy it was handed. |
 | `COPY` (without `REPLACE`) | Returns 0 on the retry: the copy exists, and the caller is told it does not. |
 | `RENAME` `RENAMENX` | The retry answers `ERR no such key` — the source moved on the first attempt. The rename SUCCEEDED and the caller sees an error. |

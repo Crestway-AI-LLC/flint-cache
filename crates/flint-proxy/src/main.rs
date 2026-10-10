@@ -1658,7 +1658,8 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     if let Some(key) = flint_commands::json_debug_key(args) {
         return key;
     }
-    // ZUNION, ZINTER, ZDIFF, ZINTERCARD and SINTERCARD: a count, then keys.
+    // ZUNION, ZINTER, ZDIFF, ZINTERCARD, SINTERCARD, LMPOP and ZMPOP: a
+    // count, then keys; BLMPOP and BZMPOP: a timeout, a count, then keys.
     if let Some(key) = flint_commands::numkeys_key(args) {
         return key;
     }
@@ -1726,6 +1727,12 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
     if flint_resp::zmpop_reply(args) {
         return flint_resp::zmpop_nested(&v);
     }
+    // A coordinate came back as a plain double, spelled with 17 decimals
+    // in either protocol, and GEOPOS's missing member as RESP3's one null,
+    // a null array in RESP2.
+    if flint_resp::geo_coordinates(args) {
+        return flint_resp::geo_reply(&v);
+    }
     // A one-field BF.INFO is a one-pair map under RESP3 and the bare value
     // in a one-element array under RESP2; flattening the map would give
     // two elements (BUG-0239).
@@ -1759,6 +1766,7 @@ fn needs_repair(args: &[Vec<u8>]) -> bool {
         || flint_resp::bf_info_field(args)
         || flint_resp::hrandfield_withvalues(args)
         || flint_resp::zmpop_reply(args)
+        || flint_resp::geo_coordinates(args)
         || is_xread(args)
 }
 
@@ -4420,6 +4428,12 @@ fn cache_invalidate_written(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) {
         b"RENAME" | b"RENAMENX" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH"
         | b"SMOVE" => {
             for k in args[1..].iter().take(2) {
+                topo.cache.invalidate(ns, k);
+            }
+        }
+        // GEORADIUS ... STORE dst: the destination, among its options.
+        b"GEORADIUS" | b"GEORADIUSBYMEMBER" => {
+            for k in flint_commands::georadius_store_keys(args) {
                 topo.cache.invalidate(ns, k);
             }
         }

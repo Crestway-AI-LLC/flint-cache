@@ -801,6 +801,14 @@ impl<'a> ZSetStore<'a> {
         key: &[u8],
         pairs: &[(f64, Vec<u8>)],
     ) -> Result<u64, StoreError> {
+        // Sized before the old key goes, as `zadd` would size it: a result
+        // refused for max-value-bytes leaves the destination as it was
+        // (BUG-0251). It used to be gone, and the write refused.
+        let distinct: std::collections::HashSet<&[u8]> =
+            pairs.iter().map(|(_, m)| m.as_slice()).collect();
+        if distinct.iter().map(|m| member_cost(m)).sum::<u64>() > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
         self.kv.delete(&self.meta_key(slot, key));
         if pairs.is_empty() {
             return Ok(0);

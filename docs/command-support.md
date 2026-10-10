@@ -1028,6 +1028,39 @@ blocking `XREAD` woken by another client's `XADD`).
     CONFIG RESETSTAT -> ERR unknown command 'CONFIG RESETSTAT'
     SHUTDOWN NOSAVE  -> ERR unknown command 'SHUTDOWN NOSAVE'
 
+
+**Geo**: GEOADD (NX, XX, CH), GEOPOS, GEODIST (M, KM, FT, MI), GEOHASH,
+GEOSEARCH (FROMMEMBER, FROMLONLAT, BYRADIUS, BYBOX, ASC, DESC, COUNT, ANY,
+WITHCOORD, WITHDIST, WITHHASH), GEOSEARCHSTORE (STOREDIST), GEORADIUS and
+GEORADIUSBYMEMBER (STORE, STOREDIST), GEORADIUS_RO, GEORADIUSBYMEMBER_RO.
+
+> A geo set is a sorted set whose scores are upstream's 52-bit geohashes,
+> so a point's score is the one Redis and Valkey give it, and the
+> sorted-set commands read and write a geo set (ZREM removes a point). A
+> search reads the cells upstream reads, in its order, so a reply asked
+> for no order lists its points as upstream lists them. When a reply is
+> sorted, points at the same distance (usually one point stored twice) may
+> come in another order than upstream's, which leaves theirs to the C
+> library's `qsort`. Checked against Valkey 9.1 and Redis 8.2 by a random
+> differential of every reply and every key.
+>
+> Where the two differ, Flint answers as Valkey: a coordinate has 17
+> decimals (`13.36138933897018433`, where Redis 8.2 spells the same
+> double `13.361389338970184`), and a centre member the set does not hold
+> is `ERR member m does not exist` (Redis 8.2: `could not decode requested
+> zset member`). Valkey 9.1's `GEOSEARCH ... BYPOLYGON` is not served, so
+> a search with no shape is refused naming BYRADIUS and BYBOX only, in
+> Redis 8.2's words.
+>
+> The arithmetic is upstream's as it runs on arm64, where the compiler
+> fuses a multiply and an add into one rounding in three places (a cell's
+> edges, the haversine and BYBOX's half diagonal). An x86-64 build of
+> Redis or Valkey rounds twice there, so it can differ from Flint, and
+> from an arm64 build of itself, in a coordinate's last digit, or for a
+> point exactly on a search's edge, in whether the point is in.
+>
+> GEOSEARCHSTORE's source and destination share a slot, and so do
+> GEORADIUS's key and its STORE key, as every multi-key command's must.
 **`INFO` through the proxy answers, minimally** (BUG-0176). Clients send it on
 their own: ioredis, by default, sends `INFO` before its first command and treats
 an error as fatal, so until this it could not connect at all. The proxy

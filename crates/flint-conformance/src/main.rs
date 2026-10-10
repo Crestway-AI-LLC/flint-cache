@@ -1121,6 +1121,184 @@ fn corpus() -> Vec<Case> {
                 ),
             ],
         },
+        // Geo, as Valkey 9.1 answers (Redis 8.2 agrees but for the
+        // coordinates' spelling, checked), in both protocols.
+        Case {
+            family: "geo",
+            name: "GEOADD, GEOPOS, GEOHASH, GEODIST, GEOSEARCH, GEORADIUS and their stores",
+            steps: {
+                let coords = |lon: &'static [u8], lat: &'static [u8]| {
+                    Expect::Arr(vec![Expect::Str(lon), Expect::Str(lat)])
+                };
+                let palermo = || coords(b"13.36138933897018433", b"38.11555639549629859");
+                let catania = || coords(b"15.08726745843887329", b"37.50266842333162032");
+                let wrongtype = "WRONGTYPE Operation against a key holding the wrong kind of value";
+                vec![
+                    s(
+                        &[b"GEOADD", b"{g}s", b"13.361389", b"38.115556", b"Palermo", b"15.087269", b"37.502669", b"Catania"],
+                        Expect::Int(2),
+                    ),
+                    s(&[b"GEOADD", b"{g}s", b"NX", b"13.361389", b"38.115556", b"Palermo"], Expect::Int(0)),
+                    s(
+                        &[b"GEOADD", b"{g}s", b"XX", b"CH", b"13.361389", b"38.115556", b"Palermo", b"1", b"1", b"nope"],
+                        Expect::Int(0),
+                    ),
+                    s(&[b"ZSCORE", b"{g}s", b"Palermo"], Expect::Str(b"3479099956230698")),
+                    s(&[b"GEOPOS", b"{g}s", b"Palermo", b"Catania"], Expect::Arr(vec![palermo(), catania()])),
+                    s(&[b"GEOPOS", b"{g}s"], Expect::Arr(vec![])),
+                    // A missing member is a null array, not a null bulk.
+                    s(&[b"GEOPOS", b"{g}s", b"nope", b"Palermo"], Expect::Arr(vec![Expect::NilArray, palermo()])),
+                    s(
+                        &[b"GEOHASH", b"{g}s", b"Palermo", b"Catania", b"nope"],
+                        Expect::Arr(vec![Expect::Str(b"sqc8b49rny0"), Expect::Str(b"sqdtr74hyu0"), Expect::Nil]),
+                    ),
+                    s(&[b"GEODIST", b"{g}s", b"Palermo", b"Catania"], Expect::Str(b"166274.1516")),
+                    s(&[b"GEODIST", b"{g}s", b"Palermo", b"Catania", b"KM"], Expect::Str(b"166.2742")),
+                    s(&[b"GEODIST", b"{g}s", b"Palermo", b"Catania", b"mi"], Expect::Str(b"103.3182")),
+                    s(&[b"GEODIST", b"{g}s", b"Palermo", b"Catania", b"ft"], Expect::Str(b"545518.8700")),
+                    s(&[b"GEODIST", b"{g}s", b"Palermo", b"nope"], Expect::Nil),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMLONLAT", b"15", b"37", b"BYRADIUS", b"200", b"km", b"ASC", b"WITHDIST", b"WITHCOORD", b"WITHHASH"],
+                        Expect::Arr(vec![
+                            Expect::Arr(vec![Expect::Str(b"Catania"), Expect::Str(b"56.4413"), Expect::Int(3479447370796909), catania()]),
+                            Expect::Arr(vec![Expect::Str(b"Palermo"), Expect::Str(b"190.4424"), Expect::Int(3479099956230698), palermo()]),
+                        ]),
+                    ),
+                    // No order asked for: the order the cells are read in.
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMLONLAT", b"15", b"37", b"BYRADIUS", b"200", b"km"],
+                        Expect::Arr(vec![Expect::Str(b"Palermo"), Expect::Str(b"Catania")]),
+                    ),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMMEMBER", b"Palermo", b"BYBOX", b"400", b"400", b"km", b"DESC", b"WITHDIST"],
+                        Expect::Arr(vec![
+                            Expect::Arr(vec![Expect::Str(b"Catania"), Expect::Str(b"166.2742")]),
+                            Expect::Arr(vec![Expect::Str(b"Palermo"), Expect::Str(b"0.0000")]),
+                        ]),
+                    ),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMMEMBER", b"Palermo", b"BYBOX", b"100", b"100", b"km"],
+                        Expect::Arr(vec![Expect::Str(b"Palermo")]),
+                    ),
+                    // COUNT sorts nearest first; COUNT ANY takes the first found.
+                    s(
+                        &[b"GEORADIUS", b"{g}s", b"15", b"37", b"200", b"km", b"COUNT", b"1"],
+                        Expect::Arr(vec![Expect::Str(b"Catania")]),
+                    ),
+                    s(
+                        &[b"GEORADIUS", b"{g}s", b"15", b"37", b"200", b"km", b"COUNT", b"1", b"ANY"],
+                        Expect::Arr(vec![Expect::Str(b"Palermo")]),
+                    ),
+                    s(
+                        &[b"GEORADIUSBYMEMBER", b"{g}s", b"Palermo", b"100", b"km"],
+                        Expect::Arr(vec![Expect::Str(b"Palermo")]),
+                    ),
+                    s(
+                        &[b"GEORADIUS_RO", b"{g}s", b"15", b"37", b"200", b"mi", b"DESC"],
+                        Expect::Arr(vec![Expect::Str(b"Palermo"), Expect::Str(b"Catania")]),
+                    ),
+                    s(
+                        &[b"GEORADIUSBYMEMBER_RO", b"{g}s", b"Catania", b"200", b"km", b"WITHDIST", b"ASC"],
+                        Expect::Arr(vec![
+                            Expect::Arr(vec![Expect::Str(b"Catania"), Expect::Str(b"0.0000")]),
+                            Expect::Arr(vec![Expect::Str(b"Palermo"), Expect::Str(b"166.2742")]),
+                        ]),
+                    ),
+                    s(&[b"GEORADIUS", b"{g}s", b"15", b"37", b"200", b"km", b"STORE", b"{g}d2"], Expect::Int(2)),
+                    s(
+                        &[b"ZRANGE", b"{g}d2", b"0", b"-1", b"WITHSCORES"],
+                        Expect::Arr(vec![
+                            Expect::Str(b"Palermo"),
+                            Expect::Str(b"3479099956230698"),
+                            Expect::Str(b"Catania"),
+                            Expect::Str(b"3479447370796909"),
+                        ]),
+                    ),
+                    s(
+                        &[b"GEOSEARCHSTORE", b"{g}d", b"{g}s", b"FROMLONLAT", b"15", b"37", b"BYRADIUS", b"200", b"km", b"STOREDIST"],
+                        Expect::Int(2),
+                    ),
+                    s(&[b"ZCARD", b"{g}d"], Expect::Int(2)),
+                    // Nothing found: the destination goes.
+                    s(
+                        &[b"GEOSEARCHSTORE", b"{g}d", b"{g}s", b"FROMLONLAT", b"0", b"0", b"BYRADIUS", b"1", b"m"],
+                        Expect::Int(0),
+                    ),
+                    s(&[b"EXISTS", b"{g}d"], Expect::Int(0)),
+                    s(
+                        &[b"GEOSEARCH", b"{g}none", b"FROMLONLAT", b"0", b"0", b"BYRADIUS", b"1", b"km"],
+                        Expect::Arr(vec![]),
+                    ),
+                    // A missing key reads no member and no radius.
+                    s(&[b"GEORADIUSBYMEMBER", b"{g}none", b"m", b"x", b"km"], Expect::Arr(vec![])),
+                    s(&[b"GEORADIUS", b"{g}none", b"0", b"0", b"1", b"km", b"STORE", b"{g}d2"], Expect::Int(0)),
+                    s(&[b"EXISTS", b"{g}d2"], Expect::Int(0)),
+                    // Errors, in upstream's words and order.
+                    s(&[b"GEOADD", b"{g}s", b"1", b"1"], Expect::Err("ERR wrong number of arguments for 'geoadd' command")),
+                    s(
+                        &[b"GEOADD", b"{g}s", b"200", b"10", b"x"],
+                        Expect::Err("ERR invalid longitude,latitude pair 200.000000,10.000000"),
+                    ),
+                    s(&[b"GEOADD", b"{g}s", b"x", b"1", b"m"], Expect::Err("ERR value is not a valid float")),
+                    s(&[b"GEOADD", b"{g}s", b"NX", b"XX", b"1", b"1", b"m"], Expect::Err("ERR syntax error")),
+                    s(&[b"GEOADD", b"{g}s", b"GT", b"1", b"1", b"m"], Expect::Err("ERR syntax error")),
+                    s(
+                        &[b"GEODIST", b"{g}s", b"Palermo", b"Catania", b"furlong"],
+                        Expect::Err("ERR unsupported unit provided. please use M, KM, FT, MI"),
+                    ),
+                    s(&[b"GEODIST", b"{g}s", b"a", b"b", b"km", b"x"], Expect::Err("ERR syntax error")),
+                    s(&[b"GEORADIUS", b"{g}s", b"15", b"37", b"-1", b"km"], Expect::Err("ERR radius cannot be negative")),
+                    s(&[b"GEORADIUS", b"{g}s", b"15", b"37", b"x", b"km"], Expect::Err("ERR need numeric radius")),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMLONLAT", b"15", b"37", b"BYBOX", b"x", b"1", b"km"],
+                        Expect::Err("ERR need numeric width"),
+                    ),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMLONLAT", b"15", b"37", b"BYBOX", b"1", b"x", b"km"],
+                        Expect::Err("ERR need numeric height"),
+                    ),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMLONLAT", b"15", b"37", b"BYBOX", b"1", b"-1", b"km"],
+                        Expect::Err("ERR height or width cannot be negative"),
+                    ),
+                    s(
+                        &[b"GEORADIUS", b"{g}s", b"15", b"37", b"1", b"km", b"COUNT", b"0"],
+                        Expect::Err("ERR COUNT must be > 0"),
+                    ),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMLONLAT", b"15", b"37", b"BYRADIUS", b"200", b"km", b"ANY"],
+                        Expect::Err("ERR the ANY argument requires COUNT argument"),
+                    ),
+                    s(
+                        &[b"GEOSEARCHSTORE", b"{g}d", b"{g}s", b"FROMLONLAT", b"15", b"37", b"BYRADIUS", b"200", b"km", b"WITHDIST"],
+                        Expect::Err("ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options"),
+                    ),
+                    s(
+                        &[b"GEORADIUSBYMEMBER", b"{g}s", b"Palermo", b"200", b"km", b"STORE", b"{g}d", b"WITHCOORD"],
+                        Expect::Err("ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options"),
+                    ),
+                    s(&[b"GEORADIUS_RO", b"{g}s", b"15", b"37", b"200", b"km", b"STORE", b"{g}d"], Expect::Err("ERR syntax error")),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"BYRADIUS", b"1", b"km", b"ASC", b"DESC"],
+                        Expect::Err("ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH"),
+                    ),
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMLONLAT", b"15", b"37", b"FROMMEMBER", b"Palermo", b"BYRADIUS", b"1", b"km"],
+                        Expect::Err("ERR syntax error"),
+                    ),
+                    // Valkey's words; Redis 8.2 says "could not decode
+                    // requested zset member".
+                    s(
+                        &[b"GEOSEARCH", b"{g}s", b"FROMMEMBER", b"nope", b"BYRADIUS", b"1", b"km"],
+                        Expect::Err("ERR member nope does not exist"),
+                    ),
+                    s(&[b"SET", b"{g}str", b"v"], Expect::Ok),
+                    s(&[b"GEODIST", b"{g}str", b"a", b"b"], Expect::Err(wrongtype)),
+                    s(&[b"GEOPOS", b"{g}str", b"a"], Expect::Err(wrongtype)),
+                    s(&[b"GEOSEARCH", b"{g}str", b"FROMLONLAT", b"0", b"0", b"BYRADIUS", b"1", b"km"], Expect::Err(wrongtype)),
+                ]
+            },
+        },
         // The sorted-set algebra that answers instead of storing, ZDIFF's
         // store, the cardinality forms and ZRANGESTORE, against Valkey 9.1
         // and Redis 8.2 (both checked).
@@ -7100,6 +7278,12 @@ impl Client {
         // reads RESP3's as a scored result.
         let v = match flint_resp::zmpop_reply(args) {
             true => flint_resp::zmpop_nested(&v),
+            false => v,
+        };
+        // A coordinate's RESP3 double, spelled with its 17 decimals again,
+        // and GEOPOS's missing member a null array again.
+        let v = match flint_resp::geo_coordinates(args) {
+            true => flint_resp::geo_reply(&v),
             false => v,
         };
         // A one-field BF.INFO is a one-pair map under RESP3; RESP2's reply

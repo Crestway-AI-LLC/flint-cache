@@ -5362,7 +5362,9 @@ fn apply_inline(store: &dyn Kv, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
 ///   source and destination differ (the same key is one key);
 /// - BLPOP, BRPOP, BZPOPMIN, BZPOPMAX of more than one key, and LMPOP,
 ///   ZMPOP, BLMPOP, BZMPOP whose count is not 1 (a malformed one too);
-/// - a script declaring more than one key (ADR-0051).
+/// - a script declaring more than one key (ADR-0051);
+/// - GEORADIUS or GEORADIUSBYMEMBER storing at a key other than the one it
+///   reads.
 fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
     let two_keys = || args.len() > 2 && args[1] != args[2];
     match name {
@@ -5379,6 +5381,10 @@ fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
         b"LMPOP" | b"ZMPOP" => args.get(1).is_some_and(|n| n.as_slice() != b"1"),
         b"BLMPOP" | b"BZMPOP" => args.get(2).is_some_and(|n| n.as_slice() != b"1"),
         b"EVAL" | b"EVALSHA" => flint_commands::eval_keys(args).is_some_and(|k| k.len() > 1),
+        // A search storing somewhere other than the key it reads.
+        b"GEORADIUS" | b"GEORADIUSBYMEMBER" => flint_commands::georadius_store_keys(args)
+            .iter()
+            .any(|k| *k != args[1].as_slice()),
         _ => false,
     }
 }

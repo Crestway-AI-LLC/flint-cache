@@ -85,6 +85,14 @@ pub enum Value {
     /// (Redis's own formatting: integral values print without a decimal
     /// point); RESP3 renders it as `,`.
     Double(f64),
+    /// A coordinate, as `addReplyHumanLongDouble` spells one for GEOPOS and
+    /// a geo search's WITHCOORD ([`fmt_human_double`]): a bulk string in
+    /// RESP2 and a `,` frame in RESP3. Valkey 9.1 spells coordinates so;
+    /// Redis 8.2 spells them as [`Value::Double`] does, and where the two
+    /// differ Flint answers as Valkey. Decoded, the frame is a
+    /// [`Value::Double`] again, so the proxy restores this by command
+    /// ([`geo_reply`]).
+    HumanDouble(f64),
     /// A field/value mapping — hashes, `HELLO`. RESP2 flattens it to an
     /// array of `2n` elements; RESP3 sends `%n`.
     Map(Vec<(Value, Value)>),
@@ -270,6 +278,65 @@ pub fn resp3_nests_reply(command: &[u8]) -> bool {
 pub fn resp3_differs_in_kind(command: &[u8]) -> bool {
     command.eq_ignore_ascii_case(b"JSON.NUMINCRBY")
         || command.eq_ignore_ascii_case(b"JSON.NUMMULTBY")
+}
+
+/// A double as upstream's `ld2string` spells it in its human mode, which is
+/// how GEOPOS and WITHCOORD spell a coordinate: `%.17Lf`, its trailing
+/// zeros and then a bare trailing point dropped, and a `-0` left as `0`.
+/// `long double` is `double` on arm64, where Valkey 9.1 is checked. The
+/// same spelling as `flint_storage::strings::fmt_float_human`, which
+/// INCRBYFLOAT's stored text uses.
+pub fn fmt_human_double(d: f64) -> Vec<u8> {
+    let mut s = format!("{d:.17}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    if s == "-0" {
+        s.remove(0);
+    }
+    s.into_bytes()
+}
+
+/// The geo commands whose replies carry coordinates: GEOPOS, and a search
+/// asked for WITHCOORD. Their doubles are all coordinates.
+pub fn geo_coordinates(args: &[Vec<u8>]) -> bool {
+    args.first().is_some_and(|n| {
+        matches!(
+            n.to_ascii_uppercase().as_slice(),
+            b"GEOPOS"
+                | b"GEORADIUS"
+                | b"GEORADIUS_RO"
+                | b"GEORADIUSBYMEMBER"
+                | b"GEORADIUSBYMEMBER_RO"
+                | b"GEOSEARCH"
+        )
+    })
+}
+
+/// A [`geo_coordinates`] reply read back from RESP3, as its own: its
+/// doubles spelled as coordinates again ([`Value::HumanDouble`]), and a
+/// null inside it, which only GEOPOS has, for a missing member, a null
+/// ARRAY again, which RESP2 spells `*-1`. The 17 decimals name the double
+/// they were printed from exactly enough that printing it again gives them
+/// back.
+pub fn geo_reply(v: &Value) -> Value {
+    fn inner(v: &Value) -> Value {
+        match v {
+            Value::Double(d) => Value::HumanDouble(*d),
+            Value::Null | Value::Bulk(None) => Value::Array(None),
+            Value::Array(Some(items)) => Value::Array(Some(items.iter().map(inner).collect())),
+            other => other.clone(),
+        }
+    }
+    match v {
+        Value::Array(Some(items)) => Value::Array(Some(items.iter().map(inner).collect())),
+        other => other.clone(),
+    }
 }
 
 /// A finite double as the seat's JSON text spells it, by the same code: the
@@ -605,6 +672,15 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
                 out.extend_from_slice(b"\r\n");
             } else {
                 encode_proto(&Value::Bulk(Some(fmt_double(*d))), proto, out);
+            }
+        }
+        Value::HumanDouble(d) => {
+            if resp3_sel {
+                out.push(b',');
+                out.extend_from_slice(&fmt_human_double(*d));
+                out.extend_from_slice(b"\r\n");
+            } else {
+                encode_proto(&Value::Bulk(Some(fmt_human_double(*d))), proto, out);
             }
         }
         Value::Map(pairs) => {
@@ -954,6 +1030,33 @@ mod tests {
         for name in ["LMPOP", "zmpop", "BLMPOP", "BZMPOP"] {
             assert!(null_is_array(&[name.as_bytes().to_vec()]), "{name}");
         }
+    }
+
+    /// A coordinate read back from RESP3 is spelled with 17 decimals again,
+    /// in both protocols, and GEOPOS's missing member is a null array again.
+    #[test]
+    fn a_geo_reply_keeps_its_coordinates_and_null_arrays_through_resp3() {
+        let seat = b"*2\r\n*2\r\n,13.36138933897018433\r\n,38.11555639549629859\r\n_\r\n";
+        let Ok(Decoded::Complete(v, _)) = decode(seat) else {
+            panic!("frame did not decode");
+        };
+        assert!(geo_coordinates(&[b"geopos".to_vec()]) && !geo_coordinates(&[b"GEODIST".to_vec()]));
+        let v = geo_reply(&v);
+        let mut out = Vec::new();
+        encode_proto(&v, Proto::Resp2, &mut out);
+        assert_eq!(
+            out,
+            b"*2\r\n*2\r\n$20\r\n13.36138933897018433\r\n$20\r\n38.11555639549629859\r\n*-1\r\n"
+        );
+        out.clear();
+        encode_proto(&v, Proto::Resp3, &mut out);
+        assert_eq!(out, seat);
+        assert_eq!(fmt_human_double(-0.0), b"0");
+        assert_eq!(fmt_human_double(180.0), b"180");
+        assert_eq!(
+            fmt_human_double(-85.051_127_512_639_42),
+            b"-85.05112751263942528"
+        );
     }
 
     #[test]

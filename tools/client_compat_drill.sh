@@ -552,6 +552,22 @@ def multi_pops():
     assert wire([["MULTI"], ["BLMPOP", "0", "1", "{m}l", "LEFT"], ["BZMPOP", "0", "1", "{m}z", "MIN"], ["EXEC"]], 0.4) == \
         b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n*-1\r\n*-1\r\n", "inside MULTI"
 check("LMPOP, ZMPOP, BLMPOP, BZMPOP: served from either pair, pairs nested, nulls arrays", multi_pops)
+def geo():
+    # A coordinate is a double under RESP3 and its 17 decimals under RESP2,
+    # through the proxy's RESP3 hop to the seat.
+    for c in (r, r2):
+        c.delete("{g}s", "{g}d")
+        assert c.geoadd("{g}s", [13.361389, 38.115556, "Palermo", 15.087269, 37.502669, "Catania"]) == 2
+        assert c.geodist("{g}s", "Palermo", "Catania", unit="km") == 166.2742
+        got = c.geosearch("{g}s", longitude=15, latitude=37, radius=200, unit="km", sort="ASC", withcoord=True, withdist=True)
+        assert got == [["Catania", 56.4413, (15.087267458438873, 37.50266842333162)],
+                       ["Palermo", 190.4424, (13.361389338970184, 38.1155563954963)]], got
+        assert c.georadius("{g}s", 15, 37, 200, unit="km", store="{g}d") == 2
+        assert c.geohash("{g}s", "Palermo", "nope") == ["sqc8b49rny0", None]
+    assert [list(p) if p else p for p in r2.geopos("{g}s", "Palermo", "nope")] == [[13.361389338970184, 38.1155563954963], None]
+    assert wire([["GEOPOS", "{g}s", "Palermo", "nope"]], 0.2) == \
+        b"*2\r\n*2\r\n$20\r\n13.36138933897018433\r\n$20\r\n38.11555639549629859\r\n*-1\r\n", "RESP2 wire: 17 decimals, a null array"
+check("GEOADD, GEODIST, GEOSEARCH, GEORADIUS STORE, GEOHASH; GEOPOS's 17 decimals", geo)
 def a_client_that_left():
     r.delete("gone")
     s = socket.create_connection(("127.0.0.1", PORT))

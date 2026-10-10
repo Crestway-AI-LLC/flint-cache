@@ -73,6 +73,28 @@ pub fn numkeys_key(args: &[Vec<u8>]) -> Option<Option<&[u8]>> {
     Some(args.get(at).map(|k| k.as_slice()))
 }
 
+/// The keys `GEORADIUS` or `GEORADIUSBYMEMBER` may store at: every value
+/// after a `STORE` or `STOREDIST` among its options, which begin after the
+/// radius's unit. A superset of the one key the command stores at, which
+/// is what the seat's write lock and the proxy's near-cache invalidation
+/// need: a word read as an option here may be a value there, and locking
+/// or dropping a key too many costs nothing.
+pub fn georadius_store_keys(args: &[Vec<u8>]) -> Vec<&[u8]> {
+    let Some(name) = args.first() else {
+        return Vec::new();
+    };
+    let base = match name.to_ascii_uppercase().as_slice() {
+        b"GEORADIUS" => 6,
+        b"GEORADIUSBYMEMBER" => 5,
+        _ => return Vec::new(),
+    };
+    let opts = args.get(base..).unwrap_or_default();
+    opts.windows(2)
+        .filter(|w| w[0].eq_ignore_ascii_case(b"STORE") || w[0].eq_ignore_ascii_case(b"STOREDIST"))
+        .map(|w| w[1].as_slice())
+        .collect()
+}
+
 /// The blocking pops (ADR-0052 D4). A seat answers each without waiting, as
 /// Redis does inside `MULTI` or a script; the proxy makes a client wait, by
 /// running that form until one answers or the timeout passes.
@@ -167,6 +189,12 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"ZINTERSTORE"
             | b"ZDIFFSTORE"
             | b"ZRANGESTORE"
+            // GEORADIUS and GEORADIUSBYMEMBER are writes, as upstream flags
+            // them, for their STORE option; GEOSEARCHSTORE writes args[1].
+            | b"GEOADD"
+            | b"GEORADIUS"
+            | b"GEORADIUSBYMEMBER"
+            | b"GEOSEARCHSTORE"
             // A pop from the first of several keys that holds anything.
             | b"LMPOP"
             | b"ZMPOP"
@@ -365,6 +393,12 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"ZREVRANK"
             | b"ZCOUNT"
             | b"ZMSCORE"
+            | b"GEOPOS"
+            | b"GEOHASH"
+            | b"GEODIST"
+            | b"GEOSEARCH"
+            | b"GEORADIUS_RO"
+            | b"GEORADIUSBYMEMBER_RO"
             | b"DBSIZE"
             | b"JSON.GET"
             | b"JSON.TYPE"

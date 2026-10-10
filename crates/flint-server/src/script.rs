@@ -35,7 +35,7 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use flint_resp::{Value, fmt_double};
+use flint_resp::{Value, fmt_double, fmt_human_double};
 use flint_slot::slot_for_key;
 use flint_storage::Kv;
 use mlua::chunk::ChunkMode;
@@ -796,6 +796,8 @@ fn to_lua(lua: &Lua, v: Value) -> mlua::Result<LuaValue> {
         Value::Bulk(None) | Value::Array(None) | Value::Null => LuaValue::Boolean(false),
         Value::Array(Some(items)) | Value::Set(items) | Value::Push(items) => array(lua, items)?,
         Value::Double(d) => LuaValue::String(lua.create_string(fmt_double(d))?),
+        // A coordinate, as a script's RESP2 reply spells it.
+        Value::HumanDouble(d) => LuaValue::String(lua.create_string(fmt_human_double(d))?),
         Value::Map(pairs) => {
             let mut flat = Vec::with_capacity(pairs.len() * 2);
             for (k, v) in pairs {

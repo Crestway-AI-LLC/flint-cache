@@ -72,6 +72,13 @@ impl<'a> SetStore<'a> {
     /// the key instead of leaving an empty set that would answer EXISTS 1
     /// and TYPE set with nothing in it.
     pub fn sreplace(&self, slot: u16, key: &[u8], members: &[Vec<u8>]) -> Result<u64, StoreError> {
+        // Sized before the old key goes, as `sadd` would size it, so a
+        // refused result leaves the destination as it was (BUG-0251).
+        let distinct: std::collections::HashSet<&[u8]> =
+            members.iter().map(|m| m.as_slice()).collect();
+        if distinct.iter().map(|m| m.len() as u64).sum::<u64>() > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
         self.kv.delete(&self.meta_key(slot, key));
         if members.is_empty() {
             return Ok(0);

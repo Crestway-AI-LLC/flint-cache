@@ -23,10 +23,13 @@ use flint_storage::strings::{
 };
 use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore, ZaddFlags, ZsetRows};
 
+/// Geo: sorted sets of geohashes.
+mod geo;
 /// The JSON commands ADR-0055 added.
 mod json;
 /// Streams (ADR-0052 D6).
 mod streams;
+use geo::GeoSearch;
 
 /// True for commands that mutate the keyspace (rejected on replicas).
 /// Delegates to the SHARED classifier (flint-commands, ADR-0005 D1): the
@@ -83,7 +86,8 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     if let Some(key) = flint_commands::json_debug_key(args) {
         return key;
     }
-    // ZUNION, ZINTER, ZDIFF, ZINTERCARD and SINTERCARD: a count, then keys.
+    // ZUNION, ZINTER, ZDIFF, ZINTERCARD, SINTERCARD, LMPOP and ZMPOP: a
+    // count, then keys; BLMPOP and BZMPOP: a timeout, a count, then keys.
     if let Some(key) = flint_commands::numkeys_key(args) {
         return key;
     }
@@ -1265,6 +1269,18 @@ impl<'a> Dispatcher<'a> {
             b"ZDIFF" => self.cmd_zalgebra(args, "zdiff", ZOp::Diff, false),
             b"ZINTERCARD" => self.cmd_zalgebra(args, "zintercard", ZOp::Card, false),
             b"ZRANGESTORE" => self.cmd_zrangestore(args),
+
+            // geo (geo.rs)
+            b"GEOADD" => self.cmd_geoadd(args),
+            b"GEOPOS" => self.cmd_geopos(args),
+            b"GEOHASH" => self.cmd_geohash(args),
+            b"GEODIST" => self.cmd_geodist(args),
+            b"GEORADIUS" => self.cmd_geosearch(args, GeoSearch::Radius),
+            b"GEORADIUS_RO" => self.cmd_geosearch(args, GeoSearch::RadiusRo),
+            b"GEORADIUSBYMEMBER" => self.cmd_geosearch(args, GeoSearch::ByMember),
+            b"GEORADIUSBYMEMBER_RO" => self.cmd_geosearch(args, GeoSearch::ByMemberRo),
+            b"GEOSEARCH" => self.cmd_geosearch(args, GeoSearch::Search),
+            b"GEOSEARCHSTORE" => self.cmd_geosearch(args, GeoSearch::SearchStore),
             b"ZREMRANGEBYSCORE" => self.cmd_zremrangebyscore(args),
             b"ZREMRANGEBYRANK" => self.cmd_zremrangebyrank(args),
 
@@ -8212,6 +8228,65 @@ return nil"#;
         assert_eq!(call(&[b"RPUSH", b"l", &[b'e'; 17]]), too_large);
         assert_eq!(call(&[b"SADD", b"s", &[b'm'; 17]]), too_large);
         assert_eq!(call(&[b"ZADD", b"z", b"1", &[b'q'; 9]]), too_large);
+    }
+
+    /// BUG-0251: a STORE whose result is refused for max-value-bytes keeps
+    /// its destination, as any refused write changes nothing. It used to
+    /// drop the destination, then refuse the result.
+    #[test]
+    fn a_store_refused_for_its_size_keeps_the_destination() {
+        let s = MemKv::new();
+        let d = Dispatcher::with_limits(
+            &s,
+            system_clock,
+            Limits {
+                max_value_bytes: 40,
+                ..Default::default()
+            },
+            DEFAULT_NS,
+        );
+        let call =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+        let too_large =
+            Value::Error("ERR value exceeds maximum allowed size (max-value-bytes)".into());
+        // A sorted-set member costs its bytes and 8 for its score: each
+        // input fits in 40, their union of three does not.
+        assert_eq!(
+            call(&[
+                b"ZADD",
+                b"{u}a",
+                b"1",
+                b"aaaaaaaaaaa1",
+                b"2",
+                b"aaaaaaaaaaa2"
+            ]),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            call(&[b"ZADD", b"{u}b", b"3", b"aaaaaaaaaaa3"]),
+            Value::Integer(1)
+        );
+        assert_eq!(call(&[b"ZADD", b"{u}d", b"9", b"kept"]), Value::Integer(1));
+        assert_eq!(
+            call(&[b"ZUNIONSTORE", b"{u}d", b"2", b"{u}a", b"{u}b"]),
+            too_large
+        );
+        assert_eq!(call(&[b"ZSCORE", b"{u}d", b"kept"]), Value::Double(9.0));
+        // A set member costs its bytes.
+        assert_eq!(
+            call(&[b"SADD", b"{u}sa", b"xxxxxxxxxxxxxx1", b"xxxxxxxxxxxxxx2"]),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            call(&[b"SADD", b"{u}sb", b"xxxxxxxxxxxxxx3"]),
+            Value::Integer(1)
+        );
+        assert_eq!(call(&[b"SADD", b"{u}sd", b"kept"]), Value::Integer(1));
+        assert_eq!(
+            call(&[b"SUNIONSTORE", b"{u}sd", b"{u}sa", b"{u}sb"]),
+            too_large
+        );
+        assert_eq!(call(&[b"SISMEMBER", b"{u}sd", b"kept"]), Value::Integer(1));
     }
 
     /// The key cap: the structural 64KB ceiling is always on (the subkey
