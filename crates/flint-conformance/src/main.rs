@@ -1044,6 +1044,97 @@ fn corpus() -> Vec<Case> {
         },
         large_strings(),
         hyperloglog(),
+        // The sorted-set algebra that answers instead of storing, ZDIFF's
+        // store, the cardinality forms and ZRANGESTORE, against Valkey 9.1
+        // and Redis 8.2 (both checked).
+        Case {
+            family: "zsets",
+            name: "ZUNION, ZINTER, ZDIFF, ZDIFFSTORE, ZINTERCARD, ZRANGESTORE",
+            steps: vec![
+                s(&[b"ZADD", b"{c}1", b"1", b"a", b"2", b"b", b"3", b"c"], Expect::Int(3)),
+                s(&[b"ZADD", b"{c}2", b"2", b"b", b"3", b"c", b"4", b"d"], Expect::Int(3)),
+                s(&[b"SADD", b"{c}s", b"c", b"d", b"e"], Expect::Int(3)),
+                s(
+                    &[b"ZUNION", b"3", b"{c}1", b"{c}2", b"{c}s", b"WITHSCORES"],
+                    Expect::Arr(["a", "1", "e", "1", "b", "4", "d", "5", "c", "7"].iter().map(|x| Expect::Str(x.as_bytes())).collect()),
+                ),
+                s(
+                    &[b"ZUNION", b"2", b"{c}1", b"{c}2"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"b"), Expect::Str(b"d"), Expect::Str(b"c")]),
+                ),
+                s(
+                    &[b"ZINTER", b"3", b"{c}1", b"{c}2", b"{c}s", b"AGGREGATE", b"MAX", b"WITHSCORES"],
+                    Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"3")]),
+                ),
+                s(
+                    &[b"ZDIFF", b"2", b"{c}1", b"{c}2", b"WITHSCORES"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")]),
+                ),
+                s(&[b"ZDIFFSTORE", b"{c}d", b"2", b"{c}2", b"{c}s"], Expect::Int(1)),
+                s(
+                    &[b"ZRANGE", b"{c}d", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"2")]),
+                ),
+                s(&[b"ZINTERCARD", b"2", b"{c}1", b"{c}2"], Expect::Int(2)),
+                s(&[b"ZINTERCARD", b"2", b"{c}1", b"{c}2", b"LIMIT", b"1"], Expect::Int(1)),
+                s(&[b"ZRANGESTORE", b"{c}r", b"{c}1", b"[b", b"+", b"BYLEX"], Expect::Int(2)),
+                s(
+                    &[b"ZRANGE", b"{c}r", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"2"), Expect::Str(b"c"), Expect::Str(b"3")]),
+                ),
+                s(
+                    &[b"ZRANGESTORE", b"{c}r", b"{c}2", b"(2", b"+inf", b"BYSCORE", b"REV", b"LIMIT", b"0", b"1"],
+                    Expect::Int(0),
+                ),
+                s(&[b"EXISTS", b"{c}r"], Expect::Int(0)),
+                // Inputs combine smallest first, as upstream orders them, so
+                // where infinities meet the sum is upstream's (BUG-0250).
+                s(&[b"ZADD", b"{o}a", b"-inf", b"m", b"1", b"x", b"2", b"y"], Expect::Int(3)),
+                s(&[b"ZADD", b"{o}b", b"inf", b"m"], Expect::Int(1)),
+                s(&[b"ZUNIONSTORE", b"{o}d", b"3", b"{o}a", b"{o}b", b"{o}b"], Expect::Int(3)),
+                s(&[b"ZSCORE", b"{o}d", b"m"], Expect::Str(b"0")),
+                // Errors, in upstream's words.
+                s(&[b"ZUNION", b"0", b"{c}1"], Expect::Err("ERR at least 1 input key is needed for 'zunion' command")),
+                s(&[b"ZUNION", b"3", b"{c}1"], Expect::Err("ERR syntax error")),
+                s(&[b"ZDIFF", b"1", b"{c}1", b"WEIGHTS", b"1"], Expect::Err("ERR syntax error")),
+                s(&[b"ZDIFFSTORE", b"{c}d", b"0"], Expect::Err("ERR wrong number of arguments for 'zdiffstore' command")),
+                s(&[b"ZINTERCARD", b"2", b"{c}1", b"{c}2", b"LIMIT", b"-1"], Expect::Err("ERR LIMIT can't be negative")),
+                s(&[b"ZINTERCARD", b"1", b"{c}1", b"WITHSCORES"], Expect::Err("ERR syntax error")),
+                s(&[b"ZRANGESTORE", b"{c}r", b"{c}1", b"0", b"-1", b"WITHSCORES"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"ZRANGESTORE", b"{c}r", b"{c}s", b"0", b"-1"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(&[b"SET", b"{c}str", b"v"], Expect::Ok),
+                s(
+                    &[b"ZUNION", b"2", b"{c}1", b"{c}str"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+            ],
+        },
+        Case {
+            family: "sets",
+            name: "SINTERCARD",
+            steps: vec![
+                s(&[b"SADD", b"{i}a", b"a", b"b", b"x"], Expect::Int(3)),
+                s(&[b"SADD", b"{i}b", b"b", b"x", b"y"], Expect::Int(3)),
+                s(&[b"SINTERCARD", b"2", b"{i}a", b"{i}b"], Expect::Int(2)),
+                s(&[b"SINTERCARD", b"2", b"{i}a", b"{i}b", b"LIMIT", b"1"], Expect::Int(1)),
+                s(&[b"SINTERCARD", b"2", b"{i}a", b"{i}none"], Expect::Int(0)),
+                s(&[b"SINTERCARD", b"0", b"{i}a"], Expect::Err("ERR numkeys should be greater than 0")),
+                s(
+                    &[b"SINTERCARD", b"3", b"{i}a"],
+                    Expect::Err("ERR Number of keys can't be greater than number of args"),
+                ),
+                s(&[b"SINTERCARD", b"1", b"{i}a", b"LIMIT", b"-1"], Expect::Err("ERR LIMIT can't be negative")),
+                s(&[b"SINTERCARD", b"1", b"{i}a", b"FOO"], Expect::Err("ERR syntax error")),
+                s(&[b"ZADD", b"{i}z", b"1", b"a"], Expect::Int(1)),
+                s(
+                    &[b"SINTERCARD", b"1", b"{i}z"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+            ],
+        },
         // Streams (ADR-0052 D6), against Valkey 9.1. `~` trimming is not
         // here: Valkey trims whole internal nodes and Flint trims exactly
         // (a documented difference); only its argument errors are.

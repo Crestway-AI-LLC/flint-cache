@@ -56,6 +56,21 @@ pub fn never_grows(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"PFCOUNT")
 }
 
+/// The first key of a command whose keys follow a count at `args[1]`
+/// (`ZUNION numkeys key ...`, and ZINTER, ZDIFF, ZINTERCARD, SINTERCARD):
+/// `Some(key)` for those, the key absent when the count is all there is;
+/// `None` for every other command. It is what such a command routes by,
+/// and the slot its keys must share: `args[1]` is the count, and read as a
+/// key it would name a slot nothing was asked of.
+pub fn numkeys_key(args: &[Vec<u8>]) -> Option<Option<&[u8]>> {
+    let name = args.first()?.to_ascii_uppercase();
+    matches!(
+        name.as_slice(),
+        b"ZUNION" | b"ZINTER" | b"ZDIFF" | b"ZINTERCARD" | b"SINTERCARD"
+    )
+    .then(|| args.get(2).map(|k| k.as_slice()))
+}
+
 /// The blocking pops (ADR-0052 D4). A seat answers each without waiting, as
 /// Redis does inside `MULTI` or a script; the proxy makes a client wait, by
 /// running that form until one answers or the timeout passes.
@@ -141,6 +156,8 @@ pub fn is_write_command(name: &[u8]) -> bool {
             // so the proxy's default invalidation already drops the right key.
             | b"ZUNIONSTORE"
             | b"ZINTERSTORE"
+            | b"ZDIFFSTORE"
+            | b"ZRANGESTORE"
             | b"SINTERSTORE"
             | b"SUNIONSTORE"
             | b"SDIFFSTORE"
@@ -311,6 +328,12 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"SINTER"
             | b"SUNION"
             | b"SDIFF"
+            // Their first key follows numkeys (`numkeys_key`).
+            | b"SINTERCARD"
+            | b"ZUNION"
+            | b"ZINTER"
+            | b"ZDIFF"
+            | b"ZINTERCARD"
             | b"LLEN"
             | b"LRANGE"
             | b"LINDEX"

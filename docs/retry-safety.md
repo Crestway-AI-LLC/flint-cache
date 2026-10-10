@@ -57,7 +57,9 @@ Three corollaries, each measured rather than assumed:
 retry answers the new one) · `BITOP` whose destination is not one of its
 sources · `TOUCH` · `HRANDFIELD` · `ZRANDMEMBER` · `PFADD` (the retry
 answers 0) · `PFCOUNT` · `PFMERGE`, even into one of its sources: an HLL's
-register only ever takes the larger value
+register only ever takes the larger value · `ZDIFFSTORE`, even into its
+first source (removing the same members twice removes nothing more) ·
+`ZRANGESTORE` whose destination is not its source
 
 **Absolute expiry**: `SET … EXAT`/`PXAT` · `EXPIREAT` ·
 `PEXPIREAT` (plain, or `XX`) · `GETEX EXAT`/`PXAT`/`PERSIST`
@@ -91,7 +93,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 |---|---|
 | `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `HINCRBY` `HINCRBYFLOAT` `ZINCRBY` `ZADD … INCR` `JSON.NUMINCRBY` `JSON.NUMMULTBY` | Double-counts, or multiplies twice. |
 | `BITFIELD` with `INCRBY` | Double-counts, as `INCRBY` does; Sidekiq's metrics flush is this shape. A `BITFIELD` of only `GET` and `SET` converges, but a retried `SET` answers the value the first attempt wrote, not the one before it. |
-| `BITOP` `ZUNIONSTORE` `ZINTERSTORE` whose destination is also a source | The retry applies the operation to its own result. Measured on Valkey 9.1: `BITOP XOR d d x` sent twice gives `d` back unchanged, and `ZUNIONSTORE zd 2 zd zx` adds `zx`'s scores a second time (1, then 2, then 3). `BITOP AND`/`OR` and the set `STORE`s into a source converge. |
+| `BITOP` `ZUNIONSTORE` `ZINTERSTORE` `ZRANGESTORE` whose destination is also a source | The retry applies the operation to its own result. Measured on Valkey 9.1: `BITOP XOR d d x` sent twice gives `d` back unchanged, and `ZUNIONSTORE zd 2 zd zx` adds `zx`'s scores a second time (1, then 2, then 3). `BITOP AND`/`OR` and the set `STORE`s into a source converge. |
 | `APPEND` `JSON.ARRAPPEND` `JSON.STRAPPEND` | Double-appends. |
 | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` | Double-pushes. |
 | `LINSERT` `JSON.ARRINSERT` | Double-inserts: `a b` becomes `a x x b`. |

@@ -270,10 +270,10 @@ HRANDFIELD (count, WITHVALUES).
 > alternative when the hash is large.
 
 **Sets**: SADD, SREM, SISMEMBER, SMISMEMBER, SMEMBERS, SCARD, SPOP,
-SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF,
-SINTERSTORE, SUNIONSTORE, SDIFFSTORE, SMOVE (same slot).
+SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF, SINTERCARD
+(LIMIT), SINTERSTORE, SUNIONSTORE, SDIFFSTORE, SMOVE (same slot).
 
-> SINTER / SUNION / SDIFF are **same-slot only**, exactly as in Redis
+> SINTER / SUNION / SDIFF / SINTERCARD are **same-slot only**, exactly as in Redis
 > Cluster: colocate the keys with a hash tag (`SINTER {u1}:a {u1}:b`) or the
 > request is refused with `CROSSSLOT`. Refused rather than answered, because
 > a key the node does not own reads as an empty set and an intersection
@@ -301,12 +301,15 @@ ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE (WITHSCORES, LIMIT, exclusive
 bounds, ±inf), ZRANGEBYLEX, ZREVRANGEBYLEX (LIMIT, exclusive bounds,
 `-`/`+`), ZLEXCOUNT, ZREMRANGEBYLEX (exclusive bounds, `-`/`+`; no LIMIT,
 as upstream), ZRANK, ZREVRANK (WITHSCORE), ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
-ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT), ZUNIONSTORE, ZINTERSTORE (WEIGHTS,
-AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands"),
-ZRANDMEMBER (count, WITHSCORES).
+ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT), ZUNION, ZINTER, ZUNIONSTORE,
+ZINTERSTORE (WEIGHTS, AGGREGATE SUM/MIN/MAX, and WITHSCORES for the forms
+that answer), ZDIFF (WITHSCORES), ZDIFFSTORE, ZINTERCARD (LIMIT),
+ZRANGESTORE (BYSCORE, BYLEX, REV, LIMIT), BZPOPMIN, BZPOPMAX (see
+"Blocking commands"), ZRANDMEMBER (count, WITHSCORES).
 
-> ZUNIONSTORE / ZINTERSTORE are **same-slot only**, and the rule covers the
-> destination as well as the inputs — these write, so a destination in an
+> The algebra (ZUNION, ZINTER, ZDIFF, their STORE forms, ZINTERCARD) and
+> ZRANGESTORE are **same-slot only**, and for the STORE forms the rule
+> covers the destination as well as the inputs — these write, so a destination in an
 > unowned slot would be stored where nothing can read it while the reply
 > claimed a cardinality. Colocate everything with one hash tag
 > (`ZUNIONSTORE {u1}:out 2 {u1}:a {u1}:b`).
@@ -317,7 +320,10 @@ ZRANDMEMBER (count, WITHSCORES).
 > zero weight against an infinite score is 0 for every union input and for
 > the intersection's first input. A later intersection input's NaN is
 > aggregated as it is: SUM makes it 0, and MIN or MAX keep the score so far
-> (BUG-0231). SUM over both infinities is 0.
+> (BUG-0231). SUM over both infinities is 0. The inputs are combined
+> smallest first, as upstream combines them, so where infinities meet the
+> result is upstream's too (BUG-0250). Checked against Valkey 9.1 and
+> Redis 8.2 by a random differential of every reply and every key.
 > A score of `-0` is stored as `0`, as Redis's listpack stores it, and ties
 > with `0` by member (BUG-0228). ZINCRBY or ZADD INCR on a new member with
 > `-0` still answers `-0`, as upstream does.

@@ -1658,6 +1658,10 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     if let Some(key) = flint_commands::json_debug_key(args) {
         return key;
     }
+    // ZUNION, ZINTER, ZDIFF, ZINTERCARD and SINTERCARD: a count, then keys.
+    if let Some(key) = flint_commands::numkeys_key(args) {
+        return key;
+    }
     // BITOP's second argument is its operator; it routes by its destination.
     if name.eq_ignore_ascii_case(b"BITOP") {
         return args.get(2).map(|k| k.as_slice());
@@ -6636,6 +6640,18 @@ mod route_tests {
             AuthStep::Reply(Value::Map(_))
         ));
         assert_eq!(proto, flint_resp::Proto::Resp3);
+    }
+
+    /// ZUNION, ZINTER, ZDIFF, ZINTERCARD and SINTERCARD route by their first
+    /// key, which follows the count in `args[1]`.
+    #[test]
+    fn the_algebra_routes_by_the_key_after_its_count() {
+        for name in ["ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "SINTERCARD"] {
+            let args = [name, "2", "{t}a", "{t}b"].map(|p| p.as_bytes().to_vec());
+            assert_eq!(route_key(&args), Some(&b"{t}a"[..]), "{name}");
+        }
+        let store = ["ZDIFFSTORE", "{t}d", "1", "{t}a"].map(|p| p.as_bytes().to_vec());
+        assert_eq!(route_key(&store), Some(&b"{t}d"[..]));
     }
 
     /// BITOP's key is its destination, `args[2]`; `args[1]` is the

@@ -83,6 +83,10 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     if let Some(key) = flint_commands::json_debug_key(args) {
         return key;
     }
+    // ZUNION, ZINTER, ZDIFF, ZINTERCARD and SINTERCARD: a count, then keys.
+    if let Some(key) = flint_commands::numkeys_key(args) {
+        return key;
+    }
     // BITOP's second argument is its operator; its key is the destination.
     if name.eq_ignore_ascii_case(b"BITOP") {
         return args.get(2).map(|k| k.as_slice());
@@ -258,6 +262,16 @@ impl Limits {
             self.max_key_bytes.min(flint_storage::MAX_KEY_BYTES)
         }
     }
+}
+
+/// What a sorted-set algebra command computes ([`Dispatcher::cmd_zalgebra`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZOp {
+    Union,
+    Inter,
+    Diff,
+    /// ZINTERCARD: the intersection's size.
+    Card,
 }
 
 pub struct Dispatcher<'a> {
@@ -995,6 +1009,7 @@ impl<'a> Dispatcher<'a> {
                     Value::Set(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())
                 })
             }
+            b"SINTERCARD" => self.cmd_sintercard(args),
             b"SPOP" => self.cmd_spop(args),
             b"SRANDMEMBER" => self.cmd_srandmember(args),
             b"SMOVE" => exact(args, 4, "smove", |a| {
@@ -1238,8 +1253,14 @@ impl<'a> Dispatcher<'a> {
             b"ZPOPMAX" => self.cmd_zpop(args, "zpopmax", true),
             b"ZLEXCOUNT" => self.cmd_zlexrange(args, "zlexcount", false),
             b"ZREMRANGEBYLEX" => self.cmd_zlexrange(args, "zremrangebylex", true),
-            b"ZUNIONSTORE" => self.cmd_zstore(args, "zunionstore", false),
-            b"ZINTERSTORE" => self.cmd_zstore(args, "zinterstore", true),
+            b"ZUNIONSTORE" => self.cmd_zalgebra(args, "zunionstore", ZOp::Union, true),
+            b"ZINTERSTORE" => self.cmd_zalgebra(args, "zinterstore", ZOp::Inter, true),
+            b"ZDIFFSTORE" => self.cmd_zalgebra(args, "zdiffstore", ZOp::Diff, true),
+            b"ZUNION" => self.cmd_zalgebra(args, "zunion", ZOp::Union, false),
+            b"ZINTER" => self.cmd_zalgebra(args, "zinter", ZOp::Inter, false),
+            b"ZDIFF" => self.cmd_zalgebra(args, "zdiff", ZOp::Diff, false),
+            b"ZINTERCARD" => self.cmd_zalgebra(args, "zintercard", ZOp::Card, false),
+            b"ZRANGESTORE" => self.cmd_zrangestore(args),
             b"ZREMRANGEBYSCORE" => self.cmd_zremrangebyscore(args),
             b"ZREMRANGEBYRANK" => self.cmd_zremrangebyrank(args),
 
@@ -2165,21 +2186,42 @@ impl<'a> Dispatcher<'a> {
     /// chose. REV with BYSCORE or BYLEX takes the bounds as (max, min), as
     /// ZREVRANGEBYSCORE does.
     fn cmd_zrange(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 4 {
+            return arity_err("zrange");
+        }
+        self.zrange_generic(&args[1], &args[2..], None)
+    }
+
+    /// `ZRANGESTORE dst src min max [BYSCORE|BYLEX] [REV] [LIMIT offset
+    /// count]`: ZRANGE's range, stored at `dst` (deleted when empty), as
+    /// its count. WITHSCORES is ZRANGE's alone. Both keys share a slot.
+    fn cmd_zrangestore(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 5 {
+            return arity_err("zrangestore");
+        }
+        if let Some(e) = Self::crossslot(&args[1], &args[2..3]) {
+            return e;
+        }
+        self.zrange_generic(&args[2], &args[3..], Some(&args[1]))
+    }
+
+    /// ZRANGE's range, from `rest` = `min max [options]`, answered, or
+    /// stored at `dst` (ZRANGESTORE), in upstream's order of checks: the
+    /// options, then the range, then the key.
+    fn zrange_generic(&self, key: &[u8], rest: &[Vec<u8>], dst: Option<&Vec<u8>>) -> Value {
         #[derive(PartialEq)]
         enum By {
             Rank,
             Score,
             Lex,
         }
-        if args.len() < 4 {
-            return arity_err("zrange");
-        }
         let (mut by, mut rev, mut withscores, mut limit) = (None, false, false, None);
-        let mut i = 4;
+        let mut i = 2;
+        let args = rest;
         while i < args.len() {
             let after = args.len() - i - 1;
             match args[i].to_ascii_uppercase().as_slice() {
-                b"WITHSCORES" => withscores = true,
+                b"WITHSCORES" if dst.is_none() => withscores = true,
                 b"LIMIT" if after >= 2 => {
                     let (Ok(offset), Ok(count)) =
                         (parse_i64(&args[i + 1]), parse_i64(&args[i + 2]))
@@ -2209,41 +2251,66 @@ impl<'a> Dispatcher<'a> {
         if withscores && by == By::Lex {
             return err("ERR syntax error, WITHSCORES not supported in combination with BYLEX");
         }
-        let (slot, key) = (slot_for_key(&args[1]), &args[1]);
+        let slot = slot_for_key(key);
         let (lo, hi) = if rev && by != By::Rank {
-            (&args[3], &args[2])
+            (&args[1], &args[0])
         } else {
-            (&args[2], &args[3])
+            (&args[0], &args[1])
         };
         let (offset, count) = limit.unwrap_or((0, -1));
-        match by {
+        let rows = match by {
             By::Rank => match (parse_i64(lo), parse_i64(hi)) {
-                (Ok(start), Ok(stop)) => reply(
-                    self.zsets.zrange_rev(slot, key, start, stop, rev),
-                    |ranked| Self::zrows(ranked, withscores),
-                ),
-                _ => err("ERR value is not an integer or out of range"),
+                (Ok(start), Ok(stop)) => self.zsets.zrange_rev(slot, key, start, stop, rev),
+                _ => return err("ERR value is not an integer or out of range"),
             },
             By::Score => {
                 let (Some(min), Some(max)) = (ScoreBound::parse(lo), ScoreBound::parse(hi)) else {
                     return err("ERR min or max is not a float");
                 };
-                reply(
-                    self.zsets
-                        .zrange_by_score(slot, key, min, max, rev, offset, count),
-                    |r| Self::zrows(r, withscores),
-                )
+                self.zsets
+                    .zrange_by_score(slot, key, min, max, rev, offset, count)
             }
             By::Lex => {
                 let (Some(min), Some(max)) = (LexBound::parse(lo), LexBound::parse(hi)) else {
                     return err("ERR min or max not valid string range item");
                 };
-                reply(
-                    self.zsets
-                        .zrange_by_lex(slot, key, &min, &max, rev, offset, count),
-                    |ms| Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())),
-                )
+                let members = match self
+                    .zsets
+                    .zrange_by_lex(slot, key, &min, &max, rev, offset, count)
+                {
+                    Ok(ms) => ms,
+                    Err(e) => return store_err(e),
+                };
+                let Some(dst) = dst else {
+                    return Value::Array(Some(
+                        members.into_iter().map(|m| Value::Bulk(Some(m))).collect(),
+                    ));
+                };
+                // Stored, a lex range keeps each member's own score.
+                match self.zsets.zmscore(slot, key, &members) {
+                    Ok(scores) => {
+                        let pairs: Vec<(f64, Vec<u8>)> = scores
+                            .into_iter()
+                            .zip(members)
+                            .map(|(s, m)| (s.unwrap_or(0.0), m))
+                            .collect();
+                        return reply(self.zsets.zreplace(slot, dst, &pairs), |n| {
+                            Value::Integer(n as i64)
+                        });
+                    }
+                    Err(e) => return store_err(e),
+                }
             }
+        };
+        match (rows, dst) {
+            (Ok(rows), None) => Self::zrows(rows, withscores),
+            (Ok(rows), Some(dst)) => {
+                let pairs: Vec<(f64, Vec<u8>)> = rows.into_iter().map(|(m, s)| (s, m)).collect();
+                reply(self.zsets.zreplace(slot, dst, &pairs), |n| {
+                    Value::Integer(n as i64)
+                })
+            }
+            (Err(e), _) => store_err(e),
         }
     }
 
@@ -2550,6 +2617,19 @@ impl<'a> Dispatcher<'a> {
         Value::Integer(self.keyspace.copy(slot, src, dst, replace) as i64)
     }
 
+    /// How many members one input to the sorted-set algebra holds: a
+    /// sorted set's or a set's cardinality, 0 for a missing key. Read from
+    /// metadata, to order the inputs as upstream does.
+    fn zstore_card(&self, slot: u16, key: &[u8]) -> Result<u64, StoreError> {
+        use flint_storage::encoding::ValueType as VT;
+        match self.keyspace.value_type(slot, key) {
+            None => Ok(0),
+            Some(VT::ZSet) => self.zsets.zcard(slot, key),
+            Some(VT::Set) => self.sets.scard(slot, key),
+            Some(_) => Err(StoreError::WrongType),
+        }
+    }
+
     /// One input to ZUNIONSTORE / ZINTERSTORE, read as (member, score).
     ///
     /// A plain SET is a legal input and contributes score 1 per member —
@@ -2571,14 +2651,19 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// ZUNIONSTORE / ZINTERSTORE dst numkeys key [key ...]
-    /// [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX].
+    /// The sorted-set algebra, as Redis's `zunionInterDiffGenericCommand`:
+    /// ZUNION, ZINTER and ZDIFF, their STORE forms, and ZINTERCARD.
     ///
-    /// Same slot as ever, and here it covers the DESTINATION too: this
-    /// writes, so a destination in a slot the node does not own would be
-    /// stored where nothing can read it while the reply claimed a
-    /// cardinality. The proxy routes by the first key, which for these is
-    /// the destination — correct precisely because every key shares its slot.
+    /// `[dst] numkeys key [key ...]` then, by command: `WEIGHTS w ...` and
+    /// `AGGREGATE SUM|MIN|MAX` (union and intersection), `WITHSCORES` (the
+    /// forms that answer members), `LIMIT n` (ZINTERCARD). A plain SET is a
+    /// legal input, every member scored 1.
+    ///
+    /// Every key shares one slot, and for the STORE forms that includes the
+    /// DESTINATION: they write, so a destination in a slot the node does
+    /// not own would be stored where nothing can read it while the reply
+    /// claimed a cardinality. The proxy routes the STORE forms by their
+    /// destination, `args[1]`, and the others by their first key.
     ///
     /// TWO PLACES A NaN CAN APPEAR, both confirmed against a live server:
     /// `0 * inf` when a weight zeroes an infinite score, and `+inf + -inf`
@@ -2588,14 +2673,17 @@ impl<'a> Dispatcher<'a> {
     /// SUM makes it 0 and MIN or MAX keep the score so far (BUG-0231, which
     /// zeroed it first). Left alone, a NaN score would encode and then order
     /// unpredictably against every other member.
-    fn cmd_zstore(&self, args: &[Vec<u8>], name: &str, inter: bool) -> Value {
+    fn cmd_zalgebra(&self, args: &[Vec<u8>], name: &str, op: ZOp, store: bool) -> Value {
         use std::collections::HashMap;
         use std::collections::hash_map::Entry;
 
-        if args.len() < 4 {
+        // `[dst] numkeys`: the STORE forms take at least one key, the
+        // others at least the count.
+        let nk = if store { 2 } else { 1 };
+        if args.len() < nk + 2 {
             return arity_err(name);
         }
-        let Ok(declared) = parse_i64(&args[2]) else {
+        let Ok(declared) = parse_i64(&args[nk]) else {
             return err("ERR value is not an integer or out of range");
         };
         if declared <= 0 {
@@ -2606,23 +2694,15 @@ impl<'a> Dispatcher<'a> {
         // Compare against what is actually there before widening: a huge
         // declared count must not become an in-bounds index by wrapping.
         let numkeys = declared as usize;
-        if numkeys > args.len() - 3 {
+        if numkeys > args.len() - nk - 1 {
             return err("ERR syntax error");
         }
-        let keys = &args[3..3 + numkeys];
-
-        let dst = &args[1];
-        let slot = slot_for_key(dst);
-        if let Some(bad) = keys.iter().find(|k| slot_for_key(k) != slot) {
-            return Value::Error(format!(
-                "CROSSSLOT Keys in request don't hash to the same slot ({} is slot {}, \
-                 {} is slot {}) — use a hash tag such as {{tag}}key to colocate them",
-                String::from_utf8_lossy(dst),
-                slot,
-                String::from_utf8_lossy(bad),
-                slot_for_key(bad)
-            ));
+        let keys = &args[nk + 1..nk + 1 + numkeys];
+        let first = if store { &args[1] } else { &keys[0] };
+        if let Some(e) = Self::crossslot(first, keys) {
+            return e;
         }
+        let slot = slot_for_key(first);
         // Every input's type before the options and before any read, as
         // upstream checks them: an intersection stops at its first empty
         // input, and a WRONGTYPE input after it was never looked at, so
@@ -2638,19 +2718,19 @@ impl<'a> Dispatcher<'a> {
             return store_err(StoreError::WrongType);
         }
 
+        let combines = matches!(op, ZOp::Union | ZOp::Inter);
         let mut weights = vec![1.0f64; numkeys];
         let mut aggregate = b"SUM".to_vec();
-        let mut i = 3 + numkeys;
+        let (mut withscores, mut limit) = (false, 0usize);
+        let mut i = nk + 1 + numkeys;
         while i < args.len() {
+            let remaining = args.len() - i;
             match args[i].to_ascii_uppercase().as_slice() {
-                b"WEIGHTS" => {
-                    // Exactly one weight per key. A short list is a syntax
-                    // error rather than a padded-with-ones convenience: the
-                    // caller has miscounted, and quietly filling in 1.0 would
-                    // produce a plausible wrong answer.
-                    if args.len() - i - 1 < numkeys {
-                        return err("ERR syntax error");
-                    }
+                // Exactly one weight per key. A short list is a syntax
+                // error rather than a padded-with-ones convenience: the
+                // caller has miscounted, and quietly filling in 1.0 would
+                // produce a plausible wrong answer.
+                b"WEIGHTS" if combines && remaining > numkeys => {
                     for (n, w) in weights.iter_mut().enumerate() {
                         let Ok(v) = parse_f64(&args[i + 1 + n]) else {
                             return err("ERR weight value is not a float");
@@ -2659,13 +2739,18 @@ impl<'a> Dispatcher<'a> {
                     }
                     i += numkeys;
                 }
-                b"AGGREGATE" => {
-                    let Some(kind) = args.get(i + 1) else {
-                        return err("ERR syntax error");
-                    };
-                    aggregate = kind.to_ascii_uppercase();
+                b"AGGREGATE" if combines && remaining >= 2 => {
+                    aggregate = args[i + 1].to_ascii_uppercase();
                     if !matches!(aggregate.as_slice(), b"SUM" | b"MIN" | b"MAX") {
                         return err("ERR syntax error");
+                    }
+                    i += 1;
+                }
+                b"WITHSCORES" if !store && op != ZOp::Card => withscores = true,
+                b"LIMIT" if op == ZOp::Card && remaining >= 2 => {
+                    match parse_i64(&args[i + 1]) {
+                        Ok(n) if n >= 0 => limit = n as usize,
+                        _ => return err("ERR LIMIT can't be negative"),
                     }
                     i += 1;
                 }
@@ -2685,25 +2770,53 @@ impl<'a> Dispatcher<'a> {
             if v.is_nan() { 0.0 } else { v }
         };
 
+        // Upstream combines the inputs smallest first, whatever order they
+        // were named in, and the weights go with their inputs. The order
+        // shows only where infinities meet: `+inf + -inf` becomes 0, so
+        // ZUNIONSTORE d 3 a b b over a = {m: -inf}, b = {m: inf, ...}
+        // stores 0 (inf + inf, then + -inf), not inf. It also decides which
+        // input is the intersection's first. A difference keeps its first
+        // input first. Ties keep their order (a stable sort).
+        let mut order: Vec<usize> = (0..numkeys).collect();
+        if op != ZOp::Diff {
+            let mut cards = Vec::with_capacity(numkeys);
+            for key in keys {
+                match self.zstore_card(slot, key) {
+                    Ok(n) => cards.push(n),
+                    Err(e) => return store_err(e),
+                }
+            }
+            order.sort_by_key(|&i| cards[i]);
+        }
         // EVERY source is read before anything is written, because the
         // destination is allowed to be one of them: ZUNIONSTORE k 2 k other
         // is legal and must fold k's own contents in before k is replaced.
+        let inter = matches!(op, ZOp::Inter | ZOp::Card);
         let mut acc: HashMap<Vec<u8>, f64> = HashMap::new();
-        for (n, key) in keys.iter().enumerate() {
-            let members = match self.zstore_source(slot, key) {
+        for (n, &idx) in order.iter().enumerate() {
+            let members = match self.zstore_source(slot, &keys[idx]) {
                 Ok(m) => m,
                 Err(e) => return store_err(e),
             };
             let zero_nan = !inter || n == 0;
             let weighted = members.into_iter().map(|(m, s)| {
-                let v = s * weights[n];
+                let v = s * weights[idx];
                 (m, if zero_nan && v.is_nan() { 0.0 } else { v })
             });
             if n == 0 {
                 acc = weighted.collect();
                 continue;
             }
-            if inter {
+            if op == ZOp::Diff {
+                // The first input's members that no other input holds,
+                // with the first input's scores.
+                for (m, _) in weighted {
+                    acc.remove(&m);
+                }
+                if acc.is_empty() {
+                    break;
+                }
+            } else if inter {
                 // Intersection keeps only what survived every earlier input,
                 // so it is rebuilt each round rather than pruned in place.
                 let mut next = HashMap::with_capacity(acc.len());
@@ -2734,10 +2847,78 @@ impl<'a> Dispatcher<'a> {
             }
         }
 
-        let pairs: Vec<(f64, Vec<u8>)> = acc.into_iter().map(|(m, s)| (s, m)).collect();
-        reply(self.zsets.zreplace(slot, dst, &pairs), |n| {
-            Value::Integer(n as i64)
-        })
+        if op == ZOp::Card {
+            // LIMIT 0 is no limit, as upstream reads it.
+            let n = if limit > 0 {
+                acc.len().min(limit)
+            } else {
+                acc.len()
+            };
+            return Value::Integer(n as i64);
+        }
+        if store {
+            let pairs: Vec<(f64, Vec<u8>)> = acc.into_iter().map(|(m, s)| (s, m)).collect();
+            return reply(self.zsets.zreplace(slot, &args[1], &pairs), |n| {
+                Value::Integer(n as i64)
+            });
+        }
+        // In the result set's order: by score, then by member's bytes. -0
+        // and 0 are one score, as in upstream's skiplist; no score is NaN.
+        let mut ranked: Vec<(Vec<u8>, f64)> = acc.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Self::zrows(ranked, withscores)
+    }
+
+    /// `SINTERCARD numkeys key [key ...] [LIMIT limit]`: how many members
+    /// every set holds, counting at most `limit` (0: no limit), in
+    /// upstream's words for its own errors, which are not ZINTERCARD's.
+    fn cmd_sintercard(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 3 {
+            return arity_err("sintercard");
+        }
+        let numkeys = match parse_i64(&args[1]) {
+            Ok(n) if n >= 1 => n as usize,
+            _ => return err("ERR numkeys should be greater than 0"),
+        };
+        if numkeys > args.len() - 2 {
+            return err("ERR Number of keys can't be greater than number of args");
+        }
+        let keys = &args[2..2 + numkeys];
+        let mut limit = 0usize;
+        let mut i = 2 + numkeys;
+        while i < args.len() {
+            if args[i].eq_ignore_ascii_case(b"LIMIT") && i + 1 < args.len() {
+                match parse_i64(&args[i + 1]) {
+                    Ok(n) if n >= 0 => limit = n as usize,
+                    _ => return err("ERR LIMIT can't be negative"),
+                }
+                i += 2;
+            } else {
+                return err("ERR syntax error");
+            }
+        }
+        if let Some(e) = Self::crossslot(&keys[0], keys) {
+            return e;
+        }
+        reply(
+            self.sets.sop(
+                slot_for_key(&keys[0]),
+                flint_storage::sets::SetOp::Inter,
+                keys,
+            ),
+            |ms| {
+                let n = if limit > 0 {
+                    ms.len().min(limit)
+                } else {
+                    ms.len()
+                };
+                Value::Integer(n as i64)
+            },
+        )
     }
 
     /// `ZRANK key member [WITHSCORE]` and ZREVRANK. WITHSCORE (Redis 7.2)
@@ -5452,6 +5633,89 @@ mod tests {
         );
         assert!(scan_all(&s, &[b"TYPE", b"json"]).is_empty());
         assert!(scan_all(&s, &[b"TYPE", b"bloom"]).is_empty());
+    }
+
+    /// ZUNION and its relatives name their keys after a count, so the key
+    /// that routes, locks and owns the slot is `args[2]`, not the count;
+    /// every key shares that slot, at queue time inside MULTI too; and the
+    /// writing forms are writes, the rest reads (replica-servable).
+    #[test]
+    fn the_algebra_routes_by_the_key_after_its_count_and_keeps_to_one_slot() {
+        let c = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+        };
+        for name in ["ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "SINTERCARD"] {
+            let args = c(&[name, "2", "{t}a", "{t}b"]);
+            assert_eq!(command_key(&args), Some(&b"{t}a"[..]), "{name}");
+            assert!(flint_commands::is_read_command(name.as_bytes()), "{name}");
+            // `a` is slot 15495, `b` 3300.
+            let cross = c(&[name, "2", "a", "b"]);
+            let s = MemKv::new();
+            let refused = Dispatcher::new(&s, system_clock).dispatch(&cross);
+            assert!(
+                matches!(&refused, Value::Error(e) if e.starts_with("CROSSSLOT")),
+                "{name}: {refused:?}"
+            );
+            assert!(queue_time_error(&cross, false).is_some(), "{name} in MULTI");
+        }
+        assert_eq!(
+            command_key(&c(&["ZUNIONSTORE", "{t}d", "1", "{t}a"])),
+            Some(&b"{t}d"[..])
+        );
+        for (name, cross) in [
+            ("ZDIFFSTORE", c(&["ZDIFFSTORE", "a", "1", "b"])),
+            ("ZRANGESTORE", c(&["ZRANGESTORE", "a", "b", "0", "-1"])),
+        ] {
+            assert!(flint_commands::is_write_command(name.as_bytes()), "{name}");
+            assert!(queue_time_error(&cross, false).is_some(), "{name} in MULTI");
+        }
+        assert_eq!(
+            flint_commands::numkeys_key(&c(&["ZUNION", "1"])),
+            Some(None)
+        );
+        assert_eq!(
+            flint_commands::numkeys_key(&c(&["ZUNIONSTORE", "d", "1", "k"])),
+            None
+        );
+    }
+
+    /// BUG-0250: the inputs combine smallest first, as upstream combines
+    /// them, so where infinities meet the score is upstream's.
+    #[test]
+    fn the_algebra_combines_its_inputs_smallest_first() {
+        let s = MemKv::new();
+        call(
+            &s,
+            &[b"ZADD", b"{o}a", b"-inf", b"m", b"1", b"x", b"2", b"y"],
+        );
+        call(&s, &[b"ZADD", b"{o}b", b"inf", b"m"]);
+        // b, b, a: inf + inf, then + -inf, is 0 (named order gave inf).
+        assert_eq!(
+            call(
+                &s,
+                &[b"ZUNIONSTORE", b"{o}d", b"3", b"{o}a", b"{o}b", b"{o}b"]
+            ),
+            Value::Integer(3)
+        );
+        assert_eq!(call(&s, &[b"ZSCORE", b"{o}d", b"m"]), Value::Double(0.0));
+        // The weights go with their inputs: b's weight -1 still applies to
+        // b, now first.
+        assert_eq!(
+            call(
+                &s,
+                &[
+                    b"ZINTER",
+                    b"2",
+                    b"{o}a",
+                    b"{o}b",
+                    b"WEIGHTS",
+                    b"1",
+                    b"-1",
+                    b"WITHSCORES"
+                ]
+            ),
+            Value::ScorePairs(vec![(b"m".to_vec(), f64::NEG_INFINITY)])
+        );
     }
 
     /// HyperLogLog's several-key forms keep to one slot, refused at queue
