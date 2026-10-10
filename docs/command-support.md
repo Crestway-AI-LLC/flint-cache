@@ -285,9 +285,9 @@ SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF, SINTERCARD
 > ZUNIONSTORE accepts a plain set at score 1. That asymmetry is upstream's,
 > not ours.
 
-**Lists**: LPUSH, RPUSH, LPUSHX, RPUSHX, LPOP and RPOP (with a count), LLEN, LRANGE, LINDEX, LSET, LTRIM,
+**Lists**: LPUSH, RPUSH, LPUSHX, RPUSHX, LPOP and RPOP (with a count), LMPOP (COUNT), LLEN, LRANGE, LINDEX, LSET, LTRIM,
 LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN), LMOVE, RPOPLPUSH, BLPOP, BRPOP,
-BLMOVE, BRPOPLPUSH (see "Blocking commands").
+BLMPOP, BLMOVE, BRPOPLPUSH (see "Blocking commands").
 
 > LMOVE and RPOPLPUSH are **same-slot only**, like the set operations:
 > colocate source and destination with a hash tag or the move is refused
@@ -304,8 +304,8 @@ as upstream), ZRANK, ZREVRANK (WITHSCORE), ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBY
 ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT), ZUNION, ZINTER, ZUNIONSTORE,
 ZINTERSTORE (WEIGHTS, AGGREGATE SUM/MIN/MAX, and WITHSCORES for the forms
 that answer), ZDIFF (WITHSCORES), ZDIFFSTORE, ZINTERCARD (LIMIT),
-ZRANGESTORE (BYSCORE, BYLEX, REV, LIMIT), BZPOPMIN, BZPOPMAX (see
-"Blocking commands"), ZRANDMEMBER (count, WITHSCORES).
+ZRANGESTORE (BYSCORE, BYLEX, REV, LIMIT), ZMPOP (COUNT), BZPOPMIN, BZPOPMAX,
+BZMPOP (see "Blocking commands"), ZRANDMEMBER (count, WITHSCORES).
 
 > The algebra (ZUNION, ZINTER, ZDIFF, their STORE forms, ZINTERCARD) and
 > ZRANGESTORE are **same-slot only**, and for the STORE forms the rule
@@ -824,12 +824,15 @@ acquire included.
 
 ## Blocking commands (ADR-0052)
 
-`BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`, `BZPOPMIN` and `BZPOPMAX` block
-as in Redis: the reply is the first element any of the keys yields, in the
+`BLPOP`, `BRPOP`, `BLMPOP`, `BLMOVE`, `BRPOPLPUSH`, `BZPOPMIN`, `BZPOPMAX`
+and `BZMPOP` block as in Redis: the reply is the first element any of the
+keys yields (up to `COUNT` of them, for `BLMPOP` and `BZMPOP`), in the
 order they are given, or a null array at the timeout (`0` waits for ever).
-The keys of `BLPOP`, `BRPOP` and the sorted-set pops need not share a slot:
-the order is a priority across pairs, which is what Sidekiq's
-`BRPOP critical default low` relies on. `BLMOVE` and `BRPOPLPUSH` need their
+The keys of `BLPOP`, `BRPOP`, `BLMPOP` and the sorted-set pops need not
+share a slot: the order is a priority across pairs, which is what Sidekiq's
+`BRPOP critical default low` relies on. Their non-blocking forms with
+several keys, `LMPOP` and `ZMPOP`, do: the keys must share a slot, as in
+Redis Cluster. `BLMOVE` and `BRPOPLPUSH` need their
 two keys in one slot, as `LMOVE` does, except on a tenant placed on one pair.
 
 The wait happens at the proxy, never on a seat, so a blocked client holds no

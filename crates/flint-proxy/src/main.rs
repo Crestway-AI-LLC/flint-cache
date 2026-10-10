@@ -1721,6 +1721,11 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
             resp3: Box::new(v),
         };
     }
+    // ZMPOP's pairs stay nested in RESP2 too, where the decoder read them
+    // as a scored result, which RESP2 would interleave.
+    if flint_resp::zmpop_reply(args) {
+        return flint_resp::zmpop_nested(&v);
+    }
     // A one-field BF.INFO is a one-pair map under RESP3 and the bare value
     // in a one-element array under RESP2; flattening the map would give
     // two elements (BUG-0239).
@@ -1753,6 +1758,7 @@ fn needs_repair(args: &[Vec<u8>]) -> bool {
         .is_some_and(|n| flint_resp::resp3_nests_reply(n) || flint_resp::resp3_differs_in_kind(n))
         || flint_resp::bf_info_field(args)
         || flint_resp::hrandfield_withvalues(args)
+        || flint_resp::zmpop_reply(args)
         || is_xread(args)
 }
 
@@ -3850,6 +3856,8 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
                 | b"BZPOPMAX"
                 | b"BLMOVE"
                 | b"BRPOPLPUSH"
+                | b"BLMPOP"
+                | b"BZMPOP"
         )
     {
         return false;
@@ -5151,9 +5159,9 @@ impl Idle for Sleep {
 const BLOCK_POLL_FIRST: Duration = Duration::from_millis(1);
 const BLOCK_POLL_MAX: Duration = Duration::from_millis(20);
 
-/// `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BLMOVE`, `BRPOPLPUSH`: the
-/// client waits here, at the proxy, and no seat ever holds a connection or
-/// a thread for it (ADR-0052 D4).
+/// `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BLMOVE`, `BRPOPLPUSH`,
+/// `BLMPOP`, `BZMPOP`: the client waits here, at the proxy, and no seat ever
+/// holds a connection or a thread for it (ADR-0052 D4).
 ///
 /// A round is one attempt per key, in the caller's order, each the command's
 /// non-blocking form for that one key on the pair that owns it, as a seat
@@ -5161,9 +5169,12 @@ const BLOCK_POLL_MAX: Duration = Duration::from_millis(20);
 /// so the keys' order is a priority, as in Redis (Sidekiq's
 /// `BRPOP critical default low`), and keys on different pairs need no hash
 /// tag. A move has one source and is one attempt; the seat refuses a
-/// cross-slot one, except a placed tenant's (ADR-0053). The first round's
-/// attempts carry the command's own timeout, so the seat checks the
-/// arguments and any error returns at once.
+/// cross-slot one, except a placed tenant's (ADR-0053). BLMPOP and BZMPOP
+/// put their timeout first and a count before their keys: each attempt is
+/// `BLMPOP timeout 1 key` and the direction and COUNT that follow, and one
+/// whose count does not parse is one attempt, which the seat refuses. The
+/// first round's attempts carry the command's own timeout, so the seat
+/// checks the arguments and any error returns at once.
 ///
 /// Between rounds the wait doubles from `BLOCK_POLL_FIRST` to
 /// `BLOCK_POLL_MAX`. At the timeout, or when the client leaves, the reply is
@@ -5180,7 +5191,29 @@ async fn blocking_pop(
 ) -> Value {
     let name = args[0].to_ascii_uppercase();
     let moves = matches!(name.as_slice(), b"BLMOVE" | b"BRPOPLPUSH");
-    let attempts: Vec<(Vec<Vec<u8>>, Vec<u8>)> = if moves || args.len() <= 3 {
+    let mpop = matches!(name.as_slice(), b"BLMPOP" | b"BZMPOP");
+    // BLMPOP's keys: the count at args[2] when it parses and names keys
+    // that are there, with the direction after them.
+    let mpop_keys = mpop
+        .then(|| {
+            std::str::from_utf8(args.get(2)?)
+                .ok()?
+                .parse::<usize>()
+                .ok()
+        })
+        .flatten()
+        .filter(|&n| n > 1 && 3 + n < args.len());
+    let attempts: Vec<(Vec<Vec<u8>>, Vec<u8>)> = if let Some(n) = mpop_keys {
+        args[3..3 + n]
+            .iter()
+            .map(|k| {
+                let mut one = vec![args[0].clone(), args[1].clone(), b"1".to_vec(), k.clone()];
+                one.extend(args[3 + n..].iter().cloned());
+                let frame = encode_cmd(&one.iter().map(Vec::as_slice).collect::<Vec<_>>());
+                (one, frame)
+            })
+            .collect()
+    } else if moves || mpop || args.len() <= 3 {
         vec![(args.to_vec(), raw.to_vec())]
     } else {
         let timeout = &args[args.len() - 1];
@@ -5203,9 +5236,10 @@ async fn blocking_pop(
             }
         }
         // Every attempt missed, so the seat accepted the arguments and the
-        // timeout parses; 0 waits for ever.
-        let secs = args
-            .last()
+        // timeout parses; 0 waits for ever. BLMPOP's and BZMPOP's comes
+        // first, every other pop's last.
+        let timeout = if mpop { args.get(1) } else { args.last() };
+        let secs = timeout
             .and_then(|t| std::str::from_utf8(t).ok())
             .and_then(|t| t.parse::<f64>().ok())
             .unwrap_or(0.0);
@@ -7736,6 +7770,22 @@ mod repair_tests {
         let added = repair_reply(&args(&[b"BF.ADD", b"k", b"x"]), Value::Boolean(true));
         assert_eq!(wire(&added, Proto::Resp2), b":1\r\n");
         assert_eq!(wire(&added, Proto::Resp3), b"#t\r\n");
+
+        // ZMPOP's pairs decoded from the seat's RESP3 as a scored result;
+        // repaired, they stay nested in RESP2, as Redis sends them.
+        let popped = Value::Array(Some(vec![
+            Value::Bulk(Some(b"z".to_vec())),
+            Value::ScorePairs(vec![(b"m".to_vec(), 1.5)]),
+        ]));
+        let z = repair_reply(&args(&[b"BZMPOP", b"0", b"1", b"z", b"MIN"]), popped);
+        assert_eq!(
+            wire(&z, Proto::Resp2),
+            b"*2\r\n$1\r\nz\r\n*1\r\n*2\r\n$1\r\nm\r\n$3\r\n1.5\r\n"
+        );
+        assert_eq!(
+            wire(&z, Proto::Resp3),
+            b"*2\r\n$1\r\nz\r\n*1\r\n*2\r\n$1\r\nm\r\n,1.5\r\n"
+        );
     }
 
     /// BUG-0242: inside EXEC, each queued command's item takes the repair

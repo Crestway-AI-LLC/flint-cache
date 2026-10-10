@@ -5360,7 +5360,8 @@ fn apply_inline(store: &dyn Kv, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
 /// - JSON.MSET naming more than one key (ADR-0055);
 /// - RENAME, RENAMENX, COPY, LMOVE, RPOPLPUSH, BLMOVE, BRPOPLPUSH, when
 ///   source and destination differ (the same key is one key);
-/// - BLPOP, BRPOP, BZPOPMIN, BZPOPMAX of more than one key;
+/// - BLPOP, BRPOP, BZPOPMIN, BZPOPMAX of more than one key, and LMPOP,
+///   ZMPOP, BLMPOP, BZMPOP whose count is not 1 (a malformed one too);
 /// - a script declaring more than one key (ADR-0051).
 fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
     let two_keys = || args.len() > 2 && args[1] != args[2];
@@ -5373,6 +5374,10 @@ fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
         // A pop from the first of several keys that holds an element: any
         // of them may be written (ADR-0052 D4).
         b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" => args.len() > 3,
+        // Likewise LMPOP and ZMPOP naming more than one key after their
+        // count, and their blocking forms, whose count follows a timeout.
+        b"LMPOP" | b"ZMPOP" => args.get(1).is_some_and(|n| n.as_slice() != b"1"),
+        b"BLMPOP" | b"BZMPOP" => args.get(2).is_some_and(|n| n.as_slice() != b"1"),
         b"EVAL" | b"EVALSHA" => flint_commands::eval_keys(args).is_some_and(|k| k.len() > 1),
         _ => false,
     }
@@ -11136,6 +11141,10 @@ mod every_writer_predicate {
             &["BRPOPLPUSH", "{t}a", "{t}b", "0"],
             &["BLPOP", "{t}a", "{t}b", "0"],
             &["BZPOPMAX", "{t}a", "{t}b", "0"],
+            &["LMPOP", "2", "{t}a", "{t}b", "LEFT"],
+            &["ZMPOP", "2", "{t}a", "{t}b", "MIN"],
+            &["BLMPOP", "0", "2", "{t}a", "{t}b", "RIGHT"],
+            &["BZMPOP", "0", "2", "{t}a", "{t}b", "MAX"],
             &["MSET", "a", "1", "b", "2"],
             &["JSON.MSET", "{t}a", "$", "1", "{t}b", "$", "2"],
             &["DEL", "a", "b"],
@@ -11155,6 +11164,8 @@ mod every_writer_predicate {
             &["LMOVE", "q", "q", "RIGHT", "LEFT"],
             &["BLPOP", "q", "0"],
             &["BZPOPMIN", "q", "0"],
+            &["LMPOP", "1", "q", "LEFT"],
+            &["BZMPOP", "0", "1", "q", "MIN"],
             &["MSET", "a", "1"],
             &["JSON.MSET", "a", "$", "1"],
             &["JSON.MSET", "a", "$.x", "1", "a", "$.y", "2"],

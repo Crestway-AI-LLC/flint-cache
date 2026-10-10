@@ -1044,6 +1044,83 @@ fn corpus() -> Vec<Case> {
         },
         large_strings(),
         hyperloglog(),
+        // LMPOP and ZMPOP, and their blocking forms, which a seat answers
+        // at once and the proxy makes wait (ADR-0052 D4); against Valkey 9.1
+        // and Redis 8.2 (both checked), in both protocols.
+        Case {
+            family: "lists",
+            name: "LMPOP, BLMPOP, ZMPOP, BZMPOP",
+            steps: vec![
+                s(&[b"RPUSH", b"{p}l1", b"a", b"b", b"c"], Expect::Int(3)),
+                s(&[b"RPUSH", b"{p}l2", b"x", b"y", b"z", b"w"], Expect::Int(4)),
+                s(
+                    &[b"LMPOP", b"2", b"{p}none", b"{p}l1", b"LEFT"],
+                    Expect::Arr(vec![Expect::Str(b"{p}l1"), Expect::Arr(vec![Expect::Str(b"a")])]),
+                ),
+                s(
+                    &[b"LMPOP", b"2", b"{p}l1", b"{p}l2", b"RIGHT", b"COUNT", b"5"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"{p}l1"),
+                        Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"b")]),
+                    ]),
+                ),
+                s(&[b"LMPOP", b"1", b"{p}l1", b"LEFT"], Expect::NilArray),
+                s(
+                    &[b"BLMPOP", b"1", b"1", b"{p}l2", b"left", b"count", b"2"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"{p}l2"),
+                        Expect::Arr(vec![Expect::Str(b"x"), Expect::Str(b"y")]),
+                    ]),
+                ),
+                s(&[b"BLMPOP", b"0.01", b"1", b"{p}none", b"LEFT"], Expect::NilArray),
+                s(&[b"ZADD", b"{p}z", b"1", b"a", b"2", b"b", b"3", b"c"], Expect::Int(3)),
+                s(
+                    &[b"ZMPOP", b"2", b"{p}none", b"{p}z", b"MIN"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"{p}z"),
+                        Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]),
+                    ]),
+                ),
+                s(
+                    &[b"BZMPOP", b"1", b"1", b"{p}z", b"MAX", b"COUNT", b"5"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"{p}z"),
+                        Expect::Arr(vec![
+                            Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"3")]),
+                            Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"2")]),
+                        ]),
+                    ]),
+                ),
+                s(&[b"ZMPOP", b"1", b"{p}z", b"MIN"], Expect::NilArray),
+                // Errors, in upstream's words and order.
+                s(&[b"LMPOP", b"1", b"{p}l1"], Expect::Err("ERR wrong number of arguments for 'lmpop' command")),
+                s(&[b"LMPOP", b"0", b"{p}l1", b"LEFT"], Expect::Err("ERR numkeys should be greater than 0")),
+                s(&[b"LMPOP", b"x", b"{p}l1", b"LEFT"], Expect::Err("ERR numkeys should be greater than 0")),
+                s(&[b"LMPOP", b"3", b"{p}l1", b"LEFT"], Expect::Err("ERR syntax error")),
+                s(&[b"LMPOP", b"1", b"{p}l1", b"UP"], Expect::Err("ERR syntax error")),
+                s(&[b"LMPOP", b"1", b"{p}l1", b"LEFT", b"COUNT", b"0"], Expect::Err("ERR count should be greater than 0")),
+                s(&[b"LMPOP", b"1", b"{p}l1", b"LEFT", b"COUNT", b"1", b"COUNT", b"2"], Expect::Err("ERR syntax error")),
+                s(&[b"ZMPOP", b"1", b"{p}z", b"MID"], Expect::Err("ERR syntax error")),
+                s(&[b"BLMPOP", b"x", b"1", b"{p}l2", b"LEFT"], Expect::Err("ERR timeout is not a float or out of range")),
+                s(&[b"BLMPOP", b"-1", b"1", b"{p}l2", b"LEFT"], Expect::Err("ERR timeout is negative")),
+                // The timeout is checked last, after the count (BLPOP's first).
+                s(
+                    &[b"BLMPOP", b"-1", b"1", b"{p}l2", b"LEFT", b"COUNT", b"0"],
+                    Expect::Err("ERR count should be greater than 0"),
+                ),
+                s(&[b"BLMPOP", b"1", b"0", b"{p}l2", b"LEFT"], Expect::Err("ERR numkeys should be greater than 0")),
+                s(&[b"BZMPOP", b"1", b"1", b"{p}l2", b"UP"], Expect::Err("ERR syntax error")),
+                s(&[b"SET", b"{p}str", b"v"], Expect::Ok),
+                s(
+                    &[b"LMPOP", b"1", b"{p}str", b"LEFT"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+                s(
+                    &[b"ZMPOP", b"1", b"{p}l2", b"MIN"],
+                    Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                ),
+            ],
+        },
         // The sorted-set algebra that answers instead of storing, ZDIFF's
         // store, the cardinality forms and ZRANGESTORE, against Valkey 9.1
         // and Redis 8.2 (both checked).
@@ -7017,6 +7094,12 @@ impl Client {
         // HRANDFIELD ... WITHVALUES nests its pairs under RESP3.
         let v = match flint_resp::hrandfield_withvalues(args) {
             true => flint_resp::flatten_pairs(&v),
+            false => v,
+        };
+        // ZMPOP's pairs are nested in both protocols, where the decoder
+        // reads RESP3's as a scored result.
+        let v = match flint_resp::zmpop_reply(args) {
+            true => flint_resp::zmpop_nested(&v),
             false => v,
         };
         // A one-field BF.INFO is a one-pair map under RESP3; RESP2's reply

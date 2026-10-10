@@ -56,19 +56,21 @@ pub fn never_grows(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"PFCOUNT")
 }
 
-/// The first key of a command whose keys follow a count at `args[1]`
-/// (`ZUNION numkeys key ...`, and ZINTER, ZDIFF, ZINTERCARD, SINTERCARD):
+/// The first key of a command whose keys follow a count: at `args[1]`
+/// (`ZUNION numkeys key ...`, and ZINTER, ZDIFF, ZINTERCARD, SINTERCARD,
+/// LMPOP, ZMPOP), or at `args[2]` after a timeout (BLMPOP, BZMPOP).
 /// `Some(key)` for those, the key absent when the count is all there is;
 /// `None` for every other command. It is what such a command routes by,
-/// and the slot its keys must share: `args[1]` is the count, and read as a
-/// key it would name a slot nothing was asked of.
+/// and the slot its keys must share: read as a key, the count would name a
+/// slot nothing was asked of.
 pub fn numkeys_key(args: &[Vec<u8>]) -> Option<Option<&[u8]>> {
     let name = args.first()?.to_ascii_uppercase();
-    matches!(
-        name.as_slice(),
-        b"ZUNION" | b"ZINTER" | b"ZDIFF" | b"ZINTERCARD" | b"SINTERCARD"
-    )
-    .then(|| args.get(2).map(|k| k.as_slice()))
+    let at = match name.as_slice() {
+        b"ZUNION" | b"ZINTER" | b"ZDIFF" | b"ZINTERCARD" | b"SINTERCARD" | b"LMPOP" | b"ZMPOP" => 2,
+        b"BLMPOP" | b"BZMPOP" => 3,
+        _ => return None,
+    };
+    Some(args.get(at).map(|k| k.as_slice()))
 }
 
 /// The blocking pops (ADR-0052 D4). A seat answers each without waiting, as
@@ -77,7 +79,14 @@ pub fn numkeys_key(args: &[Vec<u8>]) -> Option<Option<&[u8]>> {
 pub fn is_blocking_command(name: &[u8]) -> bool {
     matches!(
         name.to_ascii_uppercase().as_slice(),
-        b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" | b"BLMOVE" | b"BRPOPLPUSH"
+        b"BLPOP"
+            | b"BRPOP"
+            | b"BZPOPMIN"
+            | b"BZPOPMAX"
+            | b"BLMOVE"
+            | b"BRPOPLPUSH"
+            | b"BLMPOP"
+            | b"BZMPOP"
     )
 }
 
@@ -158,6 +167,11 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"ZINTERSTORE"
             | b"ZDIFFSTORE"
             | b"ZRANGESTORE"
+            // A pop from the first of several keys that holds anything.
+            | b"LMPOP"
+            | b"ZMPOP"
+            | b"BLMPOP"
+            | b"BZMPOP"
             | b"SINTERSTORE"
             | b"SUNIONSTORE"
             | b"SDIFFSTORE"

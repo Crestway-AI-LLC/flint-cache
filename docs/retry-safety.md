@@ -97,7 +97,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `APPEND` `JSON.ARRAPPEND` `JSON.STRAPPEND` | Double-appends. |
 | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` | Double-pushes. |
 | `LINSERT` `JSON.ARRINSERT` | Double-inserts: `a b` becomes `a x x b`. |
-| `LPOP` `RPOP` `SPOP` `ZPOPMIN` `ZPOPMAX` `BLPOP` `BRPOP` `BZPOPMIN` `BZPOPMAX` `JSON.ARRPOP` | Destroys an EXTRA element — silent data loss. `SPOP` on `{a,b,c}` returns `c`, then the retry returns `b` and two members are gone. |
+| `LPOP` `RPOP` `SPOP` `ZPOPMIN` `ZPOPMAX` `BLPOP` `BRPOP` `BZPOPMIN` `BZPOPMAX` `LMPOP` `ZMPOP` `BLMPOP` `BZMPOP` `JSON.ARRPOP` | Destroys an EXTRA element — silent data loss. `SPOP` on `{a,b,c}` returns `c`, then the retry returns `b` and two members are gone. |
 | `LMOVE` `RPOPLPUSH` `BLMOVE` `BRPOPLPUSH` | Moves an EXTRA element. A worker taking one job from a queue takes two, and the reply names only the second, so the first sits in the destination list unclaimed. On one list (a rotation) it rotates twice. |
 | `LTRIM` `ZREMRANGEBYRANK` `LREM key <n≠0> m` `JSON.ARRTRIM` | Position- or count-addressed, so the retry cuts a DIFFERENT set. `LTRIM 1 2` twice on `a b c d` leaves `c`. Also silent data loss. |
 | `JSON.TOGGLE` | The retry flips the value back. The toggle the caller was told about is undone, and the second reply names the value it started from. |

@@ -1105,6 +1105,10 @@ impl<'a> Dispatcher<'a> {
                     Err(e) => e,
                 }
             }),
+            b"LMPOP" => self.cmd_mpop(args, "lmpop", false, false),
+            b"ZMPOP" => self.cmd_mpop(args, "zmpop", true, false),
+            b"BLMPOP" => self.cmd_mpop(args, "blmpop", false, true),
+            b"BZMPOP" => self.cmd_mpop(args, "bzmpop", true, true),
             b"BLPOP" => self.cmd_bpop(args, "blpop", false, false),
             b"BRPOP" => self.cmd_bpop(args, "brpop", false, true),
             b"BZPOPMIN" => self.cmd_bpop(args, "bzpopmin", true, false),
@@ -1893,6 +1897,85 @@ impl<'a> Dispatcher<'a> {
                     Err(e) => return store_err(e),
                 }
             }
+        }
+        Value::Array(None)
+    }
+
+    /// `LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT n]` and `ZMPOP ...
+    /// MIN|MAX [COUNT n]`: up to `n` elements from the first key that holds
+    /// any, as `[key, elements]` (ZMPOP's as `[member, score]` pairs, in
+    /// either protocol), or a null array. BLMPOP and BZMPOP take a timeout
+    /// first, and a seat answers them without waiting, as Redis does inside
+    /// MULTI; the proxy makes the client wait (ADR-0052 D4).
+    ///
+    /// In upstream's order of checks: the count of keys, the direction, the
+    /// options, and only then the timeout (BLPOP checks its timeout first;
+    /// these do not); then each key's type as it is reached, so a key after
+    /// the one popped is never looked at.
+    fn cmd_mpop(&self, args: &[Vec<u8>], name: &str, zset: bool, blocking: bool) -> Value {
+        let nk = if blocking { 2 } else { 1 };
+        if args.len() < nk + 3 {
+            return arity_err(name);
+        }
+        let numkeys = match parse_i64(&args[nk]) {
+            Ok(n) if n >= 1 => n as usize,
+            _ => return err("ERR numkeys should be greater than 0"),
+        };
+        let Some(at) = numkeys.checked_add(nk + 1).filter(|&at| at < args.len()) else {
+            return err("ERR syntax error");
+        };
+        let end = match (zset, args[at].to_ascii_uppercase().as_slice()) {
+            (false, b"LEFT") | (true, b"MIN") => false,
+            (false, b"RIGHT") | (true, b"MAX") => true,
+            _ => return err("ERR syntax error"),
+        };
+        let mut count = None;
+        let mut j = at + 1;
+        while j < args.len() {
+            if count.is_none() && args[j].eq_ignore_ascii_case(b"COUNT") && j + 1 < args.len() {
+                match parse_i64(&args[j + 1]) {
+                    Ok(n) if n >= 1 => count = Some(n as u64),
+                    _ => return err("ERR count should be greater than 0"),
+                }
+                j += 2;
+            } else {
+                return err("ERR syntax error");
+            }
+        }
+        let count = count.unwrap_or(1);
+        if blocking && let Err(e) = parse_block_timeout(&args[1]) {
+            return e;
+        }
+        let keys = &args[nk + 1..at];
+        if let Some(refusal) = Self::crossslot(&keys[0], &keys[1..]) {
+            return refusal;
+        }
+        for k in keys {
+            let slot = slot_for_key(k);
+            let popped = if zset {
+                match self.zsets.zpop(slot, k, count as usize, end) {
+                    Ok(pairs) if pairs.is_empty() => continue,
+                    Ok(pairs) => pairs
+                        .into_iter()
+                        .map(|(m, score)| {
+                            Value::Array(Some(vec![Value::Bulk(Some(m)), Value::Double(score)]))
+                        })
+                        .collect(),
+                    Err(e) => return store_err(e),
+                }
+            } else {
+                match self.lists.pop_n(slot, k, count, !end) {
+                    Ok(Some(elems)) if !elems.is_empty() => {
+                        elems.into_iter().map(|e| Value::Bulk(Some(e))).collect()
+                    }
+                    Ok(_) => continue,
+                    Err(e) => return store_err(e),
+                }
+            };
+            return Value::Array(Some(vec![
+                Value::Bulk(Some(k.clone())),
+                Value::Array(Some(popped)),
+            ]));
         }
         Value::Array(None)
     }
@@ -5676,6 +5759,53 @@ mod tests {
         assert_eq!(
             flint_commands::numkeys_key(&c(&["ZUNIONSTORE", "d", "1", "k"])),
             None
+        );
+    }
+
+    /// LMPOP and ZMPOP name their keys after a count, BLMPOP and BZMPOP
+    /// after a timeout and a count: the key that routes, locks and owns the
+    /// slot is the first of them; they keep to one slot, at queue time in
+    /// MULTI too; and a seat answers the blocking forms at once.
+    #[test]
+    fn the_multi_pops_key_on_their_first_key_and_keep_to_one_slot() {
+        let c = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+        };
+        assert_eq!(
+            command_key(&c(&["LMPOP", "2", "{t}a", "{t}b", "LEFT"])),
+            Some(&b"{t}a"[..])
+        );
+        assert_eq!(
+            command_key(&c(&["BZMPOP", "0", "1", "{t}a", "MIN"])),
+            Some(&b"{t}a"[..])
+        );
+        for name in ["LMPOP", "ZMPOP", "BLMPOP", "BZMPOP"] {
+            assert!(flint_commands::is_write_command(name.as_bytes()), "{name}");
+            assert_eq!(
+                flint_commands::is_blocking_command(name.as_bytes()),
+                name.starts_with('B')
+            );
+            let dir = if name.contains('Z') { "MIN" } else { "LEFT" };
+            let mut cross = c(&[name]);
+            if name.starts_with('B') {
+                cross.push(b"0".to_vec());
+            }
+            cross.extend(c(&["2", "a", "b", dir]));
+            assert!(queue_time_error(&cross, false).is_some(), "{name} in MULTI");
+        }
+        let s = MemKv::new();
+        call(&s, &[b"RPUSH", b"{t}a", b"x"]);
+        // At once, and the element.
+        assert_eq!(
+            call(&s, &[b"BLMPOP", b"0", b"2", b"{t}none", b"{t}a", b"LEFT"]),
+            Value::Array(Some(vec![
+                Value::Bulk(Some(b"{t}a".to_vec())),
+                Value::Array(Some(vec![Value::Bulk(Some(b"x".to_vec()))])),
+            ]))
+        );
+        assert_eq!(
+            call(&s, &[b"BLMPOP", b"0", b"1", b"{t}a", b"LEFT"]),
+            Value::Array(None)
         );
     }
 

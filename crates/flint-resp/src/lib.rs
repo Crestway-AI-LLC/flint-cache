@@ -213,7 +213,8 @@ pub fn fmt_double(s: f64) -> Vec<u8> {
 /// rather than a null bulk. RESP3 has one null, `_`, and the proxy reads
 /// seats in RESP3, so it needs this to give a RESP2 client the null Redis
 /// sends:
-/// - BLPOP, BRPOP, BZPOPMIN and BZPOPMAX, in any form;
+/// - BLPOP, BRPOP, BZPOPMIN and BZPOPMAX, in any form, and LMPOP, ZMPOP,
+///   BLMPOP and BZMPOP;
 /// - LPOP and RPOP with a count, and ZRANK and ZREVRANK with WITHSCORE
 ///   (BUG-0215).
 pub fn null_is_array(args: &[Vec<u8>]) -> bool {
@@ -225,6 +226,10 @@ pub fn null_is_array(args: &[Vec<u8>]) -> bool {
         || is(b"BRPOP")
         || is(b"BZPOPMIN")
         || is(b"BZPOPMAX")
+        || is(b"LMPOP")
+        || is(b"ZMPOP")
+        || is(b"BLMPOP")
+        || is(b"BZMPOP")
         || (is(b"LPOP") || is(b"RPOP")) && args.len() == 3
         || (is(b"ZRANK") || is(b"ZREVRANK")) && args.len() == 4
         // Streams (ADR-0052 D6): an XREAD that finds nothing, and an XRANGE
@@ -300,6 +305,40 @@ pub fn hrandfield_withvalues(args: &[Vec<u8>]) -> bool {
     args.len() == 4
         && args[0].eq_ignore_ascii_case(b"HRANDFIELD")
         && args[3].eq_ignore_ascii_case(b"WITHVALUES")
+}
+
+/// ZMPOP and BZMPOP, whose `[member, score]` pairs stay nested in RESP2 as
+/// well. The decoder reads RESP3 bulk+double pairs as a scored result
+/// ([`Value::ScorePairs`]), which RESP2 renders interleaved, so the command
+/// says these are pairs.
+pub fn zmpop_reply(args: &[Vec<u8>]) -> bool {
+    args.first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"ZMPOP") || n.eq_ignore_ascii_case(b"BZMPOP"))
+}
+
+/// A ZMPOP reply, `[key, pairs]`, with its pairs as nested arrays again,
+/// which encode as pairs in both protocols. Anything else is unchanged.
+pub fn zmpop_nested(v: &Value) -> Value {
+    match v {
+        Value::Array(Some(items)) => match items.as_slice() {
+            [key, Value::ScorePairs(pairs)] => Value::Array(Some(vec![
+                key.clone(),
+                Value::Array(Some(
+                    pairs
+                        .iter()
+                        .map(|(m, s)| {
+                            Value::Array(Some(vec![
+                                Value::Bulk(Some(m.clone())),
+                                Value::Double(*s),
+                            ]))
+                        })
+                        .collect(),
+                )),
+            ])),
+            _ => v.clone(),
+        },
+        _ => v.clone(),
+    }
 }
 
 /// The RESP2 spelling of a RESP3 array of pairs: interleaved. Anything else
@@ -896,6 +935,27 @@ fn parse_int(line: &[u8]) -> Result<i64, ProtocolError> {
 
 #[cfg(test)]
 mod tests {
+    /// ZMPOP's pairs decode from RESP3 as a scored result; rebuilt, they are
+    /// nested again, which RESP2 keeps, and its null is an array.
+    #[test]
+    fn zmpop_pairs_stay_nested_and_its_null_is_an_array() {
+        let decoded = Value::Array(Some(vec![
+            Value::Bulk(Some(b"z".to_vec())),
+            Value::ScorePairs(vec![(b"m".to_vec(), 1.5)]),
+        ]));
+        let args = [b"BZMPOP".to_vec()];
+        assert!(zmpop_reply(&args) && !zmpop_reply(&[b"ZPOPMIN".to_vec()]));
+        let mut out = Vec::new();
+        encode_proto(&zmpop_nested(&decoded), Proto::Resp2, &mut out);
+        assert_eq!(
+            out,
+            b"*2\r\n$1\r\nz\r\n*1\r\n*2\r\n$1\r\nm\r\n$3\r\n1.5\r\n"
+        );
+        for name in ["LMPOP", "zmpop", "BLMPOP", "BZMPOP"] {
+            assert!(null_is_array(&[name.as_bytes().to_vec()]), "{name}");
+        }
+    }
+
     #[test]
     fn a_decoded_resp3_scored_reply_flattens_for_a_resp2_client() {
         // The proxy's whole downgrade path in one assertion: decode the

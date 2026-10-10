@@ -534,6 +534,24 @@ def every_form():
     assert wire([["ZADD", "{q}z", "1.5", "w"], ["BZPOPMIN", "{q}z", "0"]], 0.3) == \
         b":1\r\n*3\r\n$4\r\n{q}z\r\n$1\r\nw\r\n$3\r\n1.5\r\n", "RESP2 wire"
 check("BLPOP, BLMOVE, BRPOPLPUSH, BZPOPMIN, BZPOPMAX", every_form)
+def multi_pops():
+    # LMPOP and ZMPOP name their keys after a count, and their blocking
+    # forms put the timeout first. A waiter is served from either pair.
+    for key in ("a", "b"):
+        r.delete("a", "b"); got = {}
+        th = threading.Thread(target=lambda: got.update(v=r.execute_command("BLMPOP", "0", "2", "a", "b", "LEFT", "COUNT", "2")), daemon=True)
+        th.start(); time.sleep(0.3); r2.rpush(key, "x", "y", "z"); th.join(10)
+        assert got.get("v") == [key, ["x", "y"]], f"{key}: {got.get('v')!r}"
+    r.delete("a", "b")
+    t = time.time(); got = r.execute_command("BLMPOP", "0.3", "2", "a", "b", "RIGHT"); el = time.time() - t
+    assert got is None and 0.29 <= el < 2, f"{got!r} after {el:.2f}s"
+    r.delete("{q}z"); r.zadd("{q}z", {"m": 1.5, "n": 2})
+    assert wire([["ZMPOP", "1", "{q}z", "MIN"], ["BZMPOP", "0", "1", "{q}z", "MAX", "COUNT", "5"], ["BLMPOP", "0.05", "1", "{q}none", "LEFT"]], 0.4) == \
+        b"*2\r\n$4\r\n{q}z\r\n*1\r\n*2\r\n$1\r\nm\r\n$3\r\n1.5\r\n" \
+        b"*2\r\n$4\r\n{q}z\r\n*1\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n*-1\r\n", "RESP2 wire: nested pairs, a null array"
+    assert wire([["MULTI"], ["BLMPOP", "0", "1", "{m}l", "LEFT"], ["BZMPOP", "0", "1", "{m}z", "MIN"], ["EXEC"]], 0.4) == \
+        b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n*-1\r\n*-1\r\n", "inside MULTI"
+check("LMPOP, ZMPOP, BLMPOP, BZMPOP: served from either pair, pairs nested, nulls arrays", multi_pops)
 def a_client_that_left():
     r.delete("gone")
     s = socket.create_connection(("127.0.0.1", PORT))
