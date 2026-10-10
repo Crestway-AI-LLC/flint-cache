@@ -156,6 +156,16 @@ case "$PROBE" in
     ;;
 esac
 echo "  the refusal describes the archive it refused from"
+# BUG-0252. And it is COUNTED, where the ops agent reads (FLINTINFO): the only
+# real WALGAP in the suite is the only place that wiring can be asserted.
+REFUSED=$(valkey-cli -p 6413 FLINTINFO | tr '\r' '\n' | sed -n 's/^wal_gap_refusals_total://p')
+case "$REFUSED" in
+  ''|0|*[!0-9]*)
+    echo "FAIL: B refused cursor $CURSOR, and its wal_gap_refusals_total is '$REFUSED'"
+    exit 1
+    ;;
+esac
+echo "  B counted the refusal (wal_gap_refusals_total $REFUSED)"
 
 # BUG-0143. THE PRECONDITION ABOVE IS ABOUT B, NOT ABOUT A, and the gap
 # between those two is the whole bug this block used to report.

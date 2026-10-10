@@ -1111,6 +1111,12 @@ static REPLICA_STALE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static MAX_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
 static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CONNS_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// WALGAP refusals this master has sent, to a streaming replica or to a
+/// rejoin's admission check (FLINTINFO `wal_gap_refusals_total`, BUG-0252).
+/// Each one sends a replica to its rewind or a full re-seed, and is logged
+/// with the WAL files a walk could see.
+#[cfg(feature = "rocks")]
+static WAL_GAP_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What a connection over the cap is told when it asks for anything but
 /// liveness: Redis's own reply at its `maxclients`, word for word.
@@ -6757,7 +6763,7 @@ fn flintinfo(
     // One read of the pair, so the two describe the same moment.
     let ews_ewb = engine_write_samples();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nconns_reserve_admitted:{cra}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\npubsub_links_cut_total:{plc}\r\nengine_write_busy_samples:{ewb}\r\nengine_write_samples:{ews}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\nuptime_ms:{upms}\r\n{lrs}",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\nwal_gap_refusals_total:{wgr}\r\nwal_walk_recovered_total:{wwr}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nconns_reserve_admitted:{cra}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\npubsub_links_cut_total:{plc}\r\nengine_write_busy_samples:{ewb}\r\nengine_write_samples:{ews}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\nuptime_ms:{upms}\r\n{lrs}",
         if read_only { "replica" } else { "master" },
         hub.live_replica_count(now),
         soft = hub.lag_soft_ms(),
@@ -6841,6 +6847,14 @@ fn flintinfo(
         lmg = LAG_MAX_GAP.load(Ordering::Relaxed),
         wfm = WAL_FSYNC_MS.load(Ordering::Relaxed),
         wft = rocks.as_ref().map(|kv| kv.wal_fsync_total()).unwrap_or(0),
+        // BUG-0252. A rise in refusals is a replica sent to its rewind; a
+        // rise in recovered walks is the false gap that verdict guards
+        // against, caught. The seat log has the line with the WAL's files.
+        wgr = WAL_GAP_REFUSALS.load(Ordering::Relaxed),
+        wwr = rocks
+            .as_ref()
+            .map(|kv| kv.wal_walk_recovered_total())
+            .unwrap_or(0),
         // NOT `UNKNOWN_NUMERIC`: this field is signed and genuinely negative
         // once a certificate has expired, so `-1` is a real reading.
         cdr = CERT_PATH
@@ -7258,6 +7272,12 @@ fn flintsync(
             Some(s) => s.describe(),
             None => "archive state could not be read on this node".to_string(),
         };
+        // Counted and logged as the stream's refusals are (BUG-0252).
+        WAL_GAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "rejoin refused at seq {cursor}: WALGAP {why} ({held}; {})",
+            kv.wal_files_note()
+        );
         let mut out = Vec::new();
         encode(
             &Value::Error(format!(
@@ -7427,6 +7447,7 @@ fn flintsync(
                     // The master's own record of it: the replica prints the
                     // refusal as its FATAL, and this side used to say nothing
                     // (BUG-0252).
+                    WAL_GAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "replica refused at seq {cursor}: WALGAP {e} ({held}; {})",
                         kv.wal_files_note()

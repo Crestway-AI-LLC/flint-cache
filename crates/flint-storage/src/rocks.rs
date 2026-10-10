@@ -65,6 +65,8 @@ pub struct RocksKv {
     path: std::path::PathBuf,
     /// Completed WAL fsyncs (the bounded-cadence durability tick).
     wal_fsyncs: std::sync::atomic::AtomicU64,
+    /// WAL walks that saw a gap a re-walk did not (BUG-0252).
+    wal_walks_recovered: std::sync::atomic::AtomicU64,
     /// Capacity-eviction state (OPS-ADR-0023 D7). Shared with the compaction
     /// filter, which is the only thing that acts on it.
     eviction: std::sync::Arc<crate::eviction::EvictionState>,
@@ -483,6 +485,7 @@ impl RocksKv {
             db: DB::open_for_read_only(&opts, path, false)?,
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
+            wal_walks_recovered: std::sync::atomic::AtomicU64::new(0),
             // No compaction filter is installed on a read-only open, so
             // nothing here can act. Present so the type is one type.
             eviction: std::sync::Arc::new(crate::eviction::EvictionState::default()),
@@ -688,6 +691,7 @@ impl RocksKv {
             db: DB::open(&opts, path)?,
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
+            wal_walks_recovered: std::sync::atomic::AtomicU64::new(0),
             eviction,
             bytes_per_seq: std::sync::atomic::AtomicU64::new(0),
         })
@@ -774,6 +778,20 @@ impl RocksKv {
     /// Completed WAL fsync ticks (FLINTINFO `wal_fsync_total:`).
     pub fn wal_fsync_total(&self) -> u64 {
         self.wal_fsyncs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// WAL walks that saw a gap a re-walk did not, and were served
+    /// (FLINTINFO `wal_walk_recovered_total:`, BUG-0252). Any rise is the
+    /// transient that verdict guards against, caught; the seat's log has
+    /// the line with what the WAL held.
+    pub fn wal_walk_recovered_total(&self) -> u64 {
+        self.wal_walks_recovered
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_wal_walk_recovered(&self) {
+        self.wal_walks_recovered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Create a RocksDB checkpoint (hard-linked consistent copy) at `path`.

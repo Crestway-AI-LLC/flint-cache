@@ -822,6 +822,14 @@ From each seat, `flint_pubsub_links_cut_total` counts proxy links it cut off
 the proxy dials again. Each cut-off is also logged, at the end that made it,
 with "32 MiB behind" in the line.
 
+**WAL gaps** (BUG-0252). From each seat, `flint_wal_gap_refusals_total`
+counts the WALGAP refusals it sent as a master, to a streaming replica or to a
+rejoin; each sends a replica to its rewind or to a full re-seed.
+`flint_wal_walk_recovered_total` counts WAL walks that saw a gap which a walk
+a moment later did not, and that were served rather than refused. Each is also
+logged with the newest live and archived WAL files: "replica refused at seq",
+"rejoin refused at seq", and "saw a gap that a re-walk did not".
+
 **Numeric is the whole filter, so a field that cannot be known still renders a
 number** (BUG-0095): `acked_seq`, `seq_lag` and `lag_ms` read **`-1`** when no
 replica is live, and `cert_days_remaining` reads **`-99999`** when no

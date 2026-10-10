@@ -285,8 +285,10 @@ impl RocksKv {
             walk
         });
         if let Some(why) = recovered {
-            // Rare, and the evidence that this path is needed: one line per
-            // recovered walk.
+            // Rare, and the evidence that this path is needed: counted where
+            // the ops agent reads (FLINTINFO), and one line per recovered
+            // walk with what the WAL held.
+            self.note_wal_walk_recovered();
             eprintln!(
                 "WAL walk from seq {last_applied} saw a gap that a re-walk did not ({why}; {}): \
                  serving it (BUG-0252)",

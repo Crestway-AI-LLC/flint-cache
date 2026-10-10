@@ -67,5 +67,9 @@ change and is now served 4..=5, then 6..=8.
 - The 0031 branch asks `batch_covering`, and serves the covering batch
   when it ends where the offered span begins.
 - The master logs `replica refused at seq N: WALGAP ...`, with the same
-  file listing, when it sends one. It used to send the refusal and say
-  nothing, so the master's side of both playground exits was blank.
+  file listing, when it sends one, and `rejoin refused at seq N` for a
+  rejoin's admission check. It used to send the refusal and say nothing, so
+  the master's side of both playground exits was blank.
+- Both are counted where the ops agent reads, FLINTINFO
+  `wal_gap_refusals_total` and `wal_walk_recovered_total`: a rise in the
+  second after rc.82 says the transient was real and was caught.
