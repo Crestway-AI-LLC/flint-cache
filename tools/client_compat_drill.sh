@@ -599,25 +599,45 @@ def pubsub_round_trip(proto):
         got = [p.get_message(timeout=3) for _ in range(2)]
         assert [m and m["type"] for m in got] == ["subscribe", "psubscribe"], got
         # The publisher is another connection, through the same proxy.
-        assert r.publish("news", "hello") == 1
+        n = r.publish("news", "hello")
+        assert n == 1, f"PUBLISH after SUBSCRIBE counted {n}"
         m = p.get_message(timeout=3)
         assert m and (m["type"], m["channel"], m["data"]) == ("message", "news", "hello"), m
-        assert r.publish("ev:1", "x") == 1
+        n = r.publish("ev:1", "x")
+        assert n == 1, f"PUBLISH after PSUBSCRIBE counted {n}"
         m = p.get_message(timeout=3)
         assert m and (m["type"], m["pattern"], m["channel"]) == ("pmessage", "ev:*", "ev:1"), m
         assert [tuple(x) for x in r.pubsub_numsub("news")] == [("news", 1)], r.pubsub_numsub("news")
-        assert r.pubsub_numpat() == 1
+        assert r.pubsub_numpat() == 1, r.pubsub_numpat()
         p.unsubscribe("news")
         p.punsubscribe("ev:*")
         got = [p.get_message(timeout=3) for _ in range(2)]
         assert [m and m["type"] for m in got] == ["unsubscribe", "punsubscribe"], got
-        assert r.publish("news", "after") == 0
+        n = r.publish("news", "after")
+        assert n == 0, f"PUBLISH after UNSUBSCRIBE counted {n}"
         p.close()
         c.close()
     return run
+def unsubscribe_is_final():
+    # BUG-0253. Once a client reads its unsubscribe, a PUBLISH no longer
+    # counts it, as in Redis. The proxy answered before the masters had
+    # dropped it, so the count could still include it for a moment.
+    c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True)
+    p = c.pubsub()
+    for i in range(60):
+        ch = f"u{i}"
+        p.subscribe(ch)
+        assert p.get_message(timeout=3)["type"] == "subscribe"
+        p.unsubscribe(ch)
+        assert p.get_message(timeout=3)["type"] == "unsubscribe"
+        n = r.publish(ch, "late")
+        assert n == 0, f"round {i}: PUBLISH right after UNSUBSCRIBE counted {n}"
+    p.close()
+    c.close()
 check("redis-py PubSub, RESP2: subscribe, message, pattern, PUBSUB, unsubscribe",
       pubsub_round_trip(2))
 check("redis-py PubSub, RESP3 (pushes)", pubsub_round_trip(3))
+check("an UNSUBSCRIBE is final: a PUBLISH after it no longer counts the client", unsubscribe_is_final)
 def pubsub_tenants_apart():
     j = redis.Redis(host="127.0.0.1", port=PORT, password="tok-jobs", decode_responses=True)
     pj, pa = j.pubsub(), r.pubsub()

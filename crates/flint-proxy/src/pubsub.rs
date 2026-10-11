@@ -21,9 +21,11 @@
 //!   proxy's subscriptions back on the next connection. Messages published in
 //!   between are lost, as they are when a Redis client reconnects: delivery
 //!   is at most once.
-//! - **A subscribe is answered once it is registered.** A client is told it
-//!   is subscribed once every master reachable now holds the subscription,
-//!   so a message published after the reply reaches it.
+//! - **A subscribe or an unsubscribe is answered once it is registered.** A
+//!   client is told it is subscribed once every master reachable now holds
+//!   the subscription, so a message published after the reply reaches it;
+//!   and that it is unsubscribed once they have dropped it, so a `PUBLISH`
+//!   after the reply no longer counts it, as in Redis (BUG-0253).
 //! - **A slow client is cut off, not buffered without bound**: past
 //!   [`CLIENT_LIMIT_BYTES`] queued, as Redis does with its default
 //!   `client-output-buffer-limit pubsub 32mb`.
@@ -41,6 +43,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::Topology;
+
+/// `FLINT_TEST_PUBSUB_SYNC_DELAY_MS` holds each link's registration of a
+/// change that long, so a drill can make BUG-0253's race certain: a reply
+/// that does not wait for the masters reaches the client first. Unset in
+/// production: nothing ships with it, and absent means no delay.
+static TEST_SYNC_DELAY: LazyLock<Option<Duration>> = LazyLock::new(|| {
+    std::env::var("FLINT_TEST_PUBSUB_SYNC_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+});
 
 /// What a client may queue before it is disconnected: Redis's default hard
 /// limit for a pub/sub client.
@@ -352,9 +365,11 @@ impl Hub {
         seq
     }
 
-    /// Client `id` no longer holds `names`. Nothing waits for the masters:
-    /// a message they still send for it is not handed to this client.
-    fn remove(&self, ns: &[u8], kind: Kind, names: &[Vec<u8>], id: u64) {
+    /// Client `id` no longer holds `names`. Answers the sequence number to
+    /// wait for ([`Hub::registered`]): an `UNSUBSCRIBE` waits, so a `PUBLISH`
+    /// after its reply no longer counts the client (BUG-0253); a connection
+    /// that closed has no one to answer and does not.
+    fn remove(&self, ns: &[u8], kind: Kind, names: &[Vec<u8>], id: u64) -> u64 {
         let mut st = self.lock();
         st.seq += 1;
         let st = &mut *st;
@@ -375,6 +390,7 @@ impl Hub {
         for l in st.links.values() {
             l.wake.notify_one();
         }
+        st.seq
     }
 
     /// Wait until every master that can be reached holds the changes up to
@@ -529,6 +545,9 @@ impl Hub {
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if need_sync {
+                if let Some(hold) = *TEST_SYNC_DELAY {
+                    tokio::time::sleep(hold).await;
+                }
                 need_sync = false;
                 let batch = self.with_link(addr, id, |st| {
                     let seq = st.seq;
@@ -836,8 +855,8 @@ impl Subscriber {
     }
 
     /// `UNSUBSCRIBE` or `PUNSUBSCRIBE`: of `names`, or of every one held
-    /// when none is named.
-    pub(crate) fn unsubscribe(&mut self, kind: Kind, names: &[Vec<u8>]) -> Vec<Value> {
+    /// when none is named, answered once the masters have dropped them.
+    pub(crate) async fn unsubscribe(&mut self, kind: Kind, names: &[Vec<u8>]) -> Vec<Value> {
         let names = if names.is_empty() {
             self.names(kind).all()
         } else {
@@ -855,7 +874,8 @@ impl Subscriber {
             frames.push(self.confirm(kind.unsubscribed(), Some(name)));
         }
         if !removed.is_empty() {
-            HUB.remove(&self.ns, kind, &removed, self.id);
+            let seq = HUB.remove(&self.ns, kind, &removed, self.id);
+            HUB.registered(seq).await;
         }
         frames
     }
@@ -951,13 +971,13 @@ mod tests {
             Value::Push(vec![bulk(b"psubscribe"), bulk(b"a*"), Value::Integer(3)])
         );
         // Not held: answered with the count unchanged.
-        let f = s.unsubscribe(Kind::Channel, &[b"zz".to_vec()]);
+        let f = s.unsubscribe(Kind::Channel, &[b"zz".to_vec()]).await;
         assert_eq!(
             f[0],
             Value::Push(vec![bulk(b"unsubscribe"), bulk(b"zz"), Value::Integer(3)])
         );
         // All, in the order subscribed.
-        let f = s.unsubscribe(Kind::Channel, &[]);
+        let f = s.unsubscribe(Kind::Channel, &[]).await;
         assert_eq!(
             f,
             vec![
@@ -965,7 +985,7 @@ mod tests {
                 Value::Push(vec![bulk(b"unsubscribe"), bulk(b"b"), Value::Integer(1)]),
             ]
         );
-        let f = s.unsubscribe(Kind::Channel, &[]);
+        let f = s.unsubscribe(Kind::Channel, &[]).await;
         assert_eq!(
             f,
             vec![Value::Push(vec![

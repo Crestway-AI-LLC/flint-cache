@@ -22,7 +22,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-pubsub- 6522 6523 6524 6525
+fleet_init $FLINT_DRILL_ROOT/flint-pubsub- 6522 6523 6524 6525 6526
 fleet_guard
 fleet_kill proxy; fleet_kill server; sleep 0.4
 
@@ -316,5 +316,49 @@ start_seat 6523 "$BDIR"
 echo back > "$BACK"
 wait $DRIVER || exit 1
 rm -f "$GO" "$BACK"
+
+# BUG-0253. AN UNSUBSCRIBE IS FINAL: once a client reads it, a PUBLISH no
+# longer counts it, as in Redis. The proxy answered before the masters had
+# dropped the subscription, which only a loaded box ever showed (one
+# client_compat failure in many gates). A third proxy holds each link's
+# registration 300 ms, which makes that race certain: the reply has to wait.
+FLINT_TEST_PUBSUB_SYNC_DELAY_MS=300 $PX --port 6526 --pairs "127.0.0.1:6522;127.0.0.1:6523" \
+  2>"${FLEET_SCOPE}proxy-6526.log" &
+fleet_wait_listen 6526
+python3 -I - <<'PY' || exit 1
+import socket, sys, time
+def conn():
+    s = socket.create_connection(("127.0.0.1", 6526)); s.settimeout(5); return s
+def cmd(s, *args):
+    out = b"*%d\r\n" % len(args)
+    for a in args:
+        a = a.encode()
+        out += b"$%d\r\n%s\r\n" % (len(a), a)
+    s.sendall(out)
+def read(s, until):
+    buf = b""
+    while until not in buf:
+        d = s.recv(65536)
+        if not d:
+            break
+        buf += d
+    return buf
+sub, pub = conn(), conn()
+for i in range(5):
+    ch = "final:%d" % i
+    t = time.time(); cmd(sub, "SUBSCRIBE", ch); read(sub, b":1\r\n"); took = time.time() - t
+    if took < 0.25:
+        print("FAIL: SUBSCRIBE answered in %.3f s with registration held 300 ms: the knob is off" % took); sys.exit(1)
+    cmd(pub, "PUBLISH", ch, "x")
+    if read(pub, b"\r\n") != b":1\r\n":
+        print("FAIL: PUBLISH after SUBSCRIBE did not count the subscriber"); sys.exit(1)
+    read(sub, b"x\r\n")
+    t = time.time(); cmd(sub, "UNSUBSCRIBE", ch); read(sub, b":0\r\n"); took = time.time() - t
+    cmd(pub, "PUBLISH", ch, "late")
+    got = read(pub, b"\r\n")
+    if got != b":0\r\n":
+        print("FAIL: PUBLISH right after UNSUBSCRIBE (answered in %.3f s) counted %r, where Redis counts 0" % (took, got)); sys.exit(1)
+print("  an UNSUBSCRIBE is answered once the masters dropped it: a PUBLISH after it counts 0")
+PY
 
 echo "PASS: every message once to every holder, across pairs, proxies, a transaction and a seat restart"

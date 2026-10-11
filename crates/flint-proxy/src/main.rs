@@ -2999,7 +2999,7 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
                             let mut frames = if on {
                                 sub.subscribe(kind, &args[1..]).await
                             } else {
-                                sub.unsubscribe(kind, &args[1..])
+                                sub.unsubscribe(kind, &args[1..]).await
                             };
                             let last = frames.pop().unwrap_or(Value::Null);
                             for f in &frames {
