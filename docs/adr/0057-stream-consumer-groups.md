@@ -1,0 +1,288 @@
+# ADR-0057: Stream consumer groups, with pending entries that survive a failover
+
+Status: **PROPOSED 2026-10-10**, for Jeff's approval before any code. Jeff,
+2026-10-10, approving the suggestion: write an ADR for consumer groups as
+the next large item, rolled out in two releases as ADR-0056 was.
+
+## Context
+
+Streams shipped on 2026-10-09 (ADR-0052 D6) without consumer groups.
+`XGROUP`, `XREADGROUP`, `XACK`, `XPENDING`, `XCLAIM`, `XAUTOCLAIM`, `XINFO`
+and `XSETID` answer `ERR unknown command`.
+
+Groups are the part of streams most applications use. A group hands each
+entry to one of its consumers and keeps it **pending** until that consumer
+acknowledges it. If the consumer dies, another one claims the entry. The
+pending entries list (PEL) is the at-least-once record of a queue. These are
+known to use groups, from their documentation; none is measured here:
+
+- Dapr's Redis pub/sub component;
+- Watermill's `redisstream`;
+- Spring Data Redis's `StreamMessageListenerContainer`;
+- Redpanda Connect's `redis_streams` input.
+
+**Why durability matters here.** Redis replicates asynchronously, so after a
+failover it can lose the most recent `XREADGROUP` and `XACK` effects:
+entries already delivered are delivered again, and acknowledged ones become
+pending again. The application sees duplicates. Flint already keeps every
+acknowledged `XADD`. With groups on the same write path, an acknowledged
+`XACK` stays acknowledged, and a delivered entry stays pending under the
+consumer that received it.
+
+**What a seat already has.** D6 was built with groups in mind.
+
+- The metadata row records the last ID, the largest deleted ID and the
+  number of entries ever added. These are Redis 7's inputs to a group's lag,
+  so groups need no change to the metadata format.
+- Entry rows lead with tag byte 0. D6 reserved other leading bytes for the
+  rows groups need.
+
+**Valkey 9.1 and Redis 8.2 differ.** Redis 8.2 adds `XACKDEL`, `XDELEX`, and
+`KEEPREF`, `DELREF` and `ACKED` on `XADD` and `XTRIM`. Valkey 9.1 has none
+of them (checked in both local binaries, 2026-10-10). Flint follows Valkey
+9.1, as it does for the rest of streams.
+
+**Observed on Valkey 9.1** (2026-10-10, on the laptop). The design must
+reproduce each of these:
+
+- An `XREADGROUP` that delivers nothing still creates its consumer and
+  stamps its seen time.
+- Reading history (any ID but `>`) answers at once, even with `BLOCK 2000`.
+  An entry deleted since its delivery comes back as its ID with nil fields.
+- A blocked `XREADGROUP` keeps the seen time of the call. After a 1 s block
+  that timed out, `XINFO CONSUMERS` showed the consumer idle for 1,066 ms.
+- A blocked `XREADGROUP` whose group is destroyed, or whose key is deleted,
+  answers the same `NOGROUP` error that a new call gets.
+
+## Decisions
+
+### D1. The commands: Valkey 9.1's set
+
+- `XGROUP`:
+  - `CREATE` (with `MKSTREAM` and `ENTRIESREAD`);
+  - `SETID` (with `ENTRIESREAD`);
+  - `DESTROY`, `CREATECONSUMER`, `DELCONSUMER` and `HELP`.
+- `XREADGROUP`, with `COUNT`, `BLOCK` and `NOACK`.
+- `XACK`.
+- `XPENDING`: the summary form, and the extended form with `IDLE` and a
+  consumer.
+- `XCLAIM`, with `IDLE`, `TIME`, `RETRYCOUNT`, `FORCE`, `JUSTID` and
+  `LASTID`.
+- `XAUTOCLAIM`, with `COUNT` and `JUSTID`. The deleted IDs are its third
+  element.
+- `XINFO`: `STREAM` (with `FULL` and `COUNT`), `GROUPS`, `CONSUMERS` and
+  `HELP`.
+- `XSETID`, with `ENTRIESADDED` and `MAXDELETEDID`. Its fields are already
+  stored.
+
+Each is parsed as Valkey parses it, so a wrong command fails with the same
+error, checked in the same order, as D6's commands do.
+
+**Not served:** Redis 8.2's `XACKDEL` and `XDELEX`, and `KEEPREF`, `DELREF`
+and `ACKED` on `XADD` and `XTRIM`.
+
+### D2. Storage: a row per group, per pending entry and per consumer
+
+- **(a) One row per group, holding its PEL and its consumers.** Every
+  `XREADGROUP` and `XACK` would rewrite the whole PEL. That is ADR-0056's
+  problem again: a write that costs the size of the structure. Rejected.
+- **(b) A row per item, under the stream's version, beside the entries,**
+  each kind led by its own tag byte:
+
+  | tag | row | field after the tag | value |
+  |---|---|---|---|
+  | 0 | entry (exists) | ID | fields and values |
+  | 1 | group | group name | last delivered ID, entries read, pending count |
+  | 2 | pending entry | group, ID | consumer, delivery time, delivery count |
+  | 3 | consumer | group, consumer name | seen time, active time, pending count |
+  | 4 | a consumer's pending entry | group, consumer, ID | empty |
+
+  - **Names are length-prefixed** in tags 2 to 4, so group `a` never
+    prefixes the rows of group `ab`.
+  - **Tag 2 rows sort in ID order within a group.** `XPENDING`'s range,
+    `XAUTOCLAIM`'s scan, and the summary's smallest and largest IDs are
+    bounded scans.
+  - **Tag 4 is the per-consumer index** that Redis keeps as each consumer's
+    own PEL. A consumer's history read, and `XPENDING` filtered to one
+    consumer, read only that consumer's entries.
+- **(c) As (b), without tag 4,** filtering the group's PEL by consumer
+  instead. That saves one row per pending entry. But a consumer's history
+  read (`XREADGROUP … 0`, the first thing a restarted consumer does) would
+  walk every other consumer's pending entries. Rejected.
+
+**Recommendation: (b).**
+
+- **Rows written per call:**
+  - an `XREADGROUP` that delivers n entries writes 2n + 2 rows (n pending
+    rows, n index rows, the group and the consumer);
+  - an `XACK` of n entries deletes 2n rows and rewrites the group and each
+    consumer it touches.
+
+  D7 measures what that costs.
+- **Generic machinery carries groups unchanged.** Every new row is a subkey
+  row under the stream's version, as entries are. So these carry or remove
+  groups with no new code: `DEL`, expiry, GC, slot migration, backup,
+  `COPY` and `RENAME`. A `COPY` of a stream copies its groups, as Redis's
+  does.
+- **The metadata row does not change.** Group state never goes into the
+  metadata row's tail. `StreamMeta::decode` reads 40 bytes there and
+  `encode` writes 40, so a release that did not know about an added field
+  would drop it the next time an `XADD` rewrote the row.
+- **Accounting:**
+  - `XLEN` counts entries only, as now.
+  - The metadata row's `bytes` stays the entries' bytes. The per-key cap
+    (512 MiB) and read admission (BUG-0060) bound it, and a growing PEL
+    must not make `XADD` fail. Redis does not limit the size of a PEL.
+  - Tenant storage metering reads RocksDB's bytes per namespace, so it
+    counts group rows with no change.
+  - `FLINTKEYSIZE` reports a stream's entries only, as documented.
+  - `XINFO STREAM FULL COUNT 0` is the one command that reads a whole PEL.
+    Its admission adds each group's pending count, times the size of a
+    pending row, to the entries' bytes.
+
+### D3. Semantics
+
+- **Durability.** `XREADGROUP` is a write. As with every write, its reply
+  goes out after its rows are on disk, and a failover keeps them
+  (failover.md). So after a failover:
+  - an acknowledged `XACK` stays acknowledged;
+  - an entry that `XREADGROUP` delivered stays pending under its consumer,
+    so `>` does not deliver it again.
+
+  This is the gain over Redis, and D7 drills it.
+- **An ambiguous failure is still the client's problem** (retry-safety.md).
+  If the reply to an `XREADGROUP` is lost on a dropped connection, its
+  entries stay pending under that consumer. The standard recovery still
+  works: read history with `0`, or `XAUTOCLAIM`. retry-safety.md gains a
+  row for each command:
+  - `XACK` is safe to retry (it names what to change);
+  - a retried `XGROUP CREATE` answers `BUSYGROUP`;
+  - `XREADGROUP … >` is unsafe (a retry delivers the next entries);
+  - `XCLAIM` and `XAUTOCLAIM` are unsafe (a retry changes delivery counts
+    and owners again).
+- **Times** are the master's wall clock in milliseconds, as Redis's are.
+  After a failover, idle times are measured on the new master's clock.
+- **Lag and entries-read** follow Redis 7's estimate from the metadata's
+  entries added and largest deleted ID. Each is nil where Redis's is.
+- **A multi-stream `XREADGROUP` needs one slot,** except for a placed
+  tenant (ADR-0053), as `XREAD` does.
+- **In `MULTI` and scripts,** `XREADGROUP` answers without waiting, as
+  `XREAD` does.
+
+### D4. A blocked `XREADGROUP` waits at the proxy, as `XREAD` does
+
+- **(a) The proxy polls** (ADR-0052 D4's (b)). Each attempt is a
+  non-blocking `XREADGROUP` on the master, which delivers atomically.
+  - Two consumers of one group, both blocked on one stream, never both get
+    the same entry.
+  - The wait survives a failover, because the loop re-sends to the new
+    master. A Redis client blocked on a master that dies does not get that.
+- **(b) Seats wake their waiters** (ADR-0052 D4's (c)).
+
+**Recommendation: (a),** with one change from `XREAD`: **a miss must not
+write.**
+
+- **The first attempt is the client's own command.** It creates the
+  consumer and stamps its seen time, as Valkey's does.
+- **Later attempts go as `FLINTXREADGROUP`,** an internal form. The seat
+  answers it as it answers `XREADGROUP`, but writes nothing unless it
+  delivers.
+- **Without that form, an idle blocked consumer would cost a write every
+  20 ms:** each one a WAL record, shipped to the replica. `XINFO CONSUMERS`
+  would also show the consumer as idle for about 0 ms, where Valkey shows
+  the time since the call (measured above).
+
+The rest follows from Valkey:
+
+- **Only `>` waits.** An `XREADGROUP` that names any other ID answers at
+  once.
+- **A group destroyed, or a key deleted, while a client waits:** the next
+  attempt answers `NOGROUP`, the error Valkey gives a blocked client.
+
+Two costs carry over from `XREAD`:
+
+- **No first-come order among blocked consumers.** Valkey serves the
+  longest-waiting client first.
+- **Latency of up to one poll interval** (20 ms at most).
+
+Move to (b) only if D7's measurement demands it, as for the blocking pops.
+
+### D5. The rollout: two releases, as ADR-0056
+
+**Why two releases, when the rows are safe for the release before.** rc.82
+(due 2026-10-12), the first release with streams, scans only tag-0 rows. It would leave a
+group's rows untouched and keep serving the entries. But it does not know
+`XREADGROUP` or `XACK`, so after a rollback to it every consumer would fail
+until the roll forward. Rollback must work (Jeff, 2026-09-23). For a queue,
+"work" means the consumers keep consuming.
+
+- **Release R** serves every group command on groups that exist. `XGROUP
+  CREATE` (and `MKSTREAM` through it) creates a group only on a seat
+  started with `--stream-groups` (inventory: `stream-groups on`), off by
+  default. Otherwise it answers `ERR consumer groups are not enabled here
+  yet: this deployment creates none (ADR-0057)`, the same shape as streams'
+  refusal. Ops declares the inventory key, as it did for `streams on`.
+- **R+1 turns creation on,** once R is the oldest release anywhere. A
+  rollback from R+1 to R keeps every group working. It only stops new
+  groups being created.
+- **Groups need streams.** A seat creates a group only on a stream, and
+  creates a stream only with `streams on` (ADR-0052 D6), which is due to
+  become the default in the release after rc.82. That release is the
+  earliest R can be.
+- **Turning groups on sooner has a price.** An operator who does so gives up
+  rolling back below R once a tenant has a group. Below R, the entries stay
+  readable and the groups survive untouched, but no consumer can read or
+  acknowledge until the roll forward.
+
+### D6. Build order, each part with its own gate
+
+1. Storage and the core loop: `XGROUP`, non-blocking `XREADGROUP`, `XACK`,
+   `XPENDING`, and `XINFO GROUPS` and `CONSUMERS`.
+2. `XCLAIM`, `XAUTOCLAIM`, `XINFO STREAM` (with `FULL`), `XSETID`, and a
+   blocking `XREADGROUP` at the proxy (`FLINTXREADGROUP`).
+3. D7's drills, and the documentation: command-support.md, retry-safety.md
+   and self-hosting.md (the new flag).
+
+About five to eight working days in all.
+
+### D7. Verification (if accepted)
+
+- **Differential against Valkey 9.1:**
+  - a probe of every command, in RESP2 and RESP3;
+  - a random differential over the group commands, with several seeds and
+    both protocols.
+
+  Where replies carry times, the times are pinned with `XCLAIM`'s `TIME`
+  and `IDLE`, and idle fields are compared within a tolerance.
+- **A failover drill.** Producers run `XADD`, and consumers run
+  `XREADGROUP` and `XACK`, while the master is killed mid-run. Afterwards:
+  - every acknowledged `XADD` is either acknowledged or pending;
+  - no acknowledged `XACK` is pending again;
+  - `>` does not deliver again anything that `XREADGROUP` already delivered
+    to a client.
+- **A rollback drill.** Roll back from R+1 to R with groups and live
+  consumers, and the consumers keep consuming. Roll back from R to rc.82,
+  and the entries stay readable and the groups intact. The roll forward
+  restores the groups.
+- **A blocked consumer through an authenticated proxy:**
+  - a wake on `XADD`, a timeout, and `BLOCK 0`;
+  - the group destroyed, and the key deleted, while it waits;
+  - a failover while it waits.
+
+  `XINFO CONSUMERS`' idle time grows during the block. The master's WAL
+  sequence does not move while a consumer waits, which shows that misses
+  write nothing.
+- **Clients:**
+  - redis-py's group API, in `client_compat_drill`;
+  - one framework from Dapr, Watermill, Spring Data Redis and Redpanda
+    Connect. Each is a download that needs Jeff's approval.
+- **Cost:** `XREADGROUP COUNT 10` and an `XACK` per entry, with p50, p99 and
+  WAL bytes per entry, against Valkey on the same laptop.
+
+## What this does not decide
+
+- **Redis 8.2's additions** (`XACKDEL`, `XDELEX`, `KEEPREF`, `DELREF`,
+  `ACKED`). Revisit them if Valkey adopts them or a tenant needs them.
+- **Seat-side wake-ups,** and first-come order among blocked consumers
+  (D4's (b)).
+- **Which release is R.** That follows from D5 and the release calendar.

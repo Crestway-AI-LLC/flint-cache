@@ -568,7 +568,8 @@ has made a stream.
     trims whole internal nodes.
   - A multi-stream `XREAD` needs one slot, except a placed tenant's
     (ADR-0053).
-  - Consumer groups, `XINFO` and `XSETID` are not yet served.
+  - Consumer groups, `XINFO` and `XSETID` are not yet served. ADR-0057
+    proposes them (2026-10-10).
 
 **Verified** against Valkey 9.1.0 on the laptop:
 - **A probe of 88 calls per protocol** (RESP2 and RESP3) differs only where
