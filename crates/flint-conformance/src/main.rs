@@ -1818,8 +1818,7 @@ fn corpus() -> Vec<Case> {
         // list, walk and encode as the tables behind them, as Valkey's
         // read-only tables do; writing to one is refused as Valkey refuses it.
         // The `redis` table's count is left out: Flint does not claim to be
-        // Valkey (no SERVER_NAME, VALKEY_VERSION, VALKEY_VERSION_NUM), and
-        // serves no `acl_check_cmd`.
+        // Valkey (no SERVER_NAME, VALKEY_VERSION, VALKEY_VERSION_NUM).
         Case {
             family: "lua",
             name: "the libraries list and encode as Valkey's read-only tables do",
@@ -2838,6 +2837,44 @@ fn corpus() -> Vec<Case> {
                 s(
                     &[b"SCRIPT", b"FLUSH", b"BOGUS"],
                     Expect::Err("ERR SCRIPT FLUSH only support SYNC|ASYNC option"),
+                ),
+            ],
+        },
+        Case {
+            family: "scripting",
+            name: "redis.acl_check_cmd allows what is served and names an unknown command",
+            // Flint has no ACL users: a served command is allowed. The error
+            // text names `server.`, as Valkey's does, whichever table called it.
+            steps: vec![
+                s(&[b"EVAL", b"return redis.acl_check_cmd('get')", b"0"], Expect::Int(1)),
+                s(&[b"EVAL", b"return redis.acl_check_cmd('GET', 'k', 'x', 'y')", b"0"], Expect::Int(1)),
+                s(&[b"EVAL", b"return redis.acl_check_cmd('set', 1)", b"0"], Expect::Int(1)),
+                s(&[b"EVAL", b"return redis.acl_check_cmd('script', 'flush')", b"0"], Expect::Int(1)),
+                s(&[b"EVAL", b"return server.acl_check_cmd('get')", b"0"], Expect::Int(1)),
+                s(&[b"EVAL", b"return type(redis.acl_check_cmd('get'))", b"0"], Expect::Str(b"boolean")),
+                s(
+                    &[b"EVAL", b"return redis.acl_check_cmd('nope')", b"0"],
+                    Expect::Err("ERR Invalid command passed to server.acl_check_cmd() script: on @user_script:1."),
+                ),
+                s(
+                    &[b"EVAL", b"return redis.acl_check_cmd('script', 'nope')", b"0"],
+                    Expect::Err("ERR Invalid command passed to server.acl_check_cmd() script: on @user_script:1."),
+                ),
+                s(
+                    &[b"EVAL", b"return redis.acl_check_cmd()", b"0"],
+                    Expect::Err("ERR Please specify at least one argument for this call script: on @user_script:1."),
+                ),
+                s(
+                    &[b"EVAL", b"return redis.acl_check_cmd('set', {})", b"0"],
+                    Expect::Err("ERR Command arguments must be strings or integers script: on @user_script:1."),
+                ),
+                s(
+                    &[
+                        b"EVAL",
+                        b"local ok, e = pcall(redis.acl_check_cmd, 'nope') return {tostring(ok), type(e) == 'table' and e.err or tostring(e)}",
+                        b"0",
+                    ],
+                    Expect::Arr(vec![Expect::Str(b"false"), Expect::Str(b"ERR Invalid command passed to server.acl_check_cmd()")]),
                 ),
             ],
         },

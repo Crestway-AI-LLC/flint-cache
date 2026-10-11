@@ -174,6 +174,7 @@ pub fn queue_time_error(args: &[Vec<u8>], whole: bool) -> Option<Value> {
     // command checks its slots whatever the connection.
     let reply = Dispatcher::new(&probe, crate::commands::probe_clock)
         .whole(whole)
+        .probing()
         .dispatch(args);
     match &reply {
         // Both texts are produced in THIS file — `arity_err` and the
@@ -195,6 +196,47 @@ pub fn queue_time_error(args: &[Vec<u8>], whole: bool) -> Option<Value> {
 /// the wall clock at all.
 fn probe_clock() -> u64 {
     0
+}
+
+/// Whether Flint serves the command `args` names: a script's
+/// `redis.acl_check_cmd`. Flint has no ACL users, so a connection may run
+/// every command it serves, and the answer is only whether it is one.
+///
+/// As Valkey looks a command up for it: the name, then the subcommand when
+/// there is a second argument and the command has subcommands. Nothing runs:
+/// the dispatcher is a probe (`probing`), over a throwaway store. Arguments
+/// past the subcommand are not looked at, as Valkey does not look at them.
+pub fn served(args: &[Vec<u8>]) -> bool {
+    let Some(name) = args.first() else {
+        return false;
+    };
+    match name.to_ascii_uppercase().as_slice() {
+        // Served by the connection (the transaction verbs) or the proxy
+        // (AUTH, CLIENT), never by a dispatcher. CLIENT's subcommands are
+        // the proxy's own (BUG-0183).
+        b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"AUTH" => return true,
+        b"CLIENT" => {
+            return args.get(1).is_none_or(|sub| {
+                [&b"SETNAME"[..], b"GETNAME", b"ID", b"SETINFO", b"INFO"]
+                    .iter()
+                    .any(|s| sub.eq_ignore_ascii_case(s))
+            });
+        }
+        // Checked, never probed: a script is tenant code (as in
+        // `queue_time_error`).
+        b"EVAL" | b"EVALSHA" => return true,
+        _ => {}
+    }
+    let probe = flint_storage::MemKv::new();
+    let d = Dispatcher::new(&probe, probe_clock).probing();
+    let unknown =
+        |reply: &Value, prefix: &str| matches!(reply, Value::Error(e) if e.starts_with(prefix));
+    if unknown(&d.dispatch(&args[..1]), "ERR unknown command") {
+        return false;
+    }
+    // Every subcommand refusal this dispatcher writes starts so (SCRIPT,
+    // PUBSUB, JSON.DEBUG); a command without subcommands never says it.
+    args.len() < 2 || !unknown(&d.dispatch(&args[..2]), "ERR unknown subcommand")
 }
 
 /// Upstream's unknown-command reply, byte for byte — name in the case the
@@ -302,6 +344,12 @@ pub struct Dispatcher<'a> {
     /// (`FLINTWHOLE`, ADR-0053): a script may name and touch keys in any
     /// slot, not only its KEYS' one.
     whole: bool,
+    /// A probe asks what a command WOULD answer, against a throwaway store
+    /// (`queue_time_error`, `served`). The store is not the only state a
+    /// command reaches: the script cache and the pub/sub broker are the
+    /// process's. A probing dispatcher answers as it would and leaves both
+    /// alone (BUG-0254).
+    probing: bool,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -335,7 +383,14 @@ impl<'a> Dispatcher<'a> {
             every_writer: false,
             wants_every_writer: std::cell::Cell::new(false),
             whole: false,
+            probing: false,
         }
+    }
+
+    /// Make this dispatcher a probe: see `probing`.
+    pub fn probing(mut self) -> Self {
+        self.probing = true;
+        self
     }
 
     /// Tell the dispatcher that its connection is a placed tenant's
@@ -755,6 +810,9 @@ impl<'a> Dispatcher<'a> {
             // Pub/sub (ADR-0052 D5). A tenant publishes on a seat, and
             // subscribes only through a proxy, which subscribes here for it.
             b"PUBLISH" => exact(args, 3, "publish", |a| {
+                if self.probing {
+                    return Value::Integer(0);
+                }
                 Value::Integer(crate::pubsub::publish(&self.ns, &a[1], &a[2]))
             }),
             b"PUBSUB" => self.cmd_pubsub(args),
@@ -2183,7 +2241,9 @@ impl<'a> Dispatcher<'a> {
             b"LOAD" if args.len() == 3 => match crate::script::compile_check(&args[2]) {
                 Ok(()) => {
                     let sha = flint_tls::sha1_hex(&args[2]);
-                    crate::script::remember(&self.ns, &sha, &args[2]);
+                    if !self.probing {
+                        crate::script::remember(&self.ns, &sha, &args[2]);
+                    }
                     Value::Bulk(Some(sha.into_bytes()))
                 }
                 Err(e) => e,
@@ -2203,7 +2263,9 @@ impl<'a> Dispatcher<'a> {
                         && (args[2].eq_ignore_ascii_case(b"ASYNC")
                             || args[2].eq_ignore_ascii_case(b"SYNC"))) =>
             {
-                crate::script::flush(&self.ns);
+                if !self.probing {
+                    crate::script::flush(&self.ns);
+                }
                 Value::Simple("OK".into())
             }
             // A script is stopped by its time limit, not by SCRIPT KILL, and
@@ -7523,6 +7585,89 @@ mod tests {
         assert_eq!(ev(&s, &["EXISTS", "lock:{x}"]), Value::Integer(0));
         assert_eq!(ev(&s, &["LLEN", "lock-signal:{x}"]), Value::Integer(1));
         assert!(pttl(&s, "lock-signal:{x}") > 0);
+    }
+
+    /// BUG-0254: the queue-time probe ran `SCRIPT LOAD` and `SCRIPT FLUSH`
+    /// for real, in the default namespace, whatever the connection's. A
+    /// tenant's `MULTI`, `SCRIPT FLUSH` emptied namespace 0's cache at queue
+    /// time, and a queued `SCRIPT LOAD` cached its script there.
+    #[test]
+    fn a_probe_leaves_the_script_cache_alone() {
+        let q = |parts: &[&str]| {
+            queue_time_error(
+                &parts
+                    .iter()
+                    .map(|p| p.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+                false,
+            )
+        };
+        let kept = "return 'bug-0254 kept'";
+        let sha = flint_tls::sha1_hex(kept.as_bytes());
+        crate::script::remember(DEFAULT_NS, &sha, kept.as_bytes());
+        assert!(q(&["SCRIPT", "FLUSH"]).is_none());
+        assert!(
+            crate::script::lookup(DEFAULT_NS, &sha).is_some(),
+            "a queued SCRIPT FLUSH emptied namespace 0's cache"
+        );
+        let loaded = "return 'bug-0254 loaded'";
+        assert!(q(&["SCRIPT", "LOAD", loaded]).is_none());
+        assert!(
+            crate::script::lookup(DEFAULT_NS, &flint_tls::sha1_hex(loaded.as_bytes())).is_none(),
+            "a queued SCRIPT LOAD cached its script"
+        );
+        // `served` probes the same way.
+        assert!(served(&[b"SCRIPT".to_vec(), b"FLUSH".to_vec()]));
+        assert!(crate::script::lookup(DEFAULT_NS, &sha).is_some());
+    }
+
+    /// `redis.acl_check_cmd`'s lookup. Where Flint serves a command, the
+    /// answers are Valkey 9.1's (measured 2026-10-10); where it does not
+    /// (`FCALL`, `EVAL_RO`, `CLIENT LIST`, the seat's own `FLINT*`
+    /// commands), the command is unknown, as it is to `redis.call`.
+    #[test]
+    fn served_looks_a_command_up_as_valkey_does() {
+        let s = |parts: &[&str]| {
+            served(
+                &parts
+                    .iter()
+                    .map(|p| p.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for yes in [
+            &["get"][..],
+            &["GET", "k"],
+            &["get", "a", "b", "c"],
+            &["set", "1"],
+            &["script"],
+            &["script", "flush"],
+            &["subscribe", "c"],
+            &["publish", "c", "m"],
+            &["pubsub", "numsub"],
+            &["json.debug", "memory"],
+            &["multi"],
+            &["exec"],
+            &["auth", "x"],
+            &["client"],
+            &["client", "setname"],
+            &["eval", "return 1"],
+        ] {
+            assert!(s(yes), "{yes:?} is served");
+        }
+        for no in [
+            &["nope"][..],
+            &["script", "nope"],
+            &["pubsub", "nope"],
+            &["json.debug", "nope"],
+            &["client", "list"],
+            &["fcall"],
+            &["eval_ro"],
+            &["flintinfo"],
+            &["1"],
+        ] {
+            assert!(!s(no), "{no:?} is not served");
+        }
     }
 
     /// `SCRIPT` and `EVALSHA` over a namespace's cache, and upstream's

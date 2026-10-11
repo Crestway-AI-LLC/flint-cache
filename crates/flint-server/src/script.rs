@@ -322,6 +322,34 @@ impl Engine {
             })?
         };
         redis.raw_set("sha1hex", sha1hex)?;
+        // Flint has no ACL users, so a command it serves is allowed and one
+        // it does not serve is Valkey's error, raised as `sha1hex`'s is so
+        // the reply names the script's line.
+        let acl_check_cmd = {
+            let pending = Rc::clone(&pending);
+            lua.create_function(move |_, args: MultiValue| {
+                let raise = |text: &str| -> mlua::Result<bool> {
+                    *pending.borrow_mut() = Some(text.to_string());
+                    Err(mlua::Error::runtime(text.to_string()))
+                };
+                if args.is_empty() {
+                    return raise("ERR Please specify at least one argument for this call");
+                }
+                let mut parts = Vec::with_capacity(args.len());
+                for a in args {
+                    match call_arg(a) {
+                        Some(p) => parts.push(p),
+                        None => return raise("ERR Command arguments must be strings or integers"),
+                    }
+                }
+                if crate::commands::served(&parts) {
+                    Ok(true)
+                } else {
+                    raise("ERR Invalid command passed to server.acl_check_cmd()")
+                }
+            })?
+        };
+        redis.raw_set("acl_check_cmd", acl_check_cmd)?;
         g.raw_set("redis", redis.clone())?;
         lua.load(PRELUDE)
             .set_name("=flint")
@@ -738,13 +766,9 @@ fn redis_call(
     }
     let mut parts = Vec::with_capacity(n);
     for i in 1..=n {
-        match args.raw_get::<LuaValue>(i)? {
-            LuaValue::String(s) => parts.push(s.as_bytes().to_vec()),
-            LuaValue::Number(n) => parts.push(lua_number_arg(n)),
-            // mlua hands an integral Lua 5.1 number over as an integer; it is
-            // the same double, and spelled by the same rule.
-            LuaValue::Integer(i) => parts.push(lua_number_arg(i as f64)),
-            _ => return err_table(lua, "ERR Command arguments must be strings or integers"),
+        match call_arg(args.raw_get::<LuaValue>(i)?) {
+            Some(p) => parts.push(p),
+            None => return err_table(lua, "ERR Command arguments must be strings or integers"),
         }
     }
     if denied(&parts[0].to_ascii_uppercase()) {
@@ -766,6 +790,20 @@ fn redis_call(
         other => other,
     };
     to_lua(lua, reply)
+}
+
+/// One argument of `redis.call` or `redis.acl_check_cmd`, as Redis converts
+/// it: a string as it is, a number spelled as Lua spells it, and `None` for
+/// anything else.
+fn call_arg(v: LuaValue) -> Option<Vec<u8>> {
+    match v {
+        LuaValue::String(s) => Some(s.as_bytes().to_vec()),
+        LuaValue::Number(n) => Some(lua_number_arg(n)),
+        // mlua hands an integral Lua 5.1 number over as an integer; it is
+        // the same double, and spelled by the same rule.
+        LuaValue::Integer(i) => Some(lua_number_arg(i as f64)),
+        _ => None,
+    }
 }
 
 fn err_table(lua: &Lua, msg: &str) -> mlua::Result<LuaValue> {

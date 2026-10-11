@@ -52,7 +52,9 @@ Valkey has it:
 - **Valkey-only fields.** `redis.SERVER_NAME`, `VALKEY_VERSION` and
   `VALKEY_VERSION_NUM` are absent, since Flint's `INFO` does not claim to be
   Valkey either.
-- **`redis.acl_check_cmd` is absent.** Flint has no ACL users.
+- **`redis.acl_check_cmd` was absent.** Served since 2026-10-10: `true`
+  for every command Flint serves, as Flint has no ACL users (BUG-0254's
+  commit; command-support.md).
 - **Two metatables stay hidden.** `getmetatable('')` and `getmetatable(_G)`
   answer `false`, where Valkey shows the tables. Hiding them is the sandbox
   (ADR-0051).

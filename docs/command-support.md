@@ -806,15 +806,18 @@ by the conformance corpus. What Flint adds is the frame around a script:
   script holds its keys' write locks only while it runs.
 - **The sandbox.** The base, `table`, `string` and `math` libraries, and
   `redis`: `call`, `pcall`, `error_reply`, `status_reply`, `sha1hex`, `log`
-  (a no-op), `setresp(2)`, `replicate_commands`, `set_repl`, the `LOG_*`
-  and `REPL_*` constants, and `REDIS_VERSION` and `REDIS_VERSION_NUM`
-  (`7.2.4`, the version `INFO` reports). `server` is the same table, as in
-  Valkey. **Not available:** `load`, `loadstring`, `dofile`, `loadfile`,
-  `require`, `os`, `io`, `debug`, `setfenv`, `getfenv` and `print`; a script
-  that uses one fails with "nonexistent global variable". Nor are
-  `redis.acl_check_cmd`, since Flint has no ACL users, or Valkey's
-  `SERVER_NAME` and `VALKEY_VERSION`, since Flint does not claim to be
-  Valkey. Globals and the libraries are read-only, and a script's text
+  (a no-op), `setresp(2)`, `replicate_commands`, `set_repl`,
+  `acl_check_cmd`, the `LOG_*` and `REPL_*` constants, and `REDIS_VERSION`
+  and `REDIS_VERSION_NUM` (`7.2.4`, the version `INFO` reports). `server` is
+  the same table, as in Valkey. `acl_check_cmd` answers `true` for every
+  command Flint serves, since Flint has no ACL users and a connection may
+  run them all, and raises Valkey's "Invalid command passed to
+  server.acl_check_cmd()" for one it does not, including a subcommand it
+  refuses (`CLIENT LIST`). **Not available:** `load`, `loadstring`,
+  `dofile`, `loadfile`, `require`, `os`, `io`, `debug`, `setfenv`, `getfenv`
+  and `print`; a script that uses one fails with "nonexistent global
+  variable". Nor are Valkey's `SERVER_NAME` and `VALKEY_VERSION`, since
+  Flint does not claim to be Valkey. Globals and the libraries are read-only, and a script's text
   compiles as text, never as bytecode. A library lists, walks and encodes as
   Valkey's read-only tables do (`pairs`, `next`, `rawget`, `cjson.encode`),
   and a write to one is refused with Valkey's message (BUG-0247). The string
