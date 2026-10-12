@@ -85,6 +85,104 @@ pub struct RocksKv {
     /// the last. That is the choke point the watch table did NOT have, which
     /// is what made BUG-0080 possible; here it genuinely is one.
     bytes_per_seq: std::sync::atomic::AtomicU64,
+    /// Deletes archived WAL segments past the retention TTL (BUG-0259), the
+    /// job RocksDB's own TTL pruning did until it deleted fresh ones. `None`
+    /// when there is no TTL, and on a read-only open. Held for its `Drop`,
+    /// which stops the thread; nothing reads it.
+    #[allow(dead_code)]
+    archive_pruner: Option<ArchivePruner>,
+}
+
+/// The thread that ages out `archive/` (BUG-0259). Stopped when its
+/// `RocksKv` is dropped.
+struct ArchivePruner {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ArchivePruner {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl ArchivePruner {
+    /// Prune `archive` every `min(600, ttl / 2)` seconds, at least every
+    /// second: the cadence RocksDB's own TTL pruning had.
+    fn start(archive: std::path::PathBuf, ttl_seconds: u64) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let every = std::time::Duration::from_secs((ttl_seconds / 2).clamp(1, 600));
+        let thread = std::thread::Builder::new()
+            .name("wal-archive-prune".into())
+            .spawn(move || {
+                let tick = std::time::Duration::from_millis(100);
+                let mut waited = std::time::Duration::ZERO;
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(tick);
+                    waited += tick;
+                    if waited >= every {
+                        waited = std::time::Duration::ZERO;
+                        prune_archive_by_age(&archive, ttl_seconds, std::time::SystemTime::now());
+                    }
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+/// Delete the archived WAL segments in `archive` older than `ttl_seconds`,
+/// measured from `now`; returns how many went (BUG-0259).
+///
+/// RocksDB's `WalManager::PurgeObsoleteWALFiles` did this with
+/// `now_seconds - file_m_time > WAL_ttl_seconds` in u64. Its `now` is
+/// `time()`, the kernel's coarse clock, and a filesystem with fine-grained
+/// timestamps (xfs on Linux 6.13 and later) can stamp a segment written just
+/// past a second boundary with an mtime a second AHEAD of it. The
+/// subtraction then wrapped to about 1.8e19, past any TTL, and the segment a
+/// checkpoint had archived a millisecond earlier was deleted: the playground's
+/// mid-stream WALGAPs (OPS-0386). Here a segment from the future is simply
+/// not old.
+pub fn prune_archive_by_age(archive: &Path, ttl_seconds: u64, now: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(archive) else {
+        return 0;
+    };
+    let mut pruned = 0;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let is_wal = name
+            .strip_suffix(".log")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if !is_wal {
+            continue;
+        }
+        let Ok(mtime) = e.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let age = now.duration_since(mtime).unwrap_or_default().as_secs();
+        if age > ttl_seconds && std::fs::remove_file(e.path()).is_ok() {
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+/// What RocksDB is given for the archive's size limit once its TTL is off
+/// (BUG-0259). RocksDB archives a WAL only while the TTL or the size limit is
+/// set, so a caller that asked for a TTL and no size limit gets a limit too
+/// large to reach, and keeps its archive. `1 << 30` MB is 1 PiB, and
+/// RocksDB's `limit * 1024 * 1024` stays inside a u64.
+fn archive_size_limit_mb(wal_ttl_seconds: u64, wal_size_limit_mb: u64) -> u64 {
+    match (wal_ttl_seconds, wal_size_limit_mb) {
+        (_, mb) if mb > 0 => mb,
+        (0, _) => 0,
+        _ => 1 << 30,
+    }
 }
 
 /// LSM shape knobs, unset by default so stock RocksDB behaviour is unchanged.
@@ -490,6 +588,7 @@ impl RocksKv {
             // nothing here can act. Present so the type is one type.
             eviction: std::sync::Arc::new(crate::eviction::EvictionState::default()),
             bytes_per_seq: std::sync::atomic::AtomicU64::new(0),
+            archive_pruner: None,
         })
     }
 
@@ -505,10 +604,11 @@ impl RocksKv {
     /// replica approaches the window, and a shed threshold that cannot be
     /// related to the window it protects is untunable.
     ///
-    /// Both terms still come from RocksDB and are immutable after open: the
-    /// archive is deleted when a segment is older than the TTL **or** the
-    /// archive exceeds the size limit, whichever happens first, and neither
-    /// consults a replica. That is the reason the shedding in ADR-0022 exists
+    /// Both terms are fixed at open: a segment is deleted when it is older
+    /// than the TTL **or** the archive exceeds the size limit, whichever
+    /// happens first, and neither consults a replica. RocksDB applies the
+    /// size limit; the TTL is applied by `ArchivePruner`, because RocksDB's
+    /// own TTL pass deleted freshly archived segments (BUG-0259). That is the reason the shedding in ADR-0022 exists
     /// rather than a cleverer retention rule.
     pub fn open_with_retention(
         path: &Path,
@@ -524,8 +624,13 @@ impl RocksKv {
         // on a fleet serving ~50 ops/s. Volume was never the driver: what
         // consumed the window was a replica spending its life full-syncing
         // rather than tailing. See docs/bugs/0012 and ADR-0022.
-        opts.set_wal_ttl_seconds(wal_ttl_seconds);
-        opts.set_wal_size_limit_mb(wal_size_limit_mb);
+        //
+        // RocksDB is given the size limit and NOT the TTL (BUG-0259): its TTL
+        // pruning deleted a freshly archived segment whenever the file's
+        // mtime ran a second ahead of `time()`. The TTL is applied by
+        // `ArchivePruner` instead, to the same files, at the same cadence.
+        opts.set_wal_ttl_seconds(0);
+        opts.set_wal_size_limit_mb(archive_size_limit_mb(wal_ttl_seconds, wal_size_limit_mb));
         // The info LOG is bounded here too: its dominant writer is the archive
         // manager these two terms drive, so the WAL settings and the log
         // ceiling are the same subsystem seen from two sides.
@@ -687,13 +792,17 @@ impl RocksKv {
         // skiplist seek on every point read that misses it.
         opts.set_memtable_prefix_bloom_ratio(0.02);
         opts.set_memtable_whole_key_filtering(true);
+        let db = DB::open(&opts, path)?;
+        let archive_pruner = (wal_ttl_seconds > 0)
+            .then(|| ArchivePruner::start(path.join("archive"), wal_ttl_seconds));
         Ok(Self {
-            db: DB::open(&opts, path)?,
+            db,
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
             wal_walks_recovered: std::sync::atomic::AtomicU64::new(0),
             eviction,
             bytes_per_seq: std::sync::atomic::AtomicU64::new(0),
+            archive_pruner,
         })
     }
 
@@ -2251,5 +2360,143 @@ mod reverse_scan {
         drop(zr);
         drop(rocks);
         let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+#[cfg(test)]
+mod archive_ttl_tests {
+    //! BUG-0259: RocksDB's WAL TTL pruning deleted a freshly archived segment
+    //! whose mtime ran a second ahead of `time()`; Flint prunes by age itself.
+    use super::{RocksKv, archive_size_limit_mb, prune_archive_by_age};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("flint-b259-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        d
+    }
+
+    fn touch(p: &Path, mtime: SystemTime) {
+        std::fs::write(p, b"wal").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("set mtime");
+    }
+
+    fn wals(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .map(|r| {
+                r.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".log") && n != "LOG")
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn age_pruning_deletes_only_what_is_past_the_ttl() {
+        let d = dir("prune");
+        let now = SystemTime::now();
+        touch(&d.join("000010.log"), now - Duration::from_secs(3_700));
+        touch(&d.join("000011.log"), now - Duration::from_secs(60));
+        // The bug's shape: a segment stamped a second ahead of `now`.
+        touch(&d.join("000012.log"), now + Duration::from_secs(1));
+        touch(&d.join("LOG.old.1"), now - Duration::from_secs(9_999));
+        assert_eq!(prune_archive_by_age(&d, 3_600, now), 1);
+        let mut left: Vec<String> = std::fs::read_dir(&d)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["000011.log", "000012.log", "LOG.old.1"]);
+        assert_eq!(prune_archive_by_age(&d.join("missing"), 3_600, now), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn rocksdb_keeps_archiving_once_its_ttl_is_off() {
+        assert_eq!(archive_size_limit_mb(43_200, 8_192), 8_192);
+        assert_eq!(
+            archive_size_limit_mb(43_200, 0),
+            1 << 30,
+            "a TTL alone still archives"
+        );
+        assert_eq!(
+            archive_size_limit_mb(0, 0),
+            0,
+            "nothing asked for, nothing archived"
+        );
+        assert_eq!(archive_size_limit_mb(0, 64), 64);
+        assert!((1u64 << 30).checked_mul(1024 * 1024).is_some());
+    }
+
+    /// End to end, the bug's shape: an archived segment stamped ahead of the
+    /// clock, then the purge RocksDB runs after a flush. With RocksDB's TTL
+    /// (the control, as before the fix) the segment is deleted at once; with
+    /// Flint's it stays. A 2 s TTL lets RocksDB's purge run again after 1 s.
+    #[test]
+    fn a_segment_stamped_ahead_of_the_clock_survives_the_purge() {
+        fn run(d: &Path, flint: bool) -> (Vec<String>, Vec<String>) {
+            let mut kv = None;
+            let mut raw = None;
+            if flint {
+                kv = Some(RocksKv::open_with_retention(d, 2, 64).expect("open"));
+            } else {
+                let mut o = rocksdb::Options::default();
+                o.create_if_missing(true);
+                o.set_wal_ttl_seconds(2);
+                o.set_wal_size_limit_mb(64);
+                raw = Some(rocksdb::DB::open(&o, d).expect("open"));
+            }
+            let db: &rocksdb::DB = match (&kv, &raw) {
+                (Some(k), _) => &k.db,
+                (_, Some(r)) => r,
+                _ => unreachable!(),
+            };
+            let write_and_flush = |from: u32| {
+                for i in from..from + 100 {
+                    db.put(i.to_be_bytes(), b"v").expect("put");
+                }
+                db.flush().expect("flush");
+            };
+            write_and_flush(0);
+            std::thread::sleep(Duration::from_millis(200));
+            let archived = wals(&d.join("archive"));
+            for n in &archived {
+                std::fs::File::options()
+                    .write(true)
+                    .open(d.join("archive").join(n))
+                    .and_then(|f| f.set_modified(SystemTime::now() + Duration::from_secs(10)))
+                    .expect("set mtime");
+            }
+            std::thread::sleep(Duration::from_millis(1_100));
+            write_and_flush(1_000);
+            std::thread::sleep(Duration::from_millis(300));
+            (archived, wals(&d.join("archive")))
+        }
+        let control = dir("control");
+        let fixed = dir("fixed");
+        let (stamped, kept) = run(&control, false);
+        assert!(!stamped.is_empty(), "a flush archives the WAL (control)");
+        assert!(
+            !kept.contains(&stamped[0]),
+            "RocksDB's own TTL deletes a segment stamped ahead of the clock: {stamped:?} then {kept:?}"
+        );
+        let (stamped, kept) = run(&fixed, true);
+        assert!(!stamped.is_empty(), "a flush archives the WAL");
+        assert!(
+            kept.contains(&stamped[0]),
+            "the segment survives with Flint pruning (BUG-0259): {stamped:?} then {kept:?}"
+        );
+        let _ = std::fs::remove_dir_all(&control);
+        let _ = std::fs::remove_dir_all(&fixed);
     }
 }
