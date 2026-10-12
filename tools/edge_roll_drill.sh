@@ -189,6 +189,11 @@ vec() {
 [ "$(vec VEC.SET er a 1,0,0)" = "OK" ] || { echo "FAIL: VEC.SET through the edge"; exit 1; }
 [ "$(vec VEC.SEARCH er 1,0,0 1 | head -1)" = "a" ] || { echo "FAIL: VEC.SEARCH through the edge: $(vec VEC.SEARCH er 1,0,0 1)"; exit 1; }
 echo "  vec-7974 started on $TAG; the proxy routes VEC. to it: a tenant's VEC.CREATE, SET and SEARCH answer through the edge"
+# `status` names it too, with its build: what ops roll-fleet.sh's verdict
+# reads to call a co-processor rolled (ADR-0050 D4).
+echo "$ST" | grep -qE "^coproc +VEC\. 127\.0\.0\.1:7974 +up +build $TAG\$" \
+  || { echo "FAIL: status has no coproc row on $TAG: $(echo "$ST" | grep '^coproc' || echo '<none>')"; exit 1; }
+echo "  status shows vec-7974 on $TAG"
 
 echo "== a second upgrade rolls the running co-processor onto the new build"
 TAG2=edge-roll-10
@@ -198,7 +203,9 @@ $CTL upgrade --version-tag "$TAG2" --soak-ms 1500 >"$D/upgrade2.log" 2>&1 \
   || { tail -12 "$D/upgrade2.log" | sed 's/^/  | /'; echo "FAIL: the second upgrade exited $?"; exit 1; }
 kill -0 "$VPID" 2>/dev/null && { echo "FAIL: vec-7974's old process $VPID survived the roll"; exit 1; }
 [ "$(coproc_info build)" = "$TAG2" ] || { echo "FAIL: after the roll vec-7974 reports '$(coproc_info build)', expected $TAG2"; exit 1; }
-echo "  vec-7974: old process gone, new one reports $TAG2"
+$CTL status 2>&1 | grep -qE "^coproc +VEC\. 127\.0\.0\.1:7974 +up +build $TAG2\$" \
+  || { echo "FAIL: after the roll status does not show vec-7974 on $TAG2: $($CTL status 2>&1 | grep '^coproc' || echo '<none>')"; exit 1; }
+echo "  vec-7974: old process gone, new one reports $TAG2, and status says so"
 [ "$(vec VEC.SEARCH er 1,0,0 1 | head -1)" = "a" ] || { echo "FAIL: after the second roll VEC.SEARCH answers: $(vec VEC.SEARCH er 1,0,0 1)"; exit 1; }
 echo "  the set survives the roll: rebuilt from durable rows, still routed"
 

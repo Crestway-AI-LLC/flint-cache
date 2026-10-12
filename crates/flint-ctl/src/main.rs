@@ -6262,6 +6262,33 @@ fn status(inv: &Inventory) {
             if up { "up" } else { "DOWN" }
         );
     }
+    // ops ADR-0050 D4: each co-processor, from its own FLINTINFO over the
+    // mesh, so a roll's verdict (ops roll-fleet.sh) can see the build that
+    // `upgrade` asserted. A failure to ask is said, never a dash: unknown is
+    // not "no build".
+    for (fam, addr) in &inv.coprocs {
+        let (up, build) = match call(addr, &tls, &["FLINTINFO"]) {
+            Ok(Value::Bulk(Some(raw))) => {
+                let body = String::from_utf8_lossy(&raw).into_owned();
+                let reported = body
+                    .split(['\r', '\n'])
+                    .find_map(|l| l.strip_prefix("build:"))
+                    .map(|b| b.trim().to_string())
+                    .filter(|b| !b.is_empty());
+                let shown = match reported {
+                    Some(b) => flint_build::display(&b, env!("CARGO_PKG_VERSION")).to_string(),
+                    None => "-".into(),
+                };
+                (true, shown)
+            }
+            Ok(other) => (true, format!("<unreadable: FLINTINFO answered {other:?}>")),
+            Err(e) => (false, format!("<unreadable: {e}>")),
+        };
+        println!(
+            "coproc    {fam} {addr}  {:<6} build {build}",
+            if up { "up" } else { "DOWN" }
+        );
+    }
     // Printed even when empty is NOT an option here: an absent controller
     // row means the CP has heard from nobody, which during a roll is the
     // difference between "supervised" and "not". Say so rather than
