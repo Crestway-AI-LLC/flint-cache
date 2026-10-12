@@ -241,8 +241,9 @@ pub fn null_is_array(args: &[Vec<u8>]) -> bool {
         || (is(b"LPOP") || is(b"RPOP")) && args.len() == 3
         || (is(b"ZRANK") || is(b"ZREVRANK")) && args.len() == 4
         // Streams (ADR-0052 D6): an XREAD that finds nothing, and an XRANGE
-        // asked for `COUNT 0`.
+        // asked for `COUNT 0`; an XREADGROUP that finds nothing (ADR-0057).
         || is(b"XREAD")
+        || is(b"XREADGROUP")
         || is(b"XRANGE")
         || is(b"XREVRANGE")
 }
@@ -255,6 +256,72 @@ pub fn xread_resp2(v: &Value) -> Value {
             pairs
                 .iter()
                 .map(|(k, e)| Value::Array(Some(vec![k.clone(), e.clone()])))
+                .collect(),
+        )),
+        other => other.clone(),
+    }
+}
+
+/// Whether this is XREADGROUP, or XPENDING's summary, whose nested nulls are
+/// null arrays in RESP2 (ADR-0057): an entry deleted since it was delivered
+/// is its ID and a null array, and a summary with nothing pending ends in
+/// one. RESP3 has one null, and the proxy reads seats in RESP3.
+pub fn group_nulls(args: &[Vec<u8>]) -> bool {
+    args.first().is_some_and(|n| {
+        n.eq_ignore_ascii_case(b"XREADGROUP")
+            || n.eq_ignore_ascii_case(b"XPENDING") && args.len() == 3
+    })
+}
+
+/// [`group_nulls`]'s repair: the null arrays put back where RESP3 made them
+/// its one null. XREADGROUP's per-stream map or pairs keep their shape.
+pub fn group_nulls_reply(v: &Value) -> Value {
+    fn entries(v: &Value) -> Value {
+        match v {
+            Value::Array(Some(items)) => Value::Array(Some(
+                items
+                    .iter()
+                    .map(|e| match e {
+                        Value::Array(Some(parts)) if parts.len() == 2 => Value::Array(Some(vec![
+                            parts[0].clone(),
+                            match &parts[1] {
+                                Value::Null | Value::Bulk(None) => Value::Array(None),
+                                other => other.clone(),
+                            },
+                        ])),
+                        other => other.clone(),
+                    })
+                    .collect(),
+            )),
+            other => other.clone(),
+        }
+    }
+    match v {
+        // XREADGROUP, as RESP3 answers it.
+        Value::Map(streams) => Value::Map(
+            streams
+                .iter()
+                .map(|(k, e)| (k.clone(), entries(e)))
+                .collect(),
+        ),
+        // XPENDING's summary: the count, two IDs, and the consumers.
+        Value::Array(Some(items)) if items.len() == 4 && matches!(items[0], Value::Integer(_)) => {
+            let mut items = items.clone();
+            if matches!(items[3], Value::Null | Value::Bulk(None)) {
+                items[3] = Value::Array(None);
+            }
+            Value::Array(Some(items))
+        }
+        // XREADGROUP as pairs.
+        Value::Array(Some(pairs)) => Value::Array(Some(
+            pairs
+                .iter()
+                .map(|p| match p {
+                    Value::Array(Some(kv)) if kv.len() == 2 => {
+                        Value::Array(Some(vec![kv[0].clone(), entries(&kv[1])]))
+                    }
+                    other => other.clone(),
+                })
                 .collect(),
         )),
         other => other.clone(),

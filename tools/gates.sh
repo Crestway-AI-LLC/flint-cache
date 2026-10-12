@@ -4156,11 +4156,13 @@ if want conformance; then
   ( valkey-server --port 6390 --save '' --appendonly no --daemonize no \
       >"$LOGS/valkey.log" 2>&1 & echo $! >"$CDIR/oracle.pid" )
   # --streams: the corpus creates streams (ADR-0052 D6). --chunked-strings:
-  # its large strings are stored in chunks (ADR-0056 D4).
+  # its large strings are stored in chunks (ADR-0056 D4). --stream-groups:
+  # it creates consumer groups (ADR-0057).
   ( ./target/release/flint-server --port 6389 --engine mem --streams --chunked-strings \
+      --stream-groups \
       >"$LOGS/conf-mem.log" 2>&1 & echo $! >"$CDIR/mem.pid" )
   ( ./target/release/flint-server --port 6388 --engine rocks --data-dir "$CDIR/rocks" \
-      --streams --chunked-strings \
+      --streams --chunked-strings --stream-groups \
       >"$LOGS/conf-rocks.log" 2>&1 & echo $! >"$CDIR/rocks.pid" )
   for p in 6390 6389 6388; do
     for _ in $(seq 1 100); do

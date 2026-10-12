@@ -9,6 +9,12 @@
 //! Unlike an emptied list, an emptied stream keeps its key, as Redis's does:
 //! its last ID still bounds the next one.
 
+mod groups;
+pub use groups::{
+    Consumer, Created, ENTRIES_READ_UNKNOWN, Found, Group, GroupEntry, GroupStart, Pending,
+    PendingSummary, ReadFrom,
+};
+
 use crate::Kv;
 use crate::encoding::{
     Cf, MetaHeader, STREAM_ENTRY_TAG, StreamId, StreamMeta, ValueType, VersionGen, envelope,

@@ -209,6 +209,7 @@ controller on               # automatic failover supervision
 placed-tenants on           # allow `tenant add-on-pair` (ADR-0053; see section 4)
 streams on                  # let XADD create streams (ADR-0052; see section 4)
 chunked-strings on          # store strings over 64 KiB in chunks (ADR-0056; section 4)
+stream-groups on            # let XGROUP CREATE make consumer groups (ADR-0057; section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
 admin-token <tok>           # gate the PROXY*/operator surface
@@ -1263,6 +1264,16 @@ Notes:
   stream key as having no type: once a tenant has created a stream, do not
   roll this fleet back below this release. A tenant's `XADD` that would
   create a stream is refused while it is off.
+- **Stream consumer groups** (`XGROUP`, `XREADGROUP`, `XACK`, `XPENDING`,
+  `XINFO`, ADR-0057) are served on every seat, but a seat creates a group
+  only when the inventory says `stream-groups on` (each data seat then runs
+  with `--stream-groups`). It is off by default in the release that
+  introduced groups, because a release before it serves no group command,
+  so its consumers would stop: once a tenant has a group, do not roll this
+  fleet back below this release. While it is off, only a new group is
+  refused. Every command works on the groups that exist, and `XGROUP
+  CREATE` of one that exists answers `BUSYGROUP`, so a rollback to this
+  release from the one that turns it on keeps consumers consuming.
 - **Large strings in chunks** (ADR-0056): every seat reads a string stored
   in 32 KiB chunks, but a seat stores one that way only when the inventory
   says `chunked-strings on` (each data seat then runs with

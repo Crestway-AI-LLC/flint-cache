@@ -15,6 +15,9 @@ use super::*;
 use flint_storage::encoding::StreamId;
 use flint_storage::streams::{Entry, IdSpec, Trim, TrimTo};
 
+/// Consumer groups (ADR-0057).
+mod groups;
+
 const INVALID_ID: &str = "ERR Invalid stream ID specified as stream command argument";
 
 /// What `~` trims at most per call when no `LIMIT` is given: Valkey's
@@ -178,6 +181,115 @@ fn parse_add_or_trim(args: &[Vec<u8>], xadd: bool) -> Result<AddArgs, Value> {
         };
     }
     Ok(out)
+}
+
+/// XREAD's and XREADGROUP's options, as Valkey's `xreadCommand` reads them.
+struct ReadArgs<'a> {
+    /// `None` reads everything (`COUNT` 0 or less too).
+    count: Option<usize>,
+    /// XREADGROUP's group and consumer.
+    group: Option<(&'a [u8], &'a [u8])>,
+    noack: bool,
+    keys: &'a [Vec<u8>],
+    ids: &'a [Vec<u8>],
+}
+
+/// Read XREAD's or XREADGROUP's options up to `STREAMS`, with Valkey's
+/// errors in its order. A seat answers at once, so `BLOCK` is checked and
+/// dropped; the proxy does the waiting.
+fn parse_read(args: &[Vec<u8>], xreadgroup: bool) -> Result<ReadArgs<'_>, Value> {
+    let mut count = None;
+    let mut group = None;
+    let mut noack = false;
+    let mut streams_at = None;
+    let mut i = 1;
+    while i < args.len() {
+        let more = args.len() - 1 - i;
+        let o = &args[i];
+        if o.eq_ignore_ascii_case(b"BLOCK") && more > 0 {
+            match parse_i64(&args[i + 1]) {
+                Ok(ms) if ms < 0 => return Err(err("ERR timeout is negative")),
+                Ok(_) => {}
+                Err(_) => return Err(err("ERR timeout is not an integer or out of range")),
+            }
+            i += 2;
+        } else if o.eq_ignore_ascii_case(b"COUNT") && more > 0 {
+            let Ok(n) = parse_i64(&args[i + 1]) else {
+                return Err(err(NOT_AN_INTEGER));
+            };
+            count = (n > 0).then_some(n as usize);
+            i += 2;
+        } else if o.eq_ignore_ascii_case(b"STREAMS") && more > 0 {
+            if more % 2 == 1 {
+                let (name, symbol) = if xreadgroup {
+                    ("xreadgroup", '>')
+                } else {
+                    ("xread", '$')
+                };
+                return Err(err(&format!(
+                    "ERR Unbalanced '{name}' list of streams: for each stream key an ID or \
+                     '{symbol}' must be specified."
+                )));
+            }
+            streams_at = Some(i + 1);
+            break;
+        } else if o.eq_ignore_ascii_case(b"GROUP") && more >= 2 {
+            if !xreadgroup {
+                return Err(err(
+                    "ERR The GROUP option is only supported by XREADGROUP. You called XREAD instead.",
+                ));
+            }
+            group = Some((args[i + 1].as_slice(), args[i + 2].as_slice()));
+            i += 3;
+        } else if o.eq_ignore_ascii_case(b"NOACK") {
+            if !xreadgroup {
+                return Err(err(
+                    "ERR The NOACK option is only supported by XREADGROUP. You called XREAD instead.",
+                ));
+            }
+            noack = true;
+            i += 1;
+        } else {
+            return Err(err("ERR syntax error"));
+        }
+    }
+    let Some(at) = streams_at else {
+        return Err(err("ERR syntax error"));
+    };
+    if xreadgroup && group.is_none() {
+        return Err(err("ERR Missing GROUP option for XREADGROUP"));
+    }
+    let (keys, ids) = args[at..].split_at((args.len() - at) / 2);
+    Ok(ReadArgs {
+        count,
+        group,
+        noack,
+        keys,
+        ids,
+    })
+}
+
+/// XREAD's and XREADGROUP's reply: the null array when no stream had
+/// anything, else a map of key to entries in RESP3 and a list of pairs in
+/// RESP2.
+fn per_stream(found: Vec<(Vec<u8>, Value)>) -> Value {
+    if found.is_empty() {
+        return Value::Array(None);
+    }
+    Value::ByProto {
+        resp2: Box::new(Value::Array(Some(
+            found
+                .iter()
+                .map(|(k, e)| Value::Array(Some(vec![Value::Bulk(Some(k.clone())), e.clone()])))
+                .collect(),
+        ))),
+        resp3: Box::new(Value::Map(
+            found
+                .into_iter()
+                .map(|(k, e)| (Value::Bulk(Some(k)), e))
+                .collect(),
+        )),
+    }
 }
 
 /// `[id, [field, value, ...]]`, in both protocols.
@@ -347,43 +459,12 @@ impl Dispatcher<'_> {
         if args.len() < 4 {
             return arity_err("xread");
         }
-        let mut count: Option<usize> = None;
-        let mut streams_at = None;
-        let mut i = 1;
-        while i < args.len() {
-            let more = args.len() - 1 - i;
-            let o = &args[i];
-            if o.eq_ignore_ascii_case(b"BLOCK") && more > 0 {
-                match parse_i64(&args[i + 1]) {
-                    Ok(ms) if ms < 0 => return err("ERR timeout is negative"),
-                    Ok(_) => {}
-                    Err(_) => return err("ERR timeout is not an integer or out of range"),
-                }
-                i += 2;
-            } else if o.eq_ignore_ascii_case(b"COUNT") && more > 0 {
-                let Ok(n) = parse_i64(&args[i + 1]) else {
-                    return err(NOT_AN_INTEGER);
-                };
-                count = (n > 0).then_some(n as usize);
-                i += 2;
-            } else if o.eq_ignore_ascii_case(b"STREAMS") && more > 0 {
-                if more % 2 == 1 {
-                    return err(
-                        "ERR Unbalanced 'xread' list of streams: for each stream key an ID or \
-                         '$' must be specified.",
-                    );
-                }
-                streams_at = Some(i + 1);
-                break;
-            } else {
-                return err("ERR syntax error");
-            }
-        }
-        let Some(at) = streams_at else {
-            return err("ERR syntax error");
+        let ReadArgs {
+            count, keys, ids, ..
+        } = match parse_read(args, false) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
-        let n = (args.len() - at) / 2;
-        let (keys, ids) = args[at..].split_at(n);
         if !self.whole
             && let Some(refusal) = Self::crossslot(&keys[0], &keys[1..])
         {
@@ -392,7 +473,7 @@ impl Dispatcher<'_> {
         // Each key's starting point, as Valkey resolves it: a key of
         // another type refuses the whole read, and `$` and `+` read the
         // stream as it stands now.
-        let mut after = Vec::with_capacity(n);
+        let mut after = Vec::with_capacity(keys.len());
         for (key, id) in keys.iter().zip(ids) {
             let slot = slot_for_key(key);
             let meta = match self.streams.read_meta(slot, key) {
@@ -402,6 +483,12 @@ impl Dispatcher<'_> {
             let from = match id.as_slice() {
                 b"$" => meta.map_or(StreamId::MIN, |m| m.last_id),
                 b"+" => meta.map_or(StreamId::MIN, |m| m.last_id.prev().unwrap_or(StreamId::MIN)),
+                b">" => {
+                    return err(
+                        "ERR The > ID can be specified only when calling XREADGROUP using the \
+                         GROUP <group> <consumer> option.",
+                    );
+                }
                 _ => match full_id(id, 0, true) {
                     Ok(id) => id,
                     Err(e) => return e,
@@ -423,24 +510,7 @@ impl Dispatcher<'_> {
                 Err(e) => return store_err(e),
             }
         }
-        if found.is_empty() {
-            return Value::Array(None);
-        }
-        // RESP3 answers a map of key to entries, RESP2 a list of pairs.
-        Value::ByProto {
-            resp2: Box::new(Value::Array(Some(
-                found
-                    .iter()
-                    .map(|(k, e)| Value::Array(Some(vec![Value::Bulk(Some(k.clone())), e.clone()])))
-                    .collect(),
-            ))),
-            resp3: Box::new(Value::Map(
-                found
-                    .into_iter()
-                    .map(|(k, e)| (Value::Bulk(Some(k)), e))
-                    .collect(),
-            )),
-        }
+        per_stream(found)
     }
 }
 

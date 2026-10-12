@@ -101,6 +101,16 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
             .and_then(|k| k.first())
             .map(|k| k.as_slice());
     }
+    // XREADGROUP's too, and XGROUP's and XINFO's follows a subcommand
+    // (ADR-0057).
+    if name.eq_ignore_ascii_case(b"XREADGROUP") {
+        return flint_commands::xreadgroup_keys(args)
+            .and_then(|k| k.first())
+            .map(|k| k.as_slice());
+    }
+    if let Some(key) = flint_commands::subcommand_key(args) {
+        return key;
+    }
     args.get(1).map(|k| k.as_slice())
 }
 
@@ -286,6 +296,11 @@ pub struct Limits {
     /// release that reads chunked strings, for the same reason as `streams`;
     /// chunked strings that exist are read and written either way.
     pub chunked_strings: bool,
+    /// Whether XGROUP CREATE may create a consumer group (`--stream-groups`,
+    /// ADR-0057 D5). Off by default in the first release that serves groups;
+    /// every group command works on groups that exist either way, so a
+    /// rollback to that release keeps consumers consuming.
+    pub stream_groups: bool,
 }
 
 impl Default for Limits {
@@ -296,6 +311,7 @@ impl Default for Limits {
             script: crate::script::ScriptLimits::default(),
             streams: false,
             chunked_strings: false,
+            stream_groups: false,
         }
     }
 }
@@ -460,6 +476,11 @@ impl<'a> Dispatcher<'a> {
             b"XREAD" => {
                 flint_commands::xread_keys(args).is_some_and(|ks| ks.iter().any(|k| k.len() > max))
             }
+            b"XREADGROUP" => flint_commands::xreadgroup_keys(args)
+                .is_some_and(|ks| ks.iter().any(|k| k.len() > max)),
+            b"XGROUP" | b"XINFO" => flint_commands::subcommand_key(args)
+                .flatten()
+                .is_some_and(|k| k.len() > max),
             _ => args.get(1).is_some_and(|k| k.len() > max),
         }
     }
@@ -828,6 +849,12 @@ impl<'a> Dispatcher<'a> {
             b"XDEL" => self.cmd_xdel(args),
             b"XTRIM" => self.cmd_xtrim(args),
             b"XREAD" => self.cmd_xread(args),
+            // Consumer groups (ADR-0057), in `commands/streams/groups.rs`.
+            b"XGROUP" => self.cmd_xgroup(args),
+            b"XREADGROUP" => self.cmd_xreadgroup(args),
+            b"XACK" => self.cmd_xack(args),
+            b"XPENDING" => self.cmd_xpending(args),
+            b"XINFO" => self.cmd_xinfo(args),
             b"SUBSCRIBE" | b"PSUBSCRIBE" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" => err(
                 "ERR a seat serves subscriptions to proxies only: subscribe through the proxy \
                  (ADR-0052)",
@@ -7668,6 +7695,50 @@ mod tests {
         ] {
             assert!(!s(no), "{no:?} is not served");
         }
+    }
+
+    /// ADR-0057 D5: with `--stream-groups` off, only a new group is
+    /// refused. One that exists still answers BUSYGROUP and serves its
+    /// consumers, so a rollback to the release that reads groups keeps them
+    /// consuming, including consumers that create their group at startup.
+    #[test]
+    fn group_creation_waits_for_the_flag_and_nothing_else_does() {
+        let s = MemKv::new();
+        let on = Limits {
+            streams: true,
+            stream_groups: true,
+            ..Limits::default()
+        };
+        let off = Limits {
+            streams: true,
+            ..Limits::default()
+        };
+        let ev = |l: Limits, parts: &[&str]| ev_in(&s, "groups-flag", l, parts);
+        ev(on, &["XADD", "k", "1-0", "f", "v"]);
+        assert_eq!(
+            ev(on, &["XGROUP", "CREATE", "k", "g", "0"]),
+            Value::Simple("OK".into())
+        );
+        assert!(
+            matches!(ev(off, &["XGROUP", "CREATE", "k", "g2", "0"]), Value::Error(e) if e.contains("not enabled"))
+        );
+        assert!(
+            matches!(ev(off, &["XGROUP", "CREATE", "k", "g", "0"]), Value::Error(e) if e.starts_with("BUSYGROUP"))
+        );
+        assert!(!matches!(
+            ev(off, &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "k", ">"]),
+            Value::Error(_) | Value::Array(None)
+        ));
+        assert_eq!(ev(off, &["XACK", "k", "g", "1-0"]), Value::Integer(1));
+        // MKSTREAM's stream waits for `--streams` as XADD's does.
+        let groups_only = Limits {
+            stream_groups: true,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            ev(groups_only, &["XGROUP", "CREATE", "new", "g", "$", "MKSTREAM"]),
+            Value::Error(e) if e.contains("streams are not enabled")
+        ));
     }
 
     /// `SCRIPT` and `EVALSHA` over a namespace's cache, and upstream's

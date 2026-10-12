@@ -1673,6 +1673,16 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
             .and_then(|k| k.first())
             .map(|k| k.as_slice());
     }
+    // XREADGROUP's too, and XGROUP's and XINFO's follows a subcommand
+    // (ADR-0057).
+    if name.eq_ignore_ascii_case(b"XREADGROUP") {
+        return flint_commands::xreadgroup_keys(args)
+            .and_then(|k| k.first())
+            .map(|k| k.as_slice());
+    }
+    if let Some(key) = flint_commands::subcommand_key(args) {
+        return key;
+    }
     args.get(1).map(|k| k.as_slice())
 }
 
@@ -1742,6 +1752,13 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
             resp3: Box::new(v),
         };
     }
+    // XREADGROUP and XPENDING's summary: RESP3's one null back to the null
+    // arrays RESP2 has there (ADR-0057). XREADGROUP's map is then XREAD's.
+    let v = if flint_resp::group_nulls(args) {
+        flint_resp::group_nulls_reply(&v)
+    } else {
+        v
+    };
     // XREAD answers a map under RESP3 and a list of pairs under RESP2, and
     // flattening the map would interleave keys with entries (ADR-0052 D6).
     if is_xread(args) && matches!(v, Value::Map(_)) {
@@ -1755,7 +1772,7 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
 
 fn is_xread(args: &[Vec<u8>]) -> bool {
     args.first()
-        .is_some_and(|n| n.eq_ignore_ascii_case(b"XREAD"))
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"XREAD") || n.eq_ignore_ascii_case(b"XREADGROUP"))
 }
 
 /// Whether [`repair_reply`] changes this command's reply, so a transaction
@@ -1767,6 +1784,7 @@ fn needs_repair(args: &[Vec<u8>]) -> bool {
         || flint_resp::hrandfield_withvalues(args)
         || flint_resp::zmpop_reply(args)
         || flint_resp::geo_coordinates(args)
+        || flint_resp::group_nulls(args)
         || is_xread(args)
 }
 

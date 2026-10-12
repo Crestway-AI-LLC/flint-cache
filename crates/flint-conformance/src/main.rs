@@ -1632,6 +1632,178 @@ fn corpus() -> Vec<Case> {
         // Valkey 9.1's tables order keys differently from Lua 5.1's, which
         // Redis 8.2 and Flint share.
         Case {
+            family: "streams",
+            name: "consumer groups: XGROUP, and its errors in Valkey's order",
+            // ADR-0057. Generated from Valkey 9.1's replies (2026-10-12): an option is
+            // checked before the key, the key's type before its existence, and the
+            // ID last.
+            steps: vec![
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g", b"$"], Expect::Err("ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g", b"$", b"MKSTREAM"], Expect::Ok),
+                s(&[b"TYPE", b"{cg}a"], Expect::Simple("stream")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g", b"$"], Expect::Err("BUSYGROUP Consumer Group name already exists")),
+                s(&[b"XADD", b"{cg}a", b"1-0", b"a", b"1"], Expect::Str(b"1-0")),
+                s(&[b"XADD", b"{cg}a", b"2-0", b"b", b"2"], Expect::Str(b"2-0")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g0", b"0"], Expect::Ok),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"gx", b"1-0", b"ENTRIESREAD", b"1"], Expect::Ok),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"gy", b"0", b"ENTRIESREAD", b"-2"], Expect::Err("ERR value for ENTRIESREAD must be positive or -1")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"gy", b"0", b"ENTRIESREAD", b"abc"], Expect::Err("ERR value is not an integer or out of range")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"gy", b"0", b"ENTRIESREAD"], Expect::Err("ERR unknown subcommand or wrong number of arguments for 'CREATE'. Try XGROUP HELP.")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"gy", b"0", b"BOGUS"], Expect::Err("ERR unknown subcommand or wrong number of arguments for 'CREATE'. Try XGROUP HELP.")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"gy", b"+"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"gy", b"2-x"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g2", b"0", b"ENTRIESREAD", b"5", b"ENTRIESREAD", b"6"], Expect::Err("ERR unknown subcommand or wrong number of arguments for 'CREATE'. Try XGROUP HELP.")),
+                s(&[b"XGROUP", b"create", b"{cg}a", b"gl", b"0"], Expect::Ok),
+                s(&[b"XGROUP", b"Destroy", b"{cg}a", b"gl"], Expect::Int(1)),
+                s(&[b"XGROUP", b"SETID", b"{cg}a", b"g0", b"$"], Expect::Ok),
+                s(&[b"XGROUP", b"SETID", b"{cg}a", b"g0", b"-", b"ENTRIESREAD", b"0"], Expect::Ok),
+                s(&[b"XGROUP", b"SETID", b"{cg}a", b"g0", b"1-0", b"ENTRIESREAD", b"-5"], Expect::Err("ERR value for ENTRIESREAD must be positive or -1")),
+                s(&[b"XGROUP", b"SETID", b"{cg}a", b"g0", b"1-0", b"BOGUS", b"1"], Expect::Err("ERR unknown subcommand or wrong number of arguments for 'SETID'. Try XGROUP HELP.")),
+                s(&[b"XGROUP", b"SETID", b"{cg}a", b"nog", b"bad"], Expect::Err("NOGROUP No such consumer group 'nog' for key name '{cg}a'")),
+                s(&[b"XGROUP", b"SETID", b"{cg}nokey", b"g", b"0"], Expect::Err("ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.")),
+                s(&[b"XGROUP", b"CREATECONSUMER", b"{cg}a", b"g0", b"c9"], Expect::Int(1)),
+                s(&[b"XGROUP", b"CREATECONSUMER", b"{cg}a", b"g0", b"c9"], Expect::Int(0)),
+                s(&[b"XGROUP", b"CREATECONSUMER", b"{cg}a", b"nog", b"c"], Expect::Err("NOGROUP No such consumer group 'nog' for key name '{cg}a'")),
+                s(&[b"XGROUP", b"DELCONSUMER", b"{cg}a", b"g0", b"c9"], Expect::Int(0)),
+                s(&[b"XGROUP", b"DELCONSUMER", b"{cg}a", b"g0", b"zzz"], Expect::Int(0)),
+                s(&[b"XGROUP", b"DESTROY", b"{cg}a", b"gx"], Expect::Int(1)),
+                s(&[b"XGROUP", b"DESTROY", b"{cg}a", b"gx"], Expect::Int(0)),
+                s(&[b"XGROUP", b"DESTROY", b"{cg}nokey", b"gx"], Expect::Err("ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.")),
+                s(&[b"SET", b"{cg}str", b"x"], Expect::Ok),
+                s(&[b"XGROUP", b"CREATE", b"{cg}str", b"g", b"$", b"MKSTREAM"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XGROUP", b"DESTROY", b"{cg}str", b"g"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XGROUP"], Expect::Err("ERR wrong number of arguments for 'xgroup' command")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g"], Expect::Err("ERR wrong number of arguments for 'xgroup|create' command")),
+                s(&[b"XGROUP", b"FOO", b"{cg}a", b"g"], Expect::Err("ERR unknown subcommand 'FOO'. Try XGROUP HELP.")),
+                s(&[b"XGROUP", b"DESTROY", b"{cg}a", b"g", b"extra"], Expect::Err("ERR wrong number of arguments for 'xgroup|destroy' command")),
+                s(&[b"XGROUP", b"SETID", b"{cg}a", b"g0", b"0", b"ENTRIESREAD", b"1", b"x"], Expect::Err("ERR unknown subcommand or wrong number of arguments for 'SETID'. Try XGROUP HELP.")),
+                s(&[b"XGROUP", b"HELP"], Expect::Arr(vec![Expect::Simple("XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"), Expect::Simple("CREATE <key> <groupname> <id|$> [option]"), Expect::Simple("    Create a new consumer group. Options are:"), Expect::Simple("    * MKSTREAM"), Expect::Simple("      Create the empty stream if it does not exist."), Expect::Simple("    * ENTRIESREAD entries_read"), Expect::Simple("      Set the group's entries_read counter (internal use)."), Expect::Simple("CREATECONSUMER <key> <groupname> <consumer>"), Expect::Simple("    Create a new consumer in the specified group."), Expect::Simple("DELCONSUMER <key> <groupname> <consumer>"), Expect::Simple("    Remove the specified consumer."), Expect::Simple("DESTROY <key> <groupname>"), Expect::Simple("    Remove the specified group."), Expect::Simple("SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]"), Expect::Simple("    Set the current group ID and entries_read counter."), Expect::Simple("HELP"), Expect::Simple("    Print this help.")])),
+            ],
+        },
+        Case {
+            family: "streams",
+            name: "consumer groups: XREADGROUP, XACK and XPENDING",
+            // A consumer's history, a deleted entry as its ID and a null array, an
+            // entry taken over after SETID, and NOACK. XPENDING's ranges carry idle
+            // times, so only the ones that select nothing are here.
+            steps: vec![
+                s(&[b"XADD", b"{cg}a", b"1-0", b"a", b"1"], Expect::Str(b"1-0")),
+                s(&[b"XADD", b"{cg}a", b"2-0", b"b", b"2"], Expect::Str(b"2-0")),
+                s(&[b"XADD", b"{cg}a", b"3-0", b"c", b"3"], Expect::Str(b"3-0")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g", b"0"], Expect::Ok),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"COUNT", b"2", b"STREAMS", b"{cg}a", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]), Expect::Arr(vec![Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"2")])])])])])),
+                s(&[b"XPENDING", b"{cg}a", b"g"], Expect::Arr(vec![Expect::Int(2), Expect::Str(b"1-0"), Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"c1"), Expect::Str(b"2")])])])),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c2", b"STREAMS", b"{cg}a", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"3")])])])])])),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c2", b"STREAMS", b"{cg}a", b">"], Expect::NilArray),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c2", b"BLOCK", b"10", b"STREAMS", b"{cg}a", b">"], Expect::NilArray),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"{cg}a", b"0"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]), Expect::Arr(vec![Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"2")])])])])])),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"COUNT", b"1", b"STREAMS", b"{cg}a", b"1-0"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"2")])])])])])),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"{cg}a", b"9-0"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![])])])),
+                s(&[b"XACK", b"{cg}a", b"g", b"1-0", b"1-0", b"9-9"], Expect::Int(1)),
+                s(&[b"XACK", b"{cg}a", b"g", b"bad"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XACK", b"{cg}nokey", b"g", b"1-0"], Expect::Int(0)),
+                s(&[b"XACK", b"{cg}a", b"nog", b"bad"], Expect::Int(0)),
+                s(&[b"XACK", b"{cg}a", b"g"], Expect::Err("ERR wrong number of arguments for 'xack' command")),
+                s(&[b"XDEL", b"{cg}a", b"2-0"], Expect::Int(1)),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"{cg}a", b"0"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"2-0"), Expect::NilArray])])])])),
+                s(&[b"XPENDING", b"{cg}a", b"g"], Expect::Arr(vec![Expect::Int(2), Expect::Str(b"2-0"), Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"c1"), Expect::Str(b"1")]), Expect::Arr(vec![Expect::Str(b"c2"), Expect::Str(b"1")])])])),
+                s(&[b"XPENDING", b"{cg}a", b"g", b"-", b"+", b"0"], Expect::Arr(vec![])),
+                s(&[b"XPENDING", b"{cg}a", b"g", b"IDLE", b"100000000", b"-", b"+", b"10"], Expect::Arr(vec![])),
+                s(&[b"XPENDING", b"{cg}a", b"g", b"+", b"-", b"10"], Expect::Arr(vec![])),
+                s(&[b"XPENDING", b"{cg}a", b"g", b"-", b"+", b"10", b"nobody"], Expect::Arr(vec![])),
+                s(&[b"XPENDING", b"{cg}a", b"g", b"-", b"+"], Expect::Err("ERR syntax error")),
+                s(&[b"XPENDING", b"{cg}a", b"g", b"IDLE", b"5", b"-", b"+"], Expect::Err("ERR syntax error")),
+                s(&[b"XPENDING", b"{cg}a", b"g", b"-", b"(0-0", b"10"], Expect::Err("ERR invalid end ID for the interval")),
+                s(&[b"XPENDING", b"{cg}a", b"nog"], Expect::Err("NOGROUP No such key '{cg}a' or consumer group 'nog'")),
+                s(&[b"XGROUP", b"SETID", b"{cg}a", b"g", b"0"], Expect::Ok),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c3", b"STREAMS", b"{cg}a", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]), Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"3")])])])])])),
+                s(&[b"XPENDING", b"{cg}a", b"g"], Expect::Arr(vec![Expect::Int(3), Expect::Str(b"1-0"), Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"c1"), Expect::Str(b"1")]), Expect::Arr(vec![Expect::Str(b"c3"), Expect::Str(b"2")])])])),
+                s(&[b"XGROUP", b"DELCONSUMER", b"{cg}a", b"g", b"c3"], Expect::Int(2)),
+                s(&[b"XPENDING", b"{cg}a", b"g"], Expect::Arr(vec![Expect::Int(1), Expect::Str(b"2-0"), Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"c1"), Expect::Str(b"1")])])])),
+                s(&[b"XADD", b"{cg}a", b"4-0", b"d", b"4"], Expect::Str(b"4-0")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c5", b"NOACK", b"STREAMS", b"{cg}a", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"4-0"), Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"4")])])])])])),
+                s(&[b"XPENDING", b"{cg}a", b"g"], Expect::Arr(vec![Expect::Int(1), Expect::Str(b"2-0"), Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"c1"), Expect::Str(b"1")])])])),
+                s(&[b"XACK", b"{cg}a", b"g", b"2-0"], Expect::Int(1)),
+                s(&[b"XPENDING", b"{cg}a", b"g"], Expect::Arr(vec![Expect::Int(0), Expect::Nil, Expect::Nil, Expect::NilArray])),
+                s(&[b"XADD", b"{cg}b", b"1-0", b"x", b"1"], Expect::Str(b"1-0")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}b", b"g", b"0"], Expect::Ok),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"m", b"STREAMS", b"{cg}a", b"{cg}b", b">", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}b"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"x"), Expect::Str(b"1")])])])])])),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"m", b"STREAMS", b"{cg}a", b"{cg}b", b"0", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![])])])),
+            ],
+        },
+        Case {
+            family: "streams",
+            name: "consumer groups: XINFO GROUPS, lag, and the groups a COPY carries",
+            // Lag is Valkey's estimate: exact while nothing was deleted ahead of the
+            // group, nil when it cannot be known, negative when ENTRIESREAD
+            // overstates it.
+            steps: vec![
+                s(&[b"XADD", b"{cg}t", b"1-0", b"a", b"1"], Expect::Str(b"1-0")),
+                s(&[b"XADD", b"{cg}t", b"2-0", b"a", b"1"], Expect::Str(b"2-0")),
+                s(&[b"XADD", b"{cg}t", b"3-0", b"a", b"1"], Expect::Str(b"3-0")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}t", b"g", b"0"], Expect::Ok),
+                s(&[b"XGROUP", b"CREATE", b"{cg}t", b"h", b"$"], Expect::Ok),
+                s(&[b"XINFO", b"GROUPS", b"{cg}t"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"g"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"0-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Int(3)]), Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"h"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"3-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Int(0)])])),
+                s(&[b"XTRIM", b"{cg}t", b"MAXLEN", b"1"], Expect::Int(2)),
+                s(&[b"XINFO", b"GROUPS", b"{cg}t"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"g"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"0-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Int(1)]), Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"h"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"3-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Int(0)])])),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}t", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}t"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])])])])])),
+                s(&[b"XINFO", b"GROUPS", b"{cg}t"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"g"), Expect::Str(b"consumers"), Expect::Int(1), Expect::Str(b"pending"), Expect::Int(1), Expect::Str(b"last-delivered-id"), Expect::Str(b"3-0"), Expect::Str(b"entries-read"), Expect::Int(3), Expect::Str(b"lag"), Expect::Int(0)]), Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"h"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"3-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Int(0)])])),
+                s(&[b"XADD", b"{cg}t", b"4-0", b"a", b"1"], Expect::Str(b"4-0")),
+                s(&[b"XDEL", b"{cg}t", b"4-0"], Expect::Int(1)),
+                s(&[b"XINFO", b"GROUPS", b"{cg}t"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"g"), Expect::Str(b"consumers"), Expect::Int(1), Expect::Str(b"pending"), Expect::Int(1), Expect::Str(b"last-delivered-id"), Expect::Str(b"3-0"), Expect::Str(b"entries-read"), Expect::Int(3), Expect::Str(b"lag"), Expect::Nil]), Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"h"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"3-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Nil])])),
+                s(&[b"XGROUP", b"SETID", b"{cg}t", b"g", b"0", b"ENTRIESREAD", b"3"], Expect::Ok),
+                s(&[b"XINFO", b"GROUPS", b"{cg}t"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"g"), Expect::Str(b"consumers"), Expect::Int(1), Expect::Str(b"pending"), Expect::Int(1), Expect::Str(b"last-delivered-id"), Expect::Str(b"0-0"), Expect::Str(b"entries-read"), Expect::Int(3), Expect::Str(b"lag"), Expect::Nil]), Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"h"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"3-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Nil])])),
+                s(&[b"XGROUP", b"CREATE", b"{cg}e", b"e", b"$", b"MKSTREAM"], Expect::Ok),
+                s(&[b"XINFO", b"GROUPS", b"{cg}e"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"e"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"0-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Int(0)])])),
+                s(&[b"XINFO", b"GROUPS", b"{cg}nokey"], Expect::Err("ERR no such key")),
+                s(&[b"SET", b"{cg}str", b"x"], Expect::Ok),
+                s(&[b"XINFO", b"GROUPS", b"{cg}str"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XINFO", b"CONSUMERS", b"{cg}t", b"nog"], Expect::Err("NOGROUP No such consumer group 'nog' for key name '{cg}t'")),
+                s(&[b"XINFO", b"CONSUMERS", b"{cg}nokey", b"g"], Expect::Err("ERR no such key")),
+                s(&[b"XINFO"], Expect::Err("ERR wrong number of arguments for 'xinfo' command")),
+                s(&[b"XINFO", b"GROUPS"], Expect::Err("ERR wrong number of arguments for 'xinfo|groups' command")),
+                s(&[b"XINFO", b"FOO", b"{cg}t"], Expect::Err("ERR unknown subcommand 'FOO'. Try XINFO HELP.")),
+                s(&[b"XINFO", b"HELP"], Expect::Arr(vec![Expect::Simple("XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"), Expect::Simple("CONSUMERS <key> <groupname>"), Expect::Simple("    Show consumers of <groupname>."), Expect::Simple("GROUPS <key>"), Expect::Simple("    Show the stream consumer groups."), Expect::Simple("STREAM <key> [FULL [COUNT <count>]"), Expect::Simple("    Show information about the stream."), Expect::Simple("HELP"), Expect::Simple("    Print this help.")])),
+                s(&[b"COPY", b"{cg}t", b"{cg}copy"], Expect::Int(1)),
+                s(&[b"XINFO", b"GROUPS", b"{cg}copy"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"g"), Expect::Str(b"consumers"), Expect::Int(1), Expect::Str(b"pending"), Expect::Int(1), Expect::Str(b"last-delivered-id"), Expect::Str(b"0-0"), Expect::Str(b"entries-read"), Expect::Int(3), Expect::Str(b"lag"), Expect::Nil]), Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"h"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"3-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Nil])])),
+                s(&[b"DEL", b"{cg}copy"], Expect::Int(1)),
+                s(&[b"XADD", b"{cg}copy", b"1-0", b"a", b"1"], Expect::Str(b"1-0")),
+                s(&[b"XINFO", b"GROUPS", b"{cg}copy"], Expect::Arr(vec![])),
+            ],
+        },
+        Case {
+            family: "streams",
+            name: "consumer groups: XREADGROUP's and XREAD's option errors, and a transaction",
+            // One option parser for both commands, as Valkey's xreadCommand is.
+            steps: vec![
+                s(&[b"XADD", b"{cg}a", b"1-0", b"a", b"1"], Expect::Str(b"1-0")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g", b"0"], Expect::Ok),
+                s(&[b"SET", b"{cg}str", b"x"], Expect::Ok),
+                s(&[b"XREADGROUP", b"STREAMS", b"{cg}a", b">"], Expect::Err("ERR wrong number of arguments for 'xreadgroup' command")),
+                s(&[b"XREADGROUP", b"COUNT", b"1", b"STREAMS", b"{cg}a", b"{cg}b", b">", b">"], Expect::Err("ERR Missing GROUP option for XREADGROUP")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}a", b"$"], Expect::Err("ERR The $ ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The $ ID would just return an empty result set.")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}a", b"+"], Expect::Err("ERR The + ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The + ID would just return an empty result set.")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}a", b"{cg}b", b">"], Expect::Err("ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified.")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"COUNT", b"x", b"STREAMS", b"{cg}a", b">"], Expect::Err("ERR value is not an integer or out of range")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"BLOCK", b"-1", b"STREAMS", b"{cg}a", b">"], Expect::Err("ERR timeout is negative")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"BOGUS", b"STREAMS", b"{cg}a", b">"], Expect::Err("ERR syntax error")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}a", b"bad"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XREADGROUP", b"GROUP", b"nog", b"c", b"STREAMS", b"{cg}a", b">"], Expect::Err("NOGROUP No such key '{cg}a' or consumer group 'nog' in XREADGROUP with GROUP option")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}nokey", b">"], Expect::Err("NOGROUP No such key '{cg}nokey' or consumer group 'g' in XREADGROUP with GROUP option")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}str", b">"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}nokey", b"$"], Expect::Err("NOGROUP No such key '{cg}nokey' or consumer group 'g' in XREADGROUP with GROUP option")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"GROUP", b"g2", b"c2", b"STREAMS", b"{cg}a", b">"], Expect::Err("NOGROUP No such key '{cg}a' or consumer group 'g2' in XREADGROUP with GROUP option")),
+                s(&[b"XREAD", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}a", b">"], Expect::Err("ERR The GROUP option is only supported by XREADGROUP. You called XREAD instead.")),
+                s(&[b"XREAD", b"NOACK", b"STREAMS", b"{cg}a", b"0"], Expect::Err("ERR The NOACK option is only supported by XREADGROUP. You called XREAD instead.")),
+                s(&[b"XREAD", b"STREAMS", b"{cg}a", b">"], Expect::Err("ERR The > ID can be specified only when calling XREADGROUP using the GROUP <group> <consumer> option.")),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"XADD", b"{cg}a", b"5-0", b"e", b"5"], Expect::Simple("QUEUED")),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"tx", b"STREAMS", b"{cg}a", b">"], Expect::Simple("QUEUED")),
+                s(&[b"XACK", b"{cg}a", b"g", b"5-0"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::Arr(vec![Expect::Str(b"5-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]), Expect::Arr(vec![Expect::Str(b"5-0"), Expect::Arr(vec![Expect::Str(b"e"), Expect::Str(b"5")])])])])]), Expect::Int(1)])),
+            ],
+        },
+        Case {
             family: "lua",
             name: "the cjson library, as Valkey bundles it",
             steps: vec![
@@ -7329,10 +7501,20 @@ impl Client {
             true => flint_resp::bf_info_field_resp2(&v),
             false => v,
         };
-        // XREAD is a map under RESP3 and a list of pairs under RESP2
-        // (ADR-0052 D6).
+        // XREADGROUP's deleted entries and XPENDING's empty summary end in
+        // RESP2's null array, where RESP3 has its one null (ADR-0057).
+        let v = match flint_resp::group_nulls(args) {
+            true => flint_resp::group_nulls_reply(&v),
+            false => v,
+        };
+        // XREAD and XREADGROUP are a map under RESP3 and a list of pairs
+        // under RESP2 (ADR-0052 D6, ADR-0057).
         match args.first() {
-            Some(n) if n.eq_ignore_ascii_case(b"XREAD") => flint_resp::xread_resp2(&v),
+            Some(n)
+                if n.eq_ignore_ascii_case(b"XREAD") || n.eq_ignore_ascii_case(b"XREADGROUP") =>
+            {
+                flint_resp::xread_resp2(&v)
+            }
             _ => v,
         }
     }

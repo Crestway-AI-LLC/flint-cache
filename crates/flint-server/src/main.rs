@@ -98,6 +98,9 @@ const ACCEPTED_FLAGS: &[&str] = &[
     "--rewind-snaps",
     "--script-memory-limit-mb",
     "--script-time-limit-ms",
+    // A switch, which takes no value (ADR-0057 D5): XGROUP CREATE may
+    // create a consumer group.
+    "--stream-groups",
     // A switch, which takes no value (ADR-0052 D6): XADD may create a
     // stream.
     "--streams",
@@ -117,10 +120,11 @@ const ACCEPTED_FLAGS: &[&str] = &[
 /// --version early exits so those keep working, and before anything binds so
 /// a refusal costs nothing.
 ///
-/// Only `--`-prefixed tokens are inspected. Every accepted flag but
-/// `--streams` takes a value (read through `arg()`, which returns the token
-/// after the name), and no value this binary takes begins with `--`: they are
-/// ports, paths, addresses, byte counts and engine names.
+/// Only `--`-prefixed tokens are inspected. Every accepted flag but the
+/// switches (`--streams`, `--stream-groups`, `--chunked-strings`) takes a
+/// value (read through `arg()`, which returns the token after the name), and
+/// no value this binary takes begins with `--`: they are ports, paths,
+/// addresses, byte counts and engine names.
 /// Leave NOW, without running anyone's static destructors.
 ///
 /// `std::process::exit` skips Rust destructors but still runs libc `atexit` /
@@ -3099,7 +3103,15 @@ fn main() -> std::io::Result<()> {
         // ADR-0056 D4: likewise, a write stores a long string in chunks only
         // when an operator says so, in the first release that reads them.
         chunked_strings: std::env::args().any(|a| a == "--chunked-strings"),
+        // ADR-0057 D5: likewise, XGROUP CREATE makes a group only when an
+        // operator says so, in the first release that serves groups.
+        stream_groups: std::env::args().any(|a| a == "--stream-groups"),
     };
+    if limits.stream_groups {
+        eprintln!(
+            "stream-groups: on (XGROUP CREATE may create a consumer group; this fleet cannot roll back below this release while it holds one)"
+        );
+    }
     if limits.chunked_strings {
         eprintln!(
             "chunked-strings: on (strings over 64 KiB are stored in chunks; this fleet cannot roll back below this release while it holds one)"
@@ -5369,6 +5381,7 @@ fn apply_inline(store: &dyn Kv, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
 /// - BLPOP, BRPOP, BZPOPMIN, BZPOPMAX of more than one key, and LMPOP,
 ///   ZMPOP, BLMPOP, BZMPOP whose count is not 1 (a malformed one too);
 /// - a script declaring more than one key (ADR-0051);
+/// - XREADGROUP of more than one stream (ADR-0057);
 /// - GEORADIUS or GEORADIUSBYMEMBER storing at a key other than the one it
 ///   reads.
 fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
@@ -5387,6 +5400,8 @@ fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
         b"LMPOP" | b"ZMPOP" => args.get(1).is_some_and(|n| n.as_slice() != b"1"),
         b"BLMPOP" | b"BZMPOP" => args.get(2).is_some_and(|n| n.as_slice() != b"1"),
         b"EVAL" | b"EVALSHA" => flint_commands::eval_keys(args).is_some_and(|k| k.len() > 1),
+        // A group read of several streams writes each one's group (ADR-0057).
+        b"XREADGROUP" => flint_commands::xreadgroup_keys(args).is_some_and(|k| k.len() > 1),
         // A search storing somewhere other than the key it reads.
         b"GEORADIUS" | b"GEORADIUSBYMEMBER" => flint_commands::georadius_store_keys(args)
             .iter()

@@ -65,6 +65,7 @@ pair 127.0.0.1:7960,127.0.0.1:7961
 proxy 127.0.0.1:7962
 streams on
 chunked-strings on
+stream-groups on
 controller on
 EOF
 CTL="./target/release/flintctl -f $INV"

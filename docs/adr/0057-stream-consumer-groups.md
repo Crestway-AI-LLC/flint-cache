@@ -293,3 +293,68 @@ About five to eight working days in all.
 - **Seat-side wake-ups,** and first-come order among blocked consumers
   (D4's (b)).
 - **Which release is R.** That follows from D5 and the release calendar.
+
+## As built
+
+### Part 1: storage and the core loop (2026-10-12)
+
+- **Storage** (`flint-storage`, `streams/groups.rs`): D2's four row kinds.
+  - The group row holds the last delivered ID, entries read, and its pending
+    and consumer counts.
+  - A pending row holds the delivery time, the delivery count and the
+    consumer.
+  - A consumer row holds the seen time, the active time and a pending count.
+  - A consumer's own pending row is empty.
+  - The metadata row is never written for a group.
+- **Seat:** `XGROUP` (every subcommand), `XREADGROUP`, `XACK`, `XPENDING`,
+  and `XINFO GROUPS`, `CONSUMERS` and `HELP`. A seat answers `XREADGROUP`
+  at once, `BLOCK` or not. `XREAD` and `XREADGROUP` share one option parser,
+  as in Valkey, so `XREAD` now answers Valkey's own errors for `GROUP`,
+  `NOACK` and `>`.
+- **The flag:** `--stream-groups` (inventory: `stream-groups on`).
+  - It refuses only the creation of a new group. An `XGROUP CREATE` of an
+    existing group answers `BUSYGROUP` with the flag off too, so consumers
+    that create their group when they start keep working after D5's rollback.
+  - `MKSTREAM`'s stream also waits for `--streams`, as XADD's does.
+- **Proxy:**
+  - It routes by the keys after `STREAMS` and after a subcommand.
+  - It puts back the null arrays that RESP2 has where RESP3 has its one null:
+    an entry deleted since delivery, in a history read, and XPENDING's
+    summary with nothing pending.
+  - It rebuilds XREADGROUP's map as RESP2's pairs, inside `EXEC` too.
+- **Quota gates:** `XACK` counts as reducing space, so a queue over its
+  quota can still drain.
+
+**Valkey 9.1's lag rules are newer than Redis 7.0's.** The random
+differential found this, and each rule below was then measured on its own,
+over entries 1 to 5:
+
+1. **A deletion makes a group's entries-read unknown even after a trim has
+   passed it.** After `XDEL 2-0` and `XTRIM MAXLEN 2`, a group at `0-0` with
+   ENTRIESREAD 0 lags 2, not 5.
+2. **The count of an ID behind a deletion cannot be estimated, except at
+   the start of the stream.** A group at `1-0` lags nil.
+3. **A read carries the count forward only from a position the stream
+   still holds, with no deletion after it. Otherwise the count is
+   estimated again.**
+   - At `2-0` with ENTRIESREAD 2, after `XTRIM MAXLEN 2`, reading `4-0`
+     gives 4, not 3.
+   - At `1-0` with ENTRIESREAD 1, after `XDEL 2-0`, reading `3-0` gives
+     nil.
+
+**Verified** against Valkey 9.1 on the laptop:
+- **A scenario of 231 commands, and one of 60 on the order of errors,** are
+  identical at a seat in both protocols.
+- **The corpus gained four cases,** generated from Valkey's replies. They
+  pass at a seat, and through the proxy as a tenant in both protocols
+  (`proxy_conformance_drill`: 218 cases direct, 215 through the proxy).
+- **A random differential** of 100,000 commands at a seat (10 seeds) and
+  36,000 through an authenticated proxy (6 seeds), in both protocols, finds
+  no difference. It compares every reply with time fields masked.
+- **A master and its replica** hold identical groups, pending entries and
+  consumers.
+- **Ten mutants failed their tests:** nine in the storage, the seat and the
+  key parser, and one that dropped the proxy's RESP2 repair.
+
+**Next:** part 2. That is `XCLAIM`, `XAUTOCLAIM`, `XINFO STREAM` and
+`XSETID`, and `XREADGROUP BLOCK` waiting at the proxy.

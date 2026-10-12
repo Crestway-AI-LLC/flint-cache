@@ -1006,13 +1006,45 @@ memory, and `XREVRANGE … COUNT 1` reads one entry however long the stream is.
 - **`XREAD` over several streams needs them in one slot**, as every
   multi-key command does: give their names one hash tag. A tenant placed on
   one pair (ADR-0053) may read streams in any slots.
-- **Not yet served:** consumer groups (`XGROUP`, `XREADGROUP`, `XACK`,
-  `XPENDING`, `XCLAIM`, `XAUTOCLAIM`), `XINFO`, `XSETID`, and Redis 8.2's
-  `XDELEX` and `XACKDEL`. A stream already keeps the counters groups need.
+- **Not yet served:** `XCLAIM`, `XAUTOCLAIM`, `XINFO STREAM` and `XSETID`
+  (ADR-0057's second part), and Redis 8.2's `XDELEX`, `XACKDEL`, and the
+  `KEEPREF`, `DELREF` and `ACKED` options, which Valkey 9.1 does not have.
 
 Checked by the corpus against Valkey through a seat and through the proxy
 in both protocols, and by `tools/client_compat_drill.sh` (redis-py, a
 blocking `XREAD` woken by another client's `XADD`).
+
+### Consumer groups (ADR-0057)
+
+`XGROUP` (`CREATE` with `MKSTREAM` and `ENTRIESREAD`, `SETID`, `DESTROY`,
+`CREATECONSUMER`, `DELCONSUMER`, `HELP`), `XREADGROUP` (`COUNT`, `NOACK`, `>`
+and a consumer's history), `XACK`, `XPENDING` (the summary, and ranges with
+`IDLE` and a consumer) and `XINFO GROUPS`, `CONSUMERS` and `HELP` work as in
+Valkey 9.1, with its replies, its errors and its order of checking, in both
+protocols: entries-read and lag as Valkey estimates them, an entry deleted
+since delivery read back as its ID and a null, and an entry taken over by
+another consumer after `XGROUP SETID`.
+
+- **Pending entries survive a failover.** An `XREADGROUP` reply goes out
+  after its pending entries are on disk, as every write's does, so after a
+  failover an acknowledged entry stays acknowledged and a delivered one stays
+  pending under its consumer. Redis replicates asynchronously, so a failover
+  there can deliver an entry again.
+- **Creating a group needs your operator.** A seat creates one only when its
+  inventory says `stream-groups on`; until then `XGROUP CREATE` of a new
+  group is refused. Every command serves the groups that exist, and `XGROUP
+  CREATE` of one that exists still answers `BUSYGROUP`, so consumers that
+  create their group at startup keep working (see self-hosting.md).
+- **`XREADGROUP BLOCK` does not wait yet**: it answers at once, as inside
+  `MULTI`. The proxy will wait for it as it waits for `XREAD` (ADR-0057's
+  second part). A history read never waits, in Valkey either.
+- **A group read of several streams needs them in one slot**, as `XREAD`
+  does.
+- **WATCH sees no group change**, as in Valkey: only `XGROUP CREATE … MKSTREAM`
+  making the stream is a change to the key.
+- **Size:** a stream's size cap and `FLINTKEYSIZE` count its entries, not its
+  groups' rows, so a large backlog of pending entries never makes `XADD`
+  fail. Your storage bill counts both.
 
 ## Excluded by design
 

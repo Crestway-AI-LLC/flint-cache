@@ -709,9 +709,17 @@ impl StreamMeta {
     }
 }
 
-/// The leading byte of a stream entry row's field; other kinds of row a
-/// stream may hold later (consumer groups) take other bytes.
+/// The leading byte of a stream entry row's field; the consumer-group rows
+/// take the bytes after it.
 pub const STREAM_ENTRY_TAG: u8 = 0;
+/// A consumer group's row (ADR-0057 D2).
+pub const STREAM_GROUP_TAG: u8 = 1;
+/// A group's pending entry.
+pub const STREAM_PENDING_TAG: u8 = 2;
+/// A group's consumer.
+pub const STREAM_CONSUMER_TAG: u8 = 3;
+/// A consumer's own pending entry: the index its history reads walk.
+pub const STREAM_OWNED_TAG: u8 = 4;
 
 /// Hash-algorithm id recorded in every Bloom filter's metadata row.
 ///

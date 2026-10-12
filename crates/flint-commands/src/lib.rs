@@ -45,6 +45,10 @@ pub fn reduces_space(name: &[u8]) -> bool {
             // A stream's entries go, its key stays (ADR-0052 D6).
             | b"XDEL"
             | b"XTRIM"
+            // An acknowledgement only removes pending entries (ADR-0057). A
+            // queue over its quota must still drain, as Redis serves XACK
+            // at `maxmemory`.
+            | b"XACK"
     )
 }
 
@@ -160,6 +164,78 @@ pub fn xread_blocks(args: &[Vec<u8>]) -> bool {
         .iter()
         .step_by(2)
         .any(|o| o.eq_ignore_ascii_case(b"BLOCK"))
+}
+
+/// XREADGROUP's keys (ADR-0057), read as Valkey reads its options: `GROUP`
+/// takes two values, `COUNT` and `BLOCK` one each and `NOACK` none, and the
+/// keys are the first half of what follows `STREAMS`. `None` when `args` is
+/// not an XREADGROUP or the seat would refuse its shape.
+pub fn xreadgroup_keys(args: &[Vec<u8>]) -> Option<&[Vec<u8>]> {
+    if !args.first()?.eq_ignore_ascii_case(b"XREADGROUP") {
+        return None;
+    }
+    let mut i = 1;
+    while i < args.len() {
+        let more = args.len() - 1 - i;
+        let o = &args[i];
+        if (o.eq_ignore_ascii_case(b"BLOCK") || o.eq_ignore_ascii_case(b"COUNT")) && more > 0 {
+            i += 2;
+        } else if o.eq_ignore_ascii_case(b"STREAMS") && more > 0 {
+            let rest = &args[i + 1..];
+            if rest.len() % 2 == 1 {
+                return None;
+            }
+            return Some(&rest[..rest.len() / 2]);
+        } else if o.eq_ignore_ascii_case(b"GROUP") && more >= 2 {
+            i += 3;
+        } else if o.eq_ignore_ascii_case(b"NOACK") {
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Whether an XREADGROUP asks to wait: it has `BLOCK` and reads only new
+/// entries (`>` for every stream). A read of a consumer's history answers at
+/// once, `BLOCK` or not, as Valkey answers it.
+pub fn xreadgroup_blocks(args: &[Vec<u8>]) -> bool {
+    let Some(keys) = xreadgroup_keys(args) else {
+        return false;
+    };
+    let ids = &args[args.len() - keys.len()..];
+    let options = &args[1..args.len() - 2 * keys.len() - 1];
+    let mut i = 0;
+    let mut blocks = false;
+    while i < options.len() {
+        let o = &options[i];
+        if o.eq_ignore_ascii_case(b"BLOCK") {
+            blocks = true;
+            i += 2;
+        } else if o.eq_ignore_ascii_case(b"COUNT") {
+            i += 2;
+        } else if o.eq_ignore_ascii_case(b"GROUP") {
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    blocks && ids.iter().all(|id| id.as_slice() == b">")
+}
+
+/// The key of a command whose subcommand comes first (`XGROUP CREATE key
+/// …`, `XINFO GROUPS key`, ADR-0057), or `None` when `args` is not one;
+/// `Some(None)` for one without a key (`HELP`).
+pub fn subcommand_key(args: &[Vec<u8>]) -> Option<Option<&[u8]>> {
+    let name = args.first()?;
+    if !name.eq_ignore_ascii_case(b"XGROUP") && !name.eq_ignore_ascii_case(b"XINFO") {
+        return None;
+    }
+    Some(match args.get(1) {
+        Some(sub) if !sub.eq_ignore_ascii_case(b"HELP") => args.get(2).map(|k| k.as_slice()),
+        _ => None,
+    })
 }
 
 /// Whether a `FLUSHALL` or `FLUSHDB` has arguments Redis accepts: none, or
@@ -310,6 +386,11 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"XADD"
             | b"XDEL"
             | b"XTRIM"
+            // Consumer groups (ADR-0057). XREADGROUP is a write: it makes
+            // what it delivers pending.
+            | b"XGROUP"
+            | b"XREADGROUP"
+            | b"XACK"
     )
 }
 
@@ -419,6 +500,8 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"XRANGE"
             | b"XREVRANGE"
             | b"XREAD"
+            | b"XPENDING"
+            | b"XINFO"
     )
 }
 
@@ -434,6 +517,117 @@ mod tests {
         assert!(is_read_command(b"get"));
         assert!(is_read_command(b"ZRANGE"));
         assert!(!is_read_command(b"SET"));
+    }
+
+    /// ADR-0057: XREADGROUP's keys follow STREAMS after options of 0, 1
+    /// and 2 values, and only a read of new entries waits.
+    #[test]
+    fn xreadgroup_keys_and_blocks_read_its_options_as_valkey_does() {
+        let a = |v: &[&str]| v.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+        let keys = |v: &[&str]| {
+            xreadgroup_keys(&a(v)).map(|k| {
+                k.iter()
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            keys(&[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "NOACK",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "a",
+                "b",
+                ">",
+                ">"
+            ]),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        // A group named STREAMS is a value, not the keyword.
+        assert_eq!(
+            keys(&["xreadgroup", "group", "STREAMS", "c", "streams", "k", ">"]),
+            Some(vec!["k".to_string()])
+        );
+        assert_eq!(
+            keys(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "a", "b", ">"]),
+            None
+        );
+        assert_eq!(keys(&["XREADGROUP", "BOGUS", "STREAMS", "a", ">"]), None);
+        assert_eq!(keys(&["XREAD", "STREAMS", "a", "0"]), None);
+        let blocks = |v: &[&str]| xreadgroup_blocks(&a(v));
+        assert!(blocks(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "BLOCK",
+            "0",
+            "STREAMS",
+            "a",
+            ">"
+        ]));
+        assert!(!blocks(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "STREAMS",
+            "a",
+            ">"
+        ]));
+        assert!(!blocks(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "BLOCK",
+            "0",
+            "STREAMS",
+            "a",
+            "b",
+            ">",
+            "0"
+        ]));
+        // BLOCK as a group name does not ask to wait.
+        assert!(!blocks(&[
+            "XREADGROUP",
+            "GROUP",
+            "BLOCK",
+            "c",
+            "STREAMS",
+            "a",
+            ">"
+        ]));
+    }
+
+    /// ADR-0057: XGROUP and XINFO route by the key after their subcommand,
+    /// and their HELP has none.
+    #[test]
+    fn subcommand_key_is_the_argument_after_the_subcommand() {
+        let a = |v: &[&str]| v.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert_eq!(
+            subcommand_key(&a(&["XGROUP", "CREATE", "k", "g", "$"])),
+            Some(Some(&b"k"[..]))
+        );
+        assert_eq!(
+            subcommand_key(&a(&["xinfo", "groups", "k"])),
+            Some(Some(&b"k"[..]))
+        );
+        assert_eq!(subcommand_key(&a(&["XGROUP", "HELP"])), Some(None));
+        assert_eq!(subcommand_key(&a(&["XINFO"])), Some(None));
+        assert_eq!(subcommand_key(&a(&["XACK", "k", "g", "1-0"])), None);
+        assert!(
+            is_write_command(b"XREADGROUP")
+                && is_write_command(b"XGROUP")
+                && is_write_command(b"XACK")
+        );
+        assert!(is_read_command(b"XPENDING") && is_read_command(b"XINFO"));
+        assert!(reduces_space(b"xack"));
     }
 
     #[test]
