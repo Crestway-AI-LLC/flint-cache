@@ -313,6 +313,10 @@ pub struct Hnsw {
     /// without bound while the D4 meter credited every delete as freed. Never
     /// holds the entry point: that slot is freed when the entry moves.
     free: Vec<u32>,
+    /// The id and meta bytes deleted slots still hold, which the D4 meter
+    /// charges until a slot is taken again (BUG-0257). A deleted slot keeps
+    /// its id, meta, code, links and in-RAM full vector.
+    dead_bytes: usize,
     entry: Option<u32>,
     max_level: usize,
     live: usize,
@@ -410,6 +414,7 @@ impl Hnsw {
             full: Full::Ram(Vec::new()),
             id_to_idx: HashMap::new(),
             free: Vec::new(),
+            dead_bytes: 0,
             entry: None,
             max_level: 0,
             live: 0,
@@ -429,6 +434,20 @@ impl Hnsw {
     #[cfg(test)]
     fn slots(&self) -> usize {
         self.levels.len()
+    }
+    /// Deleted slots, the entry point's included, and the id and meta bytes
+    /// they hold: what the D4 meter charges a set past its live vectors
+    /// (BUG-0257).
+    pub fn dead(&self) -> (usize, usize) {
+        (self.levels.len() - self.live, self.dead_bytes)
+    }
+    /// The id and meta bytes of the deleted slot the next insert of a new id
+    /// takes, if it takes one: the charge that insert gives back.
+    pub fn next_reuse_bytes(&self) -> Option<usize> {
+        self.free.last().map(|&i| self.held_bytes(i))
+    }
+    fn held_bytes(&self, i: u32) -> usize {
+        self.ids[i as usize].len() + self.meta[i as usize].as_ref().map_or(0, |m| m.len())
     }
     pub fn contains(&self, id: &[u8]) -> bool {
         self.id_to_idx.contains_key(id)
@@ -646,6 +665,7 @@ impl Hnsw {
         let idx = match self.free.pop() {
             Some(i) => {
                 self.unlink(i);
+                self.dead_bytes -= self.held_bytes(i);
                 i
             }
             None => self.levels.len() as u32,
@@ -729,6 +749,7 @@ impl Hnsw {
             return false;
         };
         self.deleted[i as usize] = true;
+        self.dead_bytes += self.held_bytes(i);
         self.live -= 1;
         // A deleted node routes by its code; its full vector is dead.
         if let Full::File { spill, .. } = &mut self.full {

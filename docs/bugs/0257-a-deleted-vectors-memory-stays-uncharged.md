@@ -1,7 +1,10 @@
-# BUG-0257: a deleted vector's memory stays held, and its charge is given back
+# BUG-0257: a deleted vector's memory stays held, and its charge is given back (FIXED 2026-10-12)
 
-**Status:** OPEN. Measured 2026-10-12. The fix changes what `VEC.DEL` gives
-back to a tenant, so it waits for Jeff's choice (below).
+**Status:** **FIXED 2026-10-12, option A** (Jeff: "go with your
+recommendations on all three"). A deleted HNSW slot stays charged until its
+set's next insert takes it or the set is emptied. Option B, compaction, is
+for later, under its own ADR, if tenants need deletes to make room across
+sets.
 **Severity:** medium. It needs a tenant who:
 - fills a set;
 - deletes all but a few of its vectors;
@@ -61,5 +64,48 @@ index from the live vectors and free the rest.
 **C. Both:** A now, and B later if tenants need deletes to make room
 across sets.
 
-**Recommendation: C.** A closes the hole with a small, testable change, and
+**Chosen: C** (Jeff, 2026-10-12): A now, and B if it is needed. A closes the
+hole with a small, testable change, and
 B is an improvement that can wait for a tenant who needs it.
+
+## Fixed
+
+- **`Hnsw` keeps what its deleted slots hold.** That is their count (the
+  slots less the live vectors, a deleted entry point included) and the id
+  and meta bytes they keep. The meter charges a deleted slot what the live
+  entry cost: the entry's cost is the vector, the id, the meta and the
+  structure, and a deleted slot keeps all four.
+- **Every write charges the change in what its set holds:**
+  - `VEC.SET` of a new id that takes a deleted slot is charged the
+    difference, nothing for an id of the same length;
+  - `VEC.DEL` and the TTL sweep free nothing in an HNSW set until it is
+    emptied, when BUG-0255 starts it again and it all comes back;
+  - a flat set frees an entry when it is deleted, as before.
+- **The cap check before a write** credits the deleted slot a new id will
+  take. So deleting and writing within one set still works at the cap, and
+  a write to another set is refused.
+- **The overall cap's refusal** now says "delete vectors from the set being
+  written, or retry later".
+
+## Verification
+
+- `a_deleted_slot_stays_charged_until_taken_again`: deleting 49 of 50 leaves
+  the meter where it was. 48 new ids of the same length take deleted slots
+  and leave it there too. Emptying the set takes it to 0, and the TTL sweep
+  charges as `VEC.DEL` does.
+  - Why 48 and not 49: a deleted entry point is not taken again until the
+    entry moves, so the 49th new id took a new slot. The meter charged that
+    slot, which the co-processor really does hold.
+- `at_the_cap_a_delete_makes_room_only_in_its_own_set`: at the cap, after
+  six deletes in set a, set b is still refused. Five writes to set a fit,
+  and at most one more.
+- **Five mutants failed:**
+  - a delete that credits the slot;
+  - no credit for a reused slot at the cap check;
+  - an insert that ignores the deleted slots on both sides of its charge;
+  - `Hnsw::del` not counting the bytes;
+  - a sweep that credits the slots.
+
+  A sixth, which read the deleted slots after the insert on one side only,
+  was equivalent to the code and passed.
+

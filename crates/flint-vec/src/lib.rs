@@ -247,6 +247,26 @@ impl VectorSet {
         };
         Some(self.cost(id.len(), meta_len))
     }
+    /// What the deleted slots of an HNSW set still cost the D4 meter: each is
+    /// held until the set's next insert takes it, or the set is emptied
+    /// (BUG-0257). A flat set frees an entry when it is deleted.
+    fn dead_cost(&self) -> usize {
+        match &self.index {
+            Index::Flat(_) => 0,
+            Index::Hnsw(h) => {
+                let (slots, bytes) = h.dead();
+                slots * self.cost(0, 0) + bytes
+            }
+        }
+    }
+    /// What the next insert of a new id gives back by taking a deleted slot,
+    /// for the cap check before it is written: 0 when it takes none.
+    fn reuse_credit(&self) -> usize {
+        match &self.index {
+            Index::Flat(_) => 0,
+            Index::Hnsw(h) => h.next_reuse_bytes().map_or(0, |b| self.cost(0, 0) + b),
+        }
+    }
     /// What an entry with this id and meta length costs the D4 meter.
     fn cost(&self, id_len: usize, meta_len: usize) -> usize {
         entry_bytes(
@@ -932,7 +952,10 @@ impl Store {
     /// Cap the RAM one tenant's indexes may consume (ADR-0017 D4). 0 =
     /// unlimited. A `VEC.SET` that would push a namespace past this is refused
     /// with `-VECFULL` BEFORE its durable write — so nothing is ever
-    /// stored-but-unsearchable; the tenant frees space with `VEC.DEL`.
+    /// stored-but-unsearchable. A `VEC.DEL` frees space for the same set's
+    /// next writes, and in a flat set at once; an HNSW set's deleted slot is
+    /// held, and charged, until one of them takes it or the set is emptied
+    /// (BUG-0257).
     pub fn set_index_cap(&mut self, bytes: usize) {
         self.index_cap = bytes;
     }
@@ -1101,12 +1124,14 @@ impl Store {
                 // change on an upsert), computed BEFORE the set replaces it.
                 // A failed vector-file write keeps the vector in RAM, which is
                 // charged as the change in `spill_bytes`.
+                // Deleted slots are charged until taken again (BUG-0257), so a
+                // new id that takes one is charged its difference.
                 let mut charge: Option<(usize, usize)> = None;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
-                    let old = vs.entry_cost(&id).unwrap_or(0) + vs.spill_bytes();
+                    let old = vs.entry_cost(&id).unwrap_or(0) + vs.spill_bytes() + vs.dead_cost();
                     let new_entry = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
                     vs.set(id, vec, meta, expires_at);
-                    charge = Some((new_entry + vs.spill_bytes(), old));
+                    charge = Some((new_entry + vs.spill_bytes() + vs.dead_cost(), old));
                 }
                 if let Some((new, old)) = charge {
                     let e = self.ns_bytes.entry(ns.to_vec()).or_default();
@@ -1114,14 +1139,22 @@ impl Store {
                 }
             }
             Apply::Remove { set, id } => {
+                // An HNSW entry's slot stays charged as a deleted slot until it
+                // is taken again or the set is emptied (BUG-0257); a flat
+                // entry is freed now.
                 let key = (ns.to_vec(), set);
                 let mut freed = 0usize;
                 let mut emptied = false;
                 if let Some(vs) = self.sets.get_mut(&key) {
-                    let before = vs.spill_bytes();
-                    freed = vs.entry_cost(&id).unwrap_or(0);
+                    let before =
+                        vs.entry_cost(&id).unwrap_or(0) + vs.spill_bytes() + vs.dead_cost();
                     emptied = vs.del(&id) && vs.is_empty();
-                    freed += before - vs.spill_bytes();
+                    let after = if emptied {
+                        0
+                    } else {
+                        vs.spill_bytes() + vs.dead_cost()
+                    };
+                    freed = before.saturating_sub(after);
                 }
                 if emptied {
                     self.reset_set(&key);
@@ -1136,8 +1169,10 @@ impl Store {
     }
 
     /// Remove every id whose TTL has passed as of `now`, across all tenants, and
-    /// credit the freed index bytes back to each namespace; returns how many
-    /// vectors were reclaimed. This is a RAM-reclamation path, not a correctness
+    /// credit what that frees to each namespace: a flat set's entries, and an
+    /// HNSW set's slots only when it is emptied, since until then they are
+    /// held for its next inserts (BUG-0257). Returns how many vectors were
+    /// removed. This is a RAM-reclamation path, not a correctness
     /// one: `get`/`search` already mask an expired id the instant its deadline
     /// passes, and the durable row carries its own PX, so a sweep that runs late
     /// only holds memory longer — it can never serve or resurrect an expired
@@ -1151,17 +1186,21 @@ impl Store {
                 continue;
             }
             let ns = &key.0;
-            let before = vs.spill_bytes();
-            let mut freed = 0usize;
+            let mut before = vs.spill_bytes() + vs.dead_cost();
             for id in &ids {
-                freed += vs.entry_cost(id).unwrap_or(0);
+                before += vs.entry_cost(id).unwrap_or(0);
                 vs.del(id);
             }
-            freed += before - vs.spill_bytes();
             swept += ids.len();
-            if vs.is_empty() {
+            // As VEC.DEL: deleted HNSW slots stay charged, unless the set is
+            // now empty and starts again (BUG-0257).
+            let after = if vs.is_empty() {
                 emptied.push(key.clone());
-            }
+                0
+            } else {
+                vs.spill_bytes() + vs.dead_cost()
+            };
+            let freed = before.saturating_sub(after);
             if freed > 0
                 && let Some(e) = self.ns_bytes.get_mut(ns)
             {
@@ -1327,7 +1366,10 @@ impl Store {
         // never an evict-and-desync. An UPSERT of an existing id only costs its
         // meta delta, so it is charged that, not a whole new entry.
         let new = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
-        let old = vs.entry_cost(id).unwrap_or(0);
+        // A new id in an HNSW set takes a deleted slot when there is one,
+        // whose charge it gives back (BUG-0257): deleting and writing within
+        // one set needs no more room than before.
+        let old = vs.entry_cost(id).unwrap_or_else(|| vs.reuse_credit());
         if self.index_cap > 0 {
             let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
             if used.saturating_add(new).saturating_sub(old) > self.index_cap {
@@ -1347,7 +1389,7 @@ impl Store {
             if total.saturating_add(new).saturating_sub(old) > self.total_cap {
                 self.refused_total.fetch_add(1, Relaxed);
                 return Plan::Reply(err(
-                    "VECFULL vector index memory is full on this server; delete vectors, or retry later",
+                    "VECFULL vector index memory is full on this server; delete vectors from the set being written, or retry later",
                 ));
             }
         }
@@ -2066,6 +2108,144 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
         drop(st);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG-0257: an HNSW slot's memory is held until the set's next insert
+    /// takes it, so the meter keeps charging it: deleting all but one vector
+    /// gives nothing back, an insert into a deleted slot costs nothing more,
+    /// and emptying the set gives everything back.
+    #[test]
+    fn a_deleted_slot_stays_charged_until_taken_again() {
+        let mut st = Store::new();
+        let create = cmd(&[
+            "VEC.CREATE",
+            "q",
+            "DIM",
+            "8",
+            "METRIC",
+            "l2",
+            "INDEX",
+            "hnsw",
+            "QUANT",
+            "sq8",
+        ]);
+        assert_eq!(run(&mut st, b"ns", &create), Value::Simple("OK".into()));
+        let v = |i: usize| format!("{i},1,2,3,4,5,6,7");
+        let set =
+            |st: &mut Store, id: &str, i: usize| run(st, b"ns", &cmd(&["VEC.SET", "q", id, &v(i)]));
+        for i in 0..50 {
+            assert_eq!(
+                set(&mut st, &format!("x{i:03}"), i),
+                Value::Simple("OK".into())
+            );
+        }
+        let full = st.ns_mem_bytes(b"ns");
+        for i in 0..49 {
+            let del = cmd(&["VEC.DEL", "q", &format!("x{i:03}")]);
+            assert_eq!(run(&mut st, b"ns", &del), Value::Integer(1));
+        }
+        assert_eq!(
+            st.ns_mem_bytes(b"ns"),
+            full,
+            "49 deleted slots still hold their memory, so they are still charged"
+        );
+        // New ids of the same length take the deleted slots: no new charge.
+        // 48, not 49: a deleted entry point is not taken again until the
+        // entry moves, so it may stay a held, charged slot (as it should).
+        for i in 0..48 {
+            assert_eq!(
+                set(&mut st, &format!("y{i:03}"), i),
+                Value::Simple("OK".into())
+            );
+        }
+        assert_eq!(st.ns_mem_bytes(b"ns"), full);
+        // Emptying the set gives it all back (BUG-0255 starts it again).
+        for id in (0..48)
+            .map(|i| format!("y{i:03}"))
+            .chain(["x049".to_string()])
+        {
+            assert_eq!(
+                run(&mut st, b"ns", &cmd(&["VEC.DEL", "q", &id])),
+                Value::Integer(1)
+            );
+        }
+        assert_eq!(st.ns_mem_bytes(b"ns"), 0);
+
+        // The TTL sweep charges as VEC.DEL does.
+        for i in 0..10 {
+            let px = cmd(&["VEC.SET", "q", &format!("t{i:03}"), &v(i), "PX", "10"]);
+            assert_eq!(
+                run_at(&mut st, b"ns", &px, 1_000),
+                Value::Simple("OK".into())
+            );
+        }
+        assert_eq!(set(&mut st, "keep", 0), Value::Simple("OK".into()));
+        let with_ttl = st.ns_mem_bytes(b"ns");
+        assert_eq!(st.sweep_expired(2_000), 10);
+        assert_eq!(st.ns_mem_bytes(b"ns"), with_ttl, "swept slots stay charged");
+        assert_eq!(
+            run(&mut st, b"ns", &cmd(&["VEC.DEL", "q", "keep"])),
+            Value::Integer(1)
+        );
+        assert_eq!(st.ns_mem_bytes(b"ns"), 0);
+    }
+
+    /// BUG-0257, at the cap: deleting makes room for the same set's writes,
+    /// and none for another set's, whose memory the deleted slots still hold.
+    #[test]
+    fn at_the_cap_a_delete_makes_room_only_in_its_own_set() {
+        let mut st = Store::new();
+        for set in ["a", "b"] {
+            let create = cmd(&[
+                "VEC.CREATE",
+                set,
+                "DIM",
+                "8",
+                "METRIC",
+                "l2",
+                "INDEX",
+                "hnsw",
+                "QUANT",
+                "sq8",
+            ]);
+            assert_eq!(run(&mut st, b"ns", &create), Value::Simple("OK".into()));
+        }
+        let v = |i: usize| format!("{i},1,2,3,4,5,6,7");
+        let write = |st: &mut Store, set: &str, id: String, i: usize| {
+            run(st, b"ns", &cmd(&["VEC.SET", set, &id, &v(i)]))
+        };
+        for i in 0..20 {
+            assert_eq!(
+                write(&mut st, "a", format!("x{i:03}"), i),
+                Value::Simple("OK".into())
+            );
+        }
+        st.set_index_cap(st.ns_mem_bytes(b"ns"));
+        let refused = |r: Value| matches!(r, Value::Error(e) if e.starts_with("VECFULL"));
+        assert!(refused(write(&mut st, "a", "x999".into(), 1)));
+        // Six deleted: at least five are free to take, since a deleted entry
+        // point waits until the entry moves.
+        for i in 0..6 {
+            let del = cmd(&["VEC.DEL", "a", &format!("x{i:03}")]);
+            assert_eq!(run(&mut st, b"ns", &del), Value::Integer(1));
+        }
+        assert!(
+            refused(write(&mut st, "b", "y000".into(), 1)),
+            "set a's deleted slots hold memory set b would need"
+        );
+        for i in 0..5 {
+            assert_eq!(
+                write(&mut st, "a", format!("y{i:03}"), i),
+                Value::Simple("OK".into()),
+                "a deleted slot makes room for its own set's next write"
+            );
+        }
+        // At most the sixth slot is left, and then set a is full again.
+        let more = (0..3)
+            .take_while(|&i| !refused(write(&mut st, "a", format!("z{i:03}"), i)))
+            .count();
+        assert!(more <= 1, "{more} writes past the deleted slots");
+        assert!(refused(write(&mut st, "b", "y001".into(), 1)));
     }
 
     #[test]
