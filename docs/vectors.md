@@ -81,17 +81,18 @@ Doubling it added under 0.01 recall in the measurements. A vector with `EX` or
 
 ## Running it
 
-Fleets from the marketplace template run a vector co-processor unless the
-operator turns the template's vector parameter off. A self-hosted fleet
-declares one in its inventory:
+On Crestway's hosted service there is nothing to set: the fleet your
+endpoint is on runs the co-processor. A self-hosted fleet declares one in its
+inventory:
 
 ```
-coproc VEC. 127.0.0.1:7411
+coproc VEC. 127.0.0.1:7420
 coproc-index-bytes 1073741824          # per namespace (default 1 GiB)
 coproc-index-total-bytes 8589934592    # every namespace together (no default)
 ```
 
 Set `coproc-index-total-bytes` below what the host's data nodes need.
 `flintctl upgrade` starts a co-processor the inventory gained and rolls a
-running one. `flint-exporter --coproc 127.0.0.1:7411` reports its index
-memory, both caps and refusals as `flint_coproc_*` gauges.
+running one. Its index memory, both caps and refusals are reported as
+`flint_coproc_*`: by the fleet agent, which `flintctl` tells about every
+co-processor, and by `flint-exporter --coproc 127.0.0.1:7420`.
