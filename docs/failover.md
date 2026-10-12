@@ -495,6 +495,11 @@ proxy loss is invisible to clients.
 - `min_replicas_drill.sh` — the widowed-master write gate.
 - `decommission_drill.sh` — planned failover with a live writer: zero
   acked-write loss, ex-master rejoins.
+- `stream_groups_failover_drill.sh` — a stream's producer and a consumer
+  group's consumer through the proxy, across a planned failover and a -9
+  kill of a caught-up master: every acknowledged `XADD` kept and delivered,
+  every acknowledged `XACK` kept, and nothing delivered twice by `>`
+  (ADR-0057).
 - `chaos_drill.sh` / `proxy_chaos_drill.sh` — thousands of randomized
   kills with a ledger oracle: every acked write accounted for, zero
   corruption, zero double-ownership, through both direct and

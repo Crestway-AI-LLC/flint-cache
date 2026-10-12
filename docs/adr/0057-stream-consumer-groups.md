@@ -408,5 +408,56 @@ over entries 1 to 5:
   - a proxy that polled with `XREADGROUP` itself (the WAL check caught it);
   - a poll that wrote on a miss (the seat-only case caught it).
 
-**Next:** part 3, D7's drills: failover and rollback with groups, and a
-framework's consumer through the proxy.
+### Part 3: D7's drills (2026-10-12)
+
+- **`stream_groups_failover_drill`** (in the gate): a producer and a consumer
+  run through the proxy across a planned failover and a -9 kill of a master
+  whose replica has caught up. Those are the two shapes in which failover.md
+  promises that no acknowledged write is lost. An unplanned kill mid-stream
+  can lose the async tail, for a group's rows as for any key, within the RPO.
+  - Every acknowledged `XADD` is in the stream and was delivered. Each is
+    acknowledged or still pending.
+  - No acknowledged `XACK` is pending again.
+  - `>` delivered nothing twice.
+  - A consumer blocked with `BLOCK 0` across the planned failover woke for
+    the entry added after it.
+  - Locally: 2,000 to 2,400 entries a run over four runs, all delivered
+    and acknowledged, with no client error. A seat whose `XACK` forgot nothing failed
+    invariant 4.
+- **`stream_groups_rollback_drill`** (by hand, with
+  `FLINT_PREV_SERVER`): this build stores a stream with two groups, pending
+  entries and a consumer.
+  - rc.82, built from its tag, opens the same data. The 10 entries read back
+    and no group row appears as an entry. `XREADGROUP` is refused and `XADD`
+    works.
+  - This build opens it again, and the pending entries and both groups are
+    as they were. `>` delivers rc.82's entry to each group.
+  - It passes against rc.82. Given this build as the previous release, it
+    refuses to run.
+  - It is out of the gate because it needs a second build (gates.sh,
+    `EXCLUDED`).
+- **`client_compat_drill`** gains redis-py's group API in both protocols:
+  `XGROUP`, `XREADGROUP`, `XACK`, `XPENDING`, `XCLAIM`, `XAUTOCLAIM` and
+  `XINFO`. It also gains a blocking `XREADGROUP` that:
+  - wakes for an entry;
+  - shows its consumer idle for a second while it waits;
+  - times out;
+  - ends with `NOGROUP` when its group is destroyed.
+
+  The same checks pass against Valkey 9.1.
+- **Cost:** one run on the laptop, 20,000 entries of 64 bytes, one client,
+  direct to each server. The rocks seat is against Valkey 9.1 with
+  `appendonly yes`, `appendfsync everysec`:
+
+  | | Flint | Valkey |
+  |---|---|---|
+  | `XREADGROUP COUNT 10`, p50 / p99 | 166 / 305 µs | 111 / 194 µs |
+  | `XACK` of one entry, p50 / p99 | 49 / 110 µs | 28 / 70 µs |
+  | log bytes per entry read and acknowledged | 429 | 246 |
+
+  A read writes the group's row, the consumer's row, and a pending row and
+  an owned-index row per entry. An `XACK` deletes those two and rewrites
+  the group's and the consumer's counts.
+
+**Not done:** one framework's consumer (Dapr, Watermill, Spring Data Redis
+or Redpanda Connect). Each is a download, which waits for Jeff's approval.

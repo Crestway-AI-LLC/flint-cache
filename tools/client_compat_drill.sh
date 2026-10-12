@@ -713,6 +713,92 @@ def xread_waits_for_an_entry():
     assert r.xread({"evb": "$"}, block=200) in (None, [], {}), "a timeout reads nothing"
 check("a blocking XREAD on $ takes the entry added while it waits", xread_waits_for_an_entry)
 
+print("== consumer groups (ADR-0057)")
+def group_calls(proto):
+    def run():
+        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
+                        protocol=proto)
+        k = f"jobs{proto}"
+        c.delete(k)
+        assert c.xgroup_create(k, "workers", id="0", mkstream=True)
+        ids = [c.xadd(k, {"job": str(i)}) for i in range(5)]
+        got = c.xreadgroup("workers", "w1", {k: ">"}, count=3)
+        entries = got[k][0] if isinstance(got, dict) else got[0][1]
+        assert [e[0] for e in entries] == ids[:3], got
+        assert entries[0][1] == {"job": "0"}, entries
+        assert c.xack(k, "workers", ids[0]) == 1
+        p = c.xpending(k, "workers")
+        assert (p["pending"], p["min"], p["max"]) == (2, ids[1], ids[2]), p
+        assert [x["name"] for x in p["consumers"]] == ["w1"], p
+        rows = c.xpending_range(k, "workers", "-", "+", 10)
+        assert [x["message_id"] for x in rows] == ids[1:3], rows
+        assert rows[0]["times_delivered"] == 1, rows
+        claimed = c.xclaim(k, "workers", "w2", 0, [ids[1]])
+        assert [e[0] for e in claimed] == [ids[1]], claimed
+        nxt, moved, deleted = c.xautoclaim(k, "workers", "w2", 0, "0-0", count=10)[:3]
+        assert [e[0] for e in moved] == ids[1:3] and deleted == [], (nxt, moved, deleted)
+        groups = c.xinfo_groups(k)
+        assert (groups[0]["name"], groups[0]["pending"], groups[0]["consumers"]) == (
+            "workers", 2, 2), groups
+        cons = {x["name"]: x["pending"] for x in c.xinfo_consumers(k, "workers")}
+        assert cons == {"w1": 0, "w2": 2}, cons
+        full = c.xinfo_stream(k, full=True)
+        assert full["length"] == 5 and full["groups"][0]["name"] == "workers", full
+        assert c.xgroup_createconsumer(k, "workers", "w3") == 1
+        assert c.xgroup_delconsumer(k, "workers", "w2") == 2
+        assert c.xgroup_setid(k, "workers", "0")
+        again = c.xreadgroup("workers", "w1", {k: ">"})
+        entries = again[k][0] if isinstance(again, dict) else again[0][1]
+        assert [e[0] for e in entries] == ids, again
+        assert c.xgroup_destroy(k, "workers") == 1
+        c.delete(k)
+        c.close()
+    return run
+check("redis-py XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM, XINFO, RESP2",
+      group_calls(2))
+check("redis-py the same, RESP3", group_calls(3))
+def xreadgroup_waits_for_an_entry():
+    import threading, time as _t
+    k = "jobsb"
+    r.delete(k)
+    assert r.xgroup_create(k, "g", id="$", mkstream=True)
+    got = {}
+    def reader():
+        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True)
+        got["v"] = c.xreadgroup("g", "waiter", {k: ">"}, block=5000)
+        c.close()
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    _t.sleep(1.2)
+    # The proxy's repeated attempts write nothing, so the waiter's idle time
+    # grows from the call that made it, as in Valkey.
+    idle = {x["name"]: x["idle"] for x in r.xinfo_consumers(k, "g")}
+    assert idle.get("waiter", 0) >= 1000, idle
+    new = r.xadd(k, {"late": "1"})
+    t.join(6)
+    v = got.get("v")
+    entries = v[k][0] if isinstance(v, dict) else v[0][1]
+    assert [e[0] for e in entries] == [new], v
+    assert r.xreadgroup("g", "waiter", {k: ">"}, block=200) in (None, [], {}), \
+        "a timeout reads nothing"
+    def doomed():
+        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True)
+        try:
+            c.xreadgroup("g", "w2", {k: ">"}, block=5000)
+            got["d"] = "no error"
+        except redis.ResponseError as e:
+            got["d"] = str(e)
+        c.close()
+    t = threading.Thread(target=doomed, daemon=True)
+    t.start()
+    _t.sleep(0.5)
+    assert r.xgroup_destroy(k, "g") == 1
+    t.join(6)
+    assert got.get("d", "").startswith("NOGROUP"), got.get("d")
+    r.delete(k)
+check("a blocking XREADGROUP waits for an entry, times out, and ends with NOGROUP when its group goes",
+      xreadgroup_waits_for_an_entry)
+
 print("== commands we exclude by design still fail HONESTLY")
 check("SPUBLISH (sharded pub/sub)", lambda: r.execute_command("SPUBLISH", "c", "x"),
       expect_unsupported=True)

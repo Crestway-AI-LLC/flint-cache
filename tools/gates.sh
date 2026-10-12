@@ -233,7 +233,7 @@ CORE="${FLINT_CORE_ORDER:-kill_order bind_dial_sites seat_names restart repl kil
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
       write_deadline fullsync_rate edge_reroute rewind_rejoin rewind_ack_space rewind_lower_space fullsync_ckpt_dir wal_headroom wal_budget evictable_ns evictable_agree min_replicas_survivable roll_shed proxy_chain
-      walgap_quarantine three_member_repoint pipeline_nodelay batch_commit_failure build_read_failure cp_watch_idle reattach_node induced_ratchet collection_admission wal_window flintinfo_numeric host_verbs start_first_member_down verify_controller}"
+      walgap_quarantine three_member_repoint pipeline_nodelay batch_commit_failure build_read_failure cp_watch_idle reattach_node induced_ratchet collection_admission wal_window flintinfo_numeric host_verbs start_first_member_down verify_controller stream_groups_failover}"
 CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 
 # DELIBERATELY OUT, with the reason. An absence with no reason beside it is
@@ -265,6 +265,12 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 #                 "FAIL: second start did not re-record pids". That is the
 #                 symptom to work from now; it is a claim about `start` over a
 #                 live fleet, not about setup.
+#   stream_groups_rollback
+#                 needs the previous release's flint-server, built from its
+#                 tag: exits 0 with "SKIP: set FLINT_PREV_SERVER". A second
+#                 full build per gate is not worth it for a check that matters
+#                 only when how streams or groups are stored changes. Run it by
+#                 hand then (ADR-0057; its header has the commands).
 
 # THE LIST ABOVE IS NOW LOAD-BEARING, so it is a variable and not only prose.
 # coproc_family and proxy_chain sat in tools/ registered nowhere for weeks:
@@ -274,7 +280,7 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 # because nothing checked that it was complete. A convention that depends on
 # being remembered will be forgotten; assert_every_drill_accounted_for is what
 # turns it into a check.
-EXCLUDED="backup_s3 fullsync_cap stop_sweep"
+EXCLUDED="backup_s3 fullsync_cap stop_sweep stream_groups_rollback"
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.
 #
