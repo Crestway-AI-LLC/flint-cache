@@ -20,7 +20,12 @@
 #      key back through the ordinary data path, not through VEC.*;
 #   4. VEC.SEARCH returns the planted nearest neighbour, so the index was
 #      actually built and queried rather than merely accepting writes;
-#   5. `stop` reaps the seat — an unswept co-processor holds its port and
+#   5. BUG-0255: a namespace given to a new tenant holds nothing of the
+#      removed tenant's. `tenant remove` makes the co-processor forget it;
+#      after a removal that did not (an older flintctl's), `tenant add` makes
+#      it forget first; and a co-processor that cannot answer makes `tenant
+#      add` refuse rather than hand the namespace over;
+#   6. `stop` reaps the seat — an unswept co-processor holds its port and
 #      the next `start` fails on a bind that looks unrelated.
 set -u
 cd "$(dirname "$0")/.."
@@ -196,7 +201,71 @@ echo "$RES" | grep -q "^c$" || {
 }
 echo "  top-2 = a, c (by cosine), served through the proxy over mTLS"
 
-echo "== 5. stop reaps the co-processor seat"
+echo "== 5. BUG-0255: a namespace given to a new tenant holds nothing of the old one's"
+# vexec <token> <args>: one VEC.* command as that tenant, retrying -LOADING.
+vexec() {
+  local tok="$1"; shift; local out
+  for _ in $(seq 1 100); do
+    out=$(valkey-cli -p 7409 -a "$tok" --no-auth-warning "$@" 2>&1 | tr -d '\r' | tr '\n' ' ')
+    case "$out" in *LOADING*) sleep 0.2 ;; *) echo "$out"; return 0 ;; esac
+  done
+  echo "$out"
+}
+# mesh <port> <cmd...>: commands on one mesh connection, as the fleet speaks.
+mesh() {
+  local port="$1"; shift
+  printf '%s\n' "$@" | valkey-cli --tls --cacert "$STATE/certs/ca.crt" --cert "$STATE/certs/int.crt" \
+    --key "$STATE/certs/int.key" --sni flint-internal -p "$port" 2>&1 | tr -d '\r'
+}
+vecs() { ls "$STATE/vec-7402"/*.vecs 2>/dev/null | wc -l | tr -d ' '; }
+case "$(vexec tok-vt VEC.CREATE q DIM 4 METRIC l2 INDEX hnsw QUANT sq8)" in
+  OK*) ;; *) echo "FAIL: VEC.CREATE of a quantized set"; exit 1 ;; esac
+case "$(vexec tok-vt VEC.SET q secret 1,2,3,4 META private-note)" in
+  OK*) ;; *) echo "FAIL: VEC.SET q secret"; exit 1 ;; esac
+[ "$(vecs)" = 1 ] || { echo "FAIL: the quantized set has no vector file in $STATE/vec-7402 (control)"; exit 1; }
+# a. flintctl's own removal: the wipe, then the co-processor forgets.
+$CTL tenant remove vt >"$STATE/remove.log" 2>&1 || { echo "FAIL: tenant remove"; cat "$STATE/remove.log"; exit 1; }
+grep -q "coproc 127.0.0.1:7402: ns vt forgotten (2 set(s))" "$STATE/remove.log" || {
+  echo "FAIL: tenant remove did not make the co-processor forget ns vt:"
+  sed 's/^/    /' "$STATE/remove.log"; exit 1; }
+[ "$(vecs)" = 0 ] || { echo "FAIL: the removed tenant's vector file is still on disk"; exit 1; }
+$CTL tenant add vt2 tok-vt2 vt 1 >/dev/null 2>&1 || { echo "FAIL: tenant add vt2 on ns vt"; exit 1; }
+for probe in "VEC.GET q secret" "VEC.GET s a" "VEC.INFO q" "VEC.SEARCH q 1,2,3,4 1"; do
+  OUT=$(vexec tok-vt2 $probe)
+  case "$OUT" in
+    *private-note*|*"1,2,3,4"*|*secret*|*"1,0,0,0"*|*count*)
+      echo "FAIL: a new tenant on ns vt read the removed tenant's data: $probe -> $OUT"; exit 1 ;;
+  esac
+done
+echo "  tenant remove forgot 2 sets and the vector file; vt2 on ns vt reads none of vt's"
+# b. A removal that never told the co-processor, as an older flintctl's:
+# the CP record, then the wipe, and nothing else.
+case "$(vexec tok-vt2 VEC.CREATE s2 DIM 2 METRIC l2)" in OK*) ;; *) echo "FAIL: VEC.CREATE s2"; exit 1 ;; esac
+case "$(vexec tok-vt2 VEC.SET s2 left 5,6 META vt2-note)" in OK*) ;; *) echo "FAIL: VEC.SET s2"; exit 1 ;; esac
+mesh 7410 "CPDELTENANT vt2" | grep -q OK || { echo "FAIL: CPDELTENANT vt2"; exit 1; }
+for port in 7407 7408; do mesh "$port" "FLINTNS vt" FLUSHALL >/dev/null; done
+$CTL tenant add vt3 tok-vt3 vt 1 >"$STATE/add.log" 2>&1 || { echo "FAIL: tenant add vt3"; cat "$STATE/add.log"; exit 1; }
+grep -q "coproc 127.0.0.1:7402: forgot 1 set(s) it still held for ns vt" "$STATE/add.log" || {
+  echo "FAIL: tenant add did not make the co-processor forget what it still held for ns vt:"
+  sed 's/^/    /' "$STATE/add.log"; exit 1; }
+OUT=$(vexec tok-vt3 VEC.GET s2 left)
+case "$OUT" in *vt2-note*|*"5,6"*) echo "FAIL: vt3 read vt2's vector after an add on ns vt: $OUT"; exit 1 ;; esac
+echo "  tenant add forgot the set an un-told removal left; vt3 reads none of vt2's"
+# c. A co-processor that cannot answer: the add is refused, and no tenant is made.
+# The declared address is a seat's mesh port, which answers FLINTNSDROP with
+# an error, as a co-processor from before BUG-0255 does.
+sed 's/^coproc VEC\. 127\.0\.0\.1:7402$/coproc VEC. 127.0.0.1:7407/' "$INV" > "$INV.bad"
+if ./target/release/flintctl -f "$INV.bad" tenant add vt4 tok-vt4 vt4 1 >"$STATE/refuse.log" 2>&1; then
+  echo "FAIL: tenant add went ahead though the co-processor could not forget the namespace:"
+  sed 's/^/    /' "$STATE/refuse.log"; rm -f "$INV.bad"; exit 1
+fi
+rm -f "$INV.bad"
+grep -q "refusing to add a tenant on namespace vt4" "$STATE/refuse.log" || {
+  echo "FAIL: the refusal did not say why:"; sed 's/^/    /' "$STATE/refuse.log"; exit 1; }
+mesh 7410 CPTENANTS | grep -q '^vt4 ' && { echo "FAIL: the refused add made tenant vt4 anyway"; exit 1; }
+echo "  a co-processor that cannot forget refuses the add, and no tenant is made"
+
+echo "== 6. stop reaps the co-processor seat"
 $CTL stop >/dev/null 2>&1
 sleep 0.5
 pgrep -f "flint-vec --port 7402" >/dev/null && {
@@ -206,4 +275,4 @@ pgrep -f "flint-vec --port 7402" >/dev/null && {
 }
 echo "  seat gone after stop"
 
-echo "PASS: co-processor family drill — an inventory-declared co-processor is spawned by flintctl, routed by the proxy over mesh mTLS, persists its vectors into the tenant namespace, answers VEC.SEARCH by distance, and is reaped by stop"
+echo "PASS: co-processor family drill — an inventory-declared co-processor is spawned by flintctl, routed by the proxy over mesh mTLS, persists its vectors into the tenant namespace, answers VEC.SEARCH by distance, forgets a removed tenant's namespace before anyone else is given it (BUG-0255), and is reaped by stop"

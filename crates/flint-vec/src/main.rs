@@ -403,6 +403,23 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
             .count();
         return Value::Bulk(Some(flintinfo(&stats, loading).into_bytes()));
     }
+    // BUG-0255: forget a namespace whose tenant has gone, so a tenant given
+    // the same namespace later cannot read the old one's vectors from memory.
+    // flintctl sends it on `tenant remove` and on `tenant add`. Like FLINTINFO
+    // it is not a family command, so no tenant can send it.
+    if bulks.len() == 2 && bulks[0].eq_ignore_ascii_case(b"FLINTNSDROP") {
+        let ns = bulks[1];
+        // Loads, then the store: the order every path that holds both takes.
+        let mut lk = loads.lock().expect("loads lock");
+        lk.remove(ns);
+        let dropped = store.lock().expect("store lock").drop_namespace(ns);
+        drop(lk);
+        eprintln!(
+            "flint-vec: dropped ns {:?} ({dropped} set(s)); its next touch rebuilds from durable rows",
+            String::from_utf8_lossy(ns)
+        );
+        return Value::Integer(dropped as i64);
+    }
     if bulks.len() < 5 || !bulks[0].eq_ignore_ascii_case(b"FLINTFAM") {
         return err("ERR FLINTFAM <token> <callback> <ns> <cmd...>");
     }
@@ -436,11 +453,14 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
                     phase: phase.clone(),
                 },
             );
+            // Read under the loads lock, so a FLINTNSDROP either came before
+            // this chunk or makes it install nothing (BUG-0255).
+            let generation = store.lock().expect("store lock").generation(ns);
             drop(lk);
             let (ns, token, callback) = (ns.to_vec(), token.to_vec(), callback.to_vec());
             let (store, loads, edge) = (store.clone(), loads.clone(), tls.edge.clone());
             std::thread::spawn(move || {
-                rebuild_chunk(ns, token, callback, store, loads, edge, phase)
+                rebuild_chunk(ns, token, callback, store, loads, edge, phase, generation)
             });
             return err("LOADING vector index is warming, retry");
         }
@@ -473,6 +493,11 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
 /// transient channel failure it clears `running` (keeping prior progress) so the
 /// next touch retries — a partially-loaded index is NEVER marked warm (D3: a
 /// partial k-NN is a wrong answer, not a slow one).
+///
+/// `generation` is the namespace's [`Store::generation`] when the chunk began.
+/// A FLINTNSDROP since then (BUG-0255) means the rows this chunk read may be
+/// the old tenant's: it installs none of them and leaves the load state as the
+/// drop left it.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_chunk(
     ns: Vec<u8>,
@@ -482,15 +507,21 @@ fn rebuild_chunk(
     loads: Loads,
     edge: Option<Arc<flint_tls::ClientConfig>>,
     phase: Phase,
+    generation: u64,
 ) {
     let name = String::from_utf8_lossy(&ns).into_owned();
-    match rebuild_chunk_inner(&ns, &token, &callback, &store, &edge, phase) {
+    let result = rebuild_chunk_inner(&ns, &token, &callback, &store, &edge, phase, generation);
+    let mut lk = loads.lock().expect("loads lock");
+    if store.lock().expect("store lock").generation(&ns) != generation {
+        eprintln!(
+            "flint-vec: ns {name:?} was dropped during a rebuild chunk; it installed nothing"
+        );
+        return;
+    }
+    match result {
         Ok(Chunk::Done(total)) => {
             eprintln!("flint-vec: rebuilt ns {name:?} ({total} vectors) from durable rows");
-            loads
-                .lock()
-                .expect("loads lock")
-                .insert(ns, LoadState::Loaded);
+            lk.insert(ns, LoadState::Loaded);
         }
         Ok(Chunk::More { phase, installed }) => {
             let where_ = match &phase {
@@ -509,7 +540,7 @@ fn rebuild_chunk(
             eprintln!(
                 "flint-vec: ns {name:?} rebuild chunk loaded {installed}; {where_}; resuming on the next channel"
             );
-            loads.lock().expect("loads lock").insert(
+            lk.insert(
                 ns,
                 LoadState::Loading {
                     running: false,
@@ -521,9 +552,7 @@ fn rebuild_chunk(
             eprintln!(
                 "flint-vec: ns {name:?} rebuild chunk failed: {e} (will retry on next touch; index not served partial)"
             );
-            if let Some(LoadState::Loading { running, .. }) =
-                loads.lock().expect("loads lock").get_mut(&ns)
-            {
+            if let Some(LoadState::Loading { running, .. }) = lk.get_mut(&ns) {
                 *running = false;
             }
         }
@@ -540,6 +569,7 @@ fn rebuild_chunk_inner(
     store: &Arc<Mutex<Store>>,
     edge: &Option<Arc<flint_tls::ClientConfig>>,
     phase: Phase,
+    generation: u64,
 ) -> Result<Chunk, String> {
     let addr = std::str::from_utf8(callback).map_err(|_| "bad callback".to_string())?;
     let mut ch = flint_tls::connect_edge(addr, edge).map_err(|e| format!("channel dial: {e}"))?;
@@ -681,7 +711,7 @@ fn rebuild_chunk_inner(
             _ => i += 1, // null / wrong shape: skip
         }
     }
-    install(store, ns, configs, vectors);
+    install(store, ns, generation, configs, vectors);
     if unreadable > 0 {
         eprintln!(
             "flint-vec: rebuild of ns {:?} left out {unreadable} vector row(s) it cannot read; first: {first_unreadable}",
@@ -708,10 +738,16 @@ fn rebuild_chunk_inner(
 fn install(
     store: &Arc<Mutex<Store>>,
     ns: &[u8],
+    generation: u64,
     configs: Vec<LoadedConfig>,
     vectors: Vec<LoadedVector>,
 ) -> usize {
     let mut st = store.lock().expect("store lock");
+    // Dropped since the chunk began (BUG-0255): these rows may be the old
+    // tenant's. Checked under the same lock as the commits below.
+    if st.generation(ns) != generation {
+        return 0;
+    }
     for (set, dim, metric, index, quant) in configs {
         st.commit(
             ns,
@@ -876,4 +912,78 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(parts: &[&[u8]]) -> Value {
+        Value::Array(Some(
+            parts
+                .iter()
+                .map(|p| Value::Bulk(Some(p.to_vec())))
+                .collect(),
+        ))
+    }
+
+    fn loaded_set(store: &Arc<Mutex<Store>>, ns: &[u8]) {
+        let configs = vec![(b"s".to_vec(), 2, Metric::L2, IndexKind::Flat, Quant::None)];
+        let vectors = vec![(b"s".to_vec(), b"id".to_vec(), vec![1.0, 2.0], None, None)];
+        assert_eq!(install(store, ns, 0, configs, vectors), 1);
+    }
+
+    /// BUG-0255: FLINTNSDROP forgets the namespace's sets and its load state,
+    /// so the next touch rebuilds from durable rows, and leaves the rest.
+    #[test]
+    fn flintnsdrop_forgets_a_namespace_and_only_it() {
+        let store = Arc::new(Mutex::new(Store::new()));
+        let loads: Loads = Arc::new(Mutex::new(HashMap::new()));
+        for ns in [b"gone".as_slice(), b"kept"] {
+            loaded_set(&store, ns);
+            loads
+                .lock()
+                .expect("loads lock")
+                .insert(ns.to_vec(), LoadState::Loaded);
+        }
+        let tls = Tls::default();
+        let reply = handle_flintfam(&frame(&[b"FLINTNSDROP", b"gone"]), &store, &loads, &tls);
+        assert_eq!(reply, Value::Integer(1));
+        assert!(
+            !loads
+                .lock()
+                .expect("loads lock")
+                .contains_key(b"gone".as_slice())
+        );
+        assert!(
+            loads
+                .lock()
+                .expect("loads lock")
+                .contains_key(b"kept".as_slice())
+        );
+        let st = store.lock().expect("store lock");
+        assert_eq!(st.set_count(), 1);
+        assert_eq!(st.generation(b"gone"), 1);
+        assert_eq!(st.generation(b"kept"), 0);
+        drop(st);
+        let again = handle_flintfam(&frame(&[b"flintnsdrop", b"gone"]), &store, &loads, &tls);
+        assert_eq!(
+            again,
+            Value::Integer(0),
+            "dropping it twice drops nothing more"
+        );
+    }
+
+    /// BUG-0255: rows a rebuild read before a drop may be the old tenant's,
+    /// so a chunk that began before the drop installs none of them.
+    #[test]
+    fn a_rebuild_begun_before_a_drop_installs_nothing() {
+        let store = Arc::new(Mutex::new(Store::new()));
+        let before = store.lock().expect("store lock").generation(b"ns");
+        store.lock().expect("store lock").drop_namespace(b"ns");
+        let configs = vec![(b"s".to_vec(), 2, Metric::L2, IndexKind::Flat, Quant::None)];
+        let vectors = vec![(b"s".to_vec(), b"id".to_vec(), vec![1.0, 2.0], None, None)];
+        assert_eq!(install(&store, b"ns", before, configs, vectors), 0);
+        assert_eq!(store.lock().expect("store lock").set_count(), 0);
+    }
 }

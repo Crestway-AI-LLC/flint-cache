@@ -1228,6 +1228,10 @@ flintctl -f cluster.flint tenant add-on-pair jobs <token> jobs 1 2
 # quotas: fleet ops/s and storage bytes (0 = unlimited)
 flintctl -f cluster.flint tenant-quota acme 50000 53687091200
 
+# remove: revoke the token, wipe the namespace on every pair, and make every
+# co-processor forget the namespace's vectors
+flintctl -f cluster.flint tenant remove acme
+
 # opt-ins (each is the tenant's choice; see the tenant guide)
 flintctl -f cluster.flint tenant-reads acme on     # replica reads
 flintctl -f cluster.flint tenant-cache acme on     # proxy near-cache
@@ -1244,6 +1248,13 @@ a ready-to-send onboarding guide with connect-and-go sample code.
 Notes:
 - Tokens are stored **hashed** (SHA-256) — you cannot recover a token,
   only rotate it.
+- **A namespace's vectors also live in each co-processor's memory**, which
+  the wipe does not reach. `tenant remove` tells every co-processor the
+  inventory declares to forget them. `tenant add` and `tenant add-on-pair`
+  ask again before giving a namespace out. They refuse if a co-processor
+  cannot answer, because a new tenant there could read a removed tenant's
+  vectors (BUG-0255). Re-run when it answers, or restart it: a co-processor
+  rebuilds its index from the durable rows.
 - The **subset** (`k`) is a shuffle-shard of the proxy fleet; a tenant is
   served only by its subset, which bounds blast radius. `CPSETSUBSET`
   overrides it (dedicated proxies for a large tenant).

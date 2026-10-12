@@ -920,6 +920,8 @@ pub struct Store {
     /// binary's `--write-packed-rows`). Off by default until every binary a
     /// fleet may roll back to reads packed rows.
     packed_rows: bool,
+    /// How many times each namespace has been dropped ([`Store::drop_namespace`]).
+    generations: HashMap<Vec<u8>, u64>,
 }
 
 impl Store {
@@ -998,6 +1000,45 @@ impl Store {
         vs
     }
 
+    /// Forget everything held for `ns`: its sets, their vector files and its
+    /// index bytes (BUG-0255). A tenant's removal wipes its namespace's durable
+    /// rows, and a namespace name can be given to a new tenant, so an index
+    /// kept here past the removal served the old tenant's vectors to the new
+    /// one. Returns how many sets were dropped. The namespace's next touch
+    /// rebuilds from whatever durable rows it has.
+    ///
+    /// Also bumps `ns`'s [`Store::generation`], so a rebuild that was already
+    /// reading rows for it installs none of them.
+    pub fn drop_namespace(&mut self, ns: &[u8]) -> usize {
+        let before = self.sets.len();
+        self.sets.retain(|(n, _), _| n.as_slice() != ns);
+        self.ns_bytes.remove(ns);
+        *self.generations.entry(ns.to_vec()).or_default() += 1;
+        before - self.sets.len()
+    }
+
+    /// How many times `ns` has been dropped. A rebuild reads it when it starts,
+    /// and installs only while it is unchanged.
+    pub fn generation(&self, ns: &[u8]) -> u64 {
+        self.generations.get(ns).copied().unwrap_or(0)
+    }
+
+    /// Start an emptied set again (BUG-0255). A deleted vector's slot waits
+    /// for the set's next insert (BUG-0197), so a set emptied by `VEC.DEL` or
+    /// by its TTLs kept every slot's memory, and its vector file at its
+    /// largest, until the co-processor restarted. With nothing left in it,
+    /// the set keeps its configuration and its index and file start again.
+    fn reset_set(&mut self, key: &(Vec<u8>, Vec<u8>)) {
+        let Some(vs) = self.sets.get(key) else {
+            return;
+        };
+        let (dim, metric, kind, quant) = (vs.dim(), vs.metric(), vs.kind(), vs.quant());
+        // The old set and its file go before the new file is made.
+        self.sets.remove(key);
+        let fresh = self.new_set(dim, metric, kind, quant);
+        self.sets.insert(key.clone(), fresh);
+    }
+
     /// Estimated index bytes currently attributed to `ns` (for INFO/metrics).
     pub fn ns_mem_bytes(&self, ns: &[u8]) -> usize {
         self.ns_bytes.get(ns).copied().unwrap_or(0)
@@ -1073,12 +1114,17 @@ impl Store {
                 }
             }
             Apply::Remove { set, id } => {
+                let key = (ns.to_vec(), set);
                 let mut freed = 0usize;
-                if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
+                let mut emptied = false;
+                if let Some(vs) = self.sets.get_mut(&key) {
                     let before = vs.spill_bytes();
                     freed = vs.entry_cost(&id).unwrap_or(0);
-                    vs.del(&id);
+                    emptied = vs.del(&id) && vs.is_empty();
                     freed += before - vs.spill_bytes();
+                }
+                if emptied {
+                    self.reset_set(&key);
                 }
                 if freed > 0
                     && let Some(e) = self.ns_bytes.get_mut(ns)
@@ -1098,11 +1144,13 @@ impl Store {
     /// vector. Called on a timer by the networked layer.
     pub fn sweep_expired(&mut self, now: u64) -> usize {
         let mut swept = 0usize;
-        for ((ns, _set), vs) in self.sets.iter_mut() {
+        let mut emptied = Vec::new();
+        for (key, vs) in self.sets.iter_mut() {
             let ids = vs.expired_ids(now);
             if ids.is_empty() {
                 continue;
             }
+            let ns = &key.0;
             let before = vs.spill_bytes();
             let mut freed = 0usize;
             for id in &ids {
@@ -1111,11 +1159,17 @@ impl Store {
             }
             freed += before - vs.spill_bytes();
             swept += ids.len();
+            if vs.is_empty() {
+                emptied.push(key.clone());
+            }
             if freed > 0
                 && let Some(e) = self.ns_bytes.get_mut(ns)
             {
                 *e = e.saturating_sub(freed);
             }
+        }
+        for key in &emptied {
+            self.reset_set(key);
         }
         swept
     }
@@ -1857,6 +1911,160 @@ mod tests {
             0,
             "a set's file goes with the set"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG-0255: a removed tenant's namespace can be given to a new tenant,
+    /// so dropping it must leave nothing the new tenant could read, and must
+    /// leave every other namespace alone.
+    #[test]
+    fn dropping_a_namespace_leaves_nothing_of_it() {
+        let dir = std::env::temp_dir().join(format!("flint-vec-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut st = Store::new();
+        st.set_vec_dir(dir.clone());
+        let create = cmd(&[
+            "VEC.CREATE",
+            "q",
+            "DIM",
+            "4",
+            "METRIC",
+            "l2",
+            "INDEX",
+            "hnsw",
+            "QUANT",
+            "sq8",
+        ]);
+        let set = cmd(&["VEC.SET", "q", "secret", "1,2,3,4", "META", "private"]);
+        for ns in [b"old".as_slice(), b"other"] {
+            assert_eq!(run(&mut st, ns, &create), Value::Simple("OK".into()));
+            assert_eq!(run(&mut st, ns, &set), Value::Simple("OK".into()));
+        }
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 2);
+        let other_bytes = st.ns_mem_bytes(b"other");
+
+        assert_eq!(st.drop_namespace(b"old"), 1);
+        assert_eq!(st.generation(b"old"), 1);
+        assert_eq!(st.generation(b"other"), 0);
+        assert_eq!(st.ns_mem_bytes(b"old"), 0);
+        assert!(
+            matches!(
+                run(&mut st, b"old", &cmd(&["VEC.GET", "q", "secret"])),
+                Value::Error(_)
+            ),
+            "the dropped namespace has no set q"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir").count(),
+            1,
+            "the dropped set's vector file is gone"
+        );
+        // The other tenant keeps its set, its vector, its META and its bytes.
+        let got = run(&mut st, b"other", &cmd(&["VEC.GET", "q", "secret"]));
+        assert_eq!(
+            got,
+            Value::Array(Some(vec![
+                Value::Bulk(Some(b"1,2,3,4".to_vec())),
+                Value::Bulk(Some(b"private".to_vec())),
+            ]))
+        );
+        assert_eq!(st.ns_mem_bytes(b"other"), other_bytes);
+        // A new tenant on the dropped namespace starts empty, and can use it.
+        assert_eq!(run(&mut st, b"old", &create), Value::Simple("OK".into()));
+        assert_eq!(
+            info_field(&run(&mut st, b"old", &cmd(&["VEC.INFO", "q"])), "count"),
+            Value::Integer(0)
+        );
+        assert_eq!(st.drop_namespace(b"never-seen"), 0);
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG-0255: a set emptied by VEC.DEL, or by its TTLs, gives back its
+    /// slots and its vector file, and keeps working.
+    #[test]
+    fn an_emptied_set_starts_again() {
+        let dir = std::env::temp_dir().join(format!("flint-vec-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut st = Store::new();
+        st.set_vec_dir(dir.clone());
+        let create = cmd(&[
+            "VEC.CREATE",
+            "q",
+            "DIM",
+            "4",
+            "METRIC",
+            "l2",
+            "INDEX",
+            "hnsw",
+            "QUANT",
+            "bin",
+        ]);
+        assert_eq!(run(&mut st, b"ns", &create), Value::Simple("OK".into()));
+        let disk =
+            |st: &mut Store| info_field(&run(st, b"ns", &cmd(&["VEC.INFO", "q"])), "disk_bytes");
+        for i in 0..50 {
+            let v = format!("{i},1,2,3");
+            let set = cmd(&["VEC.SET", "q", &format!("id{i}"), &v]);
+            assert_eq!(run(&mut st, b"ns", &set), Value::Simple("OK".into()));
+        }
+        assert_eq!(disk(&mut st), Value::Integer(50 * 4 * 4));
+        for i in 0..49 {
+            let del = cmd(&["VEC.DEL", "q", &format!("id{i}")]);
+            assert_eq!(run(&mut st, b"ns", &del), Value::Integer(1));
+        }
+        assert_eq!(
+            disk(&mut st),
+            Value::Integer(50 * 4 * 4),
+            "a set with a vector left keeps its slots for its next inserts (BUG-0197)"
+        );
+        assert_eq!(
+            run(&mut st, b"ns", &cmd(&["VEC.DEL", "q", "id49"])),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            disk(&mut st),
+            Value::Integer(0),
+            "the emptied set's file starts again"
+        );
+        assert_eq!(st.ns_mem_bytes(b"ns"), 0);
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir").count(),
+            1,
+            "one file, the new one: the old one is gone"
+        );
+        // It keeps its configuration and serves again.
+        assert_eq!(
+            run(&mut st, b"ns", &cmd(&["VEC.SET", "q", "back", "9,1,2,3"])),
+            Value::Simple("OK".into())
+        );
+        let top = run(&mut st, b"ns", &cmd(&["VEC.SEARCH", "q", "9,1,2,3", "1"]));
+        let Value::Array(Some(rows)) = top else {
+            panic!("rows")
+        };
+        let Value::Array(Some(row)) = &rows[0] else {
+            panic!("row")
+        };
+        assert_eq!(row[0], Value::Bulk(Some(b"back".to_vec())));
+        assert_eq!(
+            info_field(&run(&mut st, b"ns", &cmd(&["VEC.INFO", "q"])), "quant"),
+            Value::Bulk(Some(b"bin".to_vec()))
+        );
+
+        // The TTL sweep empties it the same way.
+        assert_eq!(
+            run_at(
+                &mut st,
+                b"ns",
+                &cmd(&["VEC.SET", "q", "back", "9,1,2,3", "PX", "10"]),
+                1_000
+            ),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(st.sweep_expired(2_000), 1);
+        assert_eq!(disk(&mut st), Value::Integer(0));
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
+        drop(st);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

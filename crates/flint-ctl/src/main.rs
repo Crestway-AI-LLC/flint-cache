@@ -6621,6 +6621,9 @@ fn flintinfo_all(
 
 fn tenant_add(inv: &Inventory, rest: &[String]) {
     let tls = tls_client(inv);
+    if let Some(ns) = rest.get(2) {
+        forget_before_add(inv, &tls, ns);
+    }
     let mut args = vec!["CPADDTENANT"];
     let strs: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
     args.extend(strs);
@@ -6642,6 +6645,7 @@ fn tenant_add_on_pair(inv: &Inventory, rest: &[String]) {
     }
     let pair = pair_index(inv, &rest[3]).to_string();
     let tls = tls_client(inv);
+    forget_before_add(inv, &tls, &rest[2]);
     let mut args = vec!["CPADDTENANTONPAIR", &rest[0], &rest[1], &rest[2], &pair];
     if let Some(k) = rest.get(4) {
         args.push(k);
@@ -6742,7 +6746,83 @@ fn tenant_remove(inv: &Inventory, name: &str) {
             }
         );
     }
+    // The wipe reaches the namespace's durable rows, not a co-processor's
+    // index of them (BUG-0255). One that cannot forget them now is asked
+    // again by the next `tenant add` on this namespace, which refuses until
+    // it answers.
+    for (addr, forgot) in coproc_forget(inv, &tls, &ns) {
+        match forgot {
+            Forgot::Sets(n) => eprintln!("  coproc {addr}: ns {ns} forgotten ({n} set(s))"),
+            Forgot::NotRunning => eprintln!("  coproc {addr}: not running, so it holds nothing"),
+            Forgot::Failed(e) => eprintln!(
+                "  coproc {addr}: FORGET FAILED ({e}); its index of ns {ns} stays in its \
+                 memory until it restarts or a `tenant add` on ns {ns} asks again"
+            ),
+        }
+    }
     eprintln!("== tenant {name} removed (ns {ns})");
+}
+
+/// What a co-processor said when asked to forget a namespace.
+enum Forgot {
+    /// It dropped this many sets (0 when it held none).
+    Sets(i64),
+    /// Nothing listens at its address. Its index lives only in its memory, so
+    /// a co-processor that is not running holds none.
+    NotRunning,
+    /// It could not say, and why.
+    Failed(String),
+}
+
+/// Ask every co-processor the inventory declares to forget namespace `ns`
+/// (BUG-0255, `FLINTNSDROP`, over the mesh). A co-processor keeps its index
+/// of a namespace in memory, which the namespace's wipe does not reach, and
+/// a namespace name can be given to a new tenant: until the co-processor
+/// restarted, the new tenant read the old one's vectors and their META.
+fn coproc_forget(
+    inv: &Inventory,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    ns: &str,
+) -> Vec<(String, Forgot)> {
+    inv.coprocs
+        .iter()
+        .map(|(_, addr)| {
+            let forgot = match call_seq(addr, tls, &[&["FLINTNSDROP", ns]], Duration::from_secs(10))
+            {
+                Ok(Value::Integer(n)) => Forgot::Sets(n),
+                Ok(other) => Forgot::Failed(format!("answered {other:?}")),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Forgot::NotRunning,
+                // A co-processor from before BUG-0255 reads any frame that is
+                // not FLINTINFO as a malformed FLINTFAM.
+                Err(e) if e.to_string().contains("FLINTFAM <token>") => Forgot::Failed(
+                    "it predates FLINTNSDROP (BUG-0255); upgrade or restart it".into(),
+                ),
+                Err(e) => Forgot::Failed(e.to_string()),
+            };
+            (addr.clone(), forgot)
+        })
+        .collect()
+}
+
+/// Before a tenant is given namespace `ns`, make sure no co-processor still
+/// holds an index of it from a tenant removed before (BUG-0255). Refuses the
+/// add when one cannot say: the alternative is a tenant that may read another
+/// tenant's vectors.
+fn forget_before_add(inv: &Inventory, tls: &Option<Arc<flint_tls::ClientConfig>>, ns: &str) {
+    for (addr, forgot) in coproc_forget(inv, tls, ns) {
+        match forgot {
+            Forgot::Sets(0) | Forgot::NotRunning => {}
+            Forgot::Sets(n) => {
+                eprintln!("  coproc {addr}: forgot {n} set(s) it still held for ns {ns}")
+            }
+            Forgot::Failed(e) => die(&format!(
+                "refusing to add a tenant on namespace {ns}: co-processor {addr} could not \
+                 forget it ({e}). It may still hold vectors of a tenant removed from {ns}, \
+                 which the new tenant would read (BUG-0255). Re-run when it answers, or \
+                 restart it: its index is rebuilt from durable rows."
+            )),
+        }
+    }
 }
 
 fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
