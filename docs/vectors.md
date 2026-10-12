@@ -71,12 +71,16 @@ Doubling it added under 0.01 recall in the measurements. A vector with `EX` or
   rebuilds your sets from their durable rows on first touch; retry until
   the command answers. Nothing is lost.
 - **`-VECFULL ... for this namespace`**: your namespace's index has reached
-  its memory cap. The write is refused before anything is stored. Delete
-  vectors, let them expire, or ask the operator for a higher cap.
+  its memory cap. The write is refused before anything is stored. To make
+  room, delete vectors in the set you are writing to, let them expire, or
+  empty a set. You can also ask the operator for a higher cap.
+  - A deleted vector's memory is kept for its own set's next writes, so
+    deleting from one set makes no room in another.
+  - An emptied set gives back all of its memory.
 - **`-VECFULL vector index memory is full on this server`**: every tenant's
   indexes together have reached the server's share of memory, which keeps
-  vector search from taking RAM the cache needs. Reads still work; retry
-  later.
+  vector search from taking RAM the cache needs. Reads still work. Retry
+  later, or delete vectors in the set you are writing to.
 - **`-WRONGDIM`**: the vector's length is not the set's `DIM`.
 
 ## Running it
@@ -92,6 +96,9 @@ coproc-index-total-bytes 8589934592    # every namespace together (no default)
 ```
 
 Set `coproc-index-total-bytes` below what the host's data nodes need.
+`flintctl tenant remove` makes every co-processor forget the tenant's
+vectors. `tenant add` refuses while a declared co-processor cannot confirm
+that it holds nothing for the new tenant's namespace.
 `flintctl upgrade` starts a co-processor the inventory gained and rolls a
 running one. Its index memory, both caps and refusals are reported as
 `flint_coproc_*`: by the fleet agent, which `flintctl` tells about every
