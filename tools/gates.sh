@@ -1265,7 +1265,8 @@ fi
 # the drill's declared ports counts as the drill's own, so fleet_guard lets it
 # through and fleet_kill sends it -9. That is right for a leaked seat and
 # catastrophic for the real thing, because 7001/7002/7379/7500 is exactly what
-# render-inventory.sh and the playground deploy. Four public drills and one
+# render-inventory.sh and the playground deploy. 7420 joined them with ops
+# ADR-0050 step 5, which renders the vector co-processor there by default. Four public drills and one
 # fleet drill claimed that block, which meant running the suite on a machine
 # with a default-port cluster would kill it — silently, since the guard reads
 # it as ours. That is the harm the guard exists to prevent, arriving through
@@ -1780,9 +1781,9 @@ assert_no_default_ports() {
   # THROUGH THE LIBRARY (BUG-0156). Its own scan anchored at column 0 and did
   # not join continuations, so an indented or wrapped `fleet_init 7001` -- the
   # one thing this check exists to forbid -- was invisible to it.
-  hits=$(drill_fleet_init_lines | grep -E '[^0-9](7001|7002|7379|7500)([^0-9]|$)' || true)
+  hits=$(drill_fleet_init_lines | grep -E '[^0-9](7001|7002|7379|7500|7420)([^0-9]|$)' || true)
   [ -z "$hits" ] && return 0
-  echo "FAIL  drills claim the default cluster ports (7001/7002/7379/7500):"
+  echo "FAIL  drills claim the default cluster ports (7001/7002/7379/7500/7420):"
   echo "$hits" | sed 's/^/        /'
   echo "        fleet_kill would -9 a real cluster on those ports and"
   echo "        fleet_guard would not object. Move the drill to a free block."

@@ -4718,6 +4718,15 @@ fn agent_args(inv: &Inventory) -> Option<Vec<String>> {
     if inv.client_tls {
         args.extend(["--edge-ca".into(), edge_trust_path(inv)]);
     }
+    // ops ADR-0050 D2: each vector co-processor, so the agent reports how
+    // full its index is against the overall cap. Dialled over the mesh with
+    // the internal args below, the listener a co-processor serves FLINTINFO
+    // on. A wildcard address is refused at parse time (BUG-0140), so this is
+    // always dialable. An agent older than the flag ignores it: it reads the
+    // flags it asks for, and refuses only a bare leading word.
+    for (_, addr) in &inv.coprocs {
+        args.extend(["--coproc".into(), addr.clone()]);
+    }
     args.extend(internal_args(inv));
     Some(args)
 }
@@ -11033,6 +11042,32 @@ mod cert_manifest_tests {
             Some("/etc/pki/tls/certs/ca-bundle.crt")
         );
         assert!(public.iter().any(|a| a == "--client-tls"));
+    }
+
+    /// ops ADR-0050 D2: the agent is told every co-processor, and a fleet
+    /// without one passes it nothing.
+    #[test]
+    fn the_agent_is_told_each_coproc_and_nothing_without_one() {
+        let base = "statedir /var/lib/flint\n\
+                    bins /opt/flint/bin\n\
+                    cp 10.0.0.1:7500\n\
+                    pair 10.0.0.2:7001,10.0.0.3:7002\n\
+                    proxy 0.0.0.0:7379\n\
+                    agent 127.0.0.1:9464\n";
+        let coprocs = |a: &[String]| {
+            a.windows(2)
+                .filter(|w| w[0] == "--coproc")
+                .map(|w| w[1].clone())
+                .collect::<Vec<_>>()
+        };
+        let none = agent_args(&inv_from(base, "agentnocoproc")).expect("an agent line");
+        assert!(coprocs(&none).is_empty());
+        let one = agent_args(&inv_from(
+            &format!("{base}coproc VEC. 127.0.0.1:7420\n"),
+            "agentcoproc",
+        ))
+        .expect("an agent line");
+        assert_eq!(coprocs(&one), vec!["127.0.0.1:7420".to_string()]);
     }
 
     /// ...and ONLY a co-processor host. The leaf is server-auth only by design
