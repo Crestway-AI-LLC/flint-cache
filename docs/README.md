@@ -14,6 +14,8 @@ Start here if you are deploying Flint:
   in this repository with the command to reproduce it.
 - `space-reclaim.md` — Flint never evicts; how to bring your own cleanup
   policy for when the disk fills.
+- `vectors.md` — vector search (preview): the `VEC.*` commands, what sits in
+  RAM and what on NVMe, and the errors to expect.
 
 Reference:
 

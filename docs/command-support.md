@@ -495,6 +495,14 @@ GEORADIUSBYMEMBER (STORE, STOREDIST), GEORADIUS_RO, GEORADIUSBYMEMBER_RO.
 > GEOSEARCHSTORE's source and destination share a slot, and so do
 > GEORADIUS's key and its STORE key, as every multi-key command's must.
 
+### Vector search: `VEC.*` (preview)
+
+`VEC.CREATE`, `VEC.SET`, `VEC.GET`, `VEC.DEL`, `VEC.SEARCH`, `VEC.INFO`,
+`VEC.TTL`, `VEC.EXPIRE`, `VEC.PEXPIRE`, `VEC.PERSIST`. Flint's own surface,
+served by the vector co-processor rather than the data nodes, and documented
+in `vectors.md`. It is not RediSearch's `FT.*` and not Redis 8's vector
+sets; neither of those is implemented.
+
 ## Protocols: RESP2 and RESP3
 
 Both, negotiated per connection with `HELLO`. Connections start at RESP2;

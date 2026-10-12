@@ -10,6 +10,11 @@ queued behind a single thread, and every tenant lives in its own isolated
 keyspace behind its own token and quota. Clients connect with any Redis
 client; no SDK, no new protocol.
 
+Vector search (preview) is the one part that keeps data in RAM: its index
+holds a compressed copy of each vector, about 500 bytes at 1536 dimensions,
+while the vectors themselves are durable rows on NVMe. See
+[`docs/vectors.md`](docs/vectors.md).
+
 **Fewer misses beats faster hits.** A RAM cache is faster on a hit and that
 is not the number your users feel. When the working set does not fit,
 what they feel is the evictions: every evicted key is a request that falls

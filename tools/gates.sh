@@ -3694,7 +3694,7 @@ import glob, os, re, sys
 GUIDES = {
     "README.md", "release-checklist.md", "release-signing.md",
     "retry-safety.md", "security.md", "self-hosting.md", "slo.md",
-    "space-reclaim.md", "tenant-guide.md",
+    "space-reclaim.md", "tenant-guide.md", "vectors.md",
 }
 # Docs that describe MECHANISM. They name control-plane verbs -- CPLEASE,
 # FLINTDEMOTE, FLINTSLOTSTATS -- to explain how the system works, not to tell
