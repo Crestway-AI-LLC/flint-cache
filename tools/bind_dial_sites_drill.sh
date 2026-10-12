@@ -56,21 +56,24 @@ FIELDS = {
     # BUG-0140, the third field. Unlike cp and proxies this one has no dial
     # helper and deliberately never will: a wildcard `coproc` address is
     # REFUSED at parse time, because no generator writes the key and the only
-    # writer resolves the host itself. So the seven exempt readers are, each
+    # writer resolves the host itself. So the eight exempt readers are, each
     # for its own reason: parse_inventory, because reading the raw literal IS
     # the refusal; coproc_args, which BINDS; families_arg, which dials an
     # address the refusal has already guaranteed names a machine; coproc_runner,
     # which resolves placement from it the way cp_runner and proxy_runner do;
     # coproc_seat_name and coproc_family, which exist so that launch never
     # destructures the element itself -- the rule cp and proxies already
-    # follow; and roll_edge (ops ADR-0050 D4), which stops the seat on that
-    # address's port and asks it FLINTINFO there: the same literal
-    # families_arg dials, under the same guarantee, so the refusal is still
-    # enough. An EIGHTH reader is the signal to ask that again, and whether
-    # the key is wanted after all.
+    # follow; roll_edge (ops ADR-0050 D4), which stops the seat on that
+    # address's port and asks it FLINTINFO there; and coproc_forget
+    # (BUG-0255), which sends that address FLINTNSDROP. The last two dial the
+    # same literal families_arg dials, under the same guarantee, so the
+    # refusal is still enough. coproc_forget read it from the start, split
+    # across two lines that this scan matched one at a time (BUG-0260). A
+    # reader that does anything but DIAL the literal is the signal to ask
+    # again whether the key is wanted after all.
     "coprocs": {"coproc_args", "families_arg", "coproc_runner",
                 "parse_inventory", "coproc_seat_name", "coproc_family",
-                "roll_edge"},
+                "roll_edge", "coproc_forget"},
 }
 FN = re.compile(r"^(?:pub )?(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)")
 
@@ -84,16 +87,38 @@ def elem(field):
 src = open(sys.argv[1], encoding="utf-8").read().split("\n")
 
 # Tests may inspect the inventory freely: they assert ON this invariant, and
-# a fixture is not a dial site. Cut at the first test module.
-end = len(src)
-for i, l in enumerate(src):
+# a fixture is not a dial site. Each test item is skipped, through the line
+# that closes it at the attribute's own indent (rustfmt's layout). This cut
+# at the FIRST test module until BUG-0260 put one mid-file, which silently
+# took the 3,500 lines below it out of the scan.
+test = [False] * len(src)
+i = 0
+while i < len(src):
+    l = src[i]
     if l.strip().startswith("#[cfg(test)]"):
-        end = i
-        break
+        indent = l[: len(l) - len(l.lstrip())]
+        item = i if l.strip() != "#[cfg(test)]" else i + 1
+        if item < len(src) and src[item].rstrip().endswith(";"):
+            last = item
+        else:
+            last = next((k for k in range(item, len(src))
+                         if src[k].rstrip() == indent + "}"), len(src) - 1)
+        for k in range(i, last + 1):
+            test[k] = True
+        i = last + 1
+        continue
+    i += 1
+end = len(src)
+# A reader rustfmt split across lines (`inv.coprocs` then `.iter()` on the
+# next) is a reader. Matched a line at a time it was not, which is how
+# BUG-0255's coproc_forget went unlisted.
+split = re.compile(r"inv\.(?:" + "|".join(FIELDS) + r")\s*$")
 
 pats = {f: elem(f) for f in FIELDS}
 owner, bad, examined = "<top>", [], 0
 for n in range(end):
+    if test[n]:
+        continue
     line = src[n]
     m = FN.match(line)
     if m:
@@ -101,6 +126,8 @@ for n in range(end):
     # Prose discusses `inv.cp[0]` freely. Stripping from `//` can only hide a
     # hit inside a string literal, never invent one; no such literal exists.
     code = line.split("//", 1)[0]
+    if split.search(code) and n + 1 < end:
+        code = code.rstrip() + src[n + 1].split("//", 1)[0].strip()
     for field, exempt in FIELDS.items():
         if f"inv.{field}" not in code:
             continue
@@ -117,7 +144,8 @@ if examined == 0:
 
 for n, f, o, t in bad:
     print(f"{n}\tinv.{f}\t{o}\t{t}")
-print(f"# examined {examined} line(s) over {len(FIELDS)} field(s), up to line {end}")
+print(f"# examined {examined} line(s) over {len(FIELDS)} field(s); "
+      f"{sum(test)} line(s) of tests skipped")
 raise SystemExit(1 if bad else 0)
 PY
 }
@@ -165,5 +193,22 @@ control status "for p in &inv.proxies { let _ = p; }" "inv.proxies"
 # BUG-0140's field gets its own, because a rule with no control is a rule that
 # has not been shown to fail -- and this one was added last, when the exempt
 # set was being tuned and an over-broad entry would have gone unnoticed.
-control status "for c in &inv.coprocs { let _ = c; }" "inv.coprocs"
+# Injected into retire_proxy, which has no reason to read a co-processor:
+# a function that may read one legitimately would prove nothing.
+control retire_proxy "for c in &inv.coprocs { let _ = c; }" "inv.coprocs"
+
+# The two shapes the scan missed before BUG-0260, each injected into
+# retire_proxy: a reader split across lines, and a reader BELOW a test module.
+mutant() {  # mutant <label> <awk program over $SRC>
+  awk "$2" "$SRC" > "$T/mutant.rs"
+  grep -q 'INJECTED' "$T/mutant.rs" || fail "the control for $1 could not be injected."
+  if scan "$T/mutant.rs" >/dev/null 2>&1; then
+    fail "the control for $1 PASSED: the injected reader was not flagged."
+  fi
+  echo "  ok    $1 is caught"
+}
+mutant "a reader split across two lines" \
+  '{print} /^fn retire_proxy\(/ && !d {print "    let _ = inv.coprocs // INJECTED"; print "        .iter();"; d=1}'
+mutant "a reader below a test module" \
+  '/^fn retire_proxy\(/ && !d {print "#[cfg(test)]"; print "mod early_tests {"; print "}"; print ""} {print} /^fn retire_proxy\(/ && !d {print "    for c in &inv.coprocs { let _ = c; } // INJECTED"; d=1}'
 echo "BIND/DIAL SITES DRILL PASSED"
