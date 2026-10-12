@@ -8,6 +8,8 @@
 //!   flintctl -f cluster.flint status       roles/lag/liveness table
 //!   flintctl -f cluster.flint tenant add `<name>` `<token>` `<ns>` `[k]`
 //!   flintctl -f cluster.flint tenant add-on-pair `<name>` `<token>` `<ns>` `<pair>` `[k]`
+//!   flintctl -f cluster.flint tenant remove `<name>`  revoke, then wipe its namespace
+//!   flintctl -f cluster.flint tenant wipe `<ns>`      finish a removal whose wipe failed
 //!   `flintctl -f cluster.flint expand <a,b[,c]>`    new pair + reroll ctl
 //!   flintctl -f cluster.flint swap-node `<bad>` `<new>` fresh replica + CPSETPAIR
 //!   `flintctl -f cluster.flint failover <node>`     graceful master handoff
@@ -6622,7 +6624,7 @@ fn flintinfo_all(
 fn tenant_add(inv: &Inventory, rest: &[String]) {
     let tls = tls_client(inv);
     if let Some(ns) = rest.get(2) {
-        forget_before_add(inv, &tls, ns);
+        ready_namespace(inv, &tls, ns, "tenant add");
     }
     let mut args = vec!["CPADDTENANT"];
     let strs: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
@@ -6645,7 +6647,7 @@ fn tenant_add_on_pair(inv: &Inventory, rest: &[String]) {
     }
     let pair = pair_index(inv, &rest[3]).to_string();
     let tls = tls_client(inv);
-    forget_before_add(inv, &tls, &rest[2]);
+    ready_namespace(inv, &tls, &rest[2], "tenant add-on-pair");
     let mut args = vec!["CPADDTENANTONPAIR", &rest[0], &rest[1], &rest[2], &pair];
     if let Some(k) = rest.get(4) {
         args.push(k);
@@ -6675,12 +6677,6 @@ fn placed_namespaces(inv: &Inventory, tls: &Option<Arc<flint_tls::ClientConfig>>
     }
 }
 
-/// Remove a tenant end to end: look up its namespace, revoke the record at
-/// the CP (CPDELTENANT — auth dies on the next snapshot push, and the ns's
-/// slot-exception rows retire with it), then WIPE the namespace's data on
-/// every pair master (FLINTNS + FLUSHALL — namespace-scoped by the tenancy
-/// invariant). Data wipe is best-effort per pair and reported; re-running
-/// is safe (the wipe is idempotent, the CP delete errors "no such tenant").
 /// Retire a proxy registration the inventory no longer declares.
 ///
 /// The counterpart to what `verify` reports. Registrations are append-only,
@@ -6708,59 +6704,161 @@ fn retire_proxy(inv: &Inventory, addr: &str) {
     }
 }
 
+/// Remove a tenant end to end:
+/// 1. look up its namespace (the record dies with the delete);
+/// 2. revoke the record at the CP (CPDELTENANT): auth dies on the next
+///    snapshot push, and the ns's slot-exception rows retire with it;
+/// 3. wipe the namespace (`wipe_namespace`), unless another tenant shares it.
+///
+/// A wipe that fails is reported, and the tenant stays removed. Re-running
+/// this cannot finish it, because the record that named the namespace is
+/// gone; `tenant wipe <ns>` does (BUG-0260). Until then `tenant add` refuses
+/// the namespace, so no new tenant reads what is left in it.
 fn tenant_remove(inv: &Inventory, name: &str) {
     let tls = tls_client(inv);
-    // Namespace lookup BEFORE deletion (the record dies with the delete).
-    let ns = match call_cp(inv, &tls, &["CPTENANTS"]) {
-        Ok(Value::Bulk(Some(raw))) => String::from_utf8_lossy(&raw)
-            .lines()
-            .find_map(|l| {
-                let mut it = l.split_whitespace();
-                (it.next() == Some(name)).then(|| it.next().map(String::from))?
-            })
-            .unwrap_or_else(|| die(&format!("tenant remove failed: no such tenant {name:?}"))),
-        other => fail("CPTENANTS failed", &other),
+    let tenants = tenant_namespaces(inv, &tls, "tenant remove");
+    let Some(ns) = tenants
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, ns)| ns.clone())
+    else {
+        die(&format!(
+            "tenant remove failed: no such tenant {name:?}. If an earlier `tenant remove \
+             {name}` printed WIPE FAILED, finish it with `flintctl tenant wipe <its namespace>`."
+        ))
     };
     match call_cp(inv, &tls, &["CPDELTENANT", name]) {
         Ok(Value::Simple(s)) => eprintln!("== {s}"),
         other => fail("tenant remove failed", &other),
     }
-    for i in 0..inv.pairs.len() {
-        let master = pair_master(inv, &tls, &i.to_string());
-        // ONE connection for both: FLINTNS pins this connection's namespace,
-        // FLUSHALL then wipes exactly that namespace (a fresh connection
-        // would wipe the default ns instead).
-        let wiped = call_seq(
-            &master,
-            &tls,
-            &[&["FLINTNS", &ns], &["FLUSHALL"]],
-            Duration::from_secs(30),
-        )
-        .is_ok();
+    if let Some(other) = holder_of(&tenants, &ns, Some(name)) {
+        // The wipe would delete the keys of a tenant that still uses them.
+        eprintln!("  ns {ns} kept: tenant {other} shares it");
+        eprintln!("== tenant {name} removed (ns {ns} kept)");
+        return;
+    }
+    // Exit 0 either way: the tenant IS removed. A script tells a partial
+    // removal by its WIPE FAILED or FORGET FAILED line, as ops' playground
+    // reaper does.
+    if wipe_namespace(inv, &tls, &ns) {
+        eprintln!("== tenant {name} removed (ns {ns})");
+    } else {
         eprintln!(
-            "  pair {i} ({master}): ns {ns} {}",
-            if wiped {
-                "wiped"
-            } else {
-                "WIPE FAILED (re-run)"
-            }
+            "== tenant {name} removed, but ns {ns} is NOT fully wiped. Finish it with \
+             `flintctl tenant wipe {ns}`; until then `tenant add` refuses ns {ns}."
         );
     }
-    // The wipe reaches the namespace's durable rows, not a co-processor's
-    // index of them (BUG-0255). One that cannot forget them now is asked
-    // again by the next `tenant add` on this namespace, which refuses until
-    // it answers.
-    for (addr, forgot) in coproc_forget(inv, &tls, &ns) {
+}
+
+/// `tenant wipe <ns>`: wipe a namespace that no tenant holds. It finishes a
+/// `tenant remove` whose wipe failed (BUG-0260). It refuses a namespace a
+/// tenant holds, whose keys are that tenant's, and exits non-zero until
+/// every pair and co-processor has confirmed.
+fn tenant_wipe(inv: &Inventory, ns: &str) {
+    let tls = tls_client(inv);
+    if let Some(holder) = holder_of(&tenant_namespaces(inv, &tls, "tenant wipe"), ns, None) {
+        die(&format!(
+            "refusing: namespace {ns} is tenant {holder}'s, and a wipe would delete its keys. \
+             `tenant remove` wipes a namespace once its last tenant is removed."
+        ));
+    }
+    if !wipe_namespace(inv, &tls, ns) {
+        die(&format!(
+            "ns {ns} is NOT fully wiped. Re-run `flintctl tenant wipe {ns}` once what failed \
+             above answers."
+        ));
+    }
+    eprintln!("== ns {ns} wiped");
+}
+
+/// Wipe namespace `ns`: its keys on every pair master (FLINTNS + FLUSHALL)
+/// and its index on every co-processor (BUG-0255), which the keys' wipe does
+/// not reach. Each step is reported, a step that fails does not stop the
+/// others, and every step is idempotent. True when every pair and
+/// co-processor confirmed.
+fn wipe_namespace(inv: &Inventory, tls: &Option<Arc<flint_tls::ClientConfig>>, ns: &str) -> bool {
+    let mut complete = true;
+    for (i, members) in inv.pairs.iter().enumerate() {
+        // A pair with no master `die`d here, part-way through the pairs and
+        // before any co-processor was asked (BUG-0260).
+        let wiped = master_of(members, tls, &format!("pair {i}")).and_then(|master| {
+            // ONE connection for both: FLINTNS pins this connection's
+            // namespace, FLUSHALL then wipes exactly that namespace (a fresh
+            // connection would wipe the default ns instead).
+            match call_seq(
+                &master,
+                tls,
+                &[&["FLINTNS", ns], &["FLUSHALL"]],
+                Duration::from_secs(30),
+            ) {
+                Ok(_) => Ok(master),
+                Err(e) => Err(format!("{master}: {e}")),
+            }
+        });
+        match wiped {
+            Ok(master) => eprintln!("  pair {i} ({master}): ns {ns} wiped"),
+            Err(why) => {
+                complete = false;
+                eprintln!(
+                    "  pair {i}: ns {ns} WIPE FAILED: {}",
+                    why.replace('\n', "\n    ")
+                );
+            }
+        }
+    }
+    for (addr, forgot) in coproc_forget(inv, tls, ns) {
         match forgot {
             Forgot::Sets(n) => eprintln!("  coproc {addr}: ns {ns} forgotten ({n} set(s))"),
             Forgot::NotRunning => eprintln!("  coproc {addr}: not running, so it holds nothing"),
-            Forgot::Failed(e) => eprintln!(
-                "  coproc {addr}: FORGET FAILED ({e}); its index of ns {ns} stays in its \
-                 memory until it restarts or a `tenant add` on ns {ns} asks again"
-            ),
+            Forgot::Failed(e) => {
+                complete = false;
+                eprintln!(
+                    "  coproc {addr}: FORGET FAILED ({e}); its index of ns {ns} stays in its \
+                     memory until it restarts, or until `tenant wipe {ns}` or a `tenant add` \
+                     on ns {ns} asks again"
+                );
+            }
         }
     }
-    eprintln!("== tenant {name} removed (ns {ns})");
+    complete
+}
+
+/// Every tenant's name and namespace, from the control plane (CPTENANTS).
+/// `what` is the command asking, so a failure is reported as that command's.
+fn tenant_namespaces(
+    inv: &Inventory,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    what: &str,
+) -> Vec<(String, String)> {
+    match call_cp(inv, tls, &["CPTENANTS"]) {
+        Ok(Value::Bulk(Some(raw))) => parse_tenant_namespaces(&String::from_utf8_lossy(&raw)),
+        other => fail(&format!("{what} failed"), &other),
+    }
+}
+
+/// CPTENANTS answers a line per tenant that starts `<name> <ns>`.
+fn parse_tenant_namespaces(listing: &str) -> Vec<(String, String)> {
+    listing
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?.to_string(), it.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// A tenant other than `except` whose namespace is `ns`. The control plane
+/// lets tenants that are not placed share a namespace, and its keys are then
+/// all of theirs.
+fn holder_of<'a>(
+    tenants: &'a [(String, String)],
+    ns: &str,
+    except: Option<&str>,
+) -> Option<&'a str> {
+    tenants
+        .iter()
+        .find(|(name, n)| n == ns && Some(name.as_str()) != except)
+        .map(|(name, _)| name.as_str())
 }
 
 /// What a co-processor said when asked to forget a namespace.
@@ -6823,6 +6921,70 @@ fn forget_before_add(inv: &Inventory, tls: &Option<Arc<flint_tls::ClientConfig>>
             )),
         }
     }
+}
+
+/// Before a tenant is given namespace `ns`, make sure nothing a removed
+/// tenant left in it is there for the new one to read. A namespace another
+/// tenant holds is shared on purpose and left alone: what is in it is that
+/// tenant's too. Otherwise the add is refused while:
+/// - a pair master holds keys in `ns`. A `tenant remove` whose wipe failed
+///   leaves them (BUG-0260). flintctl does not wipe them here: whether they
+///   are wanted is the operator's to say, with `tenant wipe`;
+/// - a pair has no master, or its master cannot count, since either could
+///   hold such keys;
+/// - a co-processor cannot forget `ns` (`forget_before_add`, BUG-0255).
+fn ready_namespace(
+    inv: &Inventory,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    ns: &str,
+    what: &str,
+) {
+    if holder_of(&tenant_namespaces(inv, tls, what), ns, None).is_some() {
+        return;
+    }
+    for (i, members) in inv.pairs.iter().enumerate() {
+        let master = master_of(members, tls, &format!("pair {i}")).unwrap_or_else(|why| {
+            refuse_namespace(
+                ns,
+                &format!(
+                    "pair {i} has no master to say whether it holds keys in it: {}",
+                    why.replace('\n', "\n    ")
+                ),
+            )
+        });
+        match call_seq(
+            &master,
+            tls,
+            &[&["FLINTNS", ns], &["DBSIZE"]],
+            Duration::from_secs(30),
+        ) {
+            Ok(Value::Integer(0)) => {}
+            Ok(Value::Integer(n)) => refuse_namespace(
+                ns,
+                &format!(
+                    "pair {i} ({master}) still holds {n} key(s) in it. A tenant removed from \
+                     {ns} left them, because its wipe did not finish. If nothing in {ns} is \
+                     wanted, `flintctl tenant wipe {ns}` clears it"
+                ),
+            ),
+            Ok(other) => refuse_namespace(
+                ns,
+                &format!("pair {i} ({master}) answered DBSIZE with {other:?}"),
+            ),
+            Err(e) => refuse_namespace(
+                ns,
+                &format!("pair {i} ({master}) could not count its keys in it ({e})"),
+            ),
+        }
+    }
+    forget_before_add(inv, tls, ns);
+}
+
+fn refuse_namespace(ns: &str, why: &str) -> ! {
+    die(&format!(
+        "refusing to add a tenant on namespace {ns}: {why}. A new tenant there would read a \
+         removed tenant's keys (BUG-0260)."
+    ))
 }
 
 fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
@@ -9983,9 +10145,14 @@ fn main() {
                 let name = rest.get(1).expect("usage: tenant remove <name>");
                 tenant_remove(&inv, name);
             }
+            Some("wipe") => {
+                let ns = rest.get(1).expect("usage: tenant wipe <ns>");
+                tenant_wipe(&inv, ns);
+            }
             _ => panic!(
                 "usage: tenant add <name> <token> <ns> [k] | \
-                 tenant add-on-pair <name> <token> <ns> <pair> [k] | tenant remove <name>"
+                 tenant add-on-pair <name> <token> <ns> <pair> [k] | tenant remove <name> | \
+                 tenant wipe <ns>"
             ),
         },
         "expand" => {
@@ -12784,5 +12951,35 @@ mod started_line_tests {
         let l = started_line("node-7002", 42, Some("v0.1.0-rc.74".into()));
         assert!(l.starts_with("  started "), "{l}");
         assert!(l.contains("started node-7002"), "{l}");
+    }
+}
+
+#[cfg(test)]
+mod tenant_namespace_tests {
+    use super::*;
+
+    #[test]
+    fn the_listing_gives_each_tenants_namespace() {
+        let listing = "acme acme 0 0 0 512 0 0 0 - 2\r\nbeta shared 0 0 0 0 0 0 0 - 2\r\n\r\n";
+        assert_eq!(
+            parse_tenant_namespaces(listing),
+            vec![
+                ("acme".to_string(), "acme".to_string()),
+                ("beta".to_string(), "shared".to_string()),
+            ]
+        );
+    }
+
+    /// BUG-0260: `tenant remove` keeps a namespace another tenant still
+    /// uses, and `tenant wipe` and `tenant add` treat a held one as that
+    /// tenant's.
+    #[test]
+    fn a_namespace_is_held_by_any_tenant_but_the_one_leaving() {
+        let t = |a: &str, b: &str| (a.to_string(), b.to_string());
+        let tenants = vec![t("acme", "acme"), t("beta", "shared"), t("gamma", "shared")];
+        assert_eq!(holder_of(&tenants, "acme", None), Some("acme"));
+        assert_eq!(holder_of(&tenants, "acme", Some("acme")), None);
+        assert_eq!(holder_of(&tenants, "shared", Some("beta")), Some("gamma"));
+        assert_eq!(holder_of(&tenants, "gone", None), None);
     }
 }

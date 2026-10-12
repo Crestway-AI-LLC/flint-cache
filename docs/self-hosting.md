@@ -1244,6 +1244,10 @@ flintctl -f cluster.flint tenant-quota acme 50000 53687091200
 # co-processor forget the namespace's vectors
 flintctl -f cluster.flint tenant remove acme
 
+# finish a removal that printed WIPE FAILED (a pair or co-processor could not
+# be reached); re-run until it exits 0
+flintctl -f cluster.flint tenant wipe acme
+
 # opt-ins (each is the tenant's choice; see the tenant guide)
 flintctl -f cluster.flint tenant-reads acme on     # replica reads
 flintctl -f cluster.flint tenant-cache acme on     # proxy near-cache
@@ -1267,6 +1271,12 @@ Notes:
   cannot answer, because a new tenant there could read a removed tenant's
   vectors (BUG-0255). Re-run when it answers, or restart it: a co-processor
   rebuilds its index from the durable rows.
+- **A namespace is given out empty.** `tenant add` refuses a namespace that
+  no tenant holds while a pair still holds keys in it, or cannot say. That
+  is what a removal whose wipe failed leaves (BUG-0260); `tenant wipe`
+  clears it. A namespace another tenant holds is shared on purpose: the new
+  tenant reads its keys, and `tenant remove` keeps it until its last tenant
+  is removed.
 - The **subset** (`k`) is a shuffle-shard of the proxy fleet; a tenant is
   served only by its subset, which bounds blast radius. `CPSETSUBSET`
   overrides it (dedicated proxies for a large tenant).

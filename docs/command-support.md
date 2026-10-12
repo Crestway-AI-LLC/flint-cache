@@ -1192,7 +1192,7 @@ to run appears on this page.
 | `FLINTKEYSIZE` / `FLINTKEYSTAMP` | seat | the GC ranking primitives (above) |
 | `FLINTXREADGROUP` | seat | the proxy's repeated attempt for a blocked `XREADGROUP`, which writes nothing when it finds nothing (ADR-0057); not for clients |
 | `FLINTNSBYTES <ns>` | seat | stored bytes for one namespace — per-tenant attribution when deciding *whose* data to trim (space-reclaim.md) |
-| `FLINTNSDROP <ns>` | co-processor | forget one namespace's vector sets, their files and their memory; the next touch rebuilds from durable rows. `flintctl tenant remove` and `tenant add` send it (BUG-0255) |
+| `FLINTNSDROP <ns>` | co-processor | forget one namespace's vector sets, their files and their memory; the next touch rebuilds from durable rows. `flintctl tenant remove`, `tenant wipe` and `tenant add` send it (BUG-0255) |
 | `PROXYSTATS` | proxy | connections, command/read/write totals, cert expiry |
 | `PROXYLATENCY` | proxy | per-lane read/write latency |
 | `PROXYHOTKEYS` | proxy | the tenant's hot keys |
