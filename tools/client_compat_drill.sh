@@ -757,15 +757,25 @@ def group_calls(proto):
 check("redis-py XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM, XINFO, RESP2",
       group_calls(2))
 check("redis-py the same, RESP3", group_calls(3))
-def xreadgroup_waits_for_an_entry():
+def xreadgroup_waits_for_an_entry(proto):
+  # Both protocols, named: the entry a wait takes comes from the proxy's own
+  # poll, whose reply was once left in RESP3's shape for a RESP2 client
+  # (BUG-0258), and a client's default protocol hid it on one host.
+  def run():
     import threading, time as _t
-    k = "jobsb"
+    r = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
+                    protocol=proto)
+    k = f"jobsb{proto}"
     r.delete(k)
     assert r.xgroup_create(k, "g", id="$", mkstream=True)
     got = {}
     def reader():
-        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True)
-        got["v"] = c.xreadgroup("g", "waiter", {k: ">"}, block=5000)
+        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
+                        protocol=proto)
+        try:
+            got["v"] = c.xreadgroup("g", "waiter", {k: ">"}, block=5000)
+        except Exception as e:
+            got["v"] = e
         c.close()
     t = threading.Thread(target=reader, daemon=True)
     t.start()
@@ -777,12 +787,14 @@ def xreadgroup_waits_for_an_entry():
     new = r.xadd(k, {"late": "1"})
     t.join(6)
     v = got.get("v")
+    assert v is not None and not isinstance(v, Exception), repr(v)
     entries = v[k][0] if isinstance(v, dict) else v[0][1]
     assert [e[0] for e in entries] == [new], v
     assert r.xreadgroup("g", "waiter", {k: ">"}, block=200) in (None, [], {}), \
         "a timeout reads nothing"
     def doomed():
-        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True)
+        c = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
+                        protocol=proto)
         try:
             c.xreadgroup("g", "w2", {k: ">"}, block=5000)
             got["d"] = "no error"
@@ -796,8 +808,11 @@ def xreadgroup_waits_for_an_entry():
     t.join(6)
     assert got.get("d", "").startswith("NOGROUP"), got.get("d")
     r.delete(k)
-check("a blocking XREADGROUP waits for an entry, times out, and ends with NOGROUP when its group goes",
-      xreadgroup_waits_for_an_entry)
+    r.close()
+  return run
+check("a blocking XREADGROUP waits for an entry, times out, and ends with NOGROUP when its group goes, RESP2",
+      xreadgroup_waits_for_an_entry(2))
+check("the same, RESP3", xreadgroup_waits_for_an_entry(3))
 
 print("== commands we exclude by design still fail HONESTLY")
 check("SPUBLISH (sharded pub/sub)", lambda: r.execute_command("SPUBLISH", "c", "x"),

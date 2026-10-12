@@ -5461,7 +5461,10 @@ async fn blocking_xreadgroup(
         }
         match forward(topo, backends, ns, &attempt, &frame, false).await {
             Value::Null | Value::Array(None) => {}
-            other => return other,
+            // `forward` repairs a reply by the command it sent, and
+            // FLINTXREADGROUP is not the client's: put the entries in the
+            // client's dialect, as the first attempt's were (BUG-0258).
+            other => return repair_reply(args, other),
         }
         delay = (delay * 2).min(BLOCK_POLL_MAX);
     }
