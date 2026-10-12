@@ -1064,6 +1064,19 @@ blocking `XREAD` woken by another client's `XADD`).
     CONFIG RESETSTAT -> ERR unknown command 'CONFIG RESETSTAT'
     SHUTDOWN NOSAVE  -> ERR unknown command 'SHUTDOWN NOSAVE'
 
+**Clients that ask for `CONFIG`** (ADR-0058). None of the client libraries
+measured here sends it. Two known senders, from their documentation:
+
+- **Spring Session's indexed repository**, the one that publishes session
+  events, reads `notify-keyspace-events` at startup and then sets it. Flint
+  sends no keyspace notifications, so a truthful answer could not satisfy
+  it. Configure `ConfigureRedisAction.NO_OP`, as on managed Redis services
+  that refuse `CONFIG`. Session-expiry events then do not arrive, as on
+  those services.
+- **Monitoring exporters** read `CONFIG GET *` for their configuration
+  series. Use the option your exporter offers for managed Redis services
+  that refuse `CONFIG`.
+
 **`INFO` through the proxy answers, minimally** (BUG-0176). Clients send it on
 their own: ioredis, by default, sends `INFO` before its first command and treats
 an error as fatal, so until this it could not connect at all. The proxy

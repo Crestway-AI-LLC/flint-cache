@@ -1,8 +1,15 @@
 # ADR-0057: Stream consumer groups, with pending entries that survive a failover
 
-Status: **PROPOSED 2026-10-10**, for Jeff's approval before any code. Jeff,
-2026-10-10, approving the suggestion: write an ADR for consumer groups as
-the next large item, rolled out in two releases as ADR-0056 was.
+Status: **ACCEPTED 2026-10-12** (Jeff: "go with your recommendations on
+ADR-0057 and ADR-0058"). Each decision stands as recommended below:
+- D2's storage (b), with the per-consumer index;
+- D4's blocking at the proxy, with `FLINTXREADGROUP` so that a miss writes
+  nothing;
+- D5's two releases;
+- D6's three parts, each with its own gate.
+
+Proposed 2026-10-10. Jeff approved writing it that day as the next large
+item, rolled out in two releases as ADR-0056 was.
 
 ## Context
 

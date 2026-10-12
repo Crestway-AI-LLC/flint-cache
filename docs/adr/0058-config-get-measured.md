@@ -1,7 +1,12 @@
 # ADR-0058: CONFIG GET, measured: no client measured here sends it
 
-Status: **PROPOSED 2026-10-10**. The recommendation reverses the approved
-plan, so it comes back to Jeff.
+Status: **ACCEPTED 2026-10-12, option A** (Jeff: "go with your
+recommendations on ADR-0057 and ADR-0058"). `CONFIG` stays absent, and
+command-support.md names the known senders and their way out. Option B
+waits for a tenant or a measured client that needs it.
+
+Proposed 2026-10-10. The recommendation reversed the approved plan, so it
+went back to Jeff.
 
 **What was approved.** Jeff, 2026-10-10, approved this suggestion: a short
 ADR for a read-only `CONFIG GET` that answers a small, truthful list. The ADR
