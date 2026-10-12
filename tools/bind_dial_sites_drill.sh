@@ -56,7 +56,7 @@ FIELDS = {
     # BUG-0140, the third field. Unlike cp and proxies this one has no dial
     # helper and deliberately never will: a wildcard `coproc` address is
     # REFUSED at parse time, because no generator writes the key and the only
-    # writer resolves the host itself. So the eight exempt readers are, each
+    # writer resolves the host itself. So the ten exempt readers are, each
     # for its own reason: parse_inventory, because reading the raw literal IS
     # the refusal; coproc_args, which BINDS; families_arg, which dials an
     # address the refusal has already guaranteed names a machine; coproc_runner,
@@ -64,8 +64,10 @@ FIELDS = {
     # coproc_seat_name and coproc_family, which exist so that launch never
     # destructures the element itself -- the rule cp and proxies already
     # follow; roll_edge (ops ADR-0050 D4), which stops the seat on that
-    # address's port and asks it FLINTINFO there; and coproc_forget
-    # (BUG-0255), which sends that address FLINTNSDROP. The last two dial the
+    # address's port and asks it FLINTINFO there; coproc_forget (BUG-0255),
+    # which sends that address FLINTNSDROP; status (ADR-0050 D4), which asks
+    # it FLINTINFO for the row it prints; and agent_args (ADR-0050 step 5),
+    # which hands it to the agent to ask FLINTINFO. The last four dial the
     # same literal families_arg dials, under the same guarantee, so the
     # refusal is still enough. coproc_forget read it from the start, split
     # across two lines that this scan matched one at a time (BUG-0260). A
@@ -73,7 +75,7 @@ FIELDS = {
     # again whether the key is wanted after all.
     "coprocs": {"coproc_args", "families_arg", "coproc_runner",
                 "parse_inventory", "coproc_seat_name", "coproc_family",
-                "roll_edge", "coproc_forget"},
+                "roll_edge", "coproc_forget", "status", "agent_args"},
 }
 FN = re.compile(r"^(?:pub )?(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)")
 
