@@ -559,6 +559,10 @@ impl<'a> Dispatcher<'a> {
             }
             // A pop with a count materialises the slice it takes, costed as
             // LRANGE costs one (BUG-0215).
+            // Streams (BUG-0256), priced on the entries and pending entries
+            // they can return.
+            b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"XREADGROUP" | b"FLINTXREADGROUP" | b"XINFO"
+            | b"XPENDING" | b"XAUTOCLAIM" => return self.stream_read_bytes(name_upper, args),
             b"LPOP" | b"RPOP" => {
                 let n = parse_i64(args.get(2)?).ok().filter(|n| *n > 0)?;
                 let (start, stop) = if name_upper == b"LPOP" {
@@ -7370,6 +7374,111 @@ mod tests {
         assert_eq!(size(&["ZPOPMIN", "z"]), Some(12));
         assert_eq!(size(&["ZPOPMAX", "z", "500"]), Some(1200));
         assert_eq!(size(&["ZRANGE", "nosuch", "0", "-1"]), None);
+    }
+
+    /// BUG-0256: BUG-0060's admission prices a stream read on the entries,
+    /// and the pending entries, it can return. An entry of 10 payload bytes
+    /// costs 26 with its ID; a pending entry 32.
+    #[test]
+    fn a_stream_read_is_sized_by_what_it_returns() {
+        let s = MemKv::new();
+        let on = Limits {
+            streams: true,
+            stream_groups: true,
+            ..Limits::default()
+        };
+        let ev = |parts: &[&str]| ev_in(&s, "xcost", on, parts);
+        for i in 1..=100 {
+            ev(&["XADD", "x", &format!("{i}-0"), "field", "value"]);
+        }
+        ev(&["XADD", "y", "1-0", "f", "v"]);
+        ev(&["SET", "str", "v"]);
+        let d = Dispatcher::with_limits(&s, system_clock, on, b"xcost");
+        let size = |parts: &[&str]| {
+            let args: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+            d.collection_read_bytes(&args[0].to_ascii_uppercase(), &args)
+        };
+        assert_eq!(size(&["XRANGE", "x", "-", "+"]), Some(2600));
+        assert_eq!(size(&["XRANGE", "x", "-", "+", "COUNT", "10"]), Some(260));
+        assert_eq!(size(&["XRANGE", "x", "-", "+", "COUNT", "0"]), Some(0));
+        assert_eq!(
+            size(&["XRANGE", "x", "-", "+", "COUNT", "5", "COUNT", "7"]),
+            Some(182),
+            "the last COUNT wins, as in the command"
+        );
+        assert_eq!(size(&["XREVRANGE", "x", "+", "-", "COUNT", "1"]), Some(26));
+        assert_eq!(
+            size(&["XRANGE", "x", "50-0", "50-0"]),
+            Some(2600),
+            "an ID range without COUNT is charged the whole stream"
+        );
+        assert_eq!(size(&["XRANGE", "nosuch", "-", "+"]), Some(0));
+        assert_eq!(
+            size(&["XRANGE", "str", "-", "+"]),
+            None,
+            "WRONGTYPE answers"
+        );
+        assert_eq!(size(&["XRANGE", "x", "-", "+", "LIMIT", "1"]), None);
+
+        assert_eq!(size(&["XREAD", "STREAMS", "x", "y", "0", "0"]), Some(2618));
+        assert_eq!(
+            size(&["XREAD", "COUNT", "3", "STREAMS", "x", "y", "0", "0"]),
+            Some(96)
+        );
+        assert_eq!(size(&["XREAD", "BLOCK", "0", "STREAMS", "x", "$"]), Some(0));
+        assert_eq!(size(&["XREAD", "STREAMS", "x", "+"]), Some(26));
+        assert_eq!(size(&["XREAD", "STREAMS", "x", "y", "0"]), None);
+
+        assert_eq!(
+            ev(&["XGROUP", "CREATE", "x", "g", "0"]),
+            Value::Simple("OK".into())
+        );
+        for name in ["XREADGROUP", "FLINTXREADGROUP"] {
+            assert_eq!(
+                size(&[name, "GROUP", "g", "c", "STREAMS", "x", ">"]),
+                Some(2600)
+            );
+            assert_eq!(
+                size(&[name, "GROUP", "g", "c", "COUNT", "2", "STREAMS", "x", ">"]),
+                Some(52)
+            );
+        }
+        ev(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "COUNT",
+            "30",
+            "STREAMS",
+            "x",
+            ">",
+        ]);
+        assert_eq!(size(&["XPENDING", "x", "g", "-", "+", "1000"]), Some(960));
+        assert_eq!(
+            size(&["XPENDING", "x", "g", "IDLE", "0", "-", "+", "5"]),
+            Some(160)
+        );
+        assert_eq!(size(&["XPENDING", "x", "g"]), None, "the summary is small");
+        assert_eq!(size(&["XPENDING", "x", "nogroup", "-", "+", "10"]), None);
+        assert_eq!(size(&["XAUTOCLAIM", "x", "g", "c2", "0", "0"]), Some(780));
+        assert_eq!(
+            size(&["XAUTOCLAIM", "x", "g", "c2", "0", "0", "JUSTID"]),
+            Some(480)
+        );
+        assert_eq!(
+            size(&["XAUTOCLAIM", "x", "g", "c2", "0", "0", "COUNT", "4"]),
+            Some(104)
+        );
+        // XINFO STREAM FULL: 10 entries and 10 pending by default, twice for
+        // the pending (the group's list and its consumers'); COUNT 0 all.
+        assert_eq!(size(&["XINFO", "STREAM", "x", "FULL"]), Some(260 + 640));
+        assert_eq!(
+            size(&["XINFO", "STREAM", "x", "FULL", "COUNT", "0"]),
+            Some(2600 + 1920)
+        );
+        assert_eq!(size(&["XINFO", "STREAM", "x"]), None);
+        assert_eq!(size(&["XINFO", "GROUPS", "x"]), None);
     }
 
     /// BUG-0213. Not a corpus case: the reference's answer depends on how

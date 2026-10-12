@@ -24,6 +24,15 @@ const INVALID_ID: &str = "ERR Invalid stream ID specified as stream command argu
 /// `100 * stream-node-max-entries`, at its default of 100.
 const APPROX_TRIM_LIMIT: u64 = 10_000;
 
+/// An entry's ID as stored: what read admission adds to each entry's
+/// payload (BUG-0256), since a reply carries the ID of every entry.
+const STORED_ID_BYTES: u64 = 16;
+
+/// A pending entry's stored fields (its ID, delivery time and delivery
+/// count), for read admission (BUG-0256). The consumer's name is not
+/// counted: that would mean reading every pending row to price the read.
+const PENDING_ROW_BYTES: u64 = 32;
+
 /// Redis's `string2ull` for the forms clients send: decimal digits, with
 /// leading zeros and a leading `+` allowed.
 fn parse_u64(s: &[u8]) -> Option<u64> {
@@ -307,6 +316,141 @@ fn entries_value(entries: Vec<Entry>) -> Value {
 }
 
 impl Dispatcher<'_> {
+    /// What a stream read can build, for read admission (BUG-0060,
+    /// BUG-0256), or `None` when it is not one this prices or will refuse
+    /// anyway. Entries are costed at the stream's mean stored size plus
+    /// their IDs, on how many the read can return: its `COUNT` when it
+    /// gives one, the whole stream when it does not. An ID range without
+    /// `COUNT` is charged the whole stream, as a score range without
+    /// `LIMIT` is charged the whole zset.
+    pub(in crate::commands) fn stream_read_bytes(
+        &self,
+        name_upper: &[u8],
+        args: &[Vec<u8>],
+    ) -> Option<u64> {
+        match name_upper {
+            b"XRANGE" | b"XREVRANGE" => {
+                let key = args.get(1)?;
+                // The last COUNT given wins, as in the command; 0 or less
+                // reads nothing.
+                let mut count = None;
+                let mut j = 4;
+                while j < args.len() {
+                    if !args[j].eq_ignore_ascii_case(b"COUNT") {
+                        return None;
+                    }
+                    count = Some(parse_i64(args.get(j + 1)?).ok()?.max(0) as u64);
+                    j += 2;
+                }
+                self.entries_bytes(key, count)
+            }
+            b"XREAD" | b"XREADGROUP" | b"FLINTXREADGROUP" => {
+                let r = parse_read(args, name_upper != b"XREAD").ok()?;
+                let mut total = 0u64;
+                for (key, id) in r.keys.iter().zip(r.ids) {
+                    let entries = match id.as_slice() {
+                        // XREAD's `$` reads only what arrives later, which
+                        // a seat never waits for; `+` reads the last entry.
+                        b"$" if r.group.is_none() => Some(0),
+                        b"+" if r.group.is_none() => Some(1),
+                        _ => r.count.map(|c| c as u64),
+                    };
+                    total = total.saturating_add(self.entries_bytes(key, entries)?);
+                }
+                Some(total)
+            }
+            // XINFO STREAM key FULL [COUNT n]: the first n entries (10 when
+            // no COUNT is given, all of them for 0), and each group's first
+            // n pending entries twice: in its own list and its consumers'.
+            b"XINFO" => {
+                if !args.get(1)?.eq_ignore_ascii_case(b"STREAM")
+                    || !args.get(3)?.eq_ignore_ascii_case(b"FULL")
+                {
+                    return None;
+                }
+                let key = args.get(2)?;
+                let count = match args.get(4) {
+                    None => 10,
+                    Some(w) if w.eq_ignore_ascii_case(b"COUNT") => {
+                        parse_i64(args.get(5)?).ok().filter(|n| *n >= 0)? as u64
+                    }
+                    Some(_) => return None,
+                };
+                let limit = (count > 0).then_some(count);
+                let groups = self.streams.groups(slot_for_key(key), key).ok()??;
+                let pending: u64 = groups
+                    .iter()
+                    .map(|(_, g, _)| limit.map_or(g.pending, |n| n.min(g.pending)))
+                    .fold(0, u64::saturating_add);
+                let entries = self.entries_bytes(key, limit)?;
+                Some(entries.saturating_add(pending.saturating_mul(2 * PENDING_ROW_BYTES)))
+            }
+            // The extended form, `XPENDING key group [IDLE ms] start end
+            // count [consumer]`: up to `count` of the group's pending entries.
+            b"XPENDING" => {
+                let count_at = if args.get(3)?.eq_ignore_ascii_case(b"IDLE") {
+                    7
+                } else {
+                    5
+                };
+                let count = parse_i64(args.get(count_at)?).ok()?.max(0) as u64;
+                let pending = self.group_pending(args.get(1)?, args.get(2)?)?;
+                Some(count.min(pending).saturating_mul(PENDING_ROW_BYTES))
+            }
+            // `XAUTOCLAIM key group consumer min-idle start [COUNT n]
+            // [JUSTID]`: up to n of the group's pending entries, as entries,
+            // or as IDs with JUSTID.
+            b"XAUTOCLAIM" => {
+                let mut count = 100u64;
+                let mut justid = false;
+                let mut j = 6;
+                while j < args.len() {
+                    if args[j].eq_ignore_ascii_case(b"COUNT") {
+                        count = parse_i64(args.get(j + 1)?).ok().filter(|n| *n > 0)? as u64;
+                        j += 2;
+                    } else if args[j].eq_ignore_ascii_case(b"JUSTID") {
+                        justid = true;
+                        j += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                let key = args.get(1)?;
+                let rows = count.min(self.group_pending(key, args.get(2)?)?);
+                if justid {
+                    Some(rows.saturating_mul(STORED_ID_BYTES))
+                } else {
+                    self.entries_bytes(key, Some(rows))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `entries` of the stream at `key` (all of them when `None`) at its
+    /// mean stored size, each with its ID: 0 for a missing or empty stream,
+    /// `None` for another type, whose read answers WRONGTYPE.
+    fn entries_bytes(&self, key: &[u8], entries: Option<u64>) -> Option<u64> {
+        let Some(meta) = self.streams.read_meta(slot_for_key(key), key).ok()? else {
+            return Some(0);
+        };
+        let size = u64::from(meta.base.size);
+        if size == 0 {
+            return Some(0);
+        }
+        let n = entries.map_or(size, |e| e.min(size));
+        Some(n.saturating_mul(meta.base.bytes / size + STORED_ID_BYTES))
+    }
+
+    /// How many entries group `group` of the stream at `key` has pending,
+    /// or `None` when there is no such group (the command says so).
+    fn group_pending(&self, key: &[u8], group: &[u8]) -> Option<u64> {
+        match self.streams.group(slot_for_key(key), key, group).ok()? {
+            flint_storage::streams::Found::Yes((_, g)) => Some(g.pending),
+            _ => None,
+        }
+    }
+
     /// `XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] threshold [LIMIT n]]
     /// <*|id> field value [field value ...]`.
     pub(super) fn cmd_xadd(&self, args: &[Vec<u8>]) -> Value {

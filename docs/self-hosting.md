@@ -1123,8 +1123,11 @@ is ~8.1 GB — was live in every deployment precisely because the guard was.
 | `--collection-read-mode` | `enforce` | `enforce` refuses over-budget reads; `observe` admits them and counts them |
 
 When it is on, each `HGETALL`/`HKEYS`/`HVALS`/`SMEMBERS`/`ZRANGE`-family
-command is costed **before** anything is materialised, from the one cheap
-metadata read that already knows the collection's size, and refused with
+command, and each stream read that can build a large reply (`XRANGE`,
+`XREVRANGE`, `XREAD`, `XREADGROUP`, `XPENDING`'s extended form,
+`XAUTOCLAIM` and `XINFO STREAM FULL`, since BUG-0256), is costed
+**before** anything is materialised, from the one cheap metadata read that
+already knows the collection's size, and refused with
 `-THROTTLED` if it would not fit alongside what is already in flight:
 
     THROTTLED collection read needs ~1879048192 bytes (536870912 x 3.5 peak),
@@ -1211,6 +1214,13 @@ Two known gaps, both stated rather than hidden:
   A skewed list makes the mean an approximation — bounded by how far the
   requested elements sit from average, and the alternative is reading the
   range to find out how big it is, which is the work being admitted.
+- **A stream read is admitted on the entries it can return**: its `COUNT`
+  when it gives one, and the whole stream when it does not, at the stream's
+  mean entry size plus each entry's 16-byte ID. An ID range without `COUNT`
+  is charged the whole stream, as a score range without `LIMIT` is charged
+  the whole zset. A pending entry (`XPENDING`, `XINFO STREAM FULL`) is
+  charged 32 bytes, without its consumer's name. The multiplier has not been
+  measured on streams.
 
 ## 4. Managing users (tenants)
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Elastic-2.0
 # BUG-0060: prove the collection-read admission bound actually refuses.
+# BUG-0256: and that it refuses a stream read of the same size, which it
+# did not price before.
 #
 # The unit tests use a seam (a fixed available-memory figure) so the
 # arithmetic can be proven on a host with no /proc/meminfo. That leaves the
@@ -69,6 +71,15 @@ build_hash() {   # $1 = fields
   done
   [ -n "$args" ] && cli HSET h $args >/dev/null
   return 0
+}
+
+# The same bytes as a stream: one entry per field, its value VSIZE bytes.
+build_stream() {   # $1 = entries
+  local n="$1" i v
+  v=$(head -c "$VSIZE" /dev/zero | tr '\0' 'x')
+  for ((i = 0; i < n; i++)); do
+    cli XADD s '*' f "$v" >/dev/null
+  done
 }
 
 # A configuration that silently measures nothing must be refused at boot, not
@@ -177,7 +188,7 @@ fleet_kill server
 sleep 0.3
 
 echo "== armed: 1% budget, the same read must be refused"
-start_node "--collection-read-budget-pct 1"
+start_node "--collection-read-budget-pct 1 --streams"
 PCT_ON=$(info_field collection_read_budget_pct)
 [ "$PCT_ON" = "1" ] || fail "flag not applied: collection_read_budget_pct=$PCT_ON"
 build_hash "$FIELDS"
@@ -212,6 +223,24 @@ case "$SMALL" in
   *THROTTLED*) fail "a 1-field hash was refused: the bound is refusing everything" ;;
 esac
 echo "   a small read still passes, so the bound discriminates by size"
+
+# BUG-0256: a stream of the same bytes. Unpriced, XRANGE and XREAD built
+# their whole replies whatever the budget.
+build_stream "$FIELDS"
+for read in "XRANGE s - +" "XREAD STREAMS s 0"; do
+  # shellcheck disable=SC2086
+  OUT=$(cli $read 2>&1 | head -c 400 || true)
+  case "$OUT" in
+    *THROTTLED*) : ;;
+    *) fail "expected '$read' on a ${BYTES}B stream to be refused at a 1% budget, got: ${OUT:0:200}" ;;
+  esac
+done
+OUT=$(cli XRANGE s - + COUNT 1 2>&1 | head -c 200 || true)
+case "$OUT" in
+  *THROTTLED*) fail "XRANGE COUNT 1 was refused: a stream read must be priced on what it returns" ;;
+  "") fail "XRANGE COUNT 1 returned nothing on a $FIELDS-entry stream" ;;
+esac
+echo "   a stream read of the same size is refused, and its COUNT 1 slice is not"
 
 fleet_kill server
 sleep 0.3
