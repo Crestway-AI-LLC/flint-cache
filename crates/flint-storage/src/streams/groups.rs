@@ -184,6 +184,69 @@ pub struct PendingSummary {
     pub consumers: Vec<(Vec<u8>, u64)>,
 }
 
+/// XCLAIM's options, as Valkey reads them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClaimOpts {
+    /// The delivery time to record, in unix ms, from IDLE or TIME; `None`
+    /// records now.
+    pub delivered_ms: Option<u64>,
+    /// RETRYCOUNT: the delivery count to record.
+    pub retry_count: Option<u64>,
+    /// FORCE: make an entry pending that is not, when it exists.
+    pub force: bool,
+    /// JUSTID: answer IDs only, and count no delivery.
+    pub just_id: bool,
+    /// LASTID: move the group's last delivered ID forward to this.
+    pub last_id: Option<StreamId>,
+}
+
+/// An entry XCLAIM or XAUTOCLAIM answers: its fields, or `None` under
+/// JUSTID.
+pub type Claimed = (StreamId, Option<Vec<Vec<u8>>>);
+
+/// XAUTOCLAIM's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoClaimed {
+    /// Where the next call should start; `0-0` when the walk reached the end.
+    pub next: StreamId,
+    pub claimed: Vec<Claimed>,
+    /// Pending entries whose stream entries were gone, now out of the PEL.
+    pub deleted: Vec<StreamId>,
+}
+
+/// Why XSETID refuses, once the key is found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetIdRefusal {
+    BelowMaxDeleted,
+    BelowTop,
+    AddedBelowLength,
+}
+
+/// XINFO STREAM's view of a stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInfo {
+    pub meta: StreamMeta,
+    /// The first entry's ID, `0-0` when empty (Valkey's
+    /// `recorded-first-entry-id`).
+    pub first_id: StreamId,
+    pub first: Option<super::Entry>,
+    pub last: Option<super::Entry>,
+    pub groups: u64,
+}
+
+/// A group, as XINFO STREAM FULL reports one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupFull {
+    pub name: Vec<u8>,
+    pub group: Group,
+    pub lag: Option<i64>,
+    pub pending: Vec<Pending>,
+    pub consumers: Vec<(Consumer, Vec<Pending>)>,
+}
+
+/// XINFO STREAM FULL's answer: the stream, its first entries, its groups.
+pub type StreamFull = (StreamInfo, Vec<super::Entry>, Vec<GroupFull>);
+
 /// `tag | len(name) | name`: a name that more of the field follows.
 fn named(tag: u8, name: &[u8]) -> Vec<u8> {
     let mut f = Vec::with_capacity(5 + name.len() + 16);
@@ -536,7 +599,10 @@ impl StreamStore<'_> {
     /// delivered ID, and answers `None` when there are none; each becomes
     /// pending for the consumer unless `noack`. `After(id)` reads the
     /// consumer's own pending entries after `id`, counting another delivery
-    /// of each that still exists.
+    /// of each that still exists. A `poll` (the proxy's repeated attempt to
+    /// serve a blocked `XREADGROUP`, ADR-0057 D4) that finds nothing new
+    /// writes nothing: the client's own first attempt made the consumer and
+    /// stamped when it was seen, as Valkey stamps a blocked client once.
     #[allow(clippy::too_many_arguments)]
     pub fn read_group(
         &self,
@@ -547,6 +613,7 @@ impl StreamStore<'_> {
         from: ReadFrom,
         count: Option<usize>,
         noack: bool,
+        poll: bool,
     ) -> Result<Found<Option<Vec<GroupEntry>>>, StoreError> {
         let (meta, mut g) = match self.group(slot, key, group)? {
             Found::Yes(found) => found,
@@ -620,6 +687,9 @@ impl StreamStore<'_> {
                 }
             }
         };
+        if poll && served.is_none() {
+            return Ok(Found::Yes(None));
+        }
         self.save_consumer(slot, key, &meta, group, &c);
         self.save_group(slot, key, &meta, group, &g);
         Ok(Found::Yes(served))
@@ -940,6 +1010,419 @@ impl StreamStore<'_> {
                 .collect(),
         ))
     }
+
+    /// Take pending entry `p` for `c`: the old owner loses it, `c` gains it,
+    /// and its delivery is recorded. `p.consumer` is empty for an entry
+    /// FORCE just made pending, which has no owner to lose it.
+    #[allow(clippy::too_many_arguments)]
+    fn take(
+        &self,
+        slot: u16,
+        key: &[u8],
+        meta: &StreamMeta,
+        group: &[u8],
+        c: &mut Consumer,
+        others: &mut BTreeMap<Vec<u8>, Consumer>,
+        mut p: Pending,
+        owned: bool,
+    ) {
+        if !owned || p.consumer != c.name {
+            if owned {
+                self.kv
+                    .delete(&self.row(slot, key, meta, &owned_field(group, &p.consumer, p.id)));
+                if !others.contains_key(&p.consumer)
+                    && let Some(o) = self.load_consumer(slot, key, meta, group, &p.consumer)
+                {
+                    others.insert(p.consumer.clone(), o);
+                }
+                if let Some(o) = others.get_mut(&p.consumer) {
+                    o.pending = o.pending.saturating_sub(1);
+                }
+            }
+            self.kv.put(
+                &self.row(slot, key, meta, &owned_field(group, &c.name, p.id)),
+                &[],
+            );
+            c.pending += 1;
+            p.consumer = c.name.clone();
+        }
+        self.kv.put(
+            &self.row(slot, key, meta, &pending_field(group, p.id)),
+            &p.encode(),
+        );
+    }
+
+    /// Forget pending entry `p`, whose stream entry is gone.
+    #[allow(clippy::too_many_arguments)]
+    fn forget(
+        &self,
+        slot: u16,
+        key: &[u8],
+        meta: &StreamMeta,
+        group: &[u8],
+        g: &mut Group,
+        c: &mut Consumer,
+        others: &mut BTreeMap<Vec<u8>, Consumer>,
+        p: &Pending,
+    ) {
+        self.kv
+            .delete(&self.row(slot, key, meta, &pending_field(group, p.id)));
+        self.kv
+            .delete(&self.row(slot, key, meta, &owned_field(group, &p.consumer, p.id)));
+        if p.consumer == c.name {
+            c.pending = c.pending.saturating_sub(1);
+        } else {
+            if !others.contains_key(&p.consumer)
+                && let Some(o) = self.load_consumer(slot, key, meta, group, &p.consumer)
+            {
+                others.insert(p.consumer.clone(), o);
+            }
+            if let Some(o) = others.get_mut(&p.consumer) {
+                o.pending = o.pending.saturating_sub(1);
+            }
+        }
+        g.pending = g.pending.saturating_sub(1);
+    }
+
+    /// The consumer `name` of a group, made if it is new, seen now.
+    #[allow(clippy::too_many_arguments)]
+    fn consumer_seen(
+        &self,
+        slot: u16,
+        key: &[u8],
+        meta: &StreamMeta,
+        group: &[u8],
+        g: &mut Group,
+        name: &[u8],
+        now: u64,
+    ) -> Consumer {
+        let mut c = match self.load_consumer(slot, key, meta, group, name) {
+            Some(c) => c,
+            None => {
+                g.consumers += 1;
+                Consumer::new(name, now)
+            }
+        };
+        c.seen_ms = now;
+        c
+    }
+
+    /// XCLAIM: give `consumer` the entries among `ids` that are pending
+    /// and idle at least `min_idle` ms (0 takes any), as Valkey's
+    /// `xclaimCommand` does. A pending entry whose stream entry is gone
+    /// leaves the PEL and is not answered.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim(
+        &self,
+        slot: u16,
+        key: &[u8],
+        group: &[u8],
+        consumer: &[u8],
+        ids: &[StreamId],
+        min_idle: u64,
+        opts: ClaimOpts,
+    ) -> Result<Found<Vec<Claimed>>, StoreError> {
+        let (meta, mut g) = match self.group(slot, key, group)? {
+            Found::Yes(found) => found,
+            Found::NoStream => return Ok(Found::NoStream),
+            Found::NoGroup => return Ok(Found::NoGroup),
+        };
+        let now = (self.clock)();
+        if let Some(last) = opts.last_id
+            && last > g.last_id
+        {
+            g.last_id = last;
+        }
+        let mut c = self.consumer_seen(slot, key, &meta, group, &mut g, consumer, now);
+        let mut others: BTreeMap<Vec<u8>, Consumer> = BTreeMap::new();
+        let mut out = Vec::new();
+        for &id in ids {
+            let entry = self
+                .kv
+                .get(&self.entry_key(slot, key, meta.base.version, id));
+            let held = self.load_pending(slot, key, &meta, group, id);
+            let Some(entry) = entry else {
+                if let Some(p) = held {
+                    self.forget(slot, key, &meta, group, &mut g, &mut c, &mut others, &p);
+                }
+                continue;
+            };
+            let (mut p, owned) = match held {
+                Some(p) => {
+                    let idle = now as i64 - p.delivered_ms as i64;
+                    if min_idle > 0 && idle < min_idle as i64 {
+                        continue;
+                    }
+                    (p, true)
+                }
+                None if opts.force => {
+                    g.pending += 1;
+                    (
+                        Pending {
+                            id,
+                            consumer: Vec::new(),
+                            delivered_ms: now,
+                            deliveries: 1,
+                        },
+                        false,
+                    )
+                }
+                None => continue,
+            };
+            p.delivered_ms = opts.delivered_ms.unwrap_or(now);
+            if let Some(n) = opts.retry_count {
+                p.deliveries = n;
+            } else if !opts.just_id {
+                p.deliveries += 1;
+            }
+            self.take(slot, key, &meta, group, &mut c, &mut others, p, owned);
+            c.active_ms = Some(now);
+            out.push((id, (!opts.just_id).then(|| decode_fields(&entry))));
+        }
+        for o in others.values() {
+            self.save_consumer(slot, key, &meta, group, o);
+        }
+        self.save_consumer(slot, key, &meta, group, &c);
+        self.save_group(slot, key, &meta, group, &g);
+        Ok(Found::Yes(out))
+    }
+
+    /// XAUTOCLAIM: walk the group's pending entries from `start`, giving
+    /// `consumer` those idle at least `min_idle` ms, until `count` are
+    /// answered or `count × 10` were looked at, as Valkey's
+    /// `xautoclaimCommand` does. Answers where the next call should start
+    /// (`0-0` at the end), what was claimed, and the IDs whose entries were
+    /// gone, which leave the PEL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn autoclaim(
+        &self,
+        slot: u16,
+        key: &[u8],
+        group: &[u8],
+        consumer: &[u8],
+        min_idle: u64,
+        start: StreamId,
+        count: u64,
+        just_id: bool,
+    ) -> Result<Found<AutoClaimed>, StoreError> {
+        let (meta, mut g) = match self.group(slot, key, group)? {
+            Found::Yes(found) => found,
+            Found::NoStream => return Ok(Found::NoStream),
+            Found::NoGroup => return Ok(Found::NoGroup),
+        };
+        let now = (self.clock)();
+        let mut c = self.consumer_seen(slot, key, &meta, group, &mut g, consumer, now);
+        let mut others: BTreeMap<Vec<u8>, Consumer> = BTreeMap::new();
+        let prefix = self.rows(slot, key, &meta, &named(STREAM_PENDING_TAG, group));
+        let from = start
+            .prev()
+            .map(|p| {
+                let mut k = prefix.clone();
+                k.extend_from_slice(&p.to_bytes());
+                k
+            })
+            .unwrap_or_default();
+        // Read ahead in batches: the walk changes the rows it walks, and the
+        // store promises nothing about rows written during a walk.
+        let mut attempts = count.saturating_mul(10);
+        let mut left = count;
+        let mut next = StreamId::MIN;
+        let mut claimed = Vec::new();
+        let mut deleted = Vec::new();
+        let mut after = from;
+        'walk: loop {
+            let mut batch = Vec::new();
+            self.kv.for_each_from(&prefix, &after, &mut |k, v| {
+                if let Some(id) = StreamId::from_bytes(&k[prefix.len()..])
+                    && let Some(p) = Pending::decode(id, v)
+                {
+                    batch.push((k.to_vec(), p));
+                }
+                batch.len() < 256
+            });
+            if batch.is_empty() {
+                break;
+            }
+            for (k, p) in batch {
+                after = k;
+                if attempts == 0 || left == 0 {
+                    next = p.id;
+                    break 'walk;
+                }
+                attempts -= 1;
+                let id = p.id;
+                let Some(entry) = self
+                    .kv
+                    .get(&self.entry_key(slot, key, meta.base.version, id))
+                else {
+                    self.forget(slot, key, &meta, group, &mut g, &mut c, &mut others, &p);
+                    deleted.push(id);
+                    left -= 1;
+                    continue;
+                };
+                let idle = now as i64 - p.delivered_ms as i64;
+                if min_idle > 0 && idle < min_idle as i64 {
+                    continue;
+                }
+                let mut p = p;
+                p.delivered_ms = now;
+                if !just_id {
+                    p.deliveries += 1;
+                }
+                self.take(slot, key, &meta, group, &mut c, &mut others, p, true);
+                c.active_ms = Some(now);
+                claimed.push((id, (!just_id).then(|| decode_fields(&entry))));
+                left -= 1;
+            }
+        }
+        for o in others.values() {
+            self.save_consumer(slot, key, &meta, group, o);
+        }
+        self.save_consumer(slot, key, &meta, group, &c);
+        self.save_group(slot, key, &meta, group, &g);
+        Ok(Found::Yes(AutoClaimed {
+            next,
+            claimed,
+            deleted,
+        }))
+    }
+
+    /// XSETID: the stream's last ID, and optionally its entries added and
+    /// largest deleted ID, checked as Valkey's `xsetidCommand` checks them
+    /// once the key is found. `None` when there is no stream.
+    pub fn set_last_id(
+        &self,
+        slot: u16,
+        key: &[u8],
+        id: StreamId,
+        entries_added: Option<u64>,
+        max_deleted: Option<StreamId>,
+    ) -> Result<Option<Result<(), SetIdRefusal>>, StoreError> {
+        let Some(mut meta) = self.read_meta(slot, key)? else {
+            return Ok(None);
+        };
+        if id < meta.max_deleted_id {
+            return Ok(Some(Err(SetIdRefusal::BelowMaxDeleted)));
+        }
+        if meta.base.size > 0 {
+            if let Some((top, _)) = self.last_entry(slot, key)?
+                && id < top
+            {
+                return Ok(Some(Err(SetIdRefusal::BelowTop)));
+            }
+            if let Some(n) = entries_added
+                && u64::from(meta.base.size) > n
+            {
+                return Ok(Some(Err(SetIdRefusal::AddedBelowLength)));
+            }
+        }
+        meta.last_id = id;
+        if let Some(n) = entries_added {
+            meta.entries_added = n;
+        }
+        if let Some(d) = max_deleted
+            && d != StreamId::MIN
+        {
+            meta.max_deleted_id = d;
+        }
+        self.write_meta(slot, key, &meta);
+        Ok(Some(Ok(())))
+    }
+
+    /// XINFO STREAM: the metadata, the first ID Valkey records, the first
+    /// and last entries, and how many groups; `None` when there is no
+    /// stream.
+    pub fn stream_info(&self, slot: u16, key: &[u8]) -> Result<Option<StreamInfo>, StoreError> {
+        let Some(meta) = self.read_meta(slot, key)? else {
+            return Ok(None);
+        };
+        let first = self.scan(
+            slot,
+            key,
+            &meta,
+            StreamId::MIN,
+            StreamId::MAX,
+            Some(1),
+            false,
+        );
+        let last = self.scan(
+            slot,
+            key,
+            &meta,
+            StreamId::MIN,
+            StreamId::MAX,
+            Some(1),
+            true,
+        );
+        let prefix = self.rows(slot, key, &meta, &[STREAM_GROUP_TAG]);
+        let mut groups = 0u64;
+        self.kv.for_each_prefix(&prefix, &mut |_, _| {
+            groups += 1;
+            true
+        });
+        Ok(Some(StreamInfo {
+            first_id: first.first().map_or(StreamId::MIN, |(id, _)| *id),
+            first: first.into_iter().next(),
+            last: last.into_iter().next(),
+            groups,
+            meta,
+        }))
+    }
+
+    /// XINFO STREAM FULL: the first `count` entries (all when 0), and each
+    /// group with its first `count` pending entries and its consumers, each
+    /// with its first `count` own pending entries.
+    pub fn stream_info_full(
+        &self,
+        slot: u16,
+        key: &[u8],
+        count: usize,
+    ) -> Result<Option<StreamFull>, StoreError> {
+        let Some(info) = self.stream_info(slot, key)? else {
+            return Ok(None);
+        };
+        let limit = (count > 0).then_some(count);
+        let meta = &info.meta;
+        let entries = self.scan(slot, key, meta, StreamId::MIN, StreamId::MAX, limit, false);
+        let want = limit.unwrap_or(usize::MAX);
+        let mut groups = Vec::new();
+        for (name, g, lag) in self.groups(slot, key)?.unwrap_or_default() {
+            let prefix = self.rows(slot, key, meta, &named(STREAM_PENDING_TAG, &name));
+            let mut pending = Vec::new();
+            self.kv.for_each_prefix(&prefix, &mut |k, v| {
+                if let Some(id) = StreamId::from_bytes(&k[prefix.len()..])
+                    && let Some(p) = Pending::decode(id, v)
+                {
+                    pending.push(p);
+                }
+                pending.len() < want
+            });
+            let mut consumers = Vec::new();
+            for c in self.consumers(slot, key, meta, &name) {
+                let prefix = self.rows(slot, key, meta, &owned_prefix(&name, &c.name));
+                let mut ids = Vec::new();
+                self.kv.for_each_prefix(&prefix, &mut |k, _| {
+                    if let Some(id) = StreamId::from_bytes(&k[prefix.len()..]) {
+                        ids.push(id);
+                    }
+                    ids.len() < want
+                });
+                let own = ids
+                    .into_iter()
+                    .filter_map(|id| self.load_pending(slot, key, meta, &name, id))
+                    .collect();
+                consumers.push((c, own));
+            }
+            groups.push(GroupFull {
+                name,
+                group: g,
+                lag,
+                pending,
+                consumers,
+            });
+        }
+        Ok(Some((info, entries, groups)))
+    }
 }
 
 #[cfg(test)]
@@ -972,7 +1455,7 @@ mod tests {
 
     fn read(st: &StreamStore<'_>, key: &[u8], consumer: &[u8], from: ReadFrom) -> Vec<StreamId> {
         match st
-            .read_group(1, key, b"g", consumer, from, None, false)
+            .read_group(1, key, b"g", consumer, from, None, false, false)
             .expect("store")
         {
             Found::Yes(Some(e)) => e.into_iter().map(|(id, _)| id).collect(),
@@ -1070,6 +1553,7 @@ mod tests {
                 ReadFrom::After(StreamId::MIN),
                 None,
                 false,
+                false,
             )
             .expect("store")
         else {
@@ -1095,7 +1579,7 @@ mod tests {
         st.group_create(1, b"s", b"g", GroupStart::Id(StreamId::MIN), false, -1)
             .expect("store");
         let Found::Yes(Some(e)) = st
-            .read_group(1, b"s", b"g", b"a", ReadFrom::New, None, true)
+            .read_group(1, b"s", b"g", b"a", ReadFrom::New, None, true, false)
             .expect("store")
         else {
             panic!();
@@ -1119,7 +1603,7 @@ mod tests {
         for g in [&b"g"[..], b"gg"] {
             st.group_create(1, b"s", g, GroupStart::Id(StreamId::MIN), false, -1)
                 .expect("store");
-            st.read_group(1, b"s", g, b"a", ReadFrom::New, None, false)
+            st.read_group(1, b"s", g, b"a", ReadFrom::New, None, false, false)
                 .expect("store");
         }
         assert_eq!(
@@ -1210,7 +1694,7 @@ mod tests {
             },
         )
         .expect("store");
-        st.read_group(1, b"p", b"g", b"c", ReadFrom::New, Some(1), false)
+        st.read_group(1, b"p", b"g", b"c", ReadFrom::New, Some(1), false, false)
             .expect("store");
         let Found::Yes((_, g)) = st.group(1, b"p", b"g").expect("store") else {
             panic!();
@@ -1230,7 +1714,7 @@ mod tests {
         st.group_create(1, b"q", b"g", GroupStart::Id(id(1)), false, 1)
             .expect("store");
         st.del(1, b"q", &[id(2)]).expect("store");
-        st.read_group(1, b"q", b"g", b"c", ReadFrom::New, Some(1), false)
+        st.read_group(1, b"q", b"g", b"c", ReadFrom::New, Some(1), false, false)
             .expect("store");
         let Found::Yes((_, g)) = st.group(1, b"q", b"g").expect("store") else {
             panic!();

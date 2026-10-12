@@ -103,7 +103,7 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     }
     // XREADGROUP's too, and XGROUP's and XINFO's follows a subcommand
     // (ADR-0057).
-    if name.eq_ignore_ascii_case(b"XREADGROUP") {
+    if name.eq_ignore_ascii_case(b"XREADGROUP") || name.eq_ignore_ascii_case(b"FLINTXREADGROUP") {
         return flint_commands::xreadgroup_keys(args)
             .and_then(|k| k.first())
             .map(|k| k.as_slice());
@@ -476,7 +476,7 @@ impl<'a> Dispatcher<'a> {
             b"XREAD" => {
                 flint_commands::xread_keys(args).is_some_and(|ks| ks.iter().any(|k| k.len() > max))
             }
-            b"XREADGROUP" => flint_commands::xreadgroup_keys(args)
+            b"XREADGROUP" | b"FLINTXREADGROUP" => flint_commands::xreadgroup_keys(args)
                 .is_some_and(|ks| ks.iter().any(|k| k.len() > max)),
             b"XGROUP" | b"XINFO" => flint_commands::subcommand_key(args)
                 .flatten()
@@ -851,8 +851,14 @@ impl<'a> Dispatcher<'a> {
             b"XREAD" => self.cmd_xread(args),
             // Consumer groups (ADR-0057), in `commands/streams/groups.rs`.
             b"XGROUP" => self.cmd_xgroup(args),
-            b"XREADGROUP" => self.cmd_xreadgroup(args),
+            b"XREADGROUP" => self.cmd_xreadgroup(args, false),
+            // The proxy's repeated attempt for a blocked XREADGROUP, which
+            // writes nothing when it finds nothing (ADR-0057 D4).
+            b"FLINTXREADGROUP" => self.cmd_xreadgroup(args, true),
             b"XACK" => self.cmd_xack(args),
+            b"XCLAIM" => self.cmd_xclaim(args),
+            b"XAUTOCLAIM" => self.cmd_xautoclaim(args),
+            b"XSETID" => self.cmd_xsetid(args),
             b"XPENDING" => self.cmd_xpending(args),
             b"XINFO" => self.cmd_xinfo(args),
             b"SUBSCRIBE" | b"PSUBSCRIBE" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" => err(

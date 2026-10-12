@@ -171,7 +171,8 @@ pub fn xread_blocks(args: &[Vec<u8>]) -> bool {
 /// keys are the first half of what follows `STREAMS`. `None` when `args` is
 /// not an XREADGROUP or the seat would refuse its shape.
 pub fn xreadgroup_keys(args: &[Vec<u8>]) -> Option<&[Vec<u8>]> {
-    if !args.first()?.eq_ignore_ascii_case(b"XREADGROUP") {
+    let name = args.first()?;
+    if !name.eq_ignore_ascii_case(b"XREADGROUP") && !name.eq_ignore_ascii_case(b"FLINTXREADGROUP") {
         return None;
     }
     let mut i = 1;
@@ -387,10 +388,15 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"XDEL"
             | b"XTRIM"
             // Consumer groups (ADR-0057). XREADGROUP is a write: it makes
-            // what it delivers pending.
+            // what it delivers pending, and so is the proxy's repeated
+            // attempt at it for a blocked client.
             | b"XGROUP"
             | b"XREADGROUP"
+            | b"FLINTXREADGROUP"
             | b"XACK"
+            | b"XCLAIM"
+            | b"XAUTOCLAIM"
+            | b"XSETID"
     )
 }
 

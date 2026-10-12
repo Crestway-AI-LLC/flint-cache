@@ -1675,7 +1675,7 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     }
     // XREADGROUP's too, and XGROUP's and XINFO's follows a subcommand
     // (ADR-0057).
-    if name.eq_ignore_ascii_case(b"XREADGROUP") {
+    if name.eq_ignore_ascii_case(b"XREADGROUP") || name.eq_ignore_ascii_case(b"FLINTXREADGROUP") {
         return flint_commands::xreadgroup_keys(args)
             .and_then(|k| k.first())
             .map(|k| k.as_slice());
@@ -3086,6 +3086,7 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 
                 && let Some(name) = args.first()
                 && !flint_commands::is_blocking_command(name)
                 && !flint_commands::xread_blocks(args)
+                && !flint_commands::xreadgroup_blocks(args)
             {
                 let is_write = flint_commands::is_write_command(name);
                 if is_write || flint_commands::is_read_command(name) {
@@ -3888,8 +3889,9 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
     {
         return false;
     }
-    // A blocking XREAD waits at the proxy as the pops do (ADR-0052 D6).
-    if flint_commands::xread_blocks(args) {
+    // A blocking XREAD waits at the proxy as the pops do (ADR-0052 D6), and
+    // so does a blocking XREADGROUP (ADR-0057 D4).
+    if flint_commands::xread_blocks(args) || flint_commands::xreadgroup_blocks(args) {
         return false;
     }
     // Multi-key DEL / UNLINK / EXISTS may have to be SPLIT across pairs
@@ -5393,6 +5395,78 @@ async fn blocking_xread(
     }
 }
 
+/// A blocking XREADGROUP (ADR-0057 D4), waited out here as XREAD is.
+///
+/// The first attempt is the client's own command: it makes the consumer
+/// and stamps when it was seen, as Valkey does once for a blocked client,
+/// and any error it meets is the client's. Every later attempt is
+/// `FLINTXREADGROUP`, which a seat answers as XREADGROUP but which writes
+/// nothing when it finds nothing. Without it an idle consumer would write
+/// its consumer row at every poll, a WAL record each, and XINFO CONSUMERS
+/// would show it as never idle. Only a read of new entries waits
+/// (`xreadgroup_blocks`), as in Valkey. A group destroyed, or a stream
+/// deleted, during the wait is the NOGROUP Valkey sends a blocked client.
+async fn blocking_xreadgroup(
+    topo: &Arc<Topology>,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    idle: &mut dyn Idle,
+) -> Value {
+    let raw = encode_cmd(&args.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    match forward(topo, backends, ns, args, &raw, false).await {
+        Value::Null | Value::Array(None) => {}
+        other => return other,
+    }
+    // The seat accepted the command, so its BLOCK is a whole number of at
+    // least 0.
+    let Some(keys) = flint_commands::xreadgroup_keys(args) else {
+        return Value::Array(None);
+    };
+    let options = &args[1..args.len() - 2 * keys.len() - 1];
+    let mut block_ms: u64 = 0;
+    let mut i = 0;
+    while i < options.len() {
+        let o = &options[i];
+        if o.eq_ignore_ascii_case(b"BLOCK") {
+            block_ms = std::str::from_utf8(&options[i + 1])
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
+            i += 2;
+        } else if o.eq_ignore_ascii_case(b"COUNT") {
+            i += 2;
+        } else if o.eq_ignore_ascii_case(b"GROUP") {
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut attempt = args.to_vec();
+    attempt[0] = b"FLINTXREADGROUP".to_vec();
+    let frame = encode_cmd(&attempt.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let started = Instant::now();
+    let mut delay = BLOCK_POLL_FIRST;
+    loop {
+        let mut wait = delay;
+        if block_ms > 0 {
+            let left = Duration::from_millis(block_ms).saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Value::Array(None);
+            }
+            wait = wait.min(left.min(Duration::from_secs(1)));
+        }
+        if !idle.wait(wait).await {
+            return Value::Array(None);
+        }
+        match forward(topo, backends, ns, &attempt, &frame, false).await {
+            Value::Null | Value::Array(None) => {}
+            other => return other,
+        }
+        delay = (delay * 2).min(BLOCK_POLL_MAX);
+    }
+}
+
 /// The stream ID just below `id` (`ms-seq`), for XREAD's `+`; `0-0` stays.
 fn id_before(id: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(id);
@@ -5473,6 +5547,10 @@ async fn handle(
         // A blocking XREAD waits here too (ADR-0052 D6). See `blocking_xread`.
         b"XREAD" if flint_commands::xread_blocks(args) => {
             blocking_xread(topo, backends, ns, args, idle).await
+        }
+        // And a blocking XREADGROUP (ADR-0057 D4). See `blocking_xreadgroup`.
+        b"XREADGROUP" if flint_commands::xreadgroup_blocks(args) => {
+            blocking_xreadgroup(topo, backends, ns, args, idle).await
         }
         // Group-wide aggregates fan out.
         b"DBSIZE" => {

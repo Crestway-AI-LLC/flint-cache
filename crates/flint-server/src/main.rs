@@ -5401,7 +5401,9 @@ fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
         b"BLMPOP" | b"BZMPOP" => args.get(2).is_some_and(|n| n.as_slice() != b"1"),
         b"EVAL" | b"EVALSHA" => flint_commands::eval_keys(args).is_some_and(|k| k.len() > 1),
         // A group read of several streams writes each one's group (ADR-0057).
-        b"XREADGROUP" => flint_commands::xreadgroup_keys(args).is_some_and(|k| k.len() > 1),
+        b"XREADGROUP" | b"FLINTXREADGROUP" => {
+            flint_commands::xreadgroup_keys(args).is_some_and(|k| k.len() > 1)
+        }
         // A search storing somewhere other than the key it reads.
         b"GEORADIUS" | b"GEORADIUSBYMEMBER" => flint_commands::georadius_store_keys(args)
             .iter()

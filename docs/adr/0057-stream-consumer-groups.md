@@ -356,5 +356,57 @@ over entries 1 to 5:
 - **Ten mutants failed their tests:** nine in the storage, the seat and the
   key parser, and one that dropped the proxy's RESP2 repair.
 
-**Next:** part 2. That is `XCLAIM`, `XAUTOCLAIM`, `XINFO STREAM` and
-`XSETID`, and `XREADGROUP BLOCK` waiting at the proxy.
+### Part 2: claiming, `XSETID`, `XINFO STREAM`, and the wait (2026-10-12)
+
+- **Seat:**
+  - `XCLAIM`, with `IDLE`, `TIME`, `RETRYCOUNT`, `FORCE`, `JUSTID` and
+    `LASTID`.
+  - `XAUTOCLAIM`, with `COUNT` and `JUSTID`. It answers the IDs of entries
+    gone from the stream, and drops their pending rows. As in Valkey, one
+    call looks at no more than ten times `COUNT` pending entries, and
+    answers a cursor to resume from.
+  - `XSETID`, with `ENTRIESADDED` and `MAXDELETEDID`.
+  - `XINFO STREAM`, with `FULL` and `COUNT`.
+- **`XINFO STREAM`'s `radix-tree-keys` and `radix-tree-nodes`** count rows,
+  the stream's length. Flint has no radix tree to describe
+  (command-support.md).
+- **D4, the wait:**
+  - The proxy sends a blocked `XREADGROUP` once as the client sent it. That
+    first attempt makes the consumer and stamps when it was seen, as Valkey
+    does once for a blocked client.
+  - Then the proxy polls with `FLINTXREADGROUP`, on the same backoff as
+    `XREAD` (1 ms, rising to 20 ms). A poll that finds nothing writes
+    nothing: no WAL record, no replication, no consumer.
+  - A tenant cannot send `FLINTXREADGROUP`, because the proxy refuses every
+    `FLINT*` command.
+  - A blocked `XREADGROUP` is left out of staging and of the latency
+    histogram, as a blocked `XREAD` is.
+- **Destroying the group or deleting the stream during the wait** answers
+  `NOGROUP`, with the same text as Valkey 9.1 (measured, both cases).
+
+**Verified** against Valkey 9.1 on the laptop:
+- **A scenario of 123 commands** is identical at a seat in both protocols.
+- **The corpus gained three cases.**
+  - Two were generated from Valkey's replies.
+  - One is seat-only: `FLINTXREADGROUP` makes no consumer on a miss, and
+    delivers on a hit.
+  - The corpus passes at a seat, and through the proxy as a tenant in both
+    protocols (`proxy_conformance_drill`: 221 cases direct, 217 through the
+    proxy).
+- **The random differential gained part 2's commands.** It runs 60,000
+  commands at a seat and 24,000 through an authenticated proxy, and finds
+  no difference.
+- **The wait, through the proxy, in both protocols:**
+  - an entry wakes the waiter;
+  - the master's WAL does not move while a consumer waits;
+  - `XINFO CONSUMERS` shows the waiter idle for at least a second;
+  - `BLOCK` times out with a null;
+  - the two `NOGROUP` cases above;
+  - a history read answers at once;
+  - one entry goes to exactly one of two waiters.
+- **Two mutants failed:**
+  - a proxy that polled with `XREADGROUP` itself (the WAL check caught it);
+  - a poll that wrote on a miss (the seat-only case caught it).
+
+**Next:** part 3, D7's drills: failover and rollback with groups, and a
+framework's consumer through the proxy.

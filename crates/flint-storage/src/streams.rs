@@ -11,8 +11,9 @@
 
 mod groups;
 pub use groups::{
-    Consumer, Created, ENTRIES_READ_UNKNOWN, Found, Group, GroupEntry, GroupStart, Pending,
-    PendingSummary, ReadFrom,
+    AutoClaimed, ClaimOpts, Claimed, Consumer, Created, ENTRIES_READ_UNKNOWN, Found, Group,
+    GroupEntry, GroupFull, GroupStart, Pending, PendingSummary, ReadFrom, SetIdRefusal, StreamFull,
+    StreamInfo,
 };
 
 use crate::Kv;

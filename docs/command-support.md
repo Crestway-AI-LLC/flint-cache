@@ -1006,9 +1006,8 @@ memory, and `XREVRANGE … COUNT 1` reads one entry however long the stream is.
 - **`XREAD` over several streams needs them in one slot**, as every
   multi-key command does: give their names one hash tag. A tenant placed on
   one pair (ADR-0053) may read streams in any slots.
-- **Not yet served:** `XCLAIM`, `XAUTOCLAIM`, `XINFO STREAM` and `XSETID`
-  (ADR-0057's second part), and Redis 8.2's `XDELEX`, `XACKDEL`, and the
-  `KEEPREF`, `DELREF` and `ACKED` options, which Valkey 9.1 does not have.
+- **Not served:** Redis 8.2's `XDELEX`, `XACKDEL`, and the `KEEPREF`,
+  `DELREF` and `ACKED` options, which Valkey 9.1 does not have (ADR-0057).
 
 Checked by the corpus against Valkey through a seat and through the proxy
 in both protocols, and by `tools/client_compat_drill.sh` (redis-py, a
@@ -1019,8 +1018,11 @@ blocking `XREAD` woken by another client's `XADD`).
 `XGROUP` (`CREATE` with `MKSTREAM` and `ENTRIESREAD`, `SETID`, `DESTROY`,
 `CREATECONSUMER`, `DELCONSUMER`, `HELP`), `XREADGROUP` (`COUNT`, `NOACK`, `>`
 and a consumer's history), `XACK`, `XPENDING` (the summary, and ranges with
-`IDLE` and a consumer) and `XINFO GROUPS`, `CONSUMERS` and `HELP` work as in
-Valkey 9.1, with its replies, its errors and its order of checking, in both
+`IDLE` and a consumer), `XCLAIM` (`IDLE`, `TIME`, `RETRYCOUNT`, `FORCE`,
+`JUSTID`, `LASTID`), `XAUTOCLAIM` (`COUNT`, `JUSTID`, and the IDs of entries
+gone from the stream), `XSETID` (`ENTRIESADDED`, `MAXDELETEDID`) and `XINFO
+STREAM` (`FULL`, `COUNT`), `GROUPS`, `CONSUMERS` and `HELP` work as in Valkey
+9.1, with its replies, its errors and its order of checking, in both
 protocols: entries-read and lag as Valkey estimates them, an entry deleted
 since delivery read back as its ID and a null, and an entry taken over by
 another consumer after `XGROUP SETID`.
@@ -1035,9 +1037,18 @@ another consumer after `XGROUP SETID`.
   group is refused. Every command serves the groups that exist, and `XGROUP
   CREATE` of one that exists still answers `BUSYGROUP`, so consumers that
   create their group at startup keep working (see self-hosting.md).
-- **`XREADGROUP BLOCK` does not wait yet**: it answers at once, as inside
-  `MULTI`. The proxy will wait for it as it waits for `XREAD` (ADR-0057's
-  second part). A history read never waits, in Valkey either.
+- **`XREADGROUP BLOCK` waits at the proxy**, as `XREAD BLOCK` does: an
+  entry is read within about 20 ms of its arrival. Waiting writes nothing:
+  `XINFO CONSUMERS` shows a waiting consumer idle since its call, as Valkey
+  does. Two consumers of one group waiting on one stream never get the same
+  entry. Valkey serves the one that has waited longest first; Flint serves
+  whichever asks next. A group destroyed, or a stream deleted, during the
+  wait answers `NOGROUP`, as in Valkey. A history read never waits, in
+  Valkey either, and inside `MULTI` or a script nothing waits.
+- **`XINFO STREAM`'s `radix-tree-keys` and `radix-tree-nodes`** describe
+  Valkey's memory: entries packed a hundred to a node, in a radix tree.
+  Flint keeps one row per entry and no such tree, so both count its rows,
+  which is the stream's length. Every other field is Valkey's.
 - **A group read of several streams needs them in one slot**, as `XREAD`
   does.
 - **WATCH sees no group change**, as in Valkey: only `XGROUP CREATE … MKSTREAM`
@@ -1179,6 +1190,7 @@ to run appears on this page.
 | `FLINTINFO` | seat | the `field:value` health block described above |
 | `FLINTCONFIG` | seat | dump or hot-set a runtime tunable |
 | `FLINTKEYSIZE` / `FLINTKEYSTAMP` | seat | the GC ranking primitives (above) |
+| `FLINTXREADGROUP` | seat | the proxy's repeated attempt for a blocked `XREADGROUP`, which writes nothing when it finds nothing (ADR-0057); not for clients |
 | `FLINTNSBYTES <ns>` | seat | stored bytes for one namespace — per-tenant attribution when deciding *whose* data to trim (space-reclaim.md) |
 | `PROXYSTATS` | proxy | connections, command/read/write totals, cert expiry |
 | `PROXYLATENCY` | proxy | per-lane read/write latency |

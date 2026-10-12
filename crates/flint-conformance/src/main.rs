@@ -1804,6 +1804,103 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "streams",
+            name: "consumer groups: XCLAIM and XAUTOCLAIM",
+            // ADR-0057 part 2, generated from Valkey 9.1's replies (2026-10-12). Idle
+            // times are 0 or far beyond any run, so no reply depends on the clock;
+            // an entry deleted while pending leaves the PEL, and XAUTOCLAIM names it.
+            steps: vec![
+                s(&[b"XADD", b"{cg}a", b"1-0", b"a", b"1"], Expect::Str(b"1-0")),
+                s(&[b"XADD", b"{cg}a", b"2-0", b"b", b"2"], Expect::Str(b"2-0")),
+                s(&[b"XADD", b"{cg}a", b"3-0", b"c", b"3"], Expect::Str(b"3-0")),
+                s(&[b"XADD", b"{cg}a", b"4-0", b"d", b"4"], Expect::Str(b"4-0")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}a", b"g", b"0"], Expect::Ok),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"COUNT", b"3", b"STREAMS", b"{cg}a", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}a"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]), Expect::Arr(vec![Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"2")])]), Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"3")])])])])])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c2", b"0", b"1-0"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])])])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c2", b"0", b"1-0", b"2-0", b"JUSTID"], Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Str(b"2-0")])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c3", b"100000000", b"1-0"], Expect::Arr(vec![])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c3", b"0", b"3-0", b"RETRYCOUNT", b"7"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"3")])])])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c3", b"0", b"4-0"], Expect::Arr(vec![])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c3", b"0", b"4-0", b"FORCE"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"4-0"), Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"4")])])])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c3", b"0", b"9-0", b"FORCE"], Expect::Arr(vec![])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c3", b"0", b"2-0", b"LASTID", b"9-0"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"2")])])])),
+                s(&[b"XINFO", b"GROUPS", b"{cg}a"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"g"), Expect::Str(b"consumers"), Expect::Int(3), Expect::Str(b"pending"), Expect::Int(4), Expect::Str(b"last-delivered-id"), Expect::Str(b"9-0"), Expect::Str(b"entries-read"), Expect::Int(3), Expect::Str(b"lag"), Expect::Int(1)])])),
+                s(&[b"XPENDING", b"{cg}a", b"g"], Expect::Arr(vec![Expect::Int(4), Expect::Str(b"1-0"), Expect::Str(b"4-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"c2"), Expect::Str(b"1")]), Expect::Arr(vec![Expect::Str(b"c3"), Expect::Str(b"3")])])])),
+                s(&[b"XDEL", b"{cg}a", b"2-0"], Expect::Int(1)),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0", b"2-0"], Expect::Arr(vec![])),
+                s(&[b"XPENDING", b"{cg}a", b"g"], Expect::Arr(vec![Expect::Int(3), Expect::Str(b"1-0"), Expect::Str(b"4-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"c2"), Expect::Str(b"1")]), Expect::Arr(vec![Expect::Str(b"c3"), Expect::Str(b"2")])])])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0", b"1-0", b"BOGUS"], Expect::Err("ERR Unrecognized XCLAIM option 'BOGUS'")),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"x", b"1-0"], Expect::Err("ERR Invalid min-idle-time argument for XCLAIM")),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"-5", b"1-0", b"JUSTID"], Expect::Arr(vec![Expect::Str(b"1-0")])),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0", b"1-0", b"IDLE", b"x"], Expect::Err("ERR Invalid IDLE option argument for XCLAIM")),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0", b"1-0", b"TIME", b"x"], Expect::Err("ERR Invalid TIME option argument for XCLAIM")),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0", b"1-0", b"RETRYCOUNT", b"x"], Expect::Err("ERR Invalid RETRYCOUNT option argument for XCLAIM")),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0", b"1-0", b"LASTID", b"bad"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0", b"1-0", b"IDLE"], Expect::Err("ERR Unrecognized XCLAIM option 'IDLE'")),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0", b"bad", b"1-0"], Expect::Err("ERR Unrecognized XCLAIM option 'bad'")),
+                s(&[b"XCLAIM", b"{cg}a", b"nog", b"c4", b"0", b"1-0"], Expect::Err("NOGROUP No such key '{cg}a' or consumer group 'nog'")),
+                s(&[b"XCLAIM", b"{cg}nokey", b"g", b"c4", b"0", b"1-0"], Expect::Err("NOGROUP No such key '{cg}nokey' or consumer group 'g'")),
+                s(&[b"XCLAIM", b"{cg}a", b"g", b"c4", b"0"], Expect::Err("ERR wrong number of arguments for 'xclaim' command")),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c5", b"0", b"0"], Expect::Arr(vec![Expect::Str(b"0-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]), Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"3")])]), Expect::Arr(vec![Expect::Str(b"4-0"), Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"4")])])]), Expect::Arr(vec![])])),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"0", b"0", b"COUNT", b"1"], Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])])]), Expect::Arr(vec![])])),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"0", b"0", b"COUNT", b"1", b"JUSTID"], Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"1-0")]), Expect::Arr(vec![])])),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"0", b"(1-0", b"COUNT", b"1"], Expect::Arr(vec![Expect::Str(b"4-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"3")])])]), Expect::Arr(vec![])])),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"0", b"0", b"COUNT", b"0"], Expect::Err("ERR COUNT must be > 0")),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"x", b"0"], Expect::Err("ERR Invalid min-idle-time argument for XAUTOCLAIM")),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"0", b"bad"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"0", b"0", b"BOGUS"], Expect::Err("ERR syntax error")),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"100000000", b"0"], Expect::Arr(vec![Expect::Str(b"0-0"), Expect::Arr(vec![]), Expect::Arr(vec![])])),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"nog", b"c6", b"0", b"0"], Expect::Err("NOGROUP No such key '{cg}a' or consumer group 'nog'")),
+                s(&[b"XAUTOCLAIM", b"{cg}a", b"g", b"c6", b"0"], Expect::Err("ERR wrong number of arguments for 'xautoclaim' command")),
+                s(&[b"XADD", b"{cg}b", b"1-0", b"a", b"1"], Expect::Str(b"1-0")),
+                s(&[b"XADD", b"{cg}b", b"2-0", b"a", b"1"], Expect::Str(b"2-0")),
+                s(&[b"XADD", b"{cg}b", b"3-0", b"a", b"1"], Expect::Str(b"3-0")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}b", b"g", b"0"], Expect::Ok),
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"{cg}b", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{cg}b"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]), Expect::Arr(vec![Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])]), Expect::Arr(vec![Expect::Str(b"3-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])])])])])),
+                s(&[b"XDEL", b"{cg}b", b"1-0", b"3-0"], Expect::Int(2)),
+                s(&[b"XAUTOCLAIM", b"{cg}b", b"g", b"d", b"0", b"0"], Expect::Arr(vec![Expect::Str(b"0-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])])]), Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Str(b"3-0")])])),
+                s(&[b"XPENDING", b"{cg}b", b"g"], Expect::Arr(vec![Expect::Int(1), Expect::Str(b"2-0"), Expect::Str(b"2-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"d"), Expect::Str(b"1")])])])),
+                s(&[b"SET", b"{cg}str", b"x"], Expect::Ok),
+                s(&[b"XCLAIM", b"{cg}str", b"g", b"c", b"0", b"1-0"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XAUTOCLAIM", b"{cg}str", b"g", b"c", b"0", b"0"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+            ],
+        },
+        Case {
+            family: "streams",
+            name: "consumer groups: XSETID, and XINFO STREAM's errors",
+            // XINFO STREAM's own replies carry Valkey's memory layout
+            // (`radix-tree-keys`, `-nodes`), which Flint does not have, so only its
+            // errors are here; the differential compares the rest with those masked.
+            steps: vec![
+                s(&[b"XADD", b"{cg}x", b"5-0", b"a", b"1"], Expect::Str(b"5-0")),
+                s(&[b"XADD", b"{cg}x", b"6-0", b"a", b"1"], Expect::Str(b"6-0")),
+                s(&[b"XSETID", b"{cg}x", b"7-0"], Expect::Ok),
+                s(&[b"XSETID", b"{cg}x", b"5-0"], Expect::Err("ERR The ID specified in XSETID is smaller than the target stream top item")),
+                s(&[b"XSETID", b"{cg}x", b"9-0", b"ENTRIESADDED", b"1"], Expect::Err("ERR The entries_added specified in XSETID is smaller than the target stream length")),
+                s(&[b"XSETID", b"{cg}x", b"9-0", b"ENTRIESADDED", b"10", b"MAXDELETEDID", b"3-0"], Expect::Ok),
+                s(&[b"XSETID", b"{cg}x", b"2-0"], Expect::Err("ERR The ID specified in XSETID is smaller than current max_deleted_entry_id")),
+                s(&[b"XSETID", b"{cg}x", b"9-0", b"MAXDELETEDID", b"10-0"], Expect::Err("ERR The ID specified in XSETID is smaller than the provided max_deleted_entry_id")),
+                s(&[b"XSETID", b"{cg}x", b"9-0", b"ENTRIESADDED", b"-1"], Expect::Err("ERR entries_added must be positive")),
+                s(&[b"XSETID", b"{cg}x", b"9-0", b"BOGUS"], Expect::Err("ERR syntax error")),
+                s(&[b"XSETID", b"{cg}x", b"bad"], Expect::Err("ERR Invalid stream ID specified as stream command argument")),
+                s(&[b"XSETID", b"{cg}nokey", b"1-0"], Expect::Err("ERR no such key")),
+                s(&[b"XGROUP", b"CREATE", b"{cg}x", b"g", b"0"], Expect::Ok),
+                s(&[b"XINFO", b"GROUPS", b"{cg}x"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"name"), Expect::Str(b"g"), Expect::Str(b"consumers"), Expect::Int(0), Expect::Str(b"pending"), Expect::Int(0), Expect::Str(b"last-delivered-id"), Expect::Str(b"0-0"), Expect::Str(b"entries-read"), Expect::Nil, Expect::Str(b"lag"), Expect::Int(2)])])),
+                s(&[b"XADD", b"{cg}x", b"9-0", b"a", b"1"], Expect::Err("ERR The ID specified in XADD is equal or smaller than the target stream top item")),
+                s(&[b"XADD", b"{cg}x", b"9-1", b"a", b"1"], Expect::Str(b"9-1")),
+                s(&[b"SET", b"{cg}str", b"x"], Expect::Ok),
+                s(&[b"XSETID", b"{cg}str", b"1-0"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XSETID", b"{cg}x"], Expect::Err("ERR wrong number of arguments for 'xsetid' command")),
+                s(&[b"XINFO", b"STREAM", b"{cg}nokey"], Expect::Err("ERR no such key")),
+                s(&[b"XINFO", b"STREAM", b"{cg}str"], Expect::Err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                s(&[b"XINFO", b"STREAM", b"{cg}x", b"BOGUS"], Expect::Err("ERR unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP.")),
+                s(&[b"XINFO", b"STREAM", b"{cg}x", b"FULL", b"BOGUS"], Expect::Err("ERR unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP.")),
+                s(&[b"XINFO", b"STREAM", b"{cg}x", b"FULL", b"COUNT"], Expect::Err("ERR unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP.")),
+                s(&[b"XINFO", b"STREAM", b"{cg}x", b"FULL", b"COUNT", b"x"], Expect::Err("ERR value is not an integer or out of range")),
+                s(&[b"XINFO", b"STREAM"], Expect::Err("ERR wrong number of arguments for 'xinfo|stream' command")),
+            ],
+        },
+        Case {
             family: "lua",
             name: "the cjson library, as Valkey bundles it",
             steps: vec![
@@ -5361,6 +5458,25 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             family: "flint",
+            name: "flintxreadgroup, the proxy's waiting XREADGROUP, writes nothing on a miss",
+            steps: vec![
+                s(&[b"XGROUP", b"CREATE", b"{fxg}s", b"g", b"$", b"MKSTREAM"], Expect::Ok),
+                // XREADGROUP's miss makes its consumer, as Valkey's does; the
+                // proxy sends it once, as the client's own attempt.
+                s(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"{fxg}s", b">"], Expect::NilArray),
+                // The proxy's repeated attempts make nothing: CREATECONSUMER
+                // answers 1 for a consumer that is new, 0 for one that exists.
+                s(&[b"FLINTXREADGROUP", b"GROUP", b"g", b"c2", b"STREAMS", b"{fxg}s", b">"], Expect::NilArray),
+                s(&[b"XGROUP", b"CREATECONSUMER", b"{fxg}s", b"g", b"c1"], Expect::Int(0)),
+                s(&[b"XGROUP", b"CREATECONSUMER", b"{fxg}s", b"g", b"c2"], Expect::Int(1)),
+                // A hit delivers as XREADGROUP does.
+                s(&[b"XADD", b"{fxg}s", b"1-0", b"f", b"v"], Expect::Str(b"1-0")),
+                s(&[b"FLINTXREADGROUP", b"GROUP", b"g", b"c2", b"STREAMS", b"{fxg}s", b">"], Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"{fxg}s"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Str(b"f"), Expect::Str(b"v")])])])])])),
+                s(&[b"XPENDING", b"{fxg}s", b"g"], Expect::Arr(vec![Expect::Int(1), Expect::Str(b"1-0"), Expect::Str(b"1-0"), Expect::Arr(vec![Expect::Arr(vec![Expect::Str(b"c2"), Expect::Str(b"1")])])])),
+            ],
+        },
+        Case {
+            family: "flint",
             name: "flintkeysize measures payload, not encoding",
             steps: vec![
                 s(&[b"SET", b"fks1", b"hello"], Expect::Ok),
@@ -7507,11 +7623,14 @@ impl Client {
             true => flint_resp::group_nulls_reply(&v),
             false => v,
         };
-        // XREAD and XREADGROUP are a map under RESP3 and a list of pairs
-        // under RESP2 (ADR-0052 D6, ADR-0057).
+        // XREAD and XREADGROUP (and the proxy's FLINTXREADGROUP) are a map
+        // under RESP3 and a list of pairs under RESP2 (ADR-0052 D6,
+        // ADR-0057).
         match args.first() {
             Some(n)
-                if n.eq_ignore_ascii_case(b"XREAD") || n.eq_ignore_ascii_case(b"XREADGROUP") =>
+                if n.eq_ignore_ascii_case(b"XREAD")
+                    || n.eq_ignore_ascii_case(b"XREADGROUP")
+                    || n.eq_ignore_ascii_case(b"FLINTXREADGROUP") =>
             {
                 flint_resp::xread_resp2(&v)
             }

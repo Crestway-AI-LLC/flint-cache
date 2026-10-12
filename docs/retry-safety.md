@@ -84,6 +84,8 @@ even into their source (the points a search keeps are found again), and with
 fewer) · `XTRIM` (exact: a second trim to the same bound removes nothing
 more) · `XACK` (it answers how many were pending, so the retry answers fewer;
 the entries are acknowledged either way) · `XGROUP SETID` (it names the ID) ·
+`XSETID` (it names the ID and the counters; a retry below an entry the first
+attempt's caller added since answers an error) ·
 `XREADGROUP` reading a consumer's history (an ID other than `>`: the retry
 answers the same entries, and counts one more delivery of each)
 
@@ -117,6 +119,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `BF.RESERVE` | The retry answers `ERR item exists`, same shape: created, reported as failed. |
 | `XADD` | With `*` or `ms-*`, the retry adds the entry a second time, under a new ID. With an explicit ID it answers `ERR The ID specified in XADD is equal or smaller than the target stream top item`: the entry was added, and the caller is told it was not. |
 | `XREADGROUP … >` (ADR-0057) | The retry delivers the NEXT entries. The ones the first attempt delivered are pending under the consumer, and the caller never saw them. Recover them as a restarted consumer does: read its history (`XREADGROUP … 0`), or claim idle entries with `XAUTOCLAIM`. Flint keeps a delivered entry pending across a failover, so the history read finds it. |
+| `XCLAIM` `XAUTOCLAIM` | The retry claims again: each entry's delivery count goes up once more (unless `JUSTID`), and `XAUTOCLAIM` resumes past the entries the lost reply named, which are now the caller's but were never seen. Read the consumer's history (`XREADGROUP … 0`) to find them. `FLINTXREADGROUP`, the proxy's internal attempt for a blocked `XREADGROUP`, is never retried by the proxy after an ambiguous failure, as `XREADGROUP` is not. |
 | `XGROUP CREATE` `XGROUP CREATECONSUMER` `XGROUP DESTROY` `XGROUP DELCONSUMER` | The retry answers `BUSYGROUP`, or 0: created or removed, and the caller is told it was not. Consumers that create their group at startup usually ignore `BUSYGROUP` already. `XGROUP DELCONSUMER` answers 0 pending on the retry, not the count the first attempt dropped. |
 | `PUBLISH` | Delivers the message again, so every subscriber hears it twice. A message is not state, and nothing converges. Give messages an id the consumer can dedupe on, or treat an ambiguous failure as delivered. |
 | `EVAL` `EVALSHA` (ADR-0051) | A script is exactly as retry-safe as what it does, so assume it is not. Measured cases: a lock release that succeeded answers 0 on the retry (redsync's -1, "already expired"), so the caller is told it did not hold the lock; a `redlock` acquire that succeeded answers 0, the `SET NX` hazard; an extend that adds to the TTL adds twice; django-redis's `incr` double-counts; a rate limiter's hit counts twice. A failed script keeps none of its writes, so retrying a script that FAILED is safe. |
