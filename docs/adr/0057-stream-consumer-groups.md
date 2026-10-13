@@ -459,5 +459,29 @@ over entries 1 to 5:
   an owned-index row per entry. An `XACK` deletes those two and rewrites
   the group's and the consumer's counts.
 
-**Not done:** one framework's consumer (Dapr, Watermill, Spring Data Redis
-or Redpanda Connect). Each is a download, which waits for Jeff's approval.
+**A framework's consumer (2026-10-12): Redpanda Connect 4.113.0**, approved
+by Jeff and downloaded with its published sha256 (laptop only, deleted
+after). Its `redis_streams` input is go-redis 9.18.0 speaking RESP3. It
+sends `HELLO 3`, `CLIENT SETINFO`, `CLIENT SETNAME`, `XGROUP CREATE … 0
+MKSTREAM`, `XREADGROUP … COUNT 10 BLOCK 500`, first from `0` (its own
+pending entries) and then from `>`, and batched `XACK`s. Its output adds
+with `XADD`.
+
+The same scenario ran against Valkey 9.1 and against a local fleet through
+the proxy, and the two summaries were identical:
+- **200 entries** were read once each and acknowledged. The group's
+  pending count was 0, `entries-read` 200 and lag 0.
+- **A consumer killed with `kill -9`** before committing left at least
+  what it had output pending. Restarted under the same name, it got those
+  entries back. The union was all 100, and nothing was left pending.
+
+Flint only, the case this ADR is for: a consumer was killed with 50
+entries pending (40 output, 10 in flight). Then `flintctl failover` moved
+the pair's master, and the group still had 50 pending. Restarted, the
+consumer received all 40 again, and the union was 100. The group ended
+with pending 0, `entries-read` 500 and lag 0. The client logged no error
+besides the "context canceled" of a blocking read stopped at shutdown,
+which Valkey's runs log too.
+
+Dapr, Watermill and Spring Data Redis were not run. One framework was
+what this verification asked for.
