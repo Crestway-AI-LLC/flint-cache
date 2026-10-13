@@ -206,9 +206,9 @@ cp 127.0.0.1:7500           # one line = single-node CP; three = Raft HA
 pair HOST:P,HOST:P[,HOST:P] # a replica set (master first); repeatable
 proxy HOST:P                # a routing proxy; repeatable
 controller on               # automatic failover supervision
-placed-tenants on           # allow `tenant add-on-pair` (ADR-0053; see section 4)
-streams on                  # let XADD create streams (ADR-0052; see section 4)
-chunked-strings on          # store strings over 64 KiB in chunks (ADR-0056; section 4)
+placed-tenants off          # forbid `tenant add-on-pair` (on by default; ADR-0053, section 4)
+streams off                 # XADD creates no stream (on by default; ADR-0052, section 4)
+chunked-strings off         # store every string whole (on by default; ADR-0056, section 4)
 stream-groups on            # let XGROUP CREATE make consumer groups (ADR-0057; section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
@@ -1234,7 +1234,7 @@ A tenant is a namespace + a token + a proxy subset + quotas. All via
 flintctl -f cluster.flint tenant add acme <token> acme 2
 
 # or place it whole on one pair (index or member), so its transactions and
-# scripts may span slots: rq, Sidekiq (ADR-0053; needs `placed-tenants on`)
+# scripts may span slots: rq, Sidekiq (ADR-0053; refused if `placed-tenants off`)
 flintctl -f cluster.flint tenant add-on-pair jobs <token> jobs 1 2
 
 # quotas: fleet ops/s and storage bytes (0 = unlimited)
@@ -1286,17 +1286,17 @@ Notes:
   big and as fast as that pair and no bigger. Nothing moves it: the
   balancer leaves its slots where they are, though it counts them as that
   pair's fill, and `migrate-slots` refuses its namespace. It needs its own
-  namespace. The inventory must say `placed-tenants on`, which is off by
-  default in this release, because a release before it would route a
-  placed tenant as a spread one: once you place a tenant, do not roll this
-  fleet back below this release (ADR-0053).
+  namespace. It is on unless the inventory says `placed-tenants off`. It
+  was off in v0.1.0-rc.79, which introduced it, because a release before it
+  would route a placed tenant as a spread one: once you place a tenant, do
+  not roll this fleet back below v0.1.0-rc.79 (ADR-0053).
 - **Streams** (`XADD` and the rest, ADR-0052) are served on every seat,
-  but a seat creates a stream only when the inventory says `streams on`
-  (each data seat then runs with `--streams`). It is off by default in the
-  release that introduced streams, because a release before it reads a
-  stream key as having no type: once a tenant has created a stream, do not
-  roll this fleet back below this release. A tenant's `XADD` that would
-  create a stream is refused while it is off.
+  and a seat creates a stream unless the inventory says `streams off` (each
+  data seat runs with `--streams`). It was off in v0.1.0-rc.82, which
+  introduced streams, because a release before it reads a stream key as
+  having no type: once a tenant has created a stream, do not roll this
+  fleet back below v0.1.0-rc.82. A tenant's `XADD` that would create a
+  stream is refused while it is off.
 - **Stream consumer groups** (`XGROUP`, `XREADGROUP`, `XACK`, `XPENDING`,
   `XINFO`, ADR-0057) are served on every seat, but a seat creates a group
   only when the inventory says `stream-groups on` (each data seat then runs
@@ -1308,17 +1308,17 @@ Notes:
   CREATE` of one that exists answers `BUSYGROUP`, so a rollback to this
   release from the one that turns it on keeps consumers consuming.
 - **Large strings in chunks** (ADR-0056): every seat reads a string stored
-  in 32 KiB chunks, but a seat stores one that way only when the inventory
-  says `chunked-strings on` (each data seat then runs with
-  `--chunked-strings`). With it, a write to a string longer than 64 KiB
-  (SETBIT, SETRANGE, APPEND, BITFIELD) writes only the chunks it changes,
-  and GETBIT, GETRANGE and a ranged BITCOUNT or BITPOS read only theirs;
-  without it, such a write rewrites the whole string. It is off by default
-  in the release that introduced it, because a release before it reads a
-  chunked string as having no type: once a seat has stored one, do not roll
-  this fleet back below this release. Nothing is refused while it is off:
-  a string already in chunks is still written in place, until a `SET`
-  replaces it with one stored whole.
+  in 32 KiB chunks, and stores one that way unless the inventory says
+  `chunked-strings off` (each data seat runs with `--chunked-strings`).
+  With it, a write to a string longer than 64 KiB (SETBIT, SETRANGE,
+  APPEND, BITFIELD) writes only the chunks it changes, and GETBIT, GETRANGE
+  and a ranged BITCOUNT or BITPOS read only theirs; without it, such a
+  write rewrites the whole string. It was off in v0.1.0-rc.82, which
+  introduced it, because a release before it reads a chunked string as
+  having no type: once a seat has stored one, do not roll this fleet back
+  below v0.1.0-rc.82. Nothing is refused while it is off: a string already
+  in chunks is still written in place, until a `SET` replaces it with one
+  stored whole.
 
 ## 5. Rotating credentials & keys
 

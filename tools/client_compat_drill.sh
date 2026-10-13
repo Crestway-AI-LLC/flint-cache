@@ -59,6 +59,9 @@ echo "== client: $("$PY" -c 'import redis;print("redis-py", redis.__version__)')
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
   -p flint-controller -p flint-ctl --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
+# No placed-tenants, streams or chunked-strings line: each is on by default
+# (ADR-0053, ADR-0052 D6, ADR-0056 D4), and this drill is what uses all
+# three through flintctl, so it runs on the defaults.
 cat > "$INV" <<EOF
 disposable on
 statedir $STATE
@@ -68,9 +71,6 @@ cp 127.0.0.1:7724
 pair 127.0.0.1:7321,127.0.0.1:7322
 pair 127.0.0.1:7323,127.0.0.1:7324
 proxy 127.0.0.1:$PORT
-placed-tenants on
-streams on
-chunked-strings on
 stream-groups on
 EOF
 

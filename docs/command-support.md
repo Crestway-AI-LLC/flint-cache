@@ -997,11 +997,12 @@ Redis, with Valkey 9.1's replies and errors in both protocols: IDs, `*` and
 are rows on disk like a list's elements, so a stream can be far larger than
 memory, and `XREVRANGE … COUNT 1` reads one entry however long the stream is.
 
-- **Creating a stream needs your operator.** A seat creates one only when
-  its inventory says `streams on`; until then an `XADD` that would create a
-  stream is refused, and every command serves the streams that exist. It is
-  off by default in the release that introduced streams, so a fleet can roll
-  back below it until the first stream is made (see self-hosting.md).
+- **Your operator can turn stream creation off.** A seat creates a stream
+  unless its inventory says `streams off`; then an `XADD` that would create
+  a stream is refused, and every command serves the streams that exist. It
+  was off by default in the release that introduced streams, so a fleet
+  could roll back below it until the first stream was made (see
+  self-hosting.md).
 - **`XREAD BLOCK` waits at the proxy**, as the blocking pops do: an entry is
   read within about 20 ms of its arrival, where Redis wakes the reader at
   once. `$` and `+` mean where the stream stood when the command arrived. A

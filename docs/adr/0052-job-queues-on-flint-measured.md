@@ -660,3 +660,12 @@ connection carries `FLINTWHOLE`. That was the last thing rq's worker
 needed. In `client_compat_drill`, rq 2.8.0's burst worker on a placed tenant
 finishes every job and its results read back. The design and the
 measurements are in ADR-0053, under its amendment.
+
+### Streams on by default (2026-10-12)
+
+D6's second release. flintctl starts every data seat with `--streams`
+unless the inventory says `streams off`. The seat's own default stays off:
+flint-server refuses a flag it does not know, so an opt-out flag would stop
+an older release's seat that a newer flintctl starts in a rollback.
+v0.1.0-rc.82, the first release to read streams, is the oldest on every
+fleet, so the release carrying this rolls back onto one that reads them.

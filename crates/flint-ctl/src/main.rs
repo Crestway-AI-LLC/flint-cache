@@ -125,20 +125,29 @@ struct Inventory {
     /// ever needs raising, not lowering.
     billing_retain_days: Option<u64>,
     controller: bool,
-    /// `placed-tenants on`: start the control plane with `--placed-tenants`,
-    /// which lets `tenant add-on-pair` place a tenant on one pair (ADR-0053).
-    /// Off by default in the release that introduced it, because a release
-    /// before it routes a placed tenant as a spread one.
+    /// Start the control plane with `--placed-tenants`, which lets `tenant
+    /// add-on-pair` place a tenant on one pair (ADR-0053). On unless the
+    /// inventory says `placed-tenants off`. It was off in the release that
+    /// introduced placement (v0.1.0-rc.79), because a release before it
+    /// routes a placed tenant as a spread one; every release a fleet may
+    /// roll back to reads it now.
     placed_tenants: bool,
-    /// `streams on`: start every data seat with `--streams`, which lets XADD
-    /// create a stream (ADR-0052 D6). Off by default in the release that
-    /// introduced streams, because a release before it reads a stream key as
-    /// no type at all.
+    /// Start every data seat with `--streams`, which lets XADD create a
+    /// stream (ADR-0052 D6). On unless the inventory says `streams off`. It
+    /// was off in the release that introduced streams (v0.1.0-rc.82),
+    /// because a release before it reads a stream key as no type at all.
     streams: bool,
-    /// `chunked-strings on`: start every data seat with `--chunked-strings`,
-    /// which stores a string longer than 64 KiB in chunks (ADR-0056 D4). Off
-    /// by default in the release that introduced them, because a release
-    /// before it reads a chunked string as no type at all.
+    /// Start every data seat with `--chunked-strings`, which stores a string
+    /// longer than 64 KiB in chunks (ADR-0056 D4). On unless the inventory
+    /// says `chunked-strings off`. It was off in the release that introduced
+    /// them (v0.1.0-rc.82), because a release before it reads a chunked
+    /// string as no type at all.
+    ///
+    /// The three are turned on here, in what flintctl passes, and not in the
+    /// binaries' own defaults. flint-server and the control plane refuse a
+    /// flag they do not know, so an opt-out flag would stop a seat that this
+    /// flintctl starts from an older release's binaries, as a rollback does.
+    /// Every binary since v0.1.0-rc.82 knows the flags passed to turn them on.
     chunked_strings: bool,
     /// `stream-groups on`: start every data seat with `--stream-groups`,
     /// which lets XGROUP CREATE create a consumer group (ADR-0057 D5). Off by
@@ -349,11 +358,26 @@ fn warn_unknown_node_env(key: &str) {
     }
 }
 
+/// An inventory switch that defaults to on: `on` or `off`, and nothing else.
+/// A misspelt `off` read as on would leave on what the operator turned off.
+fn on_or_off(key: &str, val: &str) -> bool {
+    match val {
+        "on" => true,
+        "off" => false,
+        _ => die(&format!(
+            "inventory: `{key}` takes on or off, got `{key} {val}`"
+        )),
+    }
+}
+
 fn parse_inventory(path: &str) -> Inventory {
     let raw =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read inventory {path}: {e}"));
     let mut inv = Inventory {
         bins: "./target/release".into(),
+        placed_tenants: true,
+        streams: true,
+        chunked_strings: true,
         ..Default::default()
     };
     for line in raw.lines() {
@@ -416,9 +440,9 @@ fn parse_inventory(path: &str) -> Inventory {
             "billing" => inv.billing = Some(val.to_string()),
             "billing-retain-days" => inv.billing_retain_days = val.parse().ok(),
             "controller" => inv.controller = val == "on",
-            "placed-tenants" => inv.placed_tenants = val == "on",
-            "streams" => inv.streams = val == "on",
-            "chunked-strings" => inv.chunked_strings = val == "on",
+            "placed-tenants" => inv.placed_tenants = on_or_off(key, val),
+            "streams" => inv.streams = on_or_off(key, val),
+            "chunked-strings" => inv.chunked_strings = on_or_off(key, val),
             "stream-groups" => inv.stream_groups = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
@@ -3300,10 +3324,12 @@ fn reload(inv: &Inventory) {
     if inv.async_queue_cap.is_some() {
         restart_only.push("async-queue-cap");
     }
-    if inv.streams {
+    // Named when set to other than the default, as the keys above are when
+    // set at all.
+    if !inv.streams {
         restart_only.push("streams");
     }
-    if inv.chunked_strings {
+    if !inv.chunked_strings {
         restart_only.push("chunked-strings");
     }
     if inv.stream_groups {
@@ -10783,66 +10809,64 @@ mod cp_seat_liveness_tests {
         );
     }
 
-    /// ADR-0053: `placed-tenants on` is what lets the control plane place a
-    /// tenant, on every seat; without it the seats refuse `add-on-pair`.
+    /// ADR-0053: the control plane may place a tenant, on every seat, unless
+    /// the inventory says `placed-tenants off`. On by default from the
+    /// release after the one that introduced placement.
     #[test]
-    fn placed_tenants_on_reaches_every_control_plane_seat() {
+    fn placed_tenants_reach_every_control_plane_seat_unless_off() {
         let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
                     cp 10.0.0.1:7500\ncp 10.0.0.2:7500\ncp 10.0.0.1:7501\n\
                     pair 10.0.0.1:7001,10.0.0.2:7002\n";
-        let off = inv_from(base, "placed-off");
+        let default = inv_from(base, "placed-default");
         let on = inv_from(&format!("{base}placed-tenants on\n"), "placed-on");
+        let off = inv_from(&format!("{base}placed-tenants off\n"), "placed-off");
         for i in 0..3 {
-            assert!(
-                !cp_seat_args(&off, i)
-                    .iter()
-                    .any(|a| a == "--placed-tenants")
-            );
-            assert!(cp_seat_args(&on, i).iter().any(|a| a == "--placed-tenants"));
+            let has =
+                |inv: &Inventory| cp_seat_args(inv, i).iter().any(|a| a == "--placed-tenants");
+            assert!(has(&default) && has(&on));
+            assert!(!has(&off));
         }
     }
 
-    /// ADR-0052 D6: `streams on` reaches every data seat, master and replica
-    /// alike; without it a seat creates no stream.
+    /// ADR-0052 D6: every data seat, master and replica alike, may create a
+    /// stream unless the inventory says `streams off`. On by default from
+    /// the release after the one that introduced streams.
     #[test]
-    fn streams_on_reaches_every_data_seat() {
+    fn streams_reach_every_data_seat_unless_off() {
         let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
                     cp 10.0.0.1:7500\npair 10.0.0.1:7001,10.0.0.2:7002\n";
-        let off = inv_from(base, "streams-off");
+        let default = inv_from(base, "streams-default");
         let on = inv_from(&format!("{base}streams on\n"), "streams-on");
+        let off = inv_from(&format!("{base}streams off\n"), "streams-off");
         for replicated in [true, false] {
-            assert!(
-                !node_tuning_args(&off, replicated)
+            let has = |inv: &Inventory| {
+                node_tuning_args(inv, replicated)
                     .iter()
                     .any(|a| a == "--streams")
-            );
-            assert!(
-                node_tuning_args(&on, replicated)
-                    .iter()
-                    .any(|a| a == "--streams")
-            );
+            };
+            assert!(has(&default) && has(&on));
+            assert!(!has(&off));
         }
     }
 
-    /// ADR-0056 D4: `chunked-strings on` reaches every data seat, master and
-    /// replica alike; without it a seat stores every string inline.
+    /// ADR-0056 D4: every data seat, master and replica alike, stores a long
+    /// string in chunks unless the inventory says `chunked-strings off`. On
+    /// by default from the release after the one that introduced them.
     #[test]
-    fn chunked_strings_on_reaches_every_data_seat() {
+    fn chunked_strings_reach_every_data_seat_unless_off() {
         let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
                     cp 10.0.0.1:7500\npair 10.0.0.1:7001,10.0.0.2:7002\n";
-        let off = inv_from(base, "chunked-off");
+        let default = inv_from(base, "chunked-default");
         let on = inv_from(&format!("{base}chunked-strings on\n"), "chunked-on");
+        let off = inv_from(&format!("{base}chunked-strings off\n"), "chunked-off");
         for replicated in [true, false] {
-            assert!(
-                !node_tuning_args(&off, replicated)
+            let has = |inv: &Inventory| {
+                node_tuning_args(inv, replicated)
                     .iter()
                     .any(|a| a == "--chunked-strings")
-            );
-            assert!(
-                node_tuning_args(&on, replicated)
-                    .iter()
-                    .any(|a| a == "--chunked-strings")
-            );
+            };
+            assert!(has(&default) && has(&on));
+            assert!(!has(&off));
         }
     }
 

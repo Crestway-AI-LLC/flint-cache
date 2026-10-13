@@ -194,3 +194,12 @@ opened by the previous release (20b2a7a) on the same data directory:
 
 **One further change D5 did not list.** `SCAN … TYPE string` compares type
 names rather than type numbers, so it finds chunked strings as well.
+
+## Writing on by default (2026-10-12)
+
+D4's second release. flintctl starts every data seat with
+`--chunked-strings` unless the inventory says `chunked-strings off`.
+v0.1.0-rc.82, the first release to read chunked strings, is the oldest on
+every fleet (the playground, flint-ops-b and flint-ops all rolled to it on
+2026-10-12), which is the condition D4 set. The seat's own default stays
+off, for the reason ADR-0052's streams give.

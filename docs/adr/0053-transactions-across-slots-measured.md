@@ -249,3 +249,12 @@ rule. Measured:
 pair it was created on, and that pair's size and throughput are its limit.
 The verification item "moving a one-pair tenant to another pair, under load"
 waits with it.
+
+## On by default (2026-10-12)
+
+The second release, later than planned. flintctl starts the control plane
+with `--placed-tenants` unless the inventory says `placed-tenants off`.
+Placement has been read since v0.1.0-rc.79, and every fleet runs rc.82, so
+a rollback lands on a release that reads it. The control plane's own default
+stays off, for the reason ADR-0052's streams give: a binary refuses a flag
+it does not know, so the switch lives in what flintctl passes.
