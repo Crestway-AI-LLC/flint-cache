@@ -188,10 +188,15 @@ fn main() {
     let mut initial = Store::new();
     initial.set_index_cap(index_cap);
     initial.set_index_total_cap(total_cap);
-    // ADR-0050 D5: write durable vector rows packed, a third of text's bytes.
-    // Off by default until every binary a fleet may roll back to reads them;
-    // this binary reads both kinds either way.
-    let packed_rows = args.iter().any(|a| a == "--write-packed-rows");
+    // ADR-0050 D5, the write half: durable vector rows are written packed, a
+    // third of text's bytes, which is a third of what the tenant is billed
+    // for them. One release after the read half (`499e5ea`), so the release a
+    // fleet rolls back to reads every row this one writes. `--write-text-rows`
+    // writes what the releases before this one wrote: for a fleet that must
+    // stay readable two releases back, and for the drill that stands in for
+    // the previous release. `--write-packed-rows`, the read half's opt-in, is
+    // still accepted and now changes nothing. This binary reads both either way.
+    let packed_rows = !args.iter().any(|a| a == "--write-text-rows");
     initial.set_packed_rows(packed_rows);
     // ADR-0049 D2: where a quantized set keeps its full vectors. The files are
     // derived like the index, so every one found here is deleted before

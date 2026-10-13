@@ -936,9 +936,10 @@ pub struct Store {
     vec_dir: Option<PathBuf>,
     /// Vector files made, which names the next one.
     vec_files: u64,
-    /// Write durable vector rows packed rather than as text (ADR-0050 D5, the
-    /// binary's `--write-packed-rows`). Off by default until every binary a
-    /// fleet may roll back to reads packed rows.
+    /// Write durable vector rows packed rather than as text (ADR-0050 D5).
+    /// Off for a bare `Store`; the binary turns it on unless started with
+    /// `--write-text-rows`, from the release after the one that first read
+    /// packed rows.
     packed_rows: bool,
     /// How many times each namespace has been dropped ([`Store::drop_namespace`]).
     generations: HashMap<Vec<u8>, u64>,

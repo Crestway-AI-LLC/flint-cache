@@ -25,8 +25,9 @@
 #     reported in the co-processor's FLINTINFO and by flint-exporter
 #   - BUG-0203: the co-processor listens where --bind says, loopback by
 #     default, not on every interface
-#   - ADR-0050 D5: rows a co-processor writes packed (--write-packed-rows)
-#     rebuild in one that writes text, to the same results, META and TTL
+#   - ADR-0050 D5: rows written packed (the default) rebuild in a co-processor
+#     that writes text (--write-text-rows, the previous release), to the same
+#     results, META and TTL
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
@@ -494,9 +495,10 @@ PY
 }
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
 sleep 0.3
-$VEC --port 6678 --vec-dir "$VD" --write-packed-rows 2>"$D/vec5.log" & COPROC_PID=$!
+# No flag: packed is the default from ADR-0050 D5's write half.
+$VEC --port 6678 --vec-dir "$VD" 2>"$D/vec5.log" & COPROC_PID=$!
 fleet_wait_listen 6678
-grep -q "packed rows" "$D/vec5.log" || { echo "FAIL: --write-packed-rows is not in the startup line:"; sed 's/^/    /' "$D/vec5.log"; exit 1; }
+grep -q "packed rows" "$D/vec5.log" || { echo "FAIL: a co-processor started with no flag does not say it writes packed rows:"; sed 's/^/    /' "$D/vec5.log"; exit 1; }
 [ "$(vexec VEC.CREATE pk DIM 3 METRIC l2 INDEX hnsw QUANT bin)" = "OK " ] || { echo "FAIL: VEC.CREATE pk"; exit 1; }
 for kv in "a 0.123,0.456,0.789" "b 0.9,0.1,0.2" "c 0.5,0.5,0.5"; do
   set -- $kv
@@ -506,11 +508,12 @@ done
 [ "$(vexec VEC.SET pk m 0.2,0.2,0.9 META hello PX 600000)" = "OK " ] || { echo "FAIL: VEC.SET pk m"; exit 1; }
 R="$(vexec VEC.SEARCH pk 0.85,0.1,0.2 2)"
 [ "$R" = "$PREQ" ] || { echo "FAIL: the packed set ranks unlike the text one. packed=[$R] text=[$PREQ]"; exit 1; }
-[ "$(rows pk)" = "packed=4 text=0" ] || { echo "FAIL: with --write-packed-rows the rows are $(rows pk)"; exit 1; }
-# Restart WITHOUT the flag: this is the binary that only reads packed rows.
+[ "$(rows pk)" = "packed=4 text=0" ] || { echo "FAIL: by default the rows are $(rows pk)"; exit 1; }
+# Restart with --write-text-rows: the previous release, which reads packed rows
+# and writes text. The binary a fleet rolls back to.
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
 sleep 0.3
-$VEC --port 6678 --vec-dir "$VD" 2>"$D/vec6.log" & COPROC_PID=$!
+$VEC --port 6678 --vec-dir "$VD" --write-text-rows 2>"$D/vec6.log" & COPROC_PID=$!
 fleet_wait_listen 6678
 R="$(vexec VEC.SEARCH pk 0.85,0.1,0.2 2)"
 [ "$R" = "$PREQ" ] || { echo "FAIL: packed rows rebuilt to different results. post=[$R] text=[$PREQ]"; exit 1; }
@@ -521,7 +524,7 @@ TT="$(vexec VEC.TTL pk m)"; case "$TT" in -*|"") echo "FAIL: a packed row's expi
 case "$(vexec VEC.INFO pk)" in *"count 4 expiring 1 "*) : ;; *) echo "FAIL: VEC.INFO pk after the rebuild: $(vexec VEC.INFO pk)"; exit 1 ;; esac
 # This binary writes text, beside the packed rows, in the same set.
 [ "$(vexec VEC.SET pk d 0.1,0.1,0.1)" = "OK " ] || { echo "FAIL: VEC.SET pk d"; exit 1; }
-[ "$(rows pk)" = "packed=4 text=1" ] || { echo "FAIL: without the flag a new row should be text: $(rows pk)"; exit 1; }
+[ "$(rows pk)" = "packed=4 text=1" ] || { echo "FAIL: with --write-text-rows a new row should be text: $(rows pk)"; exit 1; }
 echo "  4 packed rows rebuilt by a text-writing binary: same results, exact GET, META and TTL kept"
 # A row in a format this binary predates (a packed row with a flag it does not
 # know) is left out and SAID to be, not read from the wrong bytes.
