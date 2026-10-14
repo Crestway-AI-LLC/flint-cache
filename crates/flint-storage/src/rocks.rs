@@ -86,15 +86,16 @@ pub struct RocksKv {
     /// is what made BUG-0080 possible; here it genuinely is one.
     bytes_per_seq: std::sync::atomic::AtomicU64,
     /// Deletes archived WAL segments past the retention TTL (BUG-0259), the
-    /// job RocksDB's own TTL pruning did until it deleted fresh ones. `None`
-    /// when there is no TTL, and on a read-only open. Held for its `Drop`,
-    /// which stops the thread; nothing reads it.
+    /// job RocksDB's own TTL pruning did until it deleted fresh ones, and
+    /// then the oldest until the archive fits its size limit (BUG-0261).
+    /// `None` when there is no TTL, and on a read-only open. Held for its
+    /// `Drop`, which stops the thread; nothing reads it.
     #[allow(dead_code)]
     archive_pruner: Option<ArchivePruner>,
 }
 
-/// The thread that ages out `archive/` (BUG-0259). Stopped when its
-/// `RocksKv` is dropped.
+/// The thread that ages out `archive/` (BUG-0259) and caps its size
+/// (BUG-0261). Stopped when its `RocksKv` is dropped.
 struct ArchivePruner {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -112,7 +113,16 @@ impl Drop for ArchivePruner {
 impl ArchivePruner {
     /// Prune `archive` every `min(600, ttl / 2)` seconds, at least every
     /// second: the cadence RocksDB's own TTL pruning had.
-    fn start(archive: std::path::PathBuf, ttl_seconds: u64) -> Self {
+    ///
+    /// BY AGE AND BY SIZE (BUG-0261). While a TTL was set, RocksDB checked
+    /// BOTH its TTL and `WAL_size_limit_MB` at that cadence. With its TTL
+    /// off (BUG-0259) it checks the size limit only every 600 s, so a short
+    /// TTL no longer meant a promptly capped archive: `--wal-ttl-seconds 2
+    /// --wal-size-limit-mb 16` grew the archive 25 MB a round to 276 MB in
+    /// snapshot_pressure, and the public gate failed from BUG-0259 on. The
+    /// limit is enforced here at the TTL's cadence again, oldest segment
+    /// first, as RocksDB did. RocksDB keeps its own 600 s check as a backstop.
+    fn start(archive: std::path::PathBuf, ttl_seconds: u64, size_limit_mb: u64) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = std::sync::Arc::clone(&stop);
         let every = std::time::Duration::from_secs((ttl_seconds / 2).clamp(1, 600));
@@ -127,6 +137,9 @@ impl ArchivePruner {
                     if waited >= every {
                         waited = std::time::Duration::ZERO;
                         prune_archive_by_age(&archive, ttl_seconds, std::time::SystemTime::now());
+                        if size_limit_mb > 0 {
+                            prune_archive_to_size(&archive, size_limit_mb);
+                        }
                     }
                 }
             })
@@ -154,11 +167,7 @@ pub fn prune_archive_by_age(archive: &Path, ttl_seconds: u64, now: std::time::Sy
     let mut pruned = 0;
     for e in entries.flatten() {
         let name = e.file_name();
-        let name = name.to_string_lossy();
-        let is_wal = name
-            .strip_suffix(".log")
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-        if !is_wal {
+        if wal_number(&name.to_string_lossy()).is_none() {
             continue;
         }
         let Ok(mtime) = e.metadata().and_then(|m| m.modified()) else {
@@ -167,6 +176,71 @@ pub fn prune_archive_by_age(archive: &Path, ttl_seconds: u64, now: std::time::Sy
         let age = now.duration_since(mtime).unwrap_or_default().as_secs();
         if age > ttl_seconds && std::fs::remove_file(e.path()).is_ok() {
             pruned += 1;
+        }
+    }
+    pruned
+}
+
+/// The number of a RocksDB WAL segment named `<digits>.log`, or `None` for
+/// anything else. One definition for both passes, so the age pass and the
+/// size pass agree on what a segment is (`parse` alone would also take
+/// `+5.log`).
+fn wal_number(name: &str) -> Option<u64> {
+    let digits = name.strip_suffix(".log")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The archived WAL segments in `archive`, oldest first: RocksDB numbers its
+/// log files in creation order, so the name is the age.
+fn archived_wals(archive: &Path) -> Vec<(u64, std::path::PathBuf, u64)> {
+    let Ok(entries) = std::fs::read_dir(archive) else {
+        return Vec::new();
+    };
+    let mut wals: Vec<(u64, std::path::PathBuf, u64)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let num = wal_number(name.to_str()?)?;
+            let len = e.metadata().ok()?.len();
+            Some((num, e.path(), len))
+        })
+        .collect();
+    wals.sort_by_key(|w| w.0);
+    wals
+}
+
+/// Delete the oldest archived WAL segments until `archive` holds at most
+/// `limit_mb` megabytes; returns how many went (BUG-0261). The rule
+/// RocksDB's `WAL_size_limit_MB` applies, enforced at the pruner's cadence
+/// rather than RocksDB's 600 s.
+pub fn prune_archive_to_size(archive: &Path, limit_mb: u64) -> usize {
+    prune_listed_to_size(archived_wals(archive), limit_mb)
+}
+
+/// The size pass over a listing already taken. Separate so a test can hand
+/// it a listing that has gone stale, which is the race with RocksDB's pass.
+fn prune_listed_to_size(wals: Vec<(u64, std::path::PathBuf, u64)>, limit_mb: u64) -> usize {
+    let limit = limit_mb.saturating_mul(1024 * 1024);
+    let mut total: u64 = wals.iter().map(|w| w.2).sum();
+    let mut pruned = 0;
+    for (_, path, len) in wals {
+        if total <= limit {
+            break;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                total = total.saturating_sub(len);
+                pruned += 1;
+            }
+            // RocksDB's own 600 s pass got there first: gone either way, so
+            // it no longer counts against the limit.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                total = total.saturating_sub(len);
+            }
+            Err(_) => {}
         }
     }
     pruned
@@ -606,10 +680,14 @@ impl RocksKv {
     ///
     /// Both terms are fixed at open: a segment is deleted when it is older
     /// than the TTL **or** the archive exceeds the size limit, whichever
-    /// happens first, and neither consults a replica. RocksDB applies the
-    /// size limit; the TTL is applied by `ArchivePruner`, because RocksDB's
-    /// own TTL pass deleted freshly archived segments (BUG-0259). That is the reason the shedding in ADR-0022 exists
-    /// rather than a cleverer retention rule.
+    /// happens first, and neither consults a replica. That is the reason the
+    /// shedding in ADR-0022 exists rather than a cleverer retention rule.
+    ///
+    /// `ArchivePruner` applies both, every `min(600, ttl / 2)` seconds: the
+    /// TTL because RocksDB's own TTL pass deleted freshly archived segments
+    /// (BUG-0259), and the size limit because with its TTL off RocksDB checks
+    /// the size limit only every 600 s (BUG-0261). RocksDB's 600 s size check
+    /// stays as a backstop.
     pub fn open_with_retention(
         path: &Path,
         wal_ttl_seconds: u64,
@@ -628,7 +706,9 @@ impl RocksKv {
         // RocksDB is given the size limit and NOT the TTL (BUG-0259): its TTL
         // pruning deleted a freshly archived segment whenever the file's
         // mtime ran a second ahead of `time()`. The TTL is applied by
-        // `ArchivePruner` instead, to the same files, at the same cadence.
+        // `ArchivePruner` instead, to the same files, at the same cadence,
+        // and the size limit at that cadence too (BUG-0261). RocksDB's own
+        // size check, every 600 s once its TTL is off, is the backstop.
         opts.set_wal_ttl_seconds(0);
         opts.set_wal_size_limit_mb(archive_size_limit_mb(wal_ttl_seconds, wal_size_limit_mb));
         // The info LOG is bounded here too: its dominant writer is the archive
@@ -793,8 +873,9 @@ impl RocksKv {
         opts.set_memtable_prefix_bloom_ratio(0.02);
         opts.set_memtable_whole_key_filtering(true);
         let db = DB::open(&opts, path)?;
-        let archive_pruner = (wal_ttl_seconds > 0)
-            .then(|| ArchivePruner::start(path.join("archive"), wal_ttl_seconds));
+        let archive_pruner = (wal_ttl_seconds > 0).then(|| {
+            ArchivePruner::start(path.join("archive"), wal_ttl_seconds, wal_size_limit_mb)
+        });
         Ok(Self {
             db,
             path: path.to_path_buf(),
@@ -2367,7 +2448,10 @@ mod reverse_scan {
 mod archive_ttl_tests {
     //! BUG-0259: RocksDB's WAL TTL pruning deleted a freshly archived segment
     //! whose mtime ran a second ahead of `time()`; Flint prunes by age itself.
-    use super::{RocksKv, archive_size_limit_mb, prune_archive_by_age};
+    use super::{
+        RocksKv, archive_size_limit_mb, archived_wals, prune_archive_by_age, prune_archive_to_size,
+        prune_listed_to_size, wal_number,
+    };
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
@@ -2419,6 +2503,72 @@ mod archive_ttl_tests {
         assert_eq!(left, ["000011.log", "000012.log", "LOG.old.1"]);
         assert_eq!(prune_archive_by_age(&d.join("missing"), 3_600, now), 0);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BUG-0261: the size limit is enforced oldest first, and stops as soon
+    /// as the archive fits. A file that is not a numbered WAL is never
+    /// counted or touched.
+    #[test]
+    fn size_pruning_deletes_the_oldest_until_the_archive_fits() {
+        let d = dir("prune-size");
+        let mb = 1024 * 1024;
+        for (name, len) in [("000020.log", 3), ("000021.log", 3), ("000022.log", 3)] {
+            std::fs::write(d.join(name), vec![0u8; len * mb]).expect("write");
+        }
+        std::fs::write(d.join("LOG"), vec![0u8; 5 * mb]).expect("write");
+        // 9 MB of WAL against a 5 MB limit: the two oldest go, the newest stays.
+        assert_eq!(prune_archive_to_size(&d, 5), 2);
+        assert_eq!(wals(&d), ["000022.log"]);
+        assert!(
+            d.join("LOG").exists(),
+            "a file that is not a WAL segment was touched"
+        );
+        // Already within the limit: nothing more goes.
+        assert_eq!(prune_archive_to_size(&d, 5), 0);
+        // Numeric, not lexical, order: 9 is older than 10.
+        std::fs::write(d.join("9.log"), vec![0u8; 3 * mb]).expect("write");
+        std::fs::write(d.join("10.log"), vec![0u8; 3 * mb]).expect("write");
+        assert_eq!(prune_archive_to_size(&d, 6), 1);
+        assert!(!d.join("9.log").exists() && d.join("10.log").exists());
+        assert_eq!(prune_archive_to_size(&d.join("missing"), 1), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A segment that vanished between the listing and the delete (RocksDB's
+    /// own pass took it) counts as gone, so nothing extra is deleted for it.
+    #[test]
+    fn a_segment_already_gone_still_counts_as_freed() {
+        let d = dir("prune-gone");
+        let mb = 1024 * 1024;
+        for name in ["000030.log", "000031.log", "000032.log"] {
+            std::fs::write(d.join(name), vec![0u8; 2 * mb]).expect("write");
+        }
+        let listing = archived_wals(&d);
+        assert_eq!(listing.len(), 3);
+        // The oldest goes behind the pruner's back after it listed: 6 MB was
+        // listed, 4 MB is really there, and the limit is 4 MB.
+        std::fs::remove_file(d.join("000030.log")).expect("rm");
+        assert_eq!(prune_listed_to_size(listing, 4), 0);
+        assert_eq!(wals(&d), ["000031.log", "000032.log"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Both passes read a segment's name the same way (BUG-0261 review).
+    #[test]
+    fn a_wal_segment_is_digits_then_dot_log() {
+        assert_eq!(wal_number("000012.log"), Some(12));
+        assert_eq!(wal_number("9.log"), Some(9));
+        for not_wal in [
+            "+5.log",
+            ".log",
+            "LOG",
+            "LOG.old.1",
+            "12.log.tmp",
+            "-3.log",
+            "1a.log",
+        ] {
+            assert_eq!(wal_number(not_wal), None, "{not_wal} read as a WAL segment");
+        }
     }
 
     #[test]

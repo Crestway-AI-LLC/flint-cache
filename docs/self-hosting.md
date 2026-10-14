@@ -988,12 +988,16 @@ can resume without a full re-sync. Its budget is derived from the volume —
 **a quarter of it, floored at 1 GiB and capped at 256 GiB** — and reported as
 `wal_archive_mb` in `FLINTINFO`.
 
-**That budget is enforced on a timer, not continuously.** RocksDB checks the
-size budget at most once every ten minutes. Segments older than
-`wal-ttl-seconds` are removed by Flint itself, every `min(600s,
-wal-ttl-seconds / 2)`, which is also ten minutes at the shipped 12 h TTL. Flint
-took that job from RocksDB because RocksDB's version deleted fresh segments
-(BUG-0259). Between passes nothing is deleted, so the archive on disk reaches:
+**That budget is enforced on a timer, not continuously.** Flint removes
+segments older than `wal-ttl-seconds`, then the oldest segments until the
+archive fits the size budget, every `min(600s, wal-ttl-seconds / 2)`. That is
+ten minutes at the shipped 12 h TTL. Flint took both jobs from RocksDB:
+RocksDB's TTL pass deleted fresh segments (BUG-0259), and with its TTL off
+RocksDB checks the size budget only every ten minutes whatever the TTL
+(BUG-0261). RocksDB's own ten-minute size check stays as a backstop. With
+`wal-ttl-seconds 0` Flint runs no pruner at all, and RocksDB alone applies the
+budget, every ten minutes. Between passes nothing is deleted, so the archive
+on disk reaches:
 
     peak archive  =  budget  +  600s x peak WAL write rate
 

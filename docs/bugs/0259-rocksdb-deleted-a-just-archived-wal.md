@@ -73,6 +73,11 @@ otherwise the archive simply had a hole.
   of the clock has age 0. It stops when its `RocksKv` is dropped.
 - **Unchanged:** the 12 h TTL, the size budget, and how often each applies
   at the shipped settings. self-hosting.md 3b says who applies which.
+- **Not unchanged at a short TTL (BUG-0261, 2026-10-14).** With RocksDB's TTL
+  off, its size check runs every 600 s whatever the TTL, so at a short TTL
+  the size limit went unenforced for up to 600 s, and public CI's
+  `snapshot_pressure` failed from this commit on. The pruner now applies the
+  size limit at its own cadence too.
 
 ## Verification
 
