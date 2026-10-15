@@ -524,6 +524,12 @@ same mistake the stall counters had before they were moved inside the leg. The
 shed counters are cumulative and unaffected, but the lag column is currently
 worthless and should be sampled during the load.
 
+> **FIXED, checked 2026-10-15.** `packaging/aws/writepath-cap/run.sh` in the
+> ops repo now reads `lag_ms` inside the leg — eight samples twelve seconds
+> apart, keeping the peak, reported as the `peak lag_ms` column — and its
+> comment names this fault. No re-run is needed to get the instrument; the
+> arm that uses it is what remains.
+
 ### LAG ARM 2026-09-03 — the cap reports the limit, it does not impose it
 
 `lag-hard-ms` walked 1000 → 8000 → 250 → 1000, order-balanced, soft held at
