@@ -19,6 +19,13 @@
 # state. It read that as the row's claim and reported a contradiction that was
 # not there, on its first run. The fixture for it is a regression test for the
 # check, not for the repo.
+# INDUCED-FAILURE CONTROLS, which is most of what this drill is. Every
+# contradiction below is constructed on purpose and the check must NAME it;
+# every agreeing shape is constructed on purpose and the check must stay
+# SILENT; and the index is deliberately removed to prove a check that cannot
+# read its input fails rather than reporting nothing wrong. A check whose
+# controls are only agreeing cases cannot tell "nothing is wrong" from
+# "nothing was examined".
 set -uo pipefail
 cd "$(dirname "$0")/.."
 fail() { echo "ADR STATE MARKERS DRILL FAILED: $*"; exit 1; }
