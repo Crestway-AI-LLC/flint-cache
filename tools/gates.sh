@@ -227,7 +227,7 @@ CORE="${FLINT_CORE_ORDER:-kill_order bind_dial_sites seat_names restart repl kil
       build_stamp config_drift tenant_status proxy_conformance edge_roll
       cpha_roll admin_gated_proxy edge_ca_trust chaos_edge_tls
       cert_rotate control_tls controller_ha controller_managed controller_slow_master controller_stall
-      controller_multipair controlplane cp_growth cp_publish failover_bystander failover_churn handover_hold gates bug_state_markers port_allocator internal_mtls json lease lease_after_repoint cp_restart_tenant_flags
+      controller_multipair controlplane cp_growth cp_publish failover_bystander failover_churn handover_hold gates bug_state_markers adr_state_markers port_allocator internal_mtls json lease lease_after_repoint cp_restart_tenant_flags
       fanout_timeout loaded_promote loading_visible m3_exit migrate_slots min_replicas node_tls proxy_backpressure
       proxy_cache proxy_tls read_under_stall replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
@@ -3322,6 +3322,116 @@ DOCINV
 ($2 of $1 inventory blocks place a seat off this machine)"
 }
 
+assert_adr_index_markers_agree_with_status() {
+  # AN ADR'S STATE HAS THE SAME TWO COPIES A BUG'S DOES, and until 2026-10-15
+  # nothing held them against each other. Three had drifted (BUG-0262): 0020
+  # and 0021 said PROPOSED while `apool.rs` described what each had *removed*,
+  # and 0027 said `proposed` while ITS OWN ROW here said `implemented`. A
+  # session surveying unbuilt core work was about to report all three to Jeff
+  # as designs awaiting his decision -- the same cost `gates.sh` already
+  # records for BUG-0014 and BUG-0050, read off the bug index.
+  #
+  # ONLY THE ROW-VS-FILE CONTRADICTION, in the two unambiguous directions.
+  # That catches 0027's shape and NOT 0020/0021's, where both copies agreed
+  # and both were wrong. What found those was the PAST TENSE IN THE CODE
+  # ("ADR-0020 removed"), whose vocabulary is open-ended; BUG-0262 leaves it
+  # as a design question rather than a grep, so it is not here.
+  #
+  # NO THIRD RULE FOR AN ABSENT MARKER, and the reason is measured rather than
+  # assumed: 8 of 35 rows carry a state parenthetical, so requiring one would
+  # fire on 27. An unmarked BUG row reads as OPEN because everything scanning
+  # that index classifies by substring; an unmarked ADR row reads as "see the
+  # file", which is honest. The bug check's third rule does not transfer.
+  local out
+  out=$(python3 - <<'AIMPY'
+import glob, re, sys
+
+# REOPENED is in neither list on purpose: it is a real state that contradicts
+# neither, so a row carrying it stays silent rather than being forced.
+PROPOSED = ("PROPOSED",)
+SETTLED = ("ACCEPTED", "DECIDED", "IMPLEMENTED", "BUILT", "DONE",
+           "SUPERSEDED", "REJECTED", "WITHDRAWN")
+
+
+def classify(word):
+    w = word.upper().rstrip(";,.:")
+    if any(w.startswith(p) for p in PROPOSED):
+        return "proposed"
+    if any(w.startswith(c) for c in SETTLED):
+        return "settled"
+    return None
+
+
+def state_marker(text):
+    # THE MARKER IS THE TRAILING PARENTHETICAL, the one closing the cell.
+    # "Last state parenthetical anywhere in the row" was the first rule here
+    # and it produced a FALSE POSITIVE on its first run: ADR-0029's cell says
+    # "**ACCEPTED 2026-09-06** (proposed the same day)", prose about an earlier
+    # state, and the rule read it as the row's claim. That is the trap the bug
+    # index check documents -- a correct marker masked by history further
+    # right -- which it solves by preferring the title cell. This index has
+    # two columns and no separate title cell, so that fix does not transfer.
+    #
+    # Measured instead: all eleven rows carrying a state word end with it,
+    # immediately before the closing pipe. A parenthetical anywhere else is
+    # prose, so it is not read.
+    m = re.search(r"\(([^()]*)\)\s*\|\s*$", text)
+    if not m:
+        return None
+    w = m.group(1).split()
+    return w[0] if w and classify(w[0]) else None
+
+
+try:
+    idx = open("docs/adr/README.md", encoding="utf-8", errors="replace").read()
+except OSError:
+    print("NOINDEX")
+    sys.exit(0)
+
+bad = []
+rows = 0
+compared = 0
+for line in idx.split("\n"):
+    m = re.match(r"\|\s*\[(\d{4})\]", line)
+    if not m:
+        continue
+    rows += 1
+    num = m.group(1)
+    marker = state_marker(line)
+    if not marker:
+        continue
+    files = glob.glob("docs/adr/%s-*.md" % num)
+    if not files:
+        bad.append("%s: an index row with no write-up" % num)
+        continue
+    body = open(files[0], encoding="utf-8", errors="replace").read()
+    sm = re.search(r"^\**Status:?\**[: ]*\**\s*([A-Za-z]+)", body, re.M)
+    if not sm:
+        continue
+    row_state, file_state = classify(marker), classify(sm.group(1))
+    if not row_state or not file_state:
+        continue
+    compared += 1
+    if row_state != file_state:
+        bad.append("%s: row says %r (%s) and its Status says %r (%s)"
+                   % (num, marker, row_state, sm.group(1), file_state))
+
+if bad:
+    print("DISAGREE")
+    for b in bad:
+        print("  " + b)
+else:
+    print("OK %d rows, %d with a state marker held against the file" % (rows, compared))
+AIMPY
+)
+  case "$out" in
+    NOINDEX*) fail "docs/adr/README.md is unreadable -- a check that cannot read its input has not run" ;;
+    DISAGREE*) echo "$out"; fail "an ADR index row contradicts its own Status line (BUG-0262)" ;;
+    OK*) echo "  every ADR index marker agrees with its write-up's Status line (${out#OK })" ;;
+    *) fail "the ADR marker check printed something unrecognised: $out" ;;
+  esac
+}
+
 assert_msrv_is_stated_once() {
   local out
   out=$(python3 - <<'MSRVPY'
@@ -4036,6 +4146,7 @@ document_assertions() {
   assert_bug_index_agrees
   assert_bug_titles_agree_with_status
   assert_bug_index_markers_agree_with_status
+  assert_adr_index_markers_agree_with_status
   assert_msrv_is_stated_once
   assert_doc_inventories_are_runnable
   assert_no_port_overlap

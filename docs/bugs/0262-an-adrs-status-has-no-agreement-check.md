@@ -1,8 +1,12 @@
 # BUG-0262: an ADR's status has no agreement check, and three said PROPOSED over shipped code
 
-**Status:** **OPEN.** The three stale statuses were corrected 2026-10-15; the
-check that would have caught them does not exist, and that is the defect. A
-row marked FIXED here would be the same drift this bug is about.
+**Status:** **FIXED 2026-10-15.** `assert_adr_index_markers_agree_with_status`
+holds every index row's trailing state marker against its write-up's Status
+line, with fixtures in `tools/adr_state_markers_drill.sh`, wired into
+`document_assertions` and the drill list. **It found a fourth on its first
+run:** ADR-0014's row said `(proposed)` over "Accepted and implemented in
+full — D1, D2, D3". The past-tense-in-code heuristic below is *not* outstanding
+work — it was never proposed, for the reason given.
 **Severity:** low in production, real in planning — it mis-routes work.
 **Area:** `docs/adr/*.md`, `docs/adr/README.md`, `tools/gates.sh`.
 

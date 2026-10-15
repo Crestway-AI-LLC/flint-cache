@@ -12,7 +12,7 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0011](0011-backup-and-restore.md) | Backup and restore: per-pair checkpoints to object storage, restore only into a fresh cluster |
 | [0012](0012-same-slot-transactions.md) | Same-slot MULTI / EXEC / WATCH: ship the three guarantees Flint can honestly give, document the fourth's absence |
 | [0013](0013-user-driven-gc-primitives.md) | User-driven GC primitives: no eviction, but a loop the operator can close |
-| [0014](0014-introspection-status-surface.md) | One status surface: a build stamp on every seat, `status --json` with drift detection, `CPMYSTATUS` for tenants (proposed) |
+| [0014](0014-introspection-status-surface.md) | One status surface: a build stamp on every seat, `status --json` with drift detection, `CPMYSTATUS` for tenants (accepted and implemented in full: D1, D2, D3) |
 | [0016](0016-bloom-filter-type.md) | Bloom filters as a native type: RedisBloom's `BF.*` protocol over a blocked filter, one row per block |
 | [0018](0018-cp-held-leases.md) | The write lease is held at the control plane, not the controller |
 | [0019](0019-rewind-rejoin-promotion-fences.md) | Rewind rejoin: promotion fences make failover RTO independent of dataset size |
