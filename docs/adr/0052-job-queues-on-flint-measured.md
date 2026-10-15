@@ -669,3 +669,50 @@ flint-server refuses a flag it does not know, so an opt-out flag would stop
 an older release's seat that a newer flintctl starts in a rollback.
 v0.1.0-rc.82, the first release to read streams, is the oldest on every
 fleet, so the release carrying this rolls back onto one that reads them.
+
+### Sharded pub/sub and keyspace notifications, measured (2026-10-15)
+
+`command-support.md` lists both as not served. Measured here the way ADR-0058
+measured `CONFIG`: by searching the libraries installed for
+`client_compat_drill`, not by guessing.
+
+**Keyspace notifications** (`notify-keyspace-events`, `__keyspace@…__`,
+`__keyevent@…__`): **zero references** in any installed client — redis-py,
+rq, Celery, kombu, limits, `@redis/client` 6.3.0, ioredis 6.0.0, BullMQ
+6.3.9, Ruby. The one named case stays the one ADR-0058 named: Spring
+Session's expiry events, which is not installed and would be a download.
+
+**Sharded pub/sub** is implemented by **two independent Node clients** —
+`@redis/client` 6.3.0 (20 files) and ioredis 6.0.0 (12 files) — and by no
+installed Python or Ruby client. **But it is strictly opt-in in both, so no
+user reaches it without asking:**
+
+- node-redis exposes `sSubscribe` / `sPublish`. Its one internal call sits in
+  `resubscribeAllPubSubListeners` under `if (allListeners.SHARDED)` — it
+  re-subscribes listeners the caller had already created, after a reconnect.
+- ioredis routes on `command.name == "ssubscribe"` in `cluster/index.js`,
+  which is dispatch for a command the caller issued.
+- **BullMQ, which depends on ioredis, references it zero times.** No
+  framework here pulls it in.
+
+**What it would cost is less than the refusal suggests.** D5 already hashes a
+channel to a pair and has the proxy subscribe at that pair's master, so the
+rendezvous sharded pub/sub needs is built. What is missing is the
+client-visible surface and the redirect contract: node-redis's `SSUBSCRIBE`
+retries on a reply beginning `MOVED` and calls `rediscover`, so a wrong-slot
+subscribe must answer `MOVED` rather than the current refusal naming
+`SUBSCRIBE`. Add `PUBSUB SHARDCHANNELS` / `SHARDNUMSUB` per shard, which
+answer empty today. The semantics are a narrowing of what D5 does, not a new
+mechanism.
+
+**Decision: both stay absent**, on ADR-0058's option-A rule and Jeff's calls
+on `CLIENT TRACKING` and `GEOSEARCH … BYPOLYGON` — documented precisely,
+built when a tenant or a measured client needs it.
+
+**What would change it:** a tenant on cluster-mode node-redis or ioredis that
+calls `sSubscribe`, or Spring Session, which needs keyspace notifications and
+is the named case for them either way.
+
+**Not measured:** no tool was run under `MONITOR`, as ADR-0058 did for
+`CONFIG`. This is a source search of installed libraries only, so a client
+that sends either without naming it in its own source would be missed.

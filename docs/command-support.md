@@ -974,14 +974,20 @@ Not served:
 
 - **Sharded pub/sub.** `SSUBSCRIBE`, `SUNSUBSCRIBE` and `SPUBLISH` are
   refused with an error naming `SUBSCRIBE` and `PUBLISH`, and
-  `PUBSUB SHARDCHANNELS` and `SHARDNUMSUB` answer none.
+  `PUBSUB SHARDCHANNELS` and `SHARDNUMSUB` answer none. Measured 2026-10-15
+  (ADR-0052): `@redis/client` 6.3.0 and ioredis 6.0.0 both implement it, both
+  only when the caller asks for it, and BullMQ — which depends on ioredis —
+  does not use it at all. Ordinary `PUBLISH`/`SUBSCRIBE` serve every client
+  measured here.
 - **A subscription command inside `MULTI`.** It is refused, and the
   transaction is discarded. Valkey queues it and answers its confirmation in
   the `EXEC` reply.
 - **Subscribing at a seat.** A seat refuses `SUBSCRIBE` and names the proxy.
 - **Keyspace notifications** (`notify-keyspace-events`). Nothing is
   published on `__keyspace@…__` or `__keyevent@…__`, so a pattern on them
-  hears nothing.
+  hears nothing. Measured 2026-10-15 (ADR-0052): no installed client
+  references them. Spring Session's expiry events are the named case, and
+  need them.
 
 Measured by `tools/pubsub_drill.sh` (two pairs, two proxies, a seat
 restart, a slow client) and by `tools/client_compat_drill.sh`, which runs
