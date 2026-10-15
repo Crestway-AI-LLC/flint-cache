@@ -1,6 +1,11 @@
 # ADR-0027 — Shared-mode stripe locks for pure writes, so a pipeline can commit as one batch
 
-**Status:** proposed
+**Status:** **IMPLEMENTED, part 2.** Corrected 2026-10-15: this said
+`proposed` while `docs/adr/README.md`'s own row already said implemented — the
+two copies of the state contradicted each other. `crates/flint-server/src/main.rs`
+carries "ADR-0027 part 2: a run of consecutive pure writes accumulates here"
+(:4302) and "armed at 128 threads before ADR-0027" (:4119). Landed in
+`0f7a49e4` and `b210961b`. Part 1 was not verified here.
 **Date:** 2026-08-31
 **Relates to:** [ADR-0005 D4](0005) (async write queue), [ADR-0012 D6](0012-same-slot-transactions.md) (no serial isolation for readers), BUG-0078 (the edge caps ingest)
 

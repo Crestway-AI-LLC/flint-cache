@@ -1,6 +1,12 @@
 # ADR-0021: Give the proxy bounded worker threads and async IO
 
-Status: PROPOSED — August 2026. Written after ADR-0020's pooled backend
+Status: **IMPLEMENTED, stages 1 and 2.** Corrected 2026-10-15: this line read
+PROPOSED while `apool.rs` had assumed "ADR-0021's model: a bounded set of
+workers" since August. What landed: `eabf2639` (give the proxy bounded worker
+threads and async IO), `36412e2e` (stage 2 — `crate::pool` removed),
+`8cf94e74` (per-backend command counters). Stages beyond 2 were not checked.
+
+Originally: PROPOSED — August 2026. Written after ADR-0020's pooled backend
 multiplexing was measured on a fleet and found to collapse under
 concurrency. This ADR changes the concurrency model that made the collapse
 structural.

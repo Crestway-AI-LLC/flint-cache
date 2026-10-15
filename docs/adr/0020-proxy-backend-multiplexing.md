@@ -1,6 +1,16 @@
 # ADR-0020: Multiplex the proxy's backend hop — decouple send from receive so a pipeline survives it
 
-Status: PROPOSED — August 2026. Written after a measured failure: the obvious
+Status: **IMPLEMENTED.** Corrected 2026-10-15: this line read PROPOSED while
+the code had referred to the ADR in the past tense since August —
+`crates/flint-proxy/src/apool.rs` describes "the socket explosion ADR-0020
+removed" and "the batching ADR-0020 wanted". What landed: `2a7e6ac5` (bound
+in-flight per backend connection), `adcc69dc` (stage a client's whole pipeline
+before collecting any reply), `5b3799de` (merge: full-duplex proxy backend
+pool, ADR-0020, **second** implementation). The first attempt is the revert
+named below; the second is what shipped. Not verified here: whether every
+decision in the body landed, only that the ADR is built and not proposed.
+
+Originally: PROPOSED — August 2026. Written after a measured failure: the obvious
 fix was built, benchmarked, and reverted (`1decd25`, reverted in `1c45e72`),
 and the reason it failed is the thing this ADR changes.
 
