@@ -52,6 +52,15 @@ back-pressure arrived as delay, not as a signal a client could act on.
 
 ## Decision
 
+> **DEMOTED by this ADR's own amendments — read them before building this.**
+> The 2026-09-02 soak measured `writes_shed_headroom` at **0** against
+> `writes_shed_lag` 134,091, so the gate below did nothing in the only
+> overload yet measured, and the amendment demoted it to a backstop "for
+> where replica lag binds". The 2026-09-03 LAG ARM then found the lag cap
+> "reports the limit, it does not impose it". What is open is the soft band's
+> control law and `lag_ms` sampling, not this gate. The paragraph below is the
+> 2026-08-30 decision, kept as the record of what was decided then.
+
 Add an admission gate on the master keyed on its **own proximity to a write
 stall**, shedding with the existing retryable `-THROTTLED` before RocksDB's
 internal delay engages. Signals are already exported in `FLINTINFO`:
