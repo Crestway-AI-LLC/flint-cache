@@ -4212,6 +4212,32 @@ fn proxy_up(inv: &Inventory, i: usize) -> bool {
     // let the BIND address reach the liveness check in the first place.
     let proxy = &proxy_dial(inv, i);
     let tls = edge_tls_client(inv);
+    // ASK AS THE OPERATOR WHEN THE TOKEN IS KNOWN (BUG-0264). The -NOAUTH
+    // below proves the proxy is up, but the proxy counts it as a refused
+    // operator command: `flint_proxy_admin_denied_total`, errors{NOAUTH} and
+    // the throttled "operator command REFUSED" line, all of which exist to
+    // show someone probing the operator surface of a public port (ops
+    // OPS-0163). `status`, `verify` and `start` (the supervisor's, every
+    // minute) each refused once per proxy: 2,641 a day on the playground on
+    // 2026-10-15, the whole of both counters, so a real probe was invisible.
+    // Presented the way `proxystats_field` already does. A WRONGPASS means
+    // the proxy holds an older digest than the CP (a rotation in flight), so
+    // it falls through to the pre-auth probe, which still proves it serving.
+    // Any other answer is the same verdict the pre-auth probe would reach:
+    // LOADING (BUG-0211) or no reply is not up.
+    if let Some(tok) = liveness_admin_token(inv) {
+        match call_seq_on(
+            proxy,
+            &tls,
+            &[&["AUTH", tok.as_str()], &["PROXYSTATS"]],
+            Duration::from_millis(1500),
+            inv.client_tls,
+        ) {
+            Ok(Value::Bulk(_)) => return true,
+            Err(e) if is_wrongpass_error(&e.to_string()) => {}
+            _ => return false,
+        }
+    }
     match call_seq_on(
         proxy,
         &tls,
@@ -4265,6 +4291,44 @@ fn is_noauth_error(msg: &str) -> bool {
     msg.trim_start_matches('-')
         .trim_start()
         .starts_with("NOAUTH")
+}
+
+/// Does this transport error carry a RESP `-WRONGPASS` reply? The proxy's
+/// answer to an admin token it holds no digest for (BUG-0264).
+fn is_wrongpass_error(msg: &str) -> bool {
+    msg.trim_start_matches('-')
+        .trim_start()
+        .starts_with("WRONGPASS")
+}
+
+/// The token [`proxy_up`] presents, looked up at most ONCE per process and
+/// fleet, failures included (BUG-0264).
+///
+/// [`admin_token`] does not memoise a failure, on purpose: `upgrade` must
+/// re-ask after it restarts the CP. A liveness check is the wrong place to
+/// pay that. `start` polls `proxy_up` every 150 ms against a 10 s deadline,
+/// and on a Raft CP that is down a failed lookup spends its whole rotation
+/// budget (about 8 s), so re-asking per poll would turn "the CP is down" into
+/// "the proxy never came up". Nothing here depends on the token: without one
+/// the pre-auth probe answers exactly as it did before, at the cost of one
+/// counted refusal. So a failure is remembered as "no token" for the rest of
+/// the process. Keyed on the CP addresses, like `admin_token`, so unit tests
+/// sharing a process do not hand each other's fleets an answer.
+fn liveness_admin_token(inv: &Inventory) -> Option<String> {
+    type Memo = std::collections::HashMap<String, Option<String>>;
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Memo>> = std::sync::OnceLock::new();
+    let key = cp_dial_all(inv);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Ok(m) = memo.lock()
+        && let Some(hit) = m.get(&key)
+    {
+        return hit.clone();
+    }
+    let got = admin_token(inv).ok().flatten();
+    if let Ok(mut m) = memo.lock() {
+        m.insert(key, got.clone());
+    }
+    got
 }
 
 fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
@@ -10716,6 +10780,183 @@ mod proxy_liveness_tests {
         assert!(!is_noauth_error("timed out"));
         assert!(!is_noauth_error("WRONGPASS invalid token"));
         assert!(!is_noauth_error(""));
+    }
+
+    // ---- BUG-0264: the liveness check is not a refused operator command ----
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A proxy with the admin gate engaged, as the real one answers it:
+    /// PROXYSTATS needs `AUTH <token>` first, a pre-auth PROXYSTATS is
+    /// refused with the live proxy's exact -NOAUTH and COUNTED (the
+    /// `admin_denied` counter this bug is about), and a token it holds no
+    /// digest for gets -WRONGPASS. `loading` answers LOADING to everything,
+    /// as a proxy with no control-plane snapshot does (BUG-0211).
+    fn gated_proxy(token: &'static str, loading: bool) -> (String, Arc<AtomicUsize>) {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = l.local_addr().expect("addr").to_string();
+        let refused = Arc::new(AtomicUsize::new(0));
+        let counter = refused.clone();
+        std::thread::spawn(move || {
+            for conn in l.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    let (mut authed, mut buf, mut chunk) = (false, Vec::new(), [0u8; 4096]);
+                    loop {
+                        match decode(&buf) {
+                            Ok(Decoded::Complete(v, used)) => {
+                                buf.drain(..used);
+                                let args: Vec<String> = match v {
+                                    Value::Array(Some(items)) => items
+                                        .into_iter()
+                                        .filter_map(|i| match i {
+                                            Value::Bulk(Some(b)) => {
+                                                Some(String::from_utf8_lossy(&b).into_owned())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect(),
+                                    _ => Vec::new(),
+                                };
+                                let cmd = args.first().map(|a| a.to_ascii_uppercase());
+                                let reply = if loading {
+                                    "-LOADING no control-plane snapshot yet\r\n".to_string()
+                                } else if cmd.as_deref() == Some("AUTH") {
+                                    if args.get(1).map(String::as_str) == Some(token) {
+                                        authed = true;
+                                        "+OK\r\n".to_string()
+                                    } else {
+                                        "-WRONGPASS invalid token\r\n".to_string()
+                                    }
+                                } else if cmd.as_deref() == Some("PROXYSTATS") && authed {
+                                    "$10\r\nbuild:test\r\n".to_string()
+                                } else {
+                                    counter.fetch_add(1, Ordering::SeqCst);
+                                    "-NOAUTH admin token required for this command\r\n".to_string()
+                                };
+                                if s.write_all(reply.as_bytes()).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(Decoded::NeedMore) => match s.read(&mut chunk) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            },
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        });
+        (addr, refused)
+    }
+
+    /// One inventory per case, each with its OWN unreachable CP port: the
+    /// liveness token is memoised per CP, so a shared CP would hand one
+    /// case another's token. Nothing listens on these ports, so a CP lookup
+    /// fails fast and reads as "no token".
+    fn liveness_inv(proxy: &str, cp_port: u16, token: Option<&str>) -> Inventory {
+        let tag = format!("{}-{cp_port}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("flint-pxlive-{tag}"));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("inv.flint");
+        let tok = token
+            .map(|t| format!("admin-token {t}\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            &path,
+            format!(
+                "statedir {}\ncp 127.0.0.1:{cp_port}\npair 127.0.0.1:7001,127.0.0.1:7002\nproxy {proxy}\n{tok}",
+                dir.display()
+            ),
+        )
+        .expect("write inventory");
+        parse_inventory(path.to_str().expect("utf8 path"))
+    }
+
+    /// THE BUG. With the token known, the check authenticates and the proxy
+    /// refuses nothing. Against the pre-auth-only `proxy_up` this reads up
+    /// too, but counts one refusal per call, which is what made 2,641 a day.
+    #[test]
+    fn a_known_token_is_presented_and_the_proxy_refuses_nothing() {
+        let (addr, refused) = gated_proxy("the-token", false);
+        let inv = liveness_inv(&addr, 1, Some("the-token"));
+        for _ in 0..3 {
+            assert!(proxy_up(&inv, 0), "a serving proxy read as down");
+        }
+        assert_eq!(
+            refused.load(Ordering::SeqCst),
+            0,
+            "the liveness check was refused as an operator command"
+        );
+    }
+
+    /// No token to present (an ungated fleet, or a CP that cannot be asked):
+    /// the pre-auth probe answers as before, and its -NOAUTH still proves up.
+    #[test]
+    fn without_a_token_the_refusal_still_proves_the_proxy_up() {
+        let (addr, refused) = gated_proxy("the-token", false);
+        let inv = liveness_inv(&addr, 2, None);
+        assert!(
+            proxy_up(&inv, 0),
+            "the pre-auth probe's -NOAUTH must still read as up"
+        );
+        assert_eq!(refused.load(Ordering::SeqCst), 1);
+    }
+
+    /// A rotation in flight: the proxy holds an older digest than the token
+    /// flintctl was given. WRONGPASS must not read as down; it falls back to
+    /// the pre-auth probe.
+    #[test]
+    fn a_token_the_proxy_does_not_hold_yet_falls_back_and_reads_up() {
+        let (addr, refused) = gated_proxy("the-new-token", false);
+        let inv = liveness_inv(&addr, 3, Some("the-old-token"));
+        assert!(
+            proxy_up(&inv, 0),
+            "WRONGPASS from a rotating proxy read as down"
+        );
+        assert_eq!(
+            refused.load(Ordering::SeqCst),
+            1,
+            "the fallback is the pre-auth probe, counted once"
+        );
+    }
+
+    /// LOADING is not up whichever way the proxy is asked (BUG-0211), and a
+    /// port with nothing behind it is not up either.
+    #[test]
+    fn a_loading_or_absent_proxy_is_not_up_either_way() {
+        let (addr, _) = gated_proxy("the-token", true);
+        assert!(
+            !proxy_up(&liveness_inv(&addr, 4, Some("the-token")), 0),
+            "LOADING read as up, with a token"
+        );
+        assert!(
+            !proxy_up(&liveness_inv(&addr, 5, None), 0),
+            "LOADING read as up, without one"
+        );
+        let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let gone = closed.local_addr().expect("addr").to_string();
+        drop(closed);
+        assert!(
+            !proxy_up(&liveness_inv(&gone, 6, Some("the-token")), 0),
+            "an absent proxy read as up"
+        );
+    }
+
+    /// WRONGPASS is recognised from the string call_seq_on produces, and
+    /// nothing else is: a NOAUTH or a timeout must not trigger the fallback
+    /// as if it were a rotation.
+    #[test]
+    fn only_a_wrongpass_reply_is_a_rotation() {
+        assert!(is_wrongpass_error("WRONGPASS invalid token"));
+        assert!(is_wrongpass_error("-WRONGPASS invalid token"));
+        assert!(!is_wrongpass_error(
+            "NOAUTH admin token required for this command"
+        ));
+        assert!(!is_wrongpass_error("LOADING no control-plane snapshot yet"));
+        assert!(!is_wrongpass_error("timed out"));
     }
 }
 

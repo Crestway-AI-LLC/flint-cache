@@ -159,6 +159,44 @@ case "$PLINE" in
 esac
 echo "  proxy up"
 
+echo "== BUG-0264: status asks as the operator, so the proxy refuses nothing"
+# proxy_up asked pre-auth and read the -NOAUTH as up, and the proxy counted
+# each one: 2,641 a day on the playground, all of admin_denied_total, so the
+# counter OPS-0163 exists for could not show a real probe. With the token
+# known it now authenticates. denied_now() reads authenticated, so it adds
+# nothing itself.
+D3=$(denied_now)
+for _ in 1 2 3; do $CTL status >/dev/null 2>&1; done
+D4=$(denied_now)
+[ -n "$D4" ] && [ "$D4" = "$D3" ] || {
+  echo "FAIL: three status runs moved admin_denied_total from $D3 to ${D4:-<none>}."
+  echo "      flintctl's own liveness check is counted as a refused operator command (BUG-0264)."
+  exit 1; }
+echo "  three status runs, admin_denied_total still $D3"
+
+echo "== and a token the proxy does not hold (a rotation in flight) still reads UP"
+# THE -NOAUTH PATH, END TO END. With the token known, the arm above reads up
+# through an authenticated Bulk, so it no longer proves that a refusal reads
+# as serving. A token the proxy holds no digest for gets WRONGPASS, which
+# must fall back to the pre-auth probe -- and that probe's -NOAUTH is the
+# evidence this drill was written to protect.
+sed 's/^admin-token .*/admin-token not-the-seeded-token/' "$INV" > "$STATE/rotating.flint"
+grep -qx 'admin-token not-the-seeded-token' "$STATE/rotating.flint" \
+  || { echo "FAIL: could not write the rotating inventory"; exit 1; }
+ST=$(./target/release/flintctl -f "$STATE/rotating.flint" status 2>&1)
+PLINE=$(echo "$ST" | grep "^proxy" | head -1)
+case "$PLINE" in
+  *" up "*) ;;
+  *) echo "FAIL: with a token the proxy rejects, status read it as: ${PLINE:-<none>}"
+     echo "      A WRONGPASS must fall back to the pre-auth probe, not read as down."
+     exit 1 ;;
+esac
+D5=$(denied_now)
+[ "${D5:-0}" -gt "$D4" ] || {
+  echo "FAIL: the WRONGPASS fallback never reached the pre-auth probe (admin_denied_total $D4 -> ${D5:-<none>})"
+  exit 1; }
+echo "  up, through the pre-auth probe's -NOAUTH (admin_denied_total $D4 -> $D5)"
+
 echo "== upgrade --version-tag completes instead of aborting at the edge"
 # THE THIRD AND WORST. roll_edge rolls every seat and THEN waits on
 # proxy_up; a false DOWN there aborts with exit 3 after the fleet has
