@@ -5,7 +5,10 @@
 two copies of the state contradicted each other. `crates/flint-server/src/main.rs`
 carries "ADR-0027 part 2: a run of consecutive pure writes accumulates here"
 (:4302) and "armed at 128 threads before ADR-0027" (:4119). Landed in
-`0f7a49e4` and `b210961b`. Part 1 was not verified here.
+`0f7a49e4` and `b210961b`. The ADR defines no numbered parts — "part 2" is
+the code's vocabulary — and its own **Amendment, 2026-08-31** is titled
+*implemented*, so the body and the index row both said built while only this
+line said proposed.
 **Date:** 2026-08-31
 **Relates to:** [ADR-0005 D4](0005) (async write queue), [ADR-0012 D6](0012-same-slot-transactions.md) (no serial isolation for readers), BUG-0078 (the edge caps ingest)
 

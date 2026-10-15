@@ -4,7 +4,13 @@ Status: **IMPLEMENTED, stages 1 and 2.** Corrected 2026-10-15: this line read
 PROPOSED while `apool.rs` had assumed "ADR-0021's model: a bounded set of
 workers" since August. What landed: `eabf2639` (give the proxy bounded worker
 threads and async IO), `36412e2e` (stage 2 — `crate::pool` removed),
-`8cf94e74` (per-backend command counters). Stages beyond 2 were not checked.
+`8cf94e74` (per-backend command counters). Stages 3 and 4 checked 2026-10-15
+and substantially landed: `forward_collect`, `fan_out` and `scan_forward` are
+`async fn`, and stage 4's scaffold is gone — the one `spawn_blocking` left in
+the proxy is BUG-0200's deliberate fix (a `coproc_call` held a worker past its
+token deadline, so it runs on the blocking pool with `_slot` bounding it), not
+stage 2's temporary one. `discover_master` is still sync; whether that is
+deliberate was not established.
 
 Originally: PROPOSED — August 2026. Written after ADR-0020's pooled backend
 multiplexing was measured on a fleet and found to collapse under
