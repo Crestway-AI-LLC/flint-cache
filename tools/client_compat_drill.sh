@@ -33,6 +33,45 @@ cleanup() {
 trap cleanup EXIT
 rm -rf "$STATE" "$INV"
 
+# ---------------------------------------------------------------------------
+# A dependency fetch keeps the reason it failed (BUG-0263).
+#
+# gates.sh reds the whole gate when a client skips -- correctly, because a
+# silent skip deletes coverage from a run someone is about to trust. So the
+# skip has to carry its reason. On 2026-10-16 it did not: a public `drills`
+# gate came back client_compat(skipped) and the asynq fetch's entire evidence
+# was "(could not fetch the module; offline?)", question mark included. Three
+# candidate causes were then tested off-box and ALL THREE were ruled out, so
+# that run's cause is simply not recoverable -- which is the whole cost being
+# fixed here. See BUG-0263 for what was ruled out and how.
+#
+# And "offline?" is not a harmless guess: running this drill on macOS makes
+# the three Ruby clients skip, and the measured reason is the system Ruby
+# being 2.6.10 against gems that need >= 3.1 -- nothing to do with the
+# network. A guessed reason does not just fail to help, it points away.
+#
+# TWO separate things were throwing the reason away, and fixing either one
+# alone leaves a skip that still says nothing:
+#
+#   1. `>/dev/null 2>&1` on the fetch.
+#   2. the fetch's OWN QUIET FLAG. Measured 2026-10-16: `npm install --silent`
+#      and `gem install --silent` emit ZERO BYTES on a failed install -- not
+#      less output, none -- so capturing a --silent fetch yields an empty
+#      string. npm needs --loglevel=error instead (492 bytes, with the 404);
+#      gem needs no quiet flag at all (83 bytes, naming the gem). pip's -q is
+#      safe and stays: it keeps the ERROR line (451 bytes).
+#
+# So every fetch below captures combined output into a variable and hands it
+# to skip_with_reason. Readiness PROBES keep >/dev/null 2>&1: their failure is
+# the answer, not an error. tools/client_compat_fetch_reasons_drill.sh holds
+# both of those rules against this file.
+FETCH_TAIL=${FLINT_COMPAT_FETCH_TAIL:-6}
+skip_with_reason() {   # <label> <what-it-tried> <captured combined output>
+  echo "== $1: SKIP ($2). The fetch said:"
+  printf '%s\n' "${3:-(nothing at all -- so the fetch was silenced, not quiet)}" \
+    | tail -"$FETCH_TAIL" | sed 's/^/     /'
+}
+
 # Find a python that has redis-py, or make one.
 PY=${FLINT_COMPAT_PY:-}
 if [ -z "$PY" ]; then
@@ -48,9 +87,9 @@ if [ -z "$PY" ]; then
     command -v "$cand" >/dev/null && { BASE=$(command -v "$cand"); break; }
   done
   [ -n "$BASE" ] || { echo "SKIP: no python3 available"; exit 0; }
-  [ -x "$VENV/bin/python" ] || "$BASE" -m venv "$VENV" >/dev/null 2>&1
-  "$VENV/bin/pip" install -q redis >/dev/null 2>&1 || {
-    echo "SKIP: could not install redis-py (offline?)"; exit 0; }
+  PY_ERR=$( { { [ -x "$VENV/bin/python" ] || "$BASE" -m venv "$VENV"; } \
+    && "$VENV/bin/pip" install -q redis; } 2>&1 ) || {
+    skip_with_reason redis-py "could not install redis-py" "${PY_ERR-}"; exit 0; }
   PY="$VENV/bin/python"
 fi
 "$PY" -c 'import redis' 2>/dev/null || { echo "SKIP: redis-py unavailable"; exit 0; }
@@ -939,11 +978,11 @@ if ! rq_ready; then
   for cand in python3.14 python3.13 python3.12 python3.11 python3; do
     command -v "$cand" >/dev/null && { RQ_BASE=$(command -v "$cand"); break; }
   done
-  [ -n "$RQ_BASE" ] && "$RQ_BASE" -m venv "$RQ_VENV" >/dev/null 2>&1 \
-    && "$RQ_VENV/bin/pip" install -q "rq==2.8.0" >/dev/null 2>&1
+  RQ_ERR=$( { [ -n "$RQ_BASE" ] && "$RQ_BASE" -m venv "$RQ_VENV" \
+    && "$RQ_VENV/bin/pip" install -q "rq==2.8.0"; } 2>&1 )
 fi
 if ! rq_ready; then
-  echo "== rq: SKIP (could not install rq 2.8.0; offline?)"
+  skip_with_reason rq "could not install rq 2.8.0" "${RQ_ERR-}"
   SKIPPED="$SKIPPED rq"
 else
   PORT=$PORT "$RQ_VENV/bin/python" - <<'PYRQ'
@@ -998,11 +1037,11 @@ if ! celery_ready; then
   for cand in python3.14 python3.13 python3.12 python3.11 python3; do
     command -v "$cand" >/dev/null && { CELERY_BASE=$(command -v "$cand"); break; }
   done
-  [ -n "$CELERY_BASE" ] && "$CELERY_BASE" -m venv "$CELERY_VENV" >/dev/null 2>&1 \
-    && "$CELERY_VENV/bin/pip" install -q "celery[redis]==5.6.3" >/dev/null 2>&1
+  CELERY_ERR=$( { [ -n "$CELERY_BASE" ] && "$CELERY_BASE" -m venv "$CELERY_VENV" \
+    && "$CELERY_VENV/bin/pip" install -q "celery[redis]==5.6.3"; } 2>&1 )
 fi
 if ! celery_ready; then
-  echo "== celery: SKIP (could not install celery 5.6.3; offline?)"
+  skip_with_reason celery "could not install celery 5.6.3" "${CELERY_ERR-}"
   SKIPPED="$SKIPPED celery"
 else
   PORT=$PORT "$CELERY_VENV/bin/python" - <<'PYCELERY'
@@ -1058,11 +1097,11 @@ if ! lim_ready; then
   for cand in python3.14 python3.13 python3.12 python3.11 python3; do
     command -v "$cand" >/dev/null && { LIM_BASE=$(command -v "$cand"); break; }
   done
-  [ -n "$LIM_BASE" ] && "$LIM_BASE" -m venv "$LIM_VENV" >/dev/null 2>&1 \
-    && "$LIM_VENV/bin/pip" install -q "limits>=4,<5" "python-redis-lock==4.0.1" redis >/dev/null 2>&1
+  LIM_ERR=$( { [ -n "$LIM_BASE" ] && "$LIM_BASE" -m venv "$LIM_VENV" \
+    && "$LIM_VENV/bin/pip" install -q "limits>=4,<5" "python-redis-lock==4.0.1" redis; } 2>&1 )
 fi
 if ! lim_ready; then
-  echo "== python rate limiting: SKIP (could not install limits and python-redis-lock; offline?)"
+  skip_with_reason "python rate limiting" "could not install limits and python-redis-lock" "${LIM_ERR-}"
   SKIPPED="$SKIPPED limits python-redis-lock"
 else
   PORT=$PORT "$LIM_VENV/bin/python" - <<'PYL'
@@ -1160,10 +1199,10 @@ else
   NODE_DIR=${FLINT_COMPAT_NODE_DIR:-$FLINT_DRILL_ROOT/flint-compat-node}
   mkdir -p "$NODE_DIR"
   if [ ! -d "$NODE_DIR/node_modules/redis" ] || [ ! -d "$NODE_DIR/node_modules/ioredis" ]; then
-    (cd "$NODE_DIR" && npm init -y >/dev/null 2>&1 && npm install redis ioredis --silent >/dev/null 2>&1)
+    NODE_ERR=$( (cd "$NODE_DIR" && npm init -y && npm install redis ioredis --loglevel=error) 2>&1 )
   fi
   if [ ! -d "$NODE_DIR/node_modules/redis" ]; then
-    echo "== node-redis: SKIP (could not install; offline?)"
+    skip_with_reason node-redis "could not install" "${NODE_ERR-}"
     SKIPPED="$SKIPPED node-redis"
   else
     echo "== client: node-redis $("$NODE" -e "console.log(require('$NODE_DIR/node_modules/redis/package.json').version)")"
@@ -1312,7 +1351,7 @@ JS
   # ran it. Defaults are the point here; do not add options to make it pass.
   # -------------------------------------------------------------------------
   if [ ! -d "$NODE_DIR/node_modules/ioredis" ]; then
-    echo "== ioredis: SKIP (could not install; offline?)"
+    skip_with_reason ioredis "could not install" "${NODE_ERR-}"
     SKIPPED="$SKIPPED ioredis"
   else
     echo "== client: ioredis $("$NODE" -e "console.log(require('$NODE_DIR/node_modules/ioredis/package.json').version)")"
@@ -1371,13 +1410,13 @@ JS
   # `latest` tag installs. Both, on ioredis, on both pairs.
   # -------------------------------------------------------------------------
   if [ -d "$NODE_DIR/node_modules/ioredis" ] && [ ! -d "$NODE_DIR/node_modules/redlock5" ]; then
-    (cd "$NODE_DIR" && npm install redlock4@npm:redlock@4.2.0 redlock5@npm:redlock@5.0.0-beta.2 --silent >/dev/null 2>&1)
+    RL_ERR=$( (cd "$NODE_DIR" && npm install redlock4@npm:redlock@4.2.0 redlock5@npm:redlock@5.0.0-beta.2 --loglevel=error) 2>&1 )
   fi
   if [ -d "$NODE_DIR/node_modules/redis" ] && [ ! -d "$NODE_DIR/node_modules/rate-limit-redis" ]; then
-    (cd "$NODE_DIR" && npm install rate-limit-redis@6.0.1 express-rate-limit@8 --silent >/dev/null 2>&1)
+    RLR_ERR=$( (cd "$NODE_DIR" && npm install rate-limit-redis@6.0.1 express-rate-limit@8 --loglevel=error) 2>&1 )
   fi
   if [ ! -d "$NODE_DIR/node_modules/redlock4" ] || [ ! -d "$NODE_DIR/node_modules/redlock5" ]; then
-    echo "== node redlock: SKIP (could not install; offline?)"
+    skip_with_reason "node redlock" "could not install" "${RL_ERR-}"
     SKIPPED="$SKIPPED node-redlock"
   else
     echo "== client: node redlock 4.2.0 and 5.0.0-beta.2, on ioredis"
@@ -1441,7 +1480,7 @@ JS
   # both pairs.
   # -------------------------------------------------------------------------
   if [ ! -d "$NODE_DIR/node_modules/rate-limit-redis" ]; then
-    echo "== rate-limit-redis: SKIP (could not install; offline?)"
+    skip_with_reason rate-limit-redis "could not install" "${RLR_ERR-}"
     SKIPPED="$SKIPPED rate-limit-redis"
   else
     echo "== client: rate-limit-redis $("$NODE" -e "console.log(JSON.parse(require('fs').readFileSync('$NODE_DIR/node_modules/rate-limit-redis/package.json','utf8')).version)"), on node-redis"
@@ -1500,10 +1539,10 @@ JS
   # that writes up to three times.
   # -------------------------------------------------------------------------
   if [ -d "$NODE_DIR/node_modules/ioredis" ] && [ ! -d "$NODE_DIR/node_modules/rate-limiter-flexible" ]; then
-    (cd "$NODE_DIR" && npm install rate-limiter-flexible@11 --silent >/dev/null 2>&1)
+    RLF_ERR=$( (cd "$NODE_DIR" && npm install rate-limiter-flexible@11 --loglevel=error) 2>&1 )
   fi
   if [ ! -d "$NODE_DIR/node_modules/rate-limiter-flexible" ]; then
-    echo "== rate-limiter-flexible: SKIP (could not install; offline?)"
+    skip_with_reason rate-limiter-flexible "could not install" "${RLF_ERR-}"
     SKIPPED="$SKIPPED rate-limiter-flexible"
   else
     echo "== client: rate-limiter-flexible $("$NODE" -e "console.log(JSON.parse(require('fs').readFileSync('$NODE_DIR/node_modules/rate-limiter-flexible/package.json','utf8')).version)"), on ioredis"
@@ -1551,10 +1590,10 @@ JS
   # XREAD BLOCK, which waits at the proxy.
   # -------------------------------------------------------------------------
   if [ -d "$NODE_DIR/node_modules/ioredis" ] && [ ! -d "$NODE_DIR/node_modules/bullmq" ]; then
-    (cd "$NODE_DIR" && npm install bullmq@6.3.9 --silent >/dev/null 2>&1)
+    BQ_ERR=$( (cd "$NODE_DIR" && npm install bullmq@6.3.9 --loglevel=error) 2>&1 )
   fi
   if [ ! -d "$NODE_DIR/node_modules/bullmq" ]; then
-    echo "== bullmq: SKIP (could not install; offline?)"
+    skip_with_reason bullmq "could not install" "${BQ_ERR-}"
     SKIPPED="$SKIPPED bullmq"
   else
     echo "== client: bullmq $("$NODE" -e "console.log(JSON.parse(require('fs').readFileSync('$NODE_DIR/node_modules/bullmq/package.json','utf8')).version)"), prefix {bull}"
@@ -1664,11 +1703,11 @@ func main() {
 }
 GOSRC
   if [ ! -f "$GO_DIR/go.sum" ]; then
-    (cd "$GO_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompat >/dev/null 2>&1; } \
-      && "$GO" get github.com/redis/go-redis/v9 >/dev/null 2>&1)
+    GO_ERR=$( (cd "$GO_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompat; } \
+      && "$GO" get github.com/redis/go-redis/v9) 2>&1 )
   fi
   if [ ! -f "$GO_DIR/go.sum" ]; then
-    echo "== go-redis: SKIP (could not fetch the module; offline?)"
+    skip_with_reason go-redis "could not fetch the module" "${GO_ERR-}"
     SKIPPED="$SKIPPED go-redis"
   else
     echo "== client: go-redis $(sed -n 's/.*go-redis\/v9 \(v[0-9.]*\).*/\1/p' "$GO_DIR/go.mod" | head -1)"
@@ -1750,12 +1789,12 @@ func main() {
 }
 GOSRC
   if [ ! -f "$RS_DIR/go.sum" ]; then
-    (cd "$RS_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatredsync >/dev/null 2>&1; } \
-      && "$GO" get github.com/go-redsync/redsync/v4@v4.18.0 github.com/redis/go-redis/v9 >/dev/null 2>&1 \
-      && "$GO" mod tidy >/dev/null 2>&1)
+    RS_ERR=$( (cd "$RS_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatredsync; } \
+      && "$GO" get github.com/go-redsync/redsync/v4@v4.18.0 github.com/redis/go-redis/v9 \
+      && "$GO" mod tidy) 2>&1 )
   fi
   if [ ! -f "$RS_DIR/go.sum" ]; then
-    echo "== redsync: SKIP (could not fetch the module; offline?)"
+    skip_with_reason redsync "could not fetch the module" "${RS_ERR-}"
     SKIPPED="$SKIPPED redsync"
   else
     echo "== client: redsync $(sed -n 's/.*go-redsync\/redsync\/v4 \(v[0-9.]*\).*/\1/p' "$RS_DIR/go.mod" | head -1), on go-redis v9"
@@ -1821,12 +1860,12 @@ func main() {
 }
 GOSRC
   if [ ! -f "$RR_DIR/go.sum" ]; then
-    (cd "$RR_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatredisrate >/dev/null 2>&1; } \
-      && "$GO" get github.com/go-redis/redis_rate/v10 github.com/redis/go-redis/v9 >/dev/null 2>&1 \
-      && "$GO" mod tidy >/dev/null 2>&1)
+    RR_ERR=$( (cd "$RR_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatredisrate; } \
+      && "$GO" get github.com/go-redis/redis_rate/v10 github.com/redis/go-redis/v9 \
+      && "$GO" mod tidy) 2>&1 )
   fi
   if [ ! -f "$RR_DIR/go.sum" ]; then
-    echo "== redis_rate: SKIP (could not fetch the module; offline?)"
+    skip_with_reason redis_rate "could not fetch the module" "${RR_ERR-}"
     SKIPPED="$SKIPPED redis_rate"
   else
     echo "== client: redis_rate $(sed -n 's/.*go-redis\/redis_rate\/v10 \(v[0-9.]*\).*/\1/p' "$RR_DIR/go.mod" | head -1), on go-redis v9"
@@ -1946,9 +1985,7 @@ GOSRC
       && "$GO" mod tidy) 2>&1 )
   fi
   if [ ! -f "$AQ_DIR/go.sum" ]; then
-    echo "== asynq: SKIP (could not fetch the module). The fetch said:"
-    printf '%s\n' "${AQ_ERR:-(nothing -- the fetch produced no output at all)}" \
-      | tail -6 | sed 's/^/     /'
+    skip_with_reason asynq "could not fetch the module" "${AQ_ERR-}"
     SKIPPED="$SKIPPED asynq"
   else
     echo "== client: asynq $(sed -n 's/.*hibiken\/asynq \(v[0-9.]*\).*/\1/p' "$AQ_DIR/go.mod" | head -1)"
@@ -1977,10 +2014,10 @@ else
   # bigdecimal, say), so the store would install and then fail to load.
   rb_ready() { GEM_HOME="$RB_HOME" "$RUBY" -e 'require "active_support"; require "redis"' >/dev/null 2>&1; }
   if ! rb_ready; then
-    GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document --silent activesupport redis >/dev/null 2>&1
+    RB_ERR=$( GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document activesupport redis 2>&1 )
   fi
   if ! rb_ready; then
-    echo "== rails cache store: SKIP (could not install activesupport and redis; offline?)"
+    skip_with_reason "rails cache store" "could not install activesupport and redis" "${RB_ERR-}"
     SKIPPED="$SKIPPED rails-cache-store"
   else
     mkdir -p "$RB_HOME"
@@ -2034,10 +2071,10 @@ RUBYSRC
   # -------------------------------------------------------------------------
   rl_ready() { GEM_HOME="$RB_HOME" "$RUBY" -e 'gem "redlock", "2.1.0"; require "redlock"' >/dev/null 2>&1; }
   if ! rl_ready; then
-    GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document --silent redlock -v 2.1.0 >/dev/null 2>&1
+    RLRB_ERR=$( GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document redlock -v 2.1.0 2>&1 )
   fi
   if ! rl_ready; then
-    echo "== redlock-rb: SKIP (could not install redlock 2.1.0; offline?)"
+    skip_with_reason redlock-rb "could not install redlock 2.1.0" "${RLRB_ERR-}"
     SKIPPED="$SKIPPED redlock-rb"
   else
     mkdir -p "$RB_HOME"
@@ -2094,10 +2131,10 @@ RUBYSRC
   # -------------------------------------------------------------------------
   sk_ready() { GEM_HOME="$RB_HOME" "$RUBY" -e 'gem "sidekiq", "8.1.7"; require "sidekiq"' >/dev/null 2>&1; }
   if ! sk_ready; then
-    GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document --silent sidekiq -v 8.1.7 >/dev/null 2>&1
+    SK_ERR=$( GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document sidekiq -v 8.1.7 2>&1 )
   fi
   if ! sk_ready; then
-    echo "== sidekiq: SKIP (could not install sidekiq 8.1.7; offline?)"
+    skip_with_reason sidekiq "could not install sidekiq 8.1.7" "${SK_ERR-}"
     SKIPPED="$SKIPPED sidekiq sidekiq-server"
   else
     cat > "$RB_HOME/sidekiq_check.rb" <<'RUBYSRC'
