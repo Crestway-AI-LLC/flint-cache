@@ -1,5 +1,13 @@
 # BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (defect 1 FIXED 2026-09-02; defect 2 CLOSED 2026-09-30: narrowed to one call, self-identifying, not reproduced)
 
+**Status:** **defect 1 FIXED 2026-09-02; defect 2 CLOSED 2026-09-30** —
+narrowed to one call, self-identifying, not reproduced. Added 2026-10-16: the
+state was readable in the H1 and in the index row but on no `Status:` line, so
+of 262 write-ups this was the only one whose state no check could read
+(`assert_bug_titles_agree_with_status` takes a title parenthetical's first
+word, and this one begins "defect"). The state is unchanged; only its machine
+readability is.
+
 **Found** 2026-09-01, in the tail of an `elasticache-bench --regime a` run. The
 benchmark produced every number correctly and then **exited 1**, on this,
 repeated once a second:
