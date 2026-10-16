@@ -485,3 +485,14 @@ which Valkey's runs log too.
 
 Dapr, Watermill and Spring Data Redis were not run. One framework was
 what this verification asked for.
+
+## Group creation on by default (2026-10-16)
+
+D5's second release. flintctl starts every data seat with `--stream-groups`
+unless the inventory says `stream-groups off`. v0.1.0-rc.83, the first
+release to serve groups, rolled to the playground and both ops boxes on
+2026-10-14, so a rollback lands on a release that serves them. As with
+ADR-0052's streams, the switch lives in what flintctl passes, and the seat's
+own default stays off. Binaries before rc.83 do not know the flag, so a
+rollback below rc.83 driven by this flintctl needs `stream-groups off`
+first.

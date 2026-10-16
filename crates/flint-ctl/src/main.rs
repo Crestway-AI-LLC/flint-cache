@@ -149,10 +149,15 @@ struct Inventory {
     /// flintctl starts from an older release's binaries, as a rollback does.
     /// Every binary since v0.1.0-rc.82 knows the flags passed to turn them on.
     chunked_strings: bool,
-    /// `stream-groups on`: start every data seat with `--stream-groups`,
-    /// which lets XGROUP CREATE create a consumer group (ADR-0057 D5). Off by
-    /// default in the release that introduced groups, because a release
-    /// before it serves no group command, so its consumers would stop.
+    /// Start every data seat with `--stream-groups`, which lets XGROUP
+    /// CREATE create a consumer group (ADR-0057 D5). On unless the inventory
+    /// says `stream-groups off`. It was off in the release that introduced
+    /// groups (v0.1.0-rc.83), because a release before it serves no group
+    /// command, so its consumers would stop. Turned on here, in what
+    /// flintctl passes, for the reason given above for the three before it.
+    /// Only binaries since v0.1.0-rc.83 know `--stream-groups`, so a rollback
+    /// below that release driven by this flintctl needs `stream-groups off`
+    /// first, or rc.82's seats refuse the flag and do not start.
     stream_groups: bool,
     /// Failure domain per HOST (`zone <host> <name>`): an availability zone
     /// on a cloud, a rack or a power domain on your own hardware.
@@ -378,6 +383,7 @@ fn parse_inventory(path: &str) -> Inventory {
         placed_tenants: true,
         streams: true,
         chunked_strings: true,
+        stream_groups: true,
         ..Default::default()
     };
     for line in raw.lines() {
@@ -443,7 +449,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "placed-tenants" => inv.placed_tenants = on_or_off(key, val),
             "streams" => inv.streams = on_or_off(key, val),
             "chunked-strings" => inv.chunked_strings = on_or_off(key, val),
-            "stream-groups" => inv.stream_groups = val == "on",
+            "stream-groups" => inv.stream_groups = on_or_off(key, val),
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
             "admin-token" => inv.admin_token = Some(val.to_string()),
@@ -3332,7 +3338,7 @@ fn reload(inv: &Inventory) {
     if !inv.chunked_strings {
         restart_only.push("chunked-strings");
     }
-    if inv.stream_groups {
+    if !inv.stream_groups {
         restart_only.push("stream-groups");
     }
     if inv.ctl_poll_ms.is_some() || inv.ctl_confirm.is_some() {
@@ -10870,25 +10876,24 @@ mod cp_seat_liveness_tests {
         }
     }
 
-    /// ADR-0057 D5: `stream-groups on` reaches every data seat, master and
-    /// replica alike; without it a seat creates no consumer group.
+    /// ADR-0057 D5: every data seat, master and replica alike, may create a
+    /// consumer group unless the inventory says `stream-groups off`. On by
+    /// default from the release after the one that introduced groups.
     #[test]
-    fn stream_groups_on_reaches_every_data_seat() {
+    fn stream_groups_reach_every_data_seat_unless_off() {
         let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
                     cp 10.0.0.1:7500\npair 10.0.0.1:7001,10.0.0.2:7002\n";
-        let off = inv_from(base, "groups-off");
+        let default = inv_from(base, "groups-default");
         let on = inv_from(&format!("{base}stream-groups on\n"), "groups-on");
+        let off = inv_from(&format!("{base}stream-groups off\n"), "groups-off");
         for replicated in [true, false] {
-            assert!(
-                !node_tuning_args(&off, replicated)
+            let has = |inv: &Inventory| {
+                node_tuning_args(inv, replicated)
                     .iter()
                     .any(|a| a == "--stream-groups")
-            );
-            assert!(
-                node_tuning_args(&on, replicated)
-                    .iter()
-                    .any(|a| a == "--stream-groups")
-            );
+            };
+            assert!(has(&default) && has(&on));
+            assert!(!has(&off));
         }
     }
 

@@ -1047,11 +1047,11 @@ another consumer after `XGROUP SETID`.
   failover an acknowledged entry stays acknowledged and a delivered one stays
   pending under its consumer. Redis replicates asynchronously, so a failover
   there can deliver an entry again.
-- **Creating a group needs your operator.** A seat creates one only when its
-  inventory says `stream-groups on`; until then `XGROUP CREATE` of a new
-  group is refused. Every command serves the groups that exist, and `XGROUP
-  CREATE` of one that exists still answers `BUSYGROUP`, so consumers that
-  create their group at startup keep working (see self-hosting.md).
+- **Your operator can turn group creation off.** A seat creates a group
+  unless its inventory says `stream-groups off`; then `XGROUP CREATE` of a
+  new group is refused. Every command serves the groups that exist, and
+  `XGROUP CREATE` of one that exists still answers `BUSYGROUP`, so consumers
+  that create their group at startup keep working (see self-hosting.md).
 - **`XREADGROUP BLOCK` waits at the proxy**, as `XREAD BLOCK` does: an
   entry is read within about 20 ms of its arrival. Waiting writes nothing:
   `XINFO CONSUMERS` shows a waiting consumer idle since its call, as Valkey

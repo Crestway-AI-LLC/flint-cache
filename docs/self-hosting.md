@@ -209,7 +209,7 @@ controller on               # automatic failover supervision
 placed-tenants off          # forbid `tenant add-on-pair` (on by default; ADR-0053, section 4)
 streams off                 # XADD creates no stream (on by default; ADR-0052, section 4)
 chunked-strings off         # store every string whole (on by default; ADR-0056, section 4)
-stream-groups on            # let XGROUP CREATE make consumer groups (ADR-0057; section 4)
+stream-groups off           # XGROUP CREATE makes no new group (on by default; ADR-0057, section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
 admin-token <tok>           # gate the PROXY*/operator surface
@@ -1302,15 +1302,17 @@ Notes:
   fleet back below v0.1.0-rc.82. A tenant's `XADD` that would create a
   stream is refused while it is off.
 - **Stream consumer groups** (`XGROUP`, `XREADGROUP`, `XACK`, `XPENDING`,
-  `XINFO`, ADR-0057) are served on every seat, but a seat creates a group
-  only when the inventory says `stream-groups on` (each data seat then runs
-  with `--stream-groups`). It is off by default in the release that
-  introduced groups, because a release before it serves no group command,
-  so its consumers would stop: once a tenant has a group, do not roll this
-  fleet back below this release. While it is off, only a new group is
-  refused. Every command works on the groups that exist, and `XGROUP
-  CREATE` of one that exists answers `BUSYGROUP`, so a rollback to this
-  release from the one that turns it on keeps consumers consuming.
+  `XINFO`, ADR-0057) are served on every seat, and a seat creates a group
+  unless the inventory says `stream-groups off` (each data seat runs with
+  `--stream-groups`). It was off in v0.1.0-rc.83, which introduced groups,
+  because a release before it serves no group command, so its consumers
+  would stop: once a tenant has a group, do not roll this fleet back below
+  v0.1.0-rc.83. While it is off, only a new group is refused. Every command
+  works on the groups that exist, and `XGROUP CREATE` of one that exists
+  answers `BUSYGROUP`, so a rollback to rc.83 keeps consumers consuming.
+  Binaries before rc.83 do not know `--stream-groups`: to roll a fleet that
+  has no group back below rc.83 with this flintctl, set `stream-groups off`
+  first.
 - **Large strings in chunks** (ADR-0056): every seat reads a string stored
   in 32 KiB chunks, and stores one that way unless the inventory says
   `chunked-strings off` (each data seat runs with `--chunked-strings`).
