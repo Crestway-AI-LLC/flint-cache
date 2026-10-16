@@ -95,3 +95,39 @@ rate somewhere below a figure that data will show.
 - **Whether the per-key path is enough.** At 96 GB the measured cost of a
   forced pass may be tolerable, in which case this stays proposed. That
   measurement is running; this ADR should not be built before it is read.
+
+## Amendment, 2026-10-16: the measurement this ADR waits on was never recorded
+
+The bullet above says *"that measurement is running; this ADR should not be
+built before it is read."* It was written 2026-08-26. **Seven weeks later there
+is no such measurement in the record**, and a reader who goes looking — as one
+did today — finds two things that look like it and are not:
+
+- `../flint-cache/docs/bench/2026-08-26-per-node-byte-ceiling.md` carries the
+  same date and opens by saying it exists because *"ADR-0023 marks three
+  decisions provisional on a byte ceiling"*. That is the **ops repo's**
+  ADR-0023, the S3 accelerator look-aside library, whose D4/D6/D10 are chunk
+  size, opt-in trigger and fallback cost. Different document, same number: the
+  two repositories number their ADRs independently.
+- `docs/self-hosting.md` documents the forced-pass instrument
+  (`forced_passes`, `marks_at_last_pass`) and the rule that *"the number that
+  matters is marks per forced pass"*. That is how to READ the cost once it is
+  measured, not a measurement of it.
+
+So the blocker stands, and this ADR stays PROPOSED — but for a different
+reason than it has been saying. It was *"waiting on a running measurement"*;
+it is actually *"waiting on a measurement nobody has taken"*, and those are
+not the same state. The first resolves by itself and the second never does.
+
+**What would settle it.** The forced pass rewrites a namespace's surviving
+rows, so its cost scales with live bytes and not with what it reclaims. The
+number needed is the wall time of one forced pass over a namespace at the
+per-node ceiling, with the hot-path latency observed ACROSS it — the same shape
+as `bigkey_delete`'s p99 arm, which had to learn that a strictly-sequential
+probe cannot see the window it names. If that cost is tolerable, this ADR stays
+proposed for good and the bullet becomes a decision; if it is not, the ADR gets
+built. Either way the next reader should not have to re-derive that the
+measurement is absent rather than pending.
+
+Nothing here changes the Decision above. This amendment only re-dates the
+blocker so it stops reading as a thing in flight.

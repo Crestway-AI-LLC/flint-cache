@@ -125,6 +125,47 @@ see, and fails if that drops below 14, so the rule cannot narrow until it
 examines nothing. It runs no fetch, so it passes on the box that could not
 fetch.
 
+## Settled 2026-10-16 by the next gate run: the fetch was transient
+
+The gate run of `8bbe5aba` came back **GATES PASSED — 158 steps**, with
+`PASS client_compat (210.8s)` and no skip. `gates.sh` reds on a skipped client,
+so a full pass means **asynq fetched**. Both runs launched from the same baked
+AMI, `ami-075ef8483550c9693` — box `i-01d58e133ec935dc0` then,
+`i-0756a41a0305e5f15` now, about ninety minutes apart. Nothing about the module,
+the pin, the toolchain or the AMI's cache changed between them, and the only
+change to that code path was the error capture itself.
+
+So the box can fetch asynq, which closes the three guesses properly: it was a
+transient failure at fetch time.
+
+### The decision, with the measurements behind it
+
+**Do not pre-seed the clients' dependencies at bake time.** It looks like it
+removes the run-time dependency and does not: any client added after the last
+bake still needs a working fetch, so the dependency is hidden rather than
+removed, and a re-bake silently becomes a prerequisite for adding a client —
+which is the coupling nothing states today and which this bug's first,
+wrong write-up assumed already existed.
+
+**Do not add a retry layer either.** Measured 2026-10-16, these fetchers
+already retry:
+
+| fetcher | built-in behaviour on a failed fetch |
+|---|---|
+| npm | `fetch-retries` = **2**, `fetch-retry-maxtimeout` 60 s |
+| pip | `--retries` = **5** |
+| go | `GOPROXY=https://proxy.golang.org,direct` — falls back to the origin |
+
+A failure that defeats two npm retries, five pip retries, or a proxy-then-direct
+fallback is not one bad second at a registry. Wrapping another loop around that
+would make a legible failure slower and less legible, and it would be built on
+a cause nobody has read.
+
+**The diagnostic IS the fix.** The next occurrence prints the reason instead of
+"offline?", and the choice between a pin, a retry and a pre-seed can be made
+from it. Choosing now would be the same guessing this write-up was corrected
+for.
+
 **Still open, but the question changed once the guesses were tested.** It was
 posed as "AMI carries the deps, or the launcher ships them, or the box gets
 egress". The box already HAS egress, so the third option is the status quo, and
