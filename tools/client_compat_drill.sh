@@ -1931,12 +1931,24 @@ func main() {
 }
 GOSRC
   if [ ! -f "$AQ_DIR/go.sum" ]; then
-    (cd "$AQ_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatasynq >/dev/null 2>&1; } \
-      && "$GO" get github.com/hibiken/asynq@v0.26.0 >/dev/null 2>&1 \
-      && "$GO" mod tidy >/dev/null 2>&1)
+    # KEEP THE REASON. This fetch used to be `>/dev/null 2>&1`, so a skip said
+    # "offline?" with a question mark and the run carried no way to tell
+    # offline from a bad version from a blocked proxy. On 2026-10-16 that cost
+    # a gate verdict: client_compat reddened a public `drills` run, every one
+    # of its 18 other clients passed, and the only evidence was the guess.
+    # go-redis, redsync and redis_rate ran in the same run, so Go worked and
+    # their modules were cached in the baked AMI -- asynq entered the drill
+    # around 2026-10-09 and the AMI predates it. That chain had to be inferred
+    # from which clients survived, which is not evidence a check should make
+    # its reader reconstruct. See BUG-0263.
+    AQ_ERR=$( (cd "$AQ_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatasynq; } \
+      && "$GO" get github.com/hibiken/asynq@v0.26.0 \
+      && "$GO" mod tidy) 2>&1 )
   fi
   if [ ! -f "$AQ_DIR/go.sum" ]; then
-    echo "== asynq: SKIP (could not fetch the module; offline?)"
+    echo "== asynq: SKIP (could not fetch the module). The fetch said:"
+    printf '%s\n' "${AQ_ERR:-(nothing -- the fetch produced no output at all)}" \
+      | tail -6 | sed 's/^/     /'
     SKIPPED="$SKIPPED asynq"
   else
     echo "== client: asynq $(sed -n 's/.*hibiken\/asynq \(v[0-9.]*\).*/\1/p' "$AQ_DIR/go.mod" | head -1)"
