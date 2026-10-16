@@ -81,3 +81,44 @@ BUG-0062's structural fix (quarantine) removes the livelock, so the urgency is
 gone and the design question can be answered properly. What remains true is that
 if it recurs in another form, the diagnosis is another evidence bundle and
 another `grep`.
+
+## Amendment, 2026-10-16 — the ownership question, answered (PROPOSED)
+
+"Not doing this yet" above rests on urgency, not on the design, and the design
+had one open question: *what owns a file that outlives the data directory it
+describes.* An existing mechanism answers it, so the question was larger in the
+abstract than in this tree.
+
+**Where.** `{statedir}/boot-counters/node-{port}.json` — in the statedir, a
+sibling of the data dir rather than inside it, so the re-seed that deletes
+`{statedir}/node-{port}/` leaves the counter that exists to count re-seeds.
+That is option (1) above, "beside the dir".
+
+**Who owns it: the inventory.** `sweep_orphans(inv: &Inventory)`
+(`crates/flint-ctl/src/main.rs:3121`) already derives what is live from the
+inventory and already removes statedir litter; the counters path joins what it
+sweeps. `decommission_node` (`:8360`) removes it with the seat's other state.
+So the orphan is prevented by a mechanism that exists and is already exercised,
+not by a new rule someone has to remember — which is what made the question
+feel open. The litter this repo has filed twice came from paths nothing owned;
+this one is owned by the same thing that owns the data dir.
+
+**Absence must not read as zero.** A missing or unparseable file reports
+`unknown`, never `0`. A seat that has never written one and a seat that has
+re-seeded nothing are different facts, and a counter whose whole purpose is to
+show a LOOP is the last place to render them identically.
+
+**Written whole, not appended.** One JSON object, four `u64`s, rewritten and
+renamed over. A torn write loses counts and cannot corrupt a reader; an append
+log would need parsing at exactly the moment the seat is least healthy.
+
+**Exported through `FLINTINFO`**, so the agent and the dashboard read a number
+instead of grepping five hosts — which is the entire point of the ADR.
+
+**What it deliberately does not do:** survive a host rebuild. Wipe the
+statedir and the history is gone, correctly — a rebuilt host has no rejoin
+history to report.
+
+**Status of this amendment: PROPOSED.** The design question is answered; whether
+to build it now is Jeff's, and the ADR's own answer above is "the urgency is
+gone".

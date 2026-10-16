@@ -51,8 +51,14 @@ An ADR's vocabulary is wider than a bug's (`PROPOSED`, `ACCEPTED`, `DECIDED`,
 the narrow rule applies: only the unambiguous contradiction, in both
 directions, or it will be switched off within a week.
 
-**A second check is worth considering and is not proposed here:** an ADR whose
-status is `PROPOSED` while `crates/*/src/**` refers to it in the past tense
-("ADR-NNNN removed", "before ADR-NNNN", "ADR-NNNN stage N"). That is what
-actually found these three, and it needs a design decision rather than a
-grep — the past-tense vocabulary is open-ended.
+**A second check was considered and is DECLINED (Jeff, 2026-10-16):** an ADR
+whose status is `PROPOSED` while `crates/*/src/**` refers to it in the past
+tense ("ADR-NNNN removed", "before ADR-NNNN", "ADR-NNNN stage N"). That is what
+actually found 0020 and 0021, and it is still the sharper instrument — but the
+past-tense vocabulary is open-ended, and the cheap-looking version of this
+check false-positived on its FIRST run while being written: "last state
+parenthetical in the row" read ADR-0029's "(proposed the same day)", which is
+prose about an earlier state, as the row's claim. A looser matcher over code
+comments has more room for that, not less. The row-vs-file check plus the habit
+of reading an ADR's last dated section before quoting its decision covers the
+same ground at no false-positive cost.
