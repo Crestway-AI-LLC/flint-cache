@@ -1097,8 +1097,7 @@ another consumer after `XGROUP SETID`.
   still refused across slots. Either write those keys one at a time, or give
   the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
   that whole cache in one slot, on one pair.
-  Also stream **consumer groups** (planned, ADR-0052),
-  **RANDOMKEY**, and **`EVAL_RO`,
+  Also **RANDOMKEY**, and **`EVAL_RO`,
   `EVALSHA_RO`, `FUNCTION` and `FCALL`** (Redis 7's read-only scripts and
   functions; `EVAL` and `EVALSHA` are supported, see "Lua scripts").
   These conflict with slot-sharded multi-tenancy or reintroduce the
