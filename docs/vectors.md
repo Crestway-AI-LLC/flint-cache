@@ -69,8 +69,8 @@ filters passed over it.
 
 ## Filtering by metadata
 
-**Off unless the operator turns it on** (`vec-filters on`, below), in the
-release that introduces it. A set can declare fields, and a search can then
+**On unless the operator turns it off** (`vec-filters off`, below). It was
+off in v0.1.0-rc.84, which introduced it. A set can declare fields, and a search can then
 ask for the nearest vectors among those that match, such as one user's
 documents or the products under $50:
 
@@ -141,12 +141,11 @@ coproc-index-total-bytes 8589934592    # every namespace together (no default)
 ```
 
 Set `coproc-index-total-bytes` below what the host's data nodes need.
-`vec-filters on` serves `FIELD` and `FILTER`. It is off in the release that
-introduces them, because a co-processor from before them answers a `FILTER`
-as if there were none: after a rollback below that release, a tenant scoping
-results by a filter would read what it scopes out. Turn it on once the fleet
-will not roll back below that release. A set made with fields still loads on
-an older co-processor, without them.
+`FIELD` and `FILTER` are served unless the inventory says `vec-filters off`.
+They were off in v0.1.0-rc.84, which introduced them, because a co-processor
+from before it answers a `FILTER` as if there were none: once a tenant
+filters, do not roll this fleet back below rc.84. A set made with fields
+still loads on an older co-processor, without them.
 `flintctl tenant remove` makes every co-processor forget the tenant's
 vectors. `tenant add` refuses while a declared co-processor cannot confirm
 that it holds nothing for the new tenant's namespace.

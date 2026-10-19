@@ -115,13 +115,14 @@ struct Inventory {
     /// (`--index-mem-total-bytes`, ops ADR-0050 D2), so vector indexes cannot
     /// take the RAM the host's seats need. Absent = no overall cap.
     coproc_index_total_bytes: Option<u64>,
-    /// coproc: start each `flint-vec` with `--vec-filters`, which serves
-    /// `VEC.CREATE ... FIELD` and `VEC.SEARCH ... FILTER` (ADR-0059). Off
-    /// unless the inventory says `vec-filters on`, in the release that
-    /// introduces filters: a `flint-vec` before it answers a `FILTER` as if
-    /// there were none, so a tenant scoping its results by one would read
-    /// what it scopes out after a rollback. A `flint-vec` before it also
-    /// passes over the flag, as it passes over any flag it does not know.
+    /// coproc: each `flint-vec` serves `VEC.CREATE ... FIELD` and
+    /// `VEC.SEARCH ... FILTER` (ADR-0059). On unless the inventory says
+    /// `vec-filters off`. It was off in v0.1.0-rc.84, which introduced
+    /// filters, because a `flint-vec` before it answers a `FILTER` as if
+    /// there were none. On, flintctl passes `--vec-filters`, so a rollback to
+    /// rc.84's `flint-vec`, whose own default is off, keeps them served; off,
+    /// it passes `--no-vec-filters`. A `flint-vec` passes over a flag it does
+    /// not know, so either reaches any release.
     vec_filters: bool,
     /// Billing journal path (agent --billing): the append-only per-tenant
     /// usage record a metering reporter aggregates from. Absent = the
@@ -392,6 +393,7 @@ fn parse_inventory(path: &str) -> Inventory {
         streams: true,
         chunked_strings: true,
         stream_groups: true,
+        vec_filters: true,
         ..Default::default()
     };
     for line in raw.lines() {
@@ -1837,9 +1839,14 @@ fn coproc_args(inv: &Inventory, i: usize) -> Vec<String> {
     if let Some(total) = inv.coproc_index_total_bytes {
         args.extend(["--index-mem-total-bytes".to_string(), total.to_string()]);
     }
-    if inv.vec_filters {
-        args.push("--vec-filters".to_string());
-    }
+    args.push(
+        if inv.vec_filters {
+            "--vec-filters"
+        } else {
+            "--no-vec-filters"
+        }
+        .to_string(),
+    );
     if inv.tls {
         args.extend([
             "--internal-ca".to_string(),
@@ -3353,7 +3360,7 @@ fn reload(inv: &Inventory) {
     if !inv.stream_groups {
         restart_only.push("stream-groups");
     }
-    if inv.vec_filters {
+    if !inv.vec_filters {
         restart_only.push("vec-filters");
     }
     if inv.ctl_poll_ms.is_some() || inv.ctl_confirm.is_some() {
@@ -11293,24 +11300,26 @@ mod cert_manifest_tests {
         );
     }
 
-    /// ADR-0059: vector filters reach a co-processor only when the inventory
-    /// says `vec-filters on`, in the release that introduces them.
+    /// ADR-0059: vector filters reach every co-processor unless the
+    /// inventory says `vec-filters off`, and either way the seat is told, so
+    /// rc.84's `flint-vec`, whose own default is off, is told too.
     #[test]
-    fn vec_filters_reach_a_coproc_seat_only_when_on() {
+    fn vec_filters_reach_a_coproc_seat_unless_off() {
         let base = "statedir /var/lib/flint\n\
                     bins /opt/flint/bin\n\
                     cp 10.0.0.1:7500\n\
                     pair 10.0.0.2:7001,10.0.0.3:7002\n\
                     proxy 0.0.0.0:7379\n\
                     coproc VEC. 127.0.0.1:7411\n";
-        let has = |extra: &str, tag: &str| {
+        let flags = |extra: &str, tag: &str| -> Vec<String> {
             coproc_args(&inv_from(&format!("{base}{extra}"), tag), 0)
-                .iter()
-                .any(|a| a == "--vec-filters")
+                .into_iter()
+                .filter(|a| a.contains("vec-filters"))
+                .collect()
         };
-        assert!(!has("", "vfdefault"), "off by default");
-        assert!(!has("vec-filters off\n", "vfoff"));
-        assert!(has("vec-filters on\n", "vfon"));
+        assert_eq!(flags("", "vfdefault"), ["--vec-filters"], "on by default");
+        assert_eq!(flags("vec-filters on\n", "vfon"), ["--vec-filters"]);
+        assert_eq!(flags("vec-filters off\n", "vfoff"), ["--no-vec-filters"]);
     }
 
     /// BUG-0227: `start` decides a co-processor is running by an exact token of

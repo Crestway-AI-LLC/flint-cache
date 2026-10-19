@@ -502,7 +502,7 @@ GEORADIUSBYMEMBER (STORE, STOREDIST), GEORADIUS_RO, GEORADIUSBYMEMBER_RO.
 served by the vector co-processor rather than the data nodes, and documented
 in `vectors.md`. It is not RediSearch's `FT.*` and not Redis 8's vector
 sets; neither of those is implemented. `VEC.SEARCH ... FILTER` (ADR-0059,
-when the operator turns it on) takes the part of RediSearch's query syntax
+unless the operator turns it off) takes the part of RediSearch's query syntax
 for `TAG` and `NUMERIC` fields, with three differences: tags match case and
 all, AND and OR do not mix without parentheses, and full-text, geo,
 tag-wildcard and `$parameter` terms are refused by name.

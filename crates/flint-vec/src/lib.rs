@@ -1077,11 +1077,11 @@ pub struct Store {
     packed_rows: bool,
     /// How many times each namespace has been dropped ([`Store::drop_namespace`]).
     generations: HashMap<Vec<u8>, u64>,
-    /// Serve `FIELD` and `FILTER` (ADR-0059). Off for a bare `Store`, and in
-    /// the binary unless it is started with `--vec-filters`, for the release
-    /// that first knows them: one before it answers a `FILTER` as if there
-    /// were none, so they wait until a rollback lands on a release that
-    /// knows them. A set that already has fields keeps them either way.
+    /// Serve `FIELD` and `FILTER` (ADR-0059). Off for a bare `Store`; the
+    /// binary turns it on unless started with `--no-vec-filters`, from the
+    /// release after the one that first knew them, which served them only
+    /// with `--vec-filters`: one before that answers a `FILTER` as if there
+    /// were none. A set that already has fields keeps them either way.
     filters: bool,
 }
 

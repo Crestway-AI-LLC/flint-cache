@@ -201,13 +201,15 @@ fn main() {
     // still accepted and now changes nothing. This binary reads both either way.
     let packed_rows = !args.iter().any(|a| a == "--write-text-rows");
     initial.set_packed_rows(packed_rows);
-    // ADR-0059, the first of two releases: serve `VEC.CREATE ... FIELD` and
-    // `VEC.SEARCH ... FILTER` only when told. The releases before this one
-    // answer a `FILTER` as if there were none, so a fleet that could roll
-    // back to one must not have tenants relying on filters yet. This release
-    // refuses every `VEC.SEARCH` option it does not know, so the next one can
-    // serve filters by default: a rollback from it lands here.
-    let filters = args.iter().any(|a| a == "--vec-filters");
+    // ADR-0059, the second of two releases: serve `VEC.CREATE ... FIELD` and
+    // `VEC.SEARCH ... FILTER` unless started with `--no-vec-filters`. The
+    // release before this one (v0.1.0-rc.84) knows them, behind its opt-in
+    // `--vec-filters`, and refuses every `VEC.SEARCH` option it does not
+    // know, so a rollback to it serves a filter or refuses it and never
+    // answers it as if there were none. The releases before that one do, so
+    // a fleet whose tenants filter must not roll back below rc.84.
+    // `--vec-filters` is still accepted and now changes nothing.
+    let filters = !args.iter().any(|a| a == "--no-vec-filters");
     initial.set_filters(filters);
     // ADR-0049 D2: where a quantized set keeps its full vectors. The files are
     // derived like the index, so every one found here is deleted before
