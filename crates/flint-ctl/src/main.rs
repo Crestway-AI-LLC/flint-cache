@@ -178,12 +178,14 @@ struct Inventory {
     stream_groups: bool,
     /// Start every data seat with `--reserve-coproc-rows`, so only a
     /// co-processor's channel may write the keys reserved to its rows
-    /// (BUG-0265). Off unless the inventory says `reserve-coproc-rows on`,
-    /// in the release that introduces it: a node refusing those writes needs
-    /// every proxy in front of it to mark its channel connections, and the
-    /// proxies of the release before do not, so the co-processor's own
-    /// writes through one would be refused mid-roll. Only binaries from this
-    /// release on know the flag.
+    /// (BUG-0265). On unless the inventory says `reserve-coproc-rows off`.
+    /// It was off in the release that introduced it, because a node refusing
+    /// those writes needs every proxy in front of it to mark its channel
+    /// connections, which the proxies of the release before it did not; that
+    /// release's proxies do. Only binaries from that release on know the
+    /// flag, so a rollback below it driven by this flintctl needs
+    /// `reserve-coproc-rows off` first, or the older seats refuse the flag
+    /// and do not start.
     reserve_coproc_rows: bool,
     /// Failure domain per HOST (`zone <host> <name>`): an availability zone
     /// on a cloud, a rack or a power domain on your own hardware.
@@ -411,6 +413,7 @@ fn parse_inventory(path: &str) -> Inventory {
         chunked_strings: true,
         stream_groups: true,
         vec_filters: true,
+        reserve_coproc_rows: true,
         ..Default::default()
     };
     for line in raw.lines() {
@@ -3398,7 +3401,7 @@ fn reload(inv: &Inventory) {
     if !inv.stream_groups {
         restart_only.push("stream-groups");
     }
-    if inv.reserve_coproc_rows {
+    if !inv.reserve_coproc_rows {
         restart_only.push("reserve-coproc-rows");
     }
     if !inv.vec_filters {
@@ -11235,11 +11238,11 @@ mod cp_seat_liveness_tests {
         }
     }
 
-    /// BUG-0265: every data seat reserves the co-processor's rows only when
-    /// the inventory says `reserve-coproc-rows on`, in the release that
-    /// introduces it.
+    /// BUG-0265: every data seat reserves the co-processor's rows unless the
+    /// inventory says `reserve-coproc-rows off`. On by default from the
+    /// release after the one that introduced it.
     #[test]
-    fn reserve_coproc_rows_reaches_every_data_seat_only_when_on() {
+    fn reserve_coproc_rows_reaches_every_data_seat_unless_off() {
         let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
                     cp 10.0.0.1:7500\npair 10.0.0.1:7001,10.0.0.2:7002\n";
         let default = inv_from(base, "reserve-default");
@@ -11251,8 +11254,8 @@ mod cp_seat_liveness_tests {
                     .iter()
                     .any(|a| a == "--reserve-coproc-rows")
             };
-            assert!(has(&on));
-            assert!(!has(&default) && !has(&off));
+            assert!(has(&default) && has(&on));
+            assert!(!has(&off));
         }
     }
 

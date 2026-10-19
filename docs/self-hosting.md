@@ -210,7 +210,7 @@ placed-tenants off          # forbid `tenant add-on-pair` (on by default; ADR-00
 streams off                 # XADD creates no stream (on by default; ADR-0052, section 4)
 chunked-strings off         # store every string whole (on by default; ADR-0056, section 4)
 stream-groups off           # XGROUP CREATE makes no new group (on by default; ADR-0057, section 4)
-reserve-coproc-rows on      # only a co-processor's channel writes its rows (off by default; BUG-0265, section 4)
+reserve-coproc-rows off     # let a tenant write the co-processor's rows (on by default; BUG-0265, section 4)
 vec-filters off             # refuse VEC.CREATE FIELD and VEC.SEARCH FILTER (on by default; ADR-0059, section 4)
 coproc-ft on                # also serve RediSearch's FT.* from each VEC. co-processor (off by default; ADR-0060, section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
@@ -1340,16 +1340,16 @@ Notes:
   set made with fields keeps them. An older `flint-vec` passes over either
   flag and loads such a set without its fields.
 
-- **The co-processor's reserved rows** (BUG-0265): with
-  `reserve-coproc-rows on` (each data seat runs with
+- **The co-processor's reserved rows** (BUG-0265): unless the inventory
+  says `reserve-coproc-rows off` (each data seat runs with
   `--reserve-coproc-rows`), a node refuses a tenant's write to a key that
   starts with `\x00vec\x00`, where the vector co-processor keeps its durable
-  rows, and lets the co-processor's own channel write them. Off in the
-  release that introduces it, because a node refusing those writes needs
-  every proxy in front of it to mark its channel connections, which the
-  release before's proxies do not: turn it on once every proxy runs this
-  release. Only binaries from this release on know the flag, so set it off
-  before rolling back below this release with this flintctl.
+  rows, and lets the co-processor's own channel write them. It was off in
+  the release that introduced it, because a node refusing those writes
+  needs every proxy in front of it to mark its channel connections, which
+  the release before that one's proxies do not. Only binaries from that
+  release on know the flag, so set `reserve-coproc-rows off` before rolling
+  back below it with this flintctl.
 
 - **RediSearch's `FT.*`** (ADR-0060, `command-support.md`): with
   `coproc-ft on`, each `VEC.` co-processor runs with `--ft`, so `FT.CREATE`

@@ -507,10 +507,9 @@ for `TAG` and `NUMERIC` fields, with three differences: tags match case and
 all, AND and OR do not mix without parentheses, and full-text, geo,
 tag-wildcard and `$parameter` terms are refused by name.
 The co-processor keeps its durable rows in your namespace under keys that
-start with `\x00vec\x00`. A fleet whose operator turns on
-`reserve-coproc-rows` refuses your own write to such a key, with any command
-or from a script, since writing one changes your vectors behind `VEC.*`
-(BUG-0265).
+start with `\x00vec\x00`. Your own write to such a key is refused, with any
+command or from a script, since writing one changes your vectors behind
+`VEC.*` (BUG-0265), unless the operator turns `reserve-coproc-rows` off.
 
 ### RediSearch's vector surface: `FT.*` (preview, off unless the operator turns it on)
 

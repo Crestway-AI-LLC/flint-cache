@@ -103,3 +103,8 @@ it needs none of ADR-0060's index machinery, so it is built first:
   not mark their channel connections, and a node refusing the
   co-processor's own writes mid-roll would fail every `VEC.SET`. The next
   release turns it on, and this half is closed then.
+
+**The second release, built 2026-10-19 and held until the first was
+tagged:** flintctl starts every data seat with `--reserve-coproc-rows`
+unless the inventory says `reserve-coproc-rows off`. The first shipped in
+v0.1.0-rc.85 (tagged 2026-10-21), and this one is on public main after it.
