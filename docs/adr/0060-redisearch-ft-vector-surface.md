@@ -4,7 +4,8 @@ Status: **ACCEPTED 2026-10-19, option A** (Jeff: "go with your
 recommendation"), with the first release's scope and the two releases as
 recommended. The downloads its verification needs, to install and run the
 three clients' own tests, are still Jeff's to approve when it is built.
-Nothing is built yet.
+Nothing is built yet. An amendment, the guard on the data node rather than on
+every proxy knowing, is PROPOSED below for Jeff before it is built.
 
 Proposed 2026-10-19.
 
@@ -130,6 +131,63 @@ needs `FT.*` over keys it writes with scripts.
   index's prefix, so after a rollback writes would reach the pairs and miss
   the index. The next release turns it on, and a rollback from it lands on a
   release that routes them.
+
+## Amendment, 2026-10-19 (PROPOSED, for Jeff): the guard is on the data node
+
+Option A as written has the proxy route each write under an indexed prefix
+to the co-processor. A fleet has several proxies, and nothing confirms that
+every one of them has heard of a new index:
+- the control plane pushes its registry to each proxy, but keeps no record
+  of which version a proxy has applied;
+- it skips a push when it judges a proxy's view unchanged;
+- a proxy whose watch is broken goes on serving its last table.
+
+A proxy that had not yet heard of an index would send a write straight to
+the pair, and the index would miss it with nothing said. That is the failure
+A exists to prevent.
+
+Slot migration has the same shape and does not depend on the proxies
+agreeing. The data node refuses a write it no longer owns with `-MOVED`, and
+a proxy that is behind is redirected. The same works here:
+
+- **The data node keeps each namespace's indexed prefixes.** The
+  co-processor sets them over its channel, with `FLINT*` commands a tenant's
+  connection cannot send. They are a row in the namespace, replicated with
+  its data, so a failover's new master has them.
+- **The node refuses a write under an indexed prefix unless it comes over
+  the co-processor's channel.** The proxy marks the backend connections it
+  opens for a channel in the `FLINTNS` handshake, as it marks async writes
+  with its `a` flag. Any other write is refused with `-INDEXED <prefix>`.
+- **A proxy that gets `-INDEXED` learns the prefix** and sends the write
+  through the co-processor, as a proxy that gets `-MOVED` learns the new
+  owner. Proxies converge on their own, and correctness never waits for
+  them.
+- **Scripts and transactions are checked on the node too,** for every key
+  they write, declared or not. That closes the gap A had, which could check
+  only the keys a script declares.
+- **`FT.CREATE` completes in three steps:**
+  1. register the prefixes on every pair, failing if a pair cannot be
+     reached;
+  2. backfill the index by scanning the prefixes' keys over the channel;
+  3. serve.
+
+  A write that reaches a pair between the first two steps is refused, so the
+  backfill misses nothing.
+- **The same guard closes BUG-0265's open half.** The co-processor's own
+  `\x00vec\x00` rows become a prefix only its channel may write, so a tenant
+  can no longer plant them.
+
+**Cost:**
+- a prefix lookup on each write, on the node, for a namespace that has an
+  index or co-processor rows;
+- one handshake flag on the proxy's channel connections;
+- a refused-and-retried write the first time a stale proxy meets an index.
+
+**Two releases, as before.** The release that brings the guard enforces it
+only when the co-processor has set prefixes, which only a co-processor
+started with the new flag does. A release before it ignores the prefix row,
+so after a rollback writes would reach the pairs unguarded. The rollback
+note is the same as the ADR's.
 
 ## Verification
 
