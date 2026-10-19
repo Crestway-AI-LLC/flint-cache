@@ -46,6 +46,11 @@ came later (ADR-0010, ADR-0017) and were added to `start`, `status` and
   binding is waited for, not failed.
 - `started_line`'s comment now says ops `supervise.sh` reads the seat name
   too (ops OPS-0406's restart-loop page).
+- **`bind_dial_sites_drill` lists `verify_checks` as an exempt reader of
+  `inv.coprocs`.** It only dials the declared address, under BUG-0140's
+  refusal of a wildcard one, exactly as `status` does. The first gate of this
+  change (b0266, 2026-10-19) failed on that drill alone: 178 of 179 steps
+  passed, `coproc_family` among them, and the drill named the new reader.
 
 ## Evidence
 
