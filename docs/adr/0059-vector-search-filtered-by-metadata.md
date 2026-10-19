@@ -98,8 +98,11 @@ above. Its only gain over the client doing it is fewer bytes on the wire.
     result. Its `EF` grows with how few match, up to a cap.
 - **The filter is a subset of the query syntax of RediSearch and Valkey
   Search:** `@folder:{contracts | invoices}`, `@price:[10 50]` with `(` for
-  an exclusive bound, `-` to negate, terms side by side for AND, and
-  parentheses. A later `FT.*` surface (option C) could share the parser.
+  an exclusive bound and `-inf` or `+inf` for an open one, `-` to negate,
+  terms side by side for AND, `|` between terms for OR, parentheses, and a
+  backslash before a punctuation character in a tag value. That is the
+  subset `redisvl` writes for tags and numbers (the survey below), so a
+  later `FT.*` surface (option C) can share the parser.
 - **`VEC.INFO`** lists the fields and the field index's bytes.
 
 ### C. Valkey Search's `FT.*` surface
@@ -172,10 +175,42 @@ there.
     rows, answers the same filtered searches.
   - The same set under rc.83's `flint-vec` loads and answers unfiltered
     searches. That is why the flag is needed, and the drill shows it.
-- **The framework survey** (downloads approved 2026-10-19).
-  Which clients send filtered vector queries, and in which dialect. That
-  means `redisvl`, LangChain's and LlamaIndex's Redis vector stores, and any
-  client that has a `VEC.*`-shaped API. This decides whether C follows.
+- **The framework survey.** Done 2026-10-19, in the next section.
+
+## The framework survey, 2026-10-19
+
+Read, not run: `redisvl` 0.28.0, `langchain-redis` 0.2.6 and
+`llama-index-vector-stores-redis` 0.9.0, the newest wheels on PyPI that day.
+Both stores build their indexes and queries with `redisvl`
+(`langchain-redis` needs `redisvl` 0.12 to below 1.0, the LlamaIndex store
+0.4.1 to below 0.5), and read and delete documents through its client with
+plain `HASH` and JSON commands in pipelines.
+
+- **They send only RediSearch's API:** `FT.CREATE`, `FT.INFO`, `FT._LIST`,
+  `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR` and `FT.DROPINDEX`, over
+  documents written as `HASH` (both stores' default) or JSON. None sends
+  `VEC.*`, so none can use Flint's vector search today, filtered or not. B
+  does not change that, and only C would.
+- **The filter dialect is B's subset, and more.** A filtered search is
+  `(<filter>)=>[KNN k @vec $vector AS vector_distance]` at `DIALECT 2`, with
+  `HYBRID_POLICY` and `EF_RUNTIME` when asked. `redisvl`'s tag and number
+  filters write exactly the forms listed under B. It also writes full-text
+  (`@f:("phrase")`), geo, and tag wildcards, which B leaves out.
+- **LangChain's default needs full text even with no filter.** Its default
+  schema declares `_index_name` as a `TEXT` field and adds
+  `@_index_name:("<index>")` to every vector query. So C needs at least an
+  exact-phrase match on a `TEXT` field to serve LangChain's default.
+- **Both stores also search without a vector**, for deletes by document id
+  and LangChain's chat history (`FilterQuery`, `CountQuery`).
+- **`redisvl` no longer refuses a server without the search module** at
+  connect ("Module validation was removed"). It reads `MODULE LIST` only to
+  test for SVS-VAMANA. A missing `FT.*` shows up at the first index call.
+
+**What this decides:** C follows B, in its own ADR. B's parser and field
+index are what C's filter needs. C's own costs are the `HASH` and JSON data
+model and the feed from every write to those keys, which the Options section
+lists. A tenant on LangChain or LlamaIndex needs C, and one on the raw
+client needs only B.
 
 ## What this does not decide
 
