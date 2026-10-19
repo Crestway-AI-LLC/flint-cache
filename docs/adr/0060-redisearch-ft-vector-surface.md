@@ -1,8 +1,12 @@
 # ADR-0060: RediSearch's `FT.*` vector surface, for the frameworks that speak only it
 
-Status: **PROPOSED 2026-10-19.** Nothing is built. The choices are Jeff's:
-which option, the scope of the first release, and the downloads its
-verification needs.
+Status: **ACCEPTED 2026-10-19, option A** (Jeff: "go with your
+recommendation"), with the first release's scope and the two releases as
+recommended. The downloads its verification needs, to install and run the
+three clients' own tests, are still Jeff's to approve when it is built.
+Nothing is built yet.
+
+Proposed 2026-10-19.
 
 ## Context
 
@@ -127,7 +131,7 @@ needs `FT.*` over keys it writes with scripts.
   the index. The next release turns it on, and a rollback from it lands on a
   release that routes them.
 
-## Verification, if accepted
+## Verification
 
 - **The clients' own tests against Flint:** `redisvl`'s, and LangChain's and
   LlamaIndex's Redis vector store suites, run unchanged against a Flint
