@@ -1,8 +1,12 @@
 # ADR-0059: Vector search filtered by metadata
 
-Status: **PROPOSED 2026-10-17.** Nothing is built. The choice is Jeff's:
-which option, and whether the framework survey under *Verification*, which
-needs downloads, comes first.
+Status: **ACCEPTED 2026-10-19, option B, in two releases** (Jeff: "go with
+your recommendations on all six"). Jeff also approved the framework survey's
+downloads, and the 999,000-vector measurement run in principle, to be asked
+for again when B is built so that one run measures A, B and the scan
+threshold. Nothing is built yet.
+
+Proposed 2026-10-17.
 
 ## Context
 
@@ -143,7 +147,7 @@ the fifth (`decode_config`), so a set made with fields still loads there.
 Nothing new is written to the durable vector rows, since `META` is already
 there.
 
-## Verification, if accepted
+## Verification
 
 - **Recall and latency against selectivity.** Recall@10 against an exact
   search over the matching vectors, for A and B, at 50%, 10%, 1% and 0.1%,
@@ -168,7 +172,7 @@ there.
     rows, answers the same filtered searches.
   - The same set under rc.83's `flint-vec` loads and answers unfiltered
     searches. That is why the flag is needed, and the drill shows it.
-- **The framework survey, which needs Jeff's approval for the downloads.**
+- **The framework survey** (downloads approved 2026-10-19).
   Which clients send filtered vector queries, and in which dialect. That
   means `redisvl`, LangChain's and LlamaIndex's Redis vector stores, and any
   client that has a `VEC.*`-shaped API. This decides whether C follows.
