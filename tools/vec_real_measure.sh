@@ -22,6 +22,10 @@
 #   VEC_DATA  where the data goes (default /mnt/d/vecdata, or
 #             /mnt/d/vecdata-<corpus> for another corpus; the instance store)
 #   VEC_OUT   where the results go (default /tmp/flint-vecreal)
+#   VEC_FILTERS  1 measures ADR-0059's filtered searches instead (bench
+#             --filters): recall against brute force over each filter's
+#             matches, 50% to 0.1% matching, by the threshold rule and with
+#             each path forced
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CORPUS="${VEC_CORPUS:-dbpedia-3large}"
@@ -33,6 +37,8 @@ esac
 OUT="${VEC_OUT:-/tmp/flint-vecreal}"
 N="${VEC_N:-}"
 ARMS="${VEC_ARMS-plain sq8-disk bin-disk}"
+FILTERS=""
+[ "${VEC_FILTERS:-}" = 1 ] && FILTERS="--filters"
 mkdir -p "$D/parquet" "$D/py" "$OUT"
 
 # The wheels are cp39: say so now rather than fail at an import.
@@ -91,7 +97,7 @@ B=./target/release/bench
 rm -f "$OUT"/*.txt "$OUT"/*.log
 "$B" --data "$D" ${N:+--n "$N"} --queries 200 --gt-only 2>&1 | tee "$OUT/gt.log"
 for arm in $ARMS; do
-  "$B" --data "$D" --arm "$arm" ${N:+--n "$N"} --queries 200 --vec-dir "/mnt/d/vecdir-$arm" \
+  "$B" --data "$D" --arm "$arm" ${N:+--n "$N"} --queries 200 --vec-dir "/mnt/d/vecdir-$arm" $FILTERS \
     > "$OUT/$arm.txt" 2> "$OUT/$arm.log" &
 done
 wait
