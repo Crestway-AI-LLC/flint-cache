@@ -696,6 +696,7 @@ dependencies = [
  "flint-resp",
  "flint-tls",
  "libc",
+ "serde_json",
 ]
 
 [[package]]

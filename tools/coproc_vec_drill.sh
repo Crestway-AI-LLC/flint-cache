@@ -28,6 +28,10 @@
 #   - ADR-0050 D5: rows written packed (the default) rebuild in a co-processor
 #     that writes text (--write-text-rows, the previous release), to the same
 #     results, META and TTL
+#   - ADR-0059: VEC.SEARCH refuses an option it does not know; FIELD and
+#     FILTER are refused without --vec-filters and served with it, through the
+#     proxy, to only the matches; a set's fields survive a restart without the
+#     flag and are indexed again by the next one with it
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
@@ -559,6 +563,63 @@ fi
 case "$(vexec VEC.INFO pipe)" in *count*24*) : ;; *) echo "FAIL: VEC.INFO pipe should count 24"; exit 1 ;; esac
 echo "  24 VEC.SETs on one connection: all OK in ${SECS}s"
 
+echo "== ADR-0059: vector filters, served only with --vec-filters"
+# The ids of a VEC.SEARCH reply, in order: every other word of vexec's line.
+ids() { vexec "$@" | awk '{for (i = 1; i <= NF; i += 2) printf "%s ", $i}'; }
+restart_vec() {   # restart_vec <log> <flags...>
+  local log="$1"; shift
+  kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+  sleep 0.3
+  $VEC --port 6678 --vec-dir "$VD" "$@" 2>"$D/$log" & COPROC_PID=$!
+  fleet_wait_listen 6678
+}
+restart_vec vec8.log
+grep -q "filters off" "$D/vec8.log" || { echo "FAIL: a co-processor started with no flag does not say filters are off:"; sed 's/^/    /' "$D/vec8.log"; exit 1; }
+# The releases before this one passed over an option they did not know, so a
+# FILTER was answered as if there were none. This one refuses it.
+case "$(vexec VEC.SEARCH docs 0.9,0.1,0 2 WITHSCORES 1)" in *"unknown VEC.SEARCH option"*) : ;; *) echo "FAIL: an unknown VEC.SEARCH option was not refused"; exit 1 ;; esac
+case "$(vexec VEC.SEARCH docs 0.9,0.1,0 2 FILTER '@t:{x}')" in *"are off"*) : ;; *) echo "FAIL: FILTER without --vec-filters: $(vexec VEC.SEARCH docs 0.9,0.1,0 2 FILTER '@t:{x}')"; exit 1 ;; esac
+case "$(vexec VEC.CREATE fs DIM 3 METRIC l2 FIELD t TAG)" in *"are off"*) : ;; *) echo "FAIL: FIELD without --vec-filters was not refused"; exit 1 ;; esac
+[ "$(ids VEC.SEARCH docs 0.9,0.1,0 2 EF 32)" = "$(ids VEC.SEARCH docs 0.9,0.1,0 2)" ] || { echo "FAIL: EF changed a three-vector search"; exit 1; }
+restart_vec vec9.log --vec-filters
+grep -q "filters on" "$D/vec9.log" || { echo "FAIL: --vec-filters is not said to be on:"; sed 's/^/    /' "$D/vec9.log"; exit 1; }
+[ "$(vexec VEC.CREATE fs DIM 3 METRIC l2 INDEX hnsw QUANT bin FIELD t TAG FIELD n NUMERIC)" = "OK " ] || { echo "FAIL: VEC.CREATE fs with fields"; exit 1; }
+# From the query 1,0,0 the order is a e b c d. e's META is not JSON. No
+# globbing while a row is split: c's META has a bracket expression in it.
+set -f
+for row in 'a 1,0,0 {"t":"x","n":1}' 'b 0.9,0.1,0 {"t":"y","n":2}' 'c 0.8,0.2,0 {"t":["x","z"],"n":3}' \
+           'd 0,1,0 {"t":"y","n":4}' 'e 0.95,0.05,0 plain'; do
+  set -- $row
+  [ "$(vexec VEC.SET fs "$1" "$2" META "$3")" = "OK " ] || { echo "FAIL: VEC.SET fs $1"; exit 1; }
+done
+set +f
+filtered() {   # filtered <expected ids> <filter>: on the fs set, k 5
+  local got; got="$(ids VEC.SEARCH fs 1,0,0 5 FILTER "$2")"
+  [ "$got" = "$1" ] || { echo "FAIL: FILTER $2 -> [$got], expected [$1]"; exit 1; }
+}
+check_filters() {
+  [ "$(ids VEC.SEARCH fs 1,0,0 5)" = "a e b c d " ] || { echo "FAIL: unfiltered fs: $(ids VEC.SEARCH fs 1,0,0 5)"; exit 1; }
+  filtered "a c " '@t:{x}'
+  filtered "d " '@t:{y} @n:[3 +inf]'
+  filtered "e " '-@t:{x|y}'
+  filtered "b c " '(@t:{z} | @n:[(1 2])'
+  filtered "" '@t:{none}'
+}
+check_filters
+case "$(vexec VEC.SEARCH fs 1,0,0 5 FILTER '@t:{x} @n:[1 2] | @t:{y}')" in *"mixes AND and OR"*) : ;; *) echo "FAIL: AND and OR mixed without parentheses were not refused"; exit 1 ;; esac
+case "$(vexec VEC.INFO fs)" in *"fields t tag n numeric field_bytes "*) : ;; *) echo "FAIL: VEC.INFO fs does not list its fields: $(vexec VEC.INFO fs)"; exit 1 ;; esac
+echo "  through the proxy: only matches, nearest first, for tags, ranges, negation and OR"
+# Without the flag, as after a rollback from the release that turns it on:
+# the set rebuilds with its fields and refuses the filter, never ignores it.
+restart_vec vec10.log
+[ "$(ids VEC.SEARCH fs 1,0,0 5)" = "a e b c d " ] || { echo "FAIL: fs did not rebuild without --vec-filters"; exit 1; }
+case "$(vexec VEC.SEARCH fs 1,0,0 5 FILTER '@t:{x}')" in *"are off"*) : ;; *) echo "FAIL: a rebuilt set's FILTER without --vec-filters was not refused"; exit 1 ;; esac
+case "$(vexec VEC.INFO fs)" in *"fields t tag n numeric "*) : ;; *) echo "FAIL: fs lost its fields in a restart without the flag"; exit 1 ;; esac
+restart_vec vec11.log --vec-filters
+check_filters
+grep -qi "rebuilt ns" "$D/vec11.log" || { echo "FAIL: no rebuild logged"; exit 1; }
+echo "  a restart without --vec-filters refuses FILTER and keeps the fields; the next with it filters the same"
+
 echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 and bin on a local file), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
 echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
@@ -569,3 +630,5 @@ echo "      open no channel, TTL holds on quantized sets, and a full tenant leav
 echo "      bin set serving (ADR-0049 verifications 4-6). Packed rows written by one"
 echo "      co-processor rebuild in the next (ADR-0050 D5), an overall cap bounds every"
 echo "      tenant's index together and is exported (D2), and the seat listens where told (BUG-0203)."
+echo "      VEC.SEARCH refuses an option it does not know, and filters are served, through the"
+echo "      proxy, only with --vec-filters, to only the matches, across a restart (ADR-0059)."

@@ -4,7 +4,12 @@ Status: **ACCEPTED 2026-10-19, option B, in two releases** (Jeff: "go with
 your recommendations on all six"). Jeff also approved the framework survey's
 downloads, and the 999,000-vector measurement run in principle, to be asked
 for again when B is built so that one run measures A, B and the scan
-threshold. Nothing is built yet.
+threshold.
+
+**Release R built 2026-10-19** (`crates/flint-vec/src/filter.rs`): every
+`VEC.SEARCH` option this binary does not know is refused, and `FIELD` and
+`FILTER` are served behind `--vec-filters` (inventory `vec-filters on`). How
+it differs from the text below is under *As built*.
 
 Proposed 2026-10-17.
 
@@ -211,6 +216,40 @@ index are what C's filter needs. C's own costs are the `HASH` and JSON data
 model and the feed from every write to those keys, which the Options section
 lists. A tenant on LangChain or LlamaIndex needs C, and one on the raw
 client needs only B.
+
+## As built, release R (2026-10-19)
+
+- **The many-matches walk does not raise `EF`.** It admits only matches to
+  the `EF` it keeps and goes on until it holds `EF` of them, so it reaches
+  further the fewer match without a separate rule. It also starts from up to
+  `EF` matches the count already found, as well as from where the descent
+  lands: with the matches lying together, layer 0 did not always link the
+  two, and on two clusters of 1,500 vectors, one of them matching, a walk
+  from the descent alone returned fewer than `k`.
+- **The threshold** between scoring every match and walking is
+  `sqrt(32 x EF x n)` matches, about 45,000 of 1,000,000 at the default `EF`:
+  where the two cost the same number of distances. That is arithmetic. The
+  999,000-vector run sets it.
+- **Counting stops at the threshold.** The count reads the smallest TAG
+  term's set of slots (or a range's), checks each slot against the whole
+  filter, and stops one past the threshold. A filter with no such term (`*`,
+  a negation) is counted by a scan of every slot, which stops there too.
+- **The field index is HNSW's only.** A flat set scores every vector anyway,
+  so it keeps each vector's values and checks them as it scans.
+- **The syntax:** blanks at a tag's ends are dropped, and a backslash keeps
+  one. `$parameter`, tag wildcards, full-text and geo terms are refused by
+  name. AND and OR do not mix without parentheses.
+- **Measured in the unit tests, not on real embeddings:** on 3,000 16-d
+  vectors, scoring every match recalled 1.0 on full vectors and at least
+  0.994 with `sq8` or `bin`. A walk recalled 1.0 on full vectors and `sq8`
+  at 1 in 2, 1 in 10 and 1 in 100 matching, with tags drawn apart from the
+  vectors or following them. With `bin` it recalled at least as much as an
+  unfiltered search of the same set, which a 16-bit code holds to between
+  0.30 and 0.82.
+- **The meter** charges the field index from counts it keeps: each tag
+  value, each slot in a value's set, each numeric slot and each vector's
+  values. `tests/meter.rs` holds it above what a set with fields holds, for
+  TAG values each vector's own and values all of them share.
 
 ## What this does not decide
 

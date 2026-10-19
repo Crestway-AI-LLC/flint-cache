@@ -18,6 +18,7 @@
 //! links, which every node has, are a fixed stride of one array; the few nodes
 //! on higher layers keep those in a map.
 
+use crate::filter::{Expr, Field, FieldIndex};
 use crate::kernel::{self, Sq8};
 use crate::quant::{self, BinQuery};
 use crate::vecfile::VecFile;
@@ -35,6 +36,17 @@ const EF_CONSTRUCTION: usize = 100;
 /// Default `ef` for a query when `VEC.SEARCH` gives no `EF` — the recall/latency
 /// knob. Higher searches more of the graph: better recall, more work.
 pub const EF_SEARCH_DEFAULT: usize = 64;
+
+/// How many matches a filtered search scores one by one, past which it walks
+/// the graph instead (ADR-0059 B). Scoring `m` matches costs `m` distances.
+/// A walk that admits a fraction `s` of the nodes visits about `ef / s` of
+/// them and scores each one's `M0` links, so the two cost the same where
+/// `m = n x s` and `m = M0 x ef / s`, at `m = sqrt(M0 x ef x n)`: about
+/// 45,000 of 1,000,000 vectors at the default `EF`. The arithmetic, not a
+/// measurement; ADR-0059's verification sets it on real embeddings.
+pub(crate) fn scan_threshold(live: usize, ef: usize) -> usize {
+    ((M0 as f64) * (ef.max(1) as f64) * (live as f64)).sqrt() as usize
+}
 /// How many of a reused slot's live neighbourhood each of its old neighbours
 /// re-selects from (BUG-0197), besides its own links. Measured on 5,000 vectors
 /// replaced half at a time for ten rounds: 128 kept recall@10 at a fresh
@@ -46,7 +58,7 @@ const REPAIR_POOL: usize = 4 * M0;
 /// SipHash is built to withstand keys an adversary picks, which slot numbers,
 /// handed out by this index, are not.
 #[derive(Default)]
-struct SlotHasher(u64);
+pub(crate) struct SlotHasher(u64);
 
 impl Hasher for SlotHasher {
     fn write(&mut self, bytes: &[u8]) {
@@ -62,7 +74,7 @@ impl Hasher for SlotHasher {
     }
 }
 
-type SlotSet = HashSet<u32, BuildHasherDefault<SlotHasher>>;
+pub(crate) type SlotSet = HashSet<u32, BuildHasherDefault<SlotHasher>>;
 
 /// Who is walking the graph, which decides what a deleted node is to the walk.
 #[derive(Clone, Copy, PartialEq)]
@@ -87,7 +99,7 @@ impl Walk {
 /// doubling `Vec` does on its own. These arrays hold every node, and just past
 /// a doubling half of one is empty: most of what BUG-0198 measured beyond the
 /// vectors themselves.
-fn grow<T>(v: &mut Vec<T>, extra: usize) {
+pub(crate) fn grow<T>(v: &mut Vec<T>, extra: usize) {
     if v.len() + extra > v.capacity() {
         v.reserve_exact((v.capacity() / 4).max(extra));
     }
@@ -322,6 +334,8 @@ pub struct Hnsw {
     live: usize,
     rng: u64,
     m_l: f64,
+    /// The set's declared fields and their index (ADR-0059), when it has any.
+    fields: Option<FieldIndex>,
 }
 
 /// A stored vector and its meta, as [`Hnsw::get`] finds them.
@@ -420,7 +434,23 @@ impl Hnsw {
             live: 0,
             rng: 0x9e3779b97f4a7c15,
             m_l: 1.0 / (M as f64).ln(),
+            fields: None,
         }
+    }
+
+    /// Index `fields` from each vector's `META` (ADR-0059). Only for a set
+    /// with nothing in it yet.
+    pub fn set_fields(&mut self, fields: Box<[Field]>) {
+        debug_assert!(self.levels.is_empty());
+        if !fields.is_empty() {
+            self.fields = Some(FieldIndex::new(fields));
+        }
+    }
+
+    /// What the field index holds, for the D4 meter: 0 for a set with no
+    /// fields.
+    pub fn fields_bytes(&self) -> usize {
+        self.fields.as_ref().map_or(0, FieldIndex::bytes)
     }
 
     pub fn len(&self) -> usize {
@@ -671,6 +701,9 @@ impl Hnsw {
             None => self.levels.len() as u32,
         };
         let id: Box<[u8]> = id.into_boxed_slice();
+        if let Some(fi) = &mut self.fields {
+            fi.put(idx, meta.as_deref());
+        }
         self.write_slot(
             idx,
             id.clone(),
@@ -707,7 +740,9 @@ impl Hnsw {
         let mut ep_set = vec![ep];
         let top = level.min(self.max_level);
         for lc in (0..=top).rev() {
-            let w = self.search_layer(&q, &ep_set, EF_CONSTRUCTION, lc, Walk::Insert(idx));
+            let w = self.search_layer(&q, &ep_set, EF_CONSTRUCTION, lc, Walk::Insert(idx), |_| {
+                true
+            });
             let mmax = if lc == 0 { M0 } else { M };
             // The walk ranked the candidates by distance to the NEW node, from
             // its full vector: with codes, a better estimate than one between
@@ -751,6 +786,9 @@ impl Hnsw {
         self.deleted[i as usize] = true;
         self.dead_bytes += self.held_bytes(i);
         self.live -= 1;
+        if let Some(fi) = &mut self.fields {
+            fi.clear(i);
+        }
         // A deleted node routes by its code; its full vector is dead.
         if let Full::File { spill, .. } = &mut self.full {
             spill.remove(&i);
@@ -864,7 +902,9 @@ impl Hnsw {
 
     /// Beam search at one layer: return up to `ef` nearest nodes. Deleted
     /// nodes always route (their links are followed); what else they are to
-    /// the walk is [`Walk`]'s to say.
+    /// the walk is [`Walk`]'s to say. A query returns only nodes `admit`
+    /// takes, and routes through the rest (ADR-0059): its walk goes on until
+    /// it holds `ef` of them, so it reaches further the fewer there are.
     fn search_layer(
         &self,
         q: &Query<'_>,
@@ -872,7 +912,12 @@ impl Hnsw {
         ef: usize,
         layer: usize,
         walk: Walk,
+        admit: impl Fn(u32) -> bool,
     ) -> Vec<DI> {
+        let returns = |n: u32| match walk {
+            Walk::Query => !self.deleted[n as usize] && admit(n),
+            Walk::Insert(_) => true,
+        };
         let mut visited = SlotSet::default();
         let mut cands: BinaryHeap<std::cmp::Reverse<DI>> = BinaryHeap::new();
         let mut w: BinaryHeap<DI> = BinaryHeap::new(); // max-heap: worst on top
@@ -882,7 +927,7 @@ impl Hnsw {
             }
             let d = self.dnq(e, q);
             cands.push(std::cmp::Reverse(DI { dist: d, idx: e }));
-            if !(walk == Walk::Query && self.deleted[e as usize]) {
+            if returns(e) {
                 w.push(DI { dist: d, idx: e });
             }
         }
@@ -899,7 +944,7 @@ impl Hnsw {
                 let worst = w.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
                 if d < worst || w.len() < ef {
                     cands.push(std::cmp::Reverse(DI { dist: d, idx: n }));
-                    if !(walk == Walk::Query && self.deleted[n as usize]) {
+                    if returns(n) {
                         w.push(DI { dist: d, idx: n });
                         if w.len() > ef {
                             w.pop();
@@ -967,20 +1012,130 @@ impl Hnsw {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let Some(mut ep) = self.entry else {
+        let Some(ep) = self.entry else {
             return Ok(Vec::new());
         };
         let qn = l2norm(q);
         let query = self.codes.query(q, qn);
-        for lc in (1..=self.max_level).rev() {
-            ep = self.greedy(&query, ep, lc, Walk::Query);
+        let depth = self.depth(k, rerank);
+        let w = self.walk(&query, ep, ef.max(depth), |_| true, &[]);
+        self.ranked(w, q, qn, k, depth)
+    }
+
+    /// [`Hnsw::knn`] over only the vectors `filter` matches (ADR-0059 B).
+    /// The field index counts the matches first. When there are no more than
+    /// [`scan_threshold`] of them, each is scored, which for an unquantized
+    /// set is exact. Past it, the graph is walked as an unfiltered search
+    /// walks it, through every node, but only matches are returned.
+    pub fn knn_where(
+        &self,
+        q: &[f32],
+        k: usize,
+        ef: usize,
+        rerank: usize,
+        filter: &Expr,
+    ) -> Result<Vec<(Vec<u8>, f32)>, String> {
+        let cap = scan_threshold(self.live, ef.max(self.depth(k, rerank)));
+        self.knn_where_capped(q, k, ef, rerank, filter, cap)
+    }
+
+    /// [`Hnsw::knn_where`], scoring the matches when there are no more than
+    /// `cap` of them.
+    fn knn_where_capped(
+        &self,
+        q: &[f32],
+        k: usize,
+        ef: usize,
+        rerank: usize,
+        filter: &Expr,
+        cap: usize,
+    ) -> Result<Vec<(Vec<u8>, f32)>, String> {
+        let Some(fi) = &self.fields else {
+            // No fields: a filter can name none, so it is `*` or its
+            // negations, and matches every vector or none.
+            return if filter.matches(None) {
+                self.knn(q, k, ef, rerank)
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        if k == 0 {
+            return Ok(Vec::new());
         }
-        let depth = if self.quant == Quant::None {
+        let Some(ep) = self.entry else {
+            return Ok(Vec::new());
+        };
+        let qn = l2norm(q);
+        let query = self.codes.query(q, qn);
+        let depth = self.depth(k, rerank);
+        let ef = ef.max(depth);
+        let (matches, all) = fi.matching(filter, cap, &self.deleted);
+        let w = if all {
+            let mut w: Vec<DI> = matches
+                .into_iter()
+                .map(|idx| DI {
+                    dist: self.dnq(idx, &query),
+                    idx,
+                })
+                .collect();
+            if w.len() > depth {
+                w.select_nth_unstable(depth);
+            }
+            w
+        } else {
+            // The walk starts from matches the count already found, as well
+            // as from where the descent lands. When the matches lie together
+            // (one tenant's folder, or tags that follow the vectors), layer
+            // 0 may not link the place the descent lands to them at all, and
+            // a walk from there alone found fewer than `k` (measured on two
+            // clusters of 1,500, one of them matching, with `sq8`).
+            let seeds = &matches[..matches.len().min(ef)];
+            self.walk(&query, ep, ef, |n| fi.matches(filter, n), seeds)
+        };
+        self.ranked(w, q, qn, k, depth)
+    }
+
+    /// How many candidates a search ranks before cutting to `k`: `k`, or for
+    /// a quantized set the `rerank` it re-scores.
+    fn depth(&self, k: usize, rerank: usize) -> usize {
+        if self.quant == Quant::None {
             k
         } else {
             rerank.max(k)
-        };
-        let mut w = self.search_layer(&query, &[ep], ef.max(depth), 0, Walk::Query);
+        }
+    }
+
+    /// Greedy descent to layer 0 from `ep`, then a beam search there with
+    /// `ef` from where it lands and from `seeds`, returning only nodes
+    /// `admit` takes.
+    fn walk(
+        &self,
+        query: &Query<'_>,
+        mut ep: u32,
+        ef: usize,
+        admit: impl Fn(u32) -> bool,
+        seeds: &[u32],
+    ) -> Vec<DI> {
+        for lc in (1..=self.max_level).rev() {
+            ep = self.greedy(query, ep, lc, Walk::Query);
+        }
+        let mut from = Vec::with_capacity(1 + seeds.len());
+        from.push(ep);
+        from.extend_from_slice(seeds);
+        self.search_layer(query, &from, ef, 0, Walk::Query, admit)
+    }
+
+    /// The best `depth` of `w`, re-scored against the full vectors when the
+    /// graph holds codes, then the `k` nearest as `(id, score)` with score in
+    /// flat's convention.
+    fn ranked(
+        &self,
+        mut w: Vec<DI>,
+        q: &[f32],
+        qn: f32,
+        k: usize,
+        depth: usize,
+    ) -> Result<Vec<(Vec<u8>, f32)>, String> {
         w.sort();
         w.truncate(depth);
         if self.quant != Quant::None {
@@ -1012,6 +1167,7 @@ impl Hnsw {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::Field;
 
     struct Rng(u64);
     impl Rng {
@@ -1487,5 +1643,188 @@ mod tests {
             all.iter().all(|(id, _)| id != b"b"),
             "deleted 'b' never in results"
         );
+    }
+
+    /// ADR-0059: recall@10 of a filtered search against brute force over the
+    /// matches alone, on 3,000 16-d vectors tagged one in `every`. `follow`
+    /// tags each cluster, so the matches lie together; otherwise the tags are
+    /// drawn apart from the vectors. `scan` scores every match; otherwise the
+    /// graph is walked. Returned beside the recall of an unfiltered search of
+    /// the same set at the same settings, against brute force over all of it.
+    fn filtered_recall(quant: Quant, every: usize, follow: bool, scan: bool) -> (f64, f64) {
+        let (n, dim, k, ef) = (3000usize, 16usize, 10usize, 64usize);
+        let mut rng = Rng(0x0059 ^ (every as u64) << 8 ^ u64::from(follow));
+        let data: Vec<Vec<f32>> = if follow {
+            clustered(&mut rng, n, dim, every)
+        } else {
+            (0..n).map(|_| rng.vec(dim)).collect()
+        };
+        let fields: Box<[Field]> = Box::new([Field {
+            name: "t".into(),
+            kind: crate::filter::FieldKind::Tag,
+        }]);
+        let mut h = Hnsw::new(Metric::L2, quant);
+        h.set_fields(fields.clone());
+        for (i, v) in data.iter().enumerate() {
+            let meta = format!(r#"{{"t":"{}"}}"#, i % every);
+            h.set(
+                format!("{i}").into_bytes(),
+                v.clone(),
+                Some(meta.into_bytes()),
+            );
+        }
+        let filter = crate::filter::parse(b"@t:{0}", &fields).expect("parses");
+        let cap = if scan { usize::MAX } else { 0 };
+        let rerank = k * quant.rerank_multiple();
+        let (mut hit, mut tot, mut plain) = (0usize, 0usize, 0usize);
+        for _ in 0..50 {
+            let q = rng.vec(dim);
+            let qn = l2norm(&q);
+            let mut all: Vec<(f32, usize)> = data
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (dist(Metric::L2, &q, qn, v, l2norm(v)), i))
+                .collect();
+            all.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let nearest: HashSet<Vec<u8>> = all[..k]
+                .iter()
+                .map(|(_, i)| format!("{i}").into_bytes())
+                .collect();
+            plain += h
+                .knn_ok(&q, k, ef, rerank)
+                .iter()
+                .filter(|(id, _)| nearest.contains(id))
+                .count();
+            let mut bf: Vec<(f32, usize)> = data
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % every == 0)
+                .map(|(i, v)| (dist(Metric::L2, &q, qn, v, l2norm(v)), i))
+                .collect();
+            bf.sort_by(|a, b| a.0.total_cmp(&b.0));
+            bf.truncate(k);
+            let truth: HashSet<Vec<u8>> = bf
+                .iter()
+                .map(|(_, i)| format!("{i}").into_bytes())
+                .collect();
+            let got = h
+                .knn_where_capped(&q, k, ef, rerank, &filter, cap)
+                .expect("an in-RAM set reads no file");
+            for (id, _) in &got {
+                let i: usize = std::str::from_utf8(id)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .expect("ids are numbers");
+                assert_eq!(i % every, 0, "a filtered search returned a non-match");
+            }
+            assert_eq!(got.len(), k, "fewer than k of the {} matches", n / every);
+            hit += got.iter().filter(|(id, _)| truth.contains(id)).count();
+            tot += k;
+        }
+        (hit as f64 / tot as f64, plain as f64 / tot as f64)
+    }
+
+    #[test]
+    fn a_filtered_scan_of_full_vectors_is_exact() {
+        for every in [10, 100] {
+            for follow in [false, true] {
+                let (r, _) = filtered_recall(Quant::None, every, follow, true);
+                assert_eq!(r, 1.0, "1 in {every}, tags follow vectors: {follow}");
+            }
+        }
+    }
+
+    /// A filtered walk recalls what an unfiltered search of the same set
+    /// does, at every matching fraction, whether or not the tags follow the
+    /// vectors. A 16-bit code (`bin` at 16 dimensions) recalls little either
+    /// way, which is why the bar is the unfiltered search's, not a number.
+    #[test]
+    fn a_filtered_walk_keeps_recall() {
+        for quant in [Quant::None, Quant::Sq8, Quant::Bin] {
+            for every in [2, 10, 100] {
+                for follow in [false, true] {
+                    let (r, plain) = filtered_recall(quant, every, follow, false);
+                    eprintln!(
+                        "walk {quant:?} 1 in {every} follow {follow}: recall@10 {r:.3}, unfiltered {plain:.3}"
+                    );
+                    assert!(
+                        r >= plain - 0.05,
+                        "{quant:?}, 1 in {every}, follow {follow}: {r} against unfiltered {plain}"
+                    );
+                    if quant != Quant::Bin {
+                        assert!(r >= 0.95, "{quant:?}, 1 in {every}, follow {follow}: {r}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_filtered_scan_of_codes_reranks_to_full_vector_recall() {
+        for quant in [Quant::Sq8, Quant::Bin] {
+            for every in [10, 100] {
+                let (r, plain) = filtered_recall(quant, every, false, true);
+                eprintln!("scan {quant:?} 1 in {every}: recall@10 {r:.3}, unfiltered {plain:.3}");
+                assert!(r >= 0.95, "{quant:?}, 1 in {every}: {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_scan_threshold_is_the_square_root_rule() {
+        assert_eq!(scan_threshold(1_000_000, 64), 45_254);
+        assert_eq!(scan_threshold(0, 64), 0);
+        assert!(
+            scan_threshold(2000, 64) > 2000,
+            "a small set is always scored"
+        );
+    }
+
+    /// A vector's values leave the field index when it is deleted or
+    /// replaced, and a reused slot carries only its new vector's.
+    #[test]
+    fn deleted_and_replaced_vectors_leave_the_filter() {
+        let fields: Box<[Field]> = Box::new([Field {
+            name: "t".into(),
+            kind: crate::filter::FieldKind::Tag,
+        }]);
+        let mut h = Hnsw::new(Metric::L2, Quant::None);
+        h.set_fields(fields.clone());
+        let tag = |t: &str| Some(format!(r#"{{"t":"{t}"}}"#).into_bytes());
+        h.set(b"a".to_vec(), vec![0.0, 0.0], tag("x"));
+        h.set(b"b".to_vec(), vec![1.0, 0.0], tag("x"));
+        h.set(b"c".to_vec(), vec![2.0, 0.0], tag("y"));
+        let x = crate::filter::parse(b"@t:{x}", &fields).expect("parses");
+        let ids = |h: &Hnsw, cap: usize| -> Vec<Vec<u8>> {
+            let mut v: Vec<Vec<u8>> = h
+                .knn_where_capped(&[0.0, 0.0], 5, 16, 5, &x, cap)
+                .expect("in RAM")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            v.sort();
+            v
+        };
+        for cap in [usize::MAX, 0] {
+            let mut h2 = Hnsw::new(Metric::L2, Quant::None);
+            h2.set_fields(fields.clone());
+            for (id, v, t) in [("a", 0.0, "x"), ("b", 1.0, "x"), ("c", 2.0, "y")] {
+                h2.set(id.as_bytes().to_vec(), vec![v, 0.0], tag(t));
+            }
+            assert_eq!(ids(&h2, cap), vec![b"a".to_vec(), b"b".to_vec()]);
+            h2.set(b"a".to_vec(), vec![0.0, 0.0], tag("y"));
+            assert_eq!(ids(&h2, cap), vec![b"b".to_vec()], "an upsert moves a");
+            h2.del(b"b");
+            assert_eq!(ids(&h2, cap), Vec::<Vec<u8>>::new(), "a delete removes b");
+            h2.set(b"d".to_vec(), vec![3.0, 0.0], tag("x"));
+            assert_eq!(
+                ids(&h2, cap),
+                vec![b"d".to_vec()],
+                "a reused slot is d's alone"
+            );
+            h2.set(b"e".to_vec(), vec![4.0, 0.0], b"not json".to_vec().into());
+            assert_eq!(ids(&h2, cap), vec![b"d".to_vec()]);
+        }
+        assert_eq!(ids(&h, usize::MAX).len(), 2);
     }
 }

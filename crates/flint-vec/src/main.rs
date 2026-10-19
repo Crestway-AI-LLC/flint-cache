@@ -35,6 +35,7 @@
 //! raise-the-budget error rather than a silent partial.
 
 use flint_resp::{Decoded, Value, decode, encode};
+use flint_vec::filter::Field;
 use flint_vec::{
     Apply, IndexKind, Metric, Persist, Plan, Quant, Store, decode_config, decode_vec_row,
     parse_durable_key,
@@ -108,8 +109,9 @@ enum Chunk {
     More { phase: Phase, installed: usize },
 }
 
-/// A decoded config row awaiting install: `(set, dim, metric, index)`.
-type LoadedConfig = (Vec<u8>, usize, Metric, IndexKind, Quant);
+/// A decoded config row awaiting install: `(set, dim, metric, index, quant,
+/// fields)`.
+type LoadedConfig = (Vec<u8>, usize, Metric, IndexKind, Quant, Vec<Field>);
 /// A decoded vector row awaiting install: `(set, id, vector, meta, expires_at)`.
 type LoadedVector = (Vec<u8>, Vec<u8>, Vec<f32>, Option<Vec<u8>>, Option<u64>);
 
@@ -135,7 +137,7 @@ fn flintinfo(s: &flint_vec::StoreStats, loading: usize) -> String {
         "build:{}\r\nrole:coproc\r\nindex_bytes:{}\r\nindex_cap_ns_bytes:{}\r\n\
          index_cap_total_bytes:{}\r\nnamespaces:{}\r\nnamespaces_loading:{loading}\r\n\
          sets:{}\r\nvectors:{}\r\nvecfull_ns_total:{}\r\nvecfull_server_total:{}\r\n\
-         packed_rows:{}\r\n",
+         packed_rows:{}\r\nvec_filters:{}\r\n",
         build_version(),
         s.index_bytes,
         s.index_cap,
@@ -146,6 +148,7 @@ fn flintinfo(s: &flint_vec::StoreStats, loading: usize) -> String {
         s.refused_ns,
         s.refused_total,
         u8::from(s.packed_rows),
+        u8::from(s.filters),
     )
 }
 
@@ -198,6 +201,14 @@ fn main() {
     // still accepted and now changes nothing. This binary reads both either way.
     let packed_rows = !args.iter().any(|a| a == "--write-text-rows");
     initial.set_packed_rows(packed_rows);
+    // ADR-0059, the first of two releases: serve `VEC.CREATE ... FIELD` and
+    // `VEC.SEARCH ... FILTER` only when told. The releases before this one
+    // answer a `FILTER` as if there were none, so a fleet that could roll
+    // back to one must not have tenants relying on filters yet. This release
+    // refuses every `VEC.SEARCH` option it does not know, so the next one can
+    // serve filters by default: a rollback from it lands here.
+    let filters = args.iter().any(|a| a == "--vec-filters");
+    initial.set_filters(filters);
     // ADR-0049 D2: where a quantized set keeps its full vectors. The files are
     // derived like the index, so every one found here is deleted before
     // serving and the rebuild writes them again. The lock is what makes that
@@ -237,8 +248,9 @@ fn main() {
     } else {
         "text rows"
     };
+    let filters_note = if filters { "filters on" } else { "filters off" };
     eprintln!(
-        "flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note}, {vec_note}, {rows_note})"
+        "flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note}, {vec_note}, {rows_note}, {filters_note})"
     );
 
     // Background reclamation of expired vectors. Reads/searches already mask an
@@ -683,8 +695,8 @@ fn rebuild_chunk_inner(
         send_cmd(&mut ch, &[b"GET", &keys[i]]).map_err(|e| format!("GET send: {e}"))?;
         match read_reply(&mut ch).map_err(|e| format!("GET read: {e}"))? {
             Value::Bulk(Some(val)) if kind == b'c' => {
-                if let Some((dim, metric, index, quant)) = decode_config(&val) {
-                    configs.push((set, dim, metric, index, quant));
+                if let Some((dim, metric, index, quant, fields)) = decode_config(&val) {
+                    configs.push((set, dim, metric, index, quant, fields));
                 }
                 i += 1;
             }
@@ -753,7 +765,7 @@ fn install(
     if st.generation(ns) != generation {
         return 0;
     }
-    for (set, dim, metric, index, quant) in configs {
+    for (set, dim, metric, index, quant, fields) in configs {
         st.commit(
             ns,
             Apply::CreateSet {
@@ -762,6 +774,7 @@ fn install(
                 metric,
                 index,
                 quant,
+                fields,
             },
         );
     }
@@ -933,7 +946,14 @@ mod tests {
     }
 
     fn loaded_set(store: &Arc<Mutex<Store>>, ns: &[u8]) {
-        let configs = vec![(b"s".to_vec(), 2, Metric::L2, IndexKind::Flat, Quant::None)];
+        let configs = vec![(
+            b"s".to_vec(),
+            2,
+            Metric::L2,
+            IndexKind::Flat,
+            Quant::None,
+            vec![],
+        )];
         let vectors = vec![(b"s".to_vec(), b"id".to_vec(), vec![1.0, 2.0], None, None)];
         assert_eq!(install(store, ns, 0, configs, vectors), 1);
     }
@@ -986,7 +1006,14 @@ mod tests {
         let store = Arc::new(Mutex::new(Store::new()));
         let before = store.lock().expect("store lock").generation(b"ns");
         store.lock().expect("store lock").drop_namespace(b"ns");
-        let configs = vec![(b"s".to_vec(), 2, Metric::L2, IndexKind::Flat, Quant::None)];
+        let configs = vec![(
+            b"s".to_vec(),
+            2,
+            Metric::L2,
+            IndexKind::Flat,
+            Quant::None,
+            vec![],
+        )];
         let vectors = vec![(b"s".to_vec(), b"id".to_vec(), vec![1.0, 2.0], None, None)];
         assert_eq!(install(&store, b"ns", before, configs, vectors), 0);
         assert_eq!(store.lock().expect("store lock").set_count(), 0);

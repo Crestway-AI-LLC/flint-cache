@@ -210,6 +210,7 @@ placed-tenants off          # forbid `tenant add-on-pair` (on by default; ADR-00
 streams off                 # XADD creates no stream (on by default; ADR-0052, section 4)
 chunked-strings off         # store every string whole (on by default; ADR-0056, section 4)
 stream-groups off           # XGROUP CREATE makes no new group (on by default; ADR-0057, section 4)
+vec-filters on              # serve VEC.CREATE FIELD and VEC.SEARCH FILTER (off by default; ADR-0059, section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
 admin-token <tok>           # gate the PROXY*/operator surface
@@ -1325,6 +1326,16 @@ Notes:
   below v0.1.0-rc.82. Nothing is refused while it is off: a string already
   in chunks is still written in place, until a `SET` replaces it with one
   stored whole.
+- **Vector filters** (`VEC.CREATE ... FIELD` and `VEC.SEARCH ... FILTER`,
+  ADR-0059, `vectors.md`) are served only when the inventory says
+  `vec-filters on` (each `flint-vec` runs with `--vec-filters`). It is off
+  in the release that introduces them, because a `flint-vec` before it
+  passes over an option it does not know, so it answers a `FILTER` as if
+  there were none: a tenant scoping each user's results with a filter would
+  read every user's after a rollback below that release. Turn it on once the
+  fleet will not roll back below it. While it is off, `FIELD` and `FILTER`
+  are refused, and a set made with fields keeps them. An older `flint-vec`
+  passes over the flag and loads such a set without its fields.
 
 ## 5. Rotating credentials & keys
 

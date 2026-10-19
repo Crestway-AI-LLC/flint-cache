@@ -271,6 +271,12 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 #                 full build per gate is not worth it for a check that matters
 #                 only when how streams or groups are stored changes. Run it by
 #                 hand then (ADR-0057; its header has the commands).
+#   vec_filters_rollback
+#                 needs the previous release's flint-vec, built from its tag:
+#                 exits 0 with "SKIP: set FLINT_PREV_VEC". The same reason:
+#                 it matters only when how a set's config row or VEC.SEARCH's
+#                 options are read changes (ADR-0059; its header has the
+#                 commands).
 
 # THE LIST ABOVE IS NOW LOAD-BEARING, so it is a variable and not only prose.
 # coproc_family and proxy_chain sat in tools/ registered nowhere for weeks:
@@ -280,7 +286,7 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 # because nothing checked that it was complete. A convention that depends on
 # being remembered will be forgotten; assert_every_drill_accounted_for is what
 # turns it into a check.
-EXCLUDED="backup_s3 fullsync_cap stop_sweep stream_groups_rollback"
+EXCLUDED="backup_s3 fullsync_cap stop_sweep stream_groups_rollback vec_filters_rollback"
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.
 #

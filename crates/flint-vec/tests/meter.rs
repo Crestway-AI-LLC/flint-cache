@@ -78,20 +78,54 @@ fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
             .collect();
         let ids: Vec<Vec<u8>> = (0..n).map(|i| b(&format!("id-{i:06}"))).collect();
         let bin = &["INDEX", "hnsw", "QUANT", "bin"][..];
-        for (label, extra, on_disk) in [
-            ("flat", &[][..], false),
-            ("hnsw", &["INDEX", "hnsw"][..], false),
-            ("hnsw sq8", &["INDEX", "hnsw", "QUANT", "sq8"][..], false),
+        // ADR-0059: a TAG and a NUMERIC field. `own` gives every vector a tag
+        // value of its own, each a whole new value in the index, the worst
+        // case; `shared` gives all of them one value and two of a handful.
+        let fields = ["FIELD", "folder", "TAG", "FIELD", "price", "NUMERIC"];
+        let flat_f = &fields[..];
+        let hnsw_f = &[
+            "INDEX", "hnsw", "FIELD", "folder", "TAG", "FIELD", "price", "NUMERIC",
+        ][..];
+        let bin_f = &[
+            "INDEX", "hnsw", "QUANT", "bin", "FIELD", "folder", "TAG", "FIELD", "price", "NUMERIC",
+        ][..];
+        let own = |i: usize| Some(format!(r#"{{"folder":"folder-{i:06}","price":{i}}}"#));
+        let shared = |i: usize| {
+            Some(format!(
+                r#"{{"folder":["all","group-{}"],"price":{}.5}}"#,
+                i % 4,
+                i % 3
+            ))
+        };
+        let none = |_: usize| None;
+        type Meta<'a> = &'a dyn Fn(usize) -> Option<String>;
+        let cases: [(&str, &[&str], bool, Meta); 11] = [
+            ("flat", &[][..], false, &none),
+            ("hnsw", &["INDEX", "hnsw"][..], false, &none),
+            (
+                "hnsw sq8",
+                &["INDEX", "hnsw", "QUANT", "sq8"][..],
+                false,
+                &none,
+            ),
             (
                 "hnsw sq8 on disk",
                 &["INDEX", "hnsw", "QUANT", "sq8"][..],
                 true,
+                &none,
             ),
-            ("hnsw bin", bin, false),
-            ("hnsw bin on disk", bin, true),
-        ] {
+            ("hnsw bin", bin, false, &none),
+            ("hnsw bin on disk", bin, true, &none),
+            ("flat, fields, own tags", flat_f, false, &own),
+            ("flat, fields, shared tags", flat_f, false, &shared),
+            ("hnsw, fields, own tags", hnsw_f, false, &own),
+            ("hnsw, fields, shared tags", hnsw_f, false, &shared),
+            ("hnsw bin on disk, fields, own tags", bin_f, true, &own),
+        ];
+        for (label, extra, on_disk, meta) in cases {
             let ns = b("meter");
             let mut st = Store::new();
+            st.set_filters(true);
             if on_disk {
                 st.set_vec_dir(dir.clone());
             }
@@ -109,9 +143,15 @@ fn the_meter_charges_at_least_what_each_kind_of_set_holds() {
             // From here: the meter charges each entry, not the set's own
             // struct and the maps VEC.CREATE makes, which a count of 33 would
             // otherwise spread over too few vectors to mean anything.
+            // Each META is made before the count starts, as `vectors` were.
+            let metas: Vec<Option<Vec<u8>>> = (0..n).map(|i| meta(i).map(|m| b(&m))).collect();
             let before = HEAP.load(Ordering::Relaxed);
-            for (id, v) in ids.iter().zip(&vectors) {
-                exec(&mut st, &ns, &[b("VEC.SET"), b("s"), id.clone(), v.clone()]);
+            for ((id, v), m) in ids.iter().zip(&vectors).zip(&metas) {
+                let mut set = vec![b("VEC.SET"), b("s"), id.clone(), v.clone()];
+                if let Some(m) = m {
+                    set.extend([b("META"), m.clone()]);
+                }
+                exec(&mut st, &ns, &set);
             }
             let held = HEAP.load(Ordering::Relaxed) - before;
             let meter = st.ns_mem_bytes(&ns) as isize;

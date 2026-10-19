@@ -19,13 +19,16 @@
 //! that graph (`QUANT sq8|bin`) with the best `RERANK` re-scored on full
 //! vectors; it adds options to the `VEC.*` surface and a fourth config field
 //! that the binary before it reads past, so the vector rows themselves are
-//! unchanged.
+//! unchanged. ADR-0059 adds fields read from a vector's `META`, which
+//! `VEC.SEARCH ... FILTER` matches before it ranks, in a fifth config field.
 
+pub mod filter;
 mod hnsw;
 mod kernel;
 mod quant;
 pub mod vecfile;
 
+use filter::{Expr, Field, FieldKind, Vals};
 use flint_resp::Value;
 use hnsw::Hnsw;
 use std::cmp::Ordering;
@@ -69,12 +72,14 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// A stored vector: the original vector (VEC.GET is lossless), its cached L2
-/// norm (cosine only), and optional opaque metadata bytes.
-#[derive(Clone)]
+/// norm (cosine only), optional opaque metadata bytes, and the values of its
+/// set's fields in them (ADR-0059). Boxed slices, not `Vec`s, so the values
+/// cost a flat entry no more than the capacities they replaced.
 struct Entry {
-    vec: Vec<f32>,
+    vec: Box<[f32]>,
     norm: f32,
-    meta: Option<Vec<u8>>,
+    meta: Option<Box<[u8]>>,
+    vals: Option<Vals>,
 }
 
 /// Which engine backs a set. Chosen at VEC.CREATE and recorded in the durable
@@ -172,6 +177,9 @@ pub struct VectorSet {
     /// durable row carries the same expiry and the data-plane key its own PX,
     /// so a restart's rebuild and the tenant's metering agree without this map.
     expiry: HashMap<Vec<u8>, u64>,
+    /// The fields declared at `VEC.CREATE` (ADR-0059), read from each
+    /// vector's `META`; empty for most sets.
+    fields: Box<[Field]>,
 }
 
 impl VectorSet {
@@ -187,7 +195,23 @@ impl VectorSet {
             metric,
             index,
             expiry: HashMap::new(),
+            fields: Box::new([]),
         }
+    }
+
+    /// The same set, indexing `fields` from each vector's `META` (ADR-0059).
+    /// Only for a set with nothing in it yet.
+    pub fn with_fields(mut self, fields: Vec<Field>) -> Self {
+        let fields = fields.into_boxed_slice();
+        if let Index::Hnsw(h) = &mut self.index {
+            h.set_fields(fields.clone());
+        }
+        self.fields = fields;
+        self
+    }
+
+    pub fn fields(&self) -> &[Field] {
+        &self.fields
     }
 
     pub fn dim(&self) -> usize {
@@ -239,13 +263,55 @@ impl VectorSet {
             Index::Hnsw(h) => h.spill_bytes(),
         }
     }
-    /// What `id` costs the D4 meter, with no file read.
+    /// What `id` costs the D4 meter, with no file read. An HNSW set's field
+    /// index is charged as a whole, in [`VectorSet::held`].
     fn entry_cost(&self, id: &[u8]) -> Option<usize> {
-        let meta_len = match &self.index {
-            Index::Flat(m) => m.get(id)?.meta.as_ref().map_or(0, |x| x.len()),
-            Index::Hnsw(h) => h.meta(id)?.map_or(0, |x| x.len()),
+        let (meta_len, vals) = match &self.index {
+            Index::Flat(m) => {
+                let e = m.get(id)?;
+                (
+                    e.meta.as_ref().map_or(0, |x| x.len()),
+                    filter::vals_bytes(e.vals.as_deref()),
+                )
+            }
+            Index::Hnsw(h) => (h.meta(id)?.map_or(0, |x| x.len()), 0),
         };
-        Some(self.cost(id.len(), meta_len))
+        Some(self.cost(id.len(), meta_len) + vals)
+    }
+    /// What the set holds for the D4 meter beyond its live entries: deleted
+    /// slots, vectors whose file write failed, and an HNSW set's field index.
+    fn held(&self) -> usize {
+        self.spill_bytes() + self.dead_cost() + self.fields_bytes()
+    }
+    fn fields_bytes(&self) -> usize {
+        match &self.index {
+            Index::Flat(_) => 0,
+            Index::Hnsw(h) => h.fields_bytes(),
+        }
+    }
+    /// What the fields' values hold, and an HNSW set's field index, for
+    /// `VEC.INFO`. A scan of a flat set, which a search scans anyway.
+    fn field_bytes(&self) -> usize {
+        match &self.index {
+            Index::Flat(m) => m
+                .values()
+                .map(|e| filter::vals_bytes(e.vals.as_deref()))
+                .sum(),
+            Index::Hnsw(h) => h.fields_bytes(),
+        }
+    }
+    /// The most writing `meta` can add to what the set's fields cost, for the
+    /// cap check before the write: what [`VectorSet::entry_cost`] and
+    /// [`VectorSet::held`] will charge for it, or more.
+    fn fields_charge(&self, meta: Option<&[u8]>) -> usize {
+        if self.fields.is_empty() {
+            return 0;
+        }
+        let vals = filter::extract(&self.fields, meta);
+        match &self.index {
+            Index::Flat(_) => filter::vals_bytes(vals.as_deref()),
+            Index::Hnsw(_) => filter::FieldIndex::charge(vals.as_deref()),
+        }
     }
     /// What the deleted slots of an HNSW set still cost the D4 meter: each is
     /// held until the set's next insert takes it, or the set is emptied
@@ -308,7 +374,16 @@ impl VectorSet {
         match &mut self.index {
             Index::Flat(m) => {
                 let norm = dot(&vec, &vec).sqrt();
-                m.insert(id, Entry { vec, norm, meta });
+                let vals = filter::extract(&self.fields, meta.as_deref());
+                m.insert(
+                    id,
+                    Entry {
+                        vec: vec.into_boxed_slice(),
+                        norm,
+                        meta: meta.map(Vec::into_boxed_slice),
+                        vals,
+                    },
+                );
             }
             Index::Hnsw(h) => h.set(id, vec, meta),
         }
@@ -355,26 +430,34 @@ impl VectorSet {
     /// when a vector file cannot be read.
     fn get(&self, id: &[u8]) -> Result<Option<Stored>, String> {
         Ok(match &self.index {
-            Index::Flat(m) => m.get(id).map(|e| (e.vec.clone(), e.meta.clone())),
+            Index::Flat(m) => m
+                .get(id)
+                .map(|e| (e.vec.to_vec(), e.meta.as_deref().map(<[u8]>::to_vec))),
             Index::Hnsw(h) => h
                 .get(id)?
                 .map(|(v, m)| (v.into_owned(), m.map(|x| x.to_vec()))),
         })
     }
 
-    /// Top-k nearest, nearest first. `ef` is HNSW's recall/latency knob and
-    /// `rerank` how many a quantized set re-scores (ADR-0049); flat ignores
-    /// both (it is always exact). Errs only when a vector file cannot be read.
+    /// Top-k nearest, nearest first, of the vectors `filter` matches, or of
+    /// all of them. `ef` is HNSW's recall/latency knob and `rerank` how many
+    /// a quantized set re-scores (ADR-0049); flat ignores both (it is always
+    /// exact). Errs only when a vector file cannot be read.
     fn search(
         &self,
         query: &[f32],
         k: usize,
         ef: usize,
         rerank: usize,
+        filter: Option<&Expr>,
     ) -> Result<Vec<(Vec<u8>, f32)>, String> {
-        match &self.index {
-            Index::Flat(m) => Ok(flat_search(m, self.metric, query, k)),
-            Index::Hnsw(h) => h.knn(query, k, ef, rerank),
+        match (&self.index, filter) {
+            (Index::Flat(m), None) => Ok(flat_search(m, self.metric, query, k, |_| true)),
+            (Index::Flat(m), Some(f)) => Ok(flat_search(m, self.metric, query, k, |e| {
+                f.matches(e.vals.as_deref())
+            })),
+            (Index::Hnsw(h), None) => h.knn(query, k, ef, rerank),
+            (Index::Hnsw(h), Some(f)) => h.knn_where(query, k, ef, rerank, f),
         }
     }
 }
@@ -405,7 +488,7 @@ fn flat_score(metric: Metric, query: &[f32], q_norm: f32, e: &Entry) -> f32 {
         Metric::Ip => dot(query, &e.vec),
         Metric::L2 => -query
             .iter()
-            .zip(&e.vec)
+            .zip(e.vec.iter())
             .map(|(q, x)| {
                 let d = q - x;
                 d * d
@@ -422,12 +505,14 @@ fn flat_score(metric: Metric, query: &[f32], q_norm: f32, e: &Entry) -> f32 {
     }
 }
 
-/// Exact flat top-k, nearest first (recall 1.0). O(n log k).
+/// Exact flat top-k of the entries `admit` takes, nearest first (recall 1.0).
+/// O(n log k).
 fn flat_search(
     entries: &HashMap<Vec<u8>, Entry>,
     metric: Metric,
     query: &[f32],
     k: usize,
+    admit: impl Fn(&Entry) -> bool,
 ) -> Vec<(Vec<u8>, f32)> {
     if k == 0 {
         return Vec::new();
@@ -438,7 +523,7 @@ fn flat_search(
         0.0
     };
     let mut heap: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
-    for (id, e) in entries {
+    for (id, e) in entries.iter().filter(|(_, e)| admit(e)) {
         let score = flat_score(metric, query, q_norm, e);
         heap.push(std::cmp::Reverse(Scored {
             score,
@@ -494,6 +579,8 @@ pub enum Apply {
         metric: Metric,
         index: IndexKind,
         quant: Quant,
+        /// Declared at `VEC.CREATE` (ADR-0059); empty for most sets.
+        fields: Vec<Field>,
     },
     Insert {
         set: Vec<u8>,
@@ -729,7 +816,7 @@ fn entry_bytes(
     // id and meta, a flat entry held 163 B and an HNSW node 284 B. These were
     // 64 and 256, and the meter charged up to a third less than a set held.
     let structural = match kind {
-        // Entry { vec, norm, meta }, its key, and its slot in the map.
+        // Entry { vec, norm, meta, vals }, its key, and its slot in the map.
         IndexKind::Flat => 192,
         // A slot in each of the node arrays (ADR-0049 step 3), its layer-0
         // links among them, a share of the upper layers' map, and the id map.
@@ -839,12 +926,13 @@ pub fn decode_vec_row(val: &[u8]) -> Result<DecodedVecRow, String> {
     Ok((parse_vector(floats)?, meta, expires_at))
 }
 
-/// A decoded config row: `(dim, metric, index kind, quantization)`.
-pub type SetConfig = (usize, Metric, IndexKind, Quant);
+/// A decoded config row: `(dim, metric, index kind, quantization, fields)`.
+pub type SetConfig = (usize, Metric, IndexKind, Quant, Vec<Field>);
 
-/// Inverse of a config row: `<dim>|<metric>[|<index>[|<quant>]]`. A 2-field
-/// config (written before v0.2 added the index kind) is flat, and a 3-field one
-/// (before ADR-0049) is unquantized.
+/// Inverse of a config row: `<dim>|<metric>[|<index>[|<quant>[|<fields>]]]`.
+/// A 2-field config (written before v0.2 added the index kind) is flat, a
+/// 3-field one (before ADR-0049) is unquantized, and a 4-field one (before
+/// ADR-0059) declares no fields.
 ///
 /// A code this binary does not know is a later binary's (ADR-0049 item 2 adds
 /// codes): the set loads unquantized, from the same full durable rows, as a
@@ -864,20 +952,28 @@ pub fn decode_config(val: &[u8]) -> Option<SetConfig> {
         .next()
         .and_then(|q| Quant::parse(q.as_bytes()))
         .unwrap_or(Quant::None);
-    Some((dim, metric, index, quant))
+    let fields = it.next().map(filter::decode_fields).unwrap_or_default();
+    Some((dim, metric, index, quant, fields))
 }
 
 /// The config row for a set. A plain set keeps the 3-field form, byte for byte
-/// what every earlier binary wrote; only a quantized set adds the fourth.
-fn encode_config(dim: usize, metric: Metric, index: IndexKind, quant: Quant) -> Vec<u8> {
-    match quant {
-        Quant::None => format!("{dim}|{}|{}", metric.as_str(), index.as_str()),
-        q => format!(
-            "{dim}|{}|{}|{}",
-            metric.as_str(),
-            index.as_str(),
-            q.as_str()
-        ),
+/// what every earlier binary wrote; only a quantized set adds the fourth, and
+/// only a set with fields the fifth (ADR-0059), with an unquantized set's
+/// fourth written `none`. Every binary from v0.2 on reads the first four and
+/// passes over the fifth, so a set with fields loads, unfiltered, on a
+/// release from before them.
+fn encode_config(
+    dim: usize,
+    metric: Metric,
+    index: IndexKind,
+    quant: Quant,
+    fields: &[Field],
+) -> Vec<u8> {
+    let (m, i) = (metric.as_str(), index.as_str());
+    match (quant, fields) {
+        (Quant::None, []) => format!("{dim}|{m}|{i}"),
+        (q, []) => format!("{dim}|{m}|{i}|{}", q.as_str()),
+        (q, f) => format!("{dim}|{m}|{i}|{}|{}", q.as_str(), filter::encode_fields(f)),
     }
     .into_bytes()
 }
@@ -889,6 +985,10 @@ fn valid_name(b: &[u8]) -> bool {
 fn err(msg: &str) -> Value {
     Value::Error(msg.to_string())
 }
+
+/// The refusal of `FIELD` or `FILTER` by a co-processor without
+/// `--vec-filters`.
+const FILTERS_OFF: &str = "ERR vector filters (FIELD and FILTER) are off on this server";
 
 /// The operator's view of a [`Store`], from [`Store::stats`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -907,6 +1007,9 @@ pub struct StoreStats {
     pub refused_total: u64,
     /// Whether durable rows are written packed (ADR-0050 D5).
     pub packed_rows: bool,
+    /// Whether `VEC.CREATE ... FIELD` and `VEC.SEARCH ... FILTER` are served
+    /// (ADR-0059, `--vec-filters`).
+    pub filters: bool,
 }
 
 /// The co-processor's per-tenant, per-set state. One `Store` per running
@@ -943,6 +1046,12 @@ pub struct Store {
     packed_rows: bool,
     /// How many times each namespace has been dropped ([`Store::drop_namespace`]).
     generations: HashMap<Vec<u8>, u64>,
+    /// Serve `FIELD` and `FILTER` (ADR-0059). Off for a bare `Store`, and in
+    /// the binary unless it is started with `--vec-filters`, for the release
+    /// that first knows them: one before it answers a `FILTER` as if there
+    /// were none, so they wait until a rollback lands on a release that
+    /// knows them. A set that already has fields keeps them either way.
+    filters: bool,
 }
 
 impl Store {
@@ -981,7 +1090,13 @@ impl Store {
             refused_ns: self.refused_ns.load(Relaxed),
             refused_total: self.refused_total.load(Relaxed),
             packed_rows: self.packed_rows,
+            filters: self.filters,
         }
+    }
+
+    /// Serve `VEC.CREATE ... FIELD` and `VEC.SEARCH ... FILTER` (ADR-0059).
+    pub fn set_filters(&mut self, on: bool) {
+        self.filters = on;
     }
 
     /// Write durable vector rows packed (ADR-0050 D5). Rows already written
@@ -1009,8 +1124,15 @@ impl Store {
     /// A new set, with a vector file when it is quantized and there is a
     /// `vec_dir`. A file that cannot be created leaves the vectors in RAM,
     /// where the meter charges them, rather than refusing the set.
-    fn new_set(&mut self, dim: usize, metric: Metric, index: IndexKind, quant: Quant) -> VectorSet {
-        let mut vs = VectorSet::new(dim, metric, index, quant);
+    fn new_set(
+        &mut self,
+        dim: usize,
+        metric: Metric,
+        index: IndexKind,
+        quant: Quant,
+        fields: Vec<Field>,
+    ) -> VectorSet {
+        let mut vs = VectorSet::new(dim, metric, index, quant).with_fields(fields);
         if let Some(dir) = &self.vec_dir
             && index == IndexKind::Hnsw
             && quant != Quant::None
@@ -1057,9 +1179,10 @@ impl Store {
             return;
         };
         let (dim, metric, kind, quant) = (vs.dim(), vs.metric(), vs.kind(), vs.quant());
+        let fields = vs.fields().to_vec();
         // The old set and its file go before the new file is made.
         self.sets.remove(key);
-        let fresh = self.new_set(dim, metric, kind, quant);
+        let fresh = self.new_set(dim, metric, kind, quant, fields);
         self.sets.insert(key.clone(), fresh);
     }
 
@@ -1107,10 +1230,11 @@ impl Store {
                 metric,
                 index,
                 quant,
+                fields,
             } => {
                 let key = (ns.to_vec(), set);
                 if !self.sets.contains_key(&key) {
-                    let vs = self.new_set(dim, metric, index, quant);
+                    let vs = self.new_set(dim, metric, index, quant, fields);
                     self.sets.insert(key, vs);
                 }
             }
@@ -1129,10 +1253,10 @@ impl Store {
                 // new id that takes one is charged its difference.
                 let mut charge: Option<(usize, usize)> = None;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
-                    let old = vs.entry_cost(&id).unwrap_or(0) + vs.spill_bytes() + vs.dead_cost();
-                    let new_entry = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
-                    vs.set(id, vec, meta, expires_at);
-                    charge = Some((new_entry + vs.spill_bytes() + vs.dead_cost(), old));
+                    let old = vs.entry_cost(&id).unwrap_or(0) + vs.held();
+                    vs.set(id.clone(), vec, meta, expires_at);
+                    let new = vs.entry_cost(&id).unwrap_or(0) + vs.held();
+                    charge = Some((new, old));
                 }
                 if let Some((new, old)) = charge {
                     let e = self.ns_bytes.entry(ns.to_vec()).or_default();
@@ -1147,14 +1271,9 @@ impl Store {
                 let mut freed = 0usize;
                 let mut emptied = false;
                 if let Some(vs) = self.sets.get_mut(&key) {
-                    let before =
-                        vs.entry_cost(&id).unwrap_or(0) + vs.spill_bytes() + vs.dead_cost();
+                    let before = vs.entry_cost(&id).unwrap_or(0) + vs.held();
                     emptied = vs.del(&id) && vs.is_empty();
-                    let after = if emptied {
-                        0
-                    } else {
-                        vs.spill_bytes() + vs.dead_cost()
-                    };
+                    let after = if emptied { 0 } else { vs.held() };
                     freed = before.saturating_sub(after);
                 }
                 if emptied {
@@ -1187,7 +1306,7 @@ impl Store {
                 continue;
             }
             let ns = &key.0;
-            let mut before = vs.spill_bytes() + vs.dead_cost();
+            let mut before = vs.held();
             for id in &ids {
                 before += vs.entry_cost(id).unwrap_or(0);
                 vs.del(id);
@@ -1199,7 +1318,7 @@ impl Store {
                 emptied.push(key.clone());
                 0
             } else {
-                vs.spill_bytes() + vs.dead_cost()
+                vs.held()
             };
             let freed = before.saturating_sub(after);
             if freed > 0
@@ -1214,7 +1333,8 @@ impl Store {
         swept
     }
 
-    /// VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip> [INDEX flat]
+    /// VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip> [INDEX flat|hnsw]
+    /// [QUANT none|sq8|bin] [FIELD <name> TAG|NUMERIC ...]
     fn plan_create(&self, ns: &[u8], args: &[Vec<u8>]) -> Plan {
         if args.len() < 6 {
             return Plan::Reply(err("ERR VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip>"));
@@ -1236,10 +1356,12 @@ impl Store {
         let Some(metric) = Metric::parse(&args[5]) else {
             return Plan::Reply(err("ERR METRIC must be one of cosine, l2, ip"));
         };
-        // Optional trailing `INDEX flat|hnsw` (default flat, exact, the oracle)
-        // and `QUANT none|sq8|bin` (ADR-0049; HNSW only), in either order.
+        // Optional trailing `INDEX flat|hnsw` (default flat, exact, the oracle),
+        // `QUANT none|sq8|bin` (ADR-0049; HNSW only) and any number of
+        // `FIELD <name> TAG|NUMERIC` (ADR-0059), in any order.
         let mut index = IndexKind::Flat;
         let mut quant = Quant::None;
+        let mut fields: Vec<Field> = Vec::new();
         let mut i = 6;
         while i < args.len() {
             let Some(val) = args.get(i + 1) else {
@@ -1254,8 +1376,42 @@ impl Store {
                     Some(q) => quant = q,
                     None => return Plan::Reply(err("ERR QUANT must be none, sq8 or bin")),
                 },
+                b"FIELD" => {
+                    if !self.filters {
+                        return Plan::Reply(err(FILTERS_OFF));
+                    }
+                    let Some(kind) = args.get(i + 2) else {
+                        return Plan::Reply(err("ERR FIELD <name> TAG|NUMERIC"));
+                    };
+                    if !filter::valid_name(val) {
+                        return Plan::Reply(err(&format!(
+                            "ERR FIELD name must be letters, digits and _, at most {} of them",
+                            filter::MAX_NAME
+                        )));
+                    }
+                    let Some(kind) = FieldKind::parse(kind) else {
+                        return Plan::Reply(err("ERR FIELD type must be TAG or NUMERIC"));
+                    };
+                    let name = String::from_utf8_lossy(val);
+                    if fields.iter().any(|f| *f.name == *name) {
+                        return Plan::Reply(err(&format!("ERR FIELD {name} is given twice")));
+                    }
+                    if fields.len() == filter::MAX_FIELDS {
+                        return Plan::Reply(err(&format!(
+                            "ERR a set has at most {} FIELDs",
+                            filter::MAX_FIELDS
+                        )));
+                    }
+                    fields.push(Field {
+                        name: name.into(),
+                        kind,
+                    });
+                    i += 1;
+                }
                 _ => {
-                    return Plan::Reply(err("ERR unknown VEC.CREATE option (want INDEX or QUANT)"));
+                    return Plan::Reply(err(
+                        "ERR unknown VEC.CREATE option (want INDEX, QUANT or FIELD)",
+                    ));
                 }
             }
             i += 2;
@@ -1277,7 +1433,7 @@ impl Store {
                 },
                 Persist::Put {
                     key: durable_key(b'c', set, b""),
-                    val: encode_config(dim, metric, index, quant),
+                    val: encode_config(dim, metric, index, quant, &fields),
                     // A set's config row never expires; TTL is per-vector.
                     ttl_ms: None,
                 },
@@ -1288,6 +1444,7 @@ impl Store {
                 metric,
                 index,
                 quant,
+                fields,
             },
             ok: Value::Simple("OK".into()),
         }
@@ -1366,7 +1523,8 @@ impl Store {
         // refusal here means the vector is not persisted either — a hard bound,
         // never an evict-and-desync. An UPSERT of an existing id only costs its
         // meta delta, so it is charged that, not a whole new entry.
-        let new = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()));
+        let new = vs.cost(id.len(), meta.as_ref().map_or(0, |m| m.len()))
+            + vs.fields_charge(meta.as_deref());
         // A new id in an HNSW set takes a deleted slot when there is one,
         // whose charge it gives back (BUG-0257): deleting and writing within
         // one set needs no more room than before.
@@ -1480,10 +1638,10 @@ impl Store {
         }
     }
 
-    /// VEC.SEARCH <set> <query> <k> [EF <n>] [RERANK <n>]
+    /// VEC.SEARCH <set> <query> <k> [EF <n>] [RERANK <n>] [FILTER <expr>]
     fn search(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Value {
         if args.len() < 4 {
-            return err("ERR VEC.SEARCH <set> <query> <k> [EF <n>] [RERANK <n>]");
+            return err("ERR VEC.SEARCH <set> <query> <k> [EF <n>] [RERANK <n>] [FILTER <expr>]");
         }
         let Some(vs) = self.sets.get(&(ns.to_vec(), args[1].to_vec())) else {
             return err("ERR no such set");
@@ -1506,18 +1664,58 @@ impl Store {
             Some(k) => k,
             None => return err("ERR k must be a non-negative integer"),
         };
-        // Optional `EF <n>` (HNSW's recall/latency knob) and `RERANK <n>` (how
-        // many candidates a quantized set re-scores, ADR-0049), in either order.
-        // Flat ignores both. Anything else is passed over, as before.
-        let opt = |name: &[u8]| -> Option<usize> {
-            args[4..]
-                .windows(2)
-                .find(|w| w[0].eq_ignore_ascii_case(name))
-                .and_then(|w| std::str::from_utf8(&w[1]).ok())
-                .and_then(|s| s.parse::<usize>().ok())
+        // Optional `EF <n>` (HNSW's recall/latency knob), `RERANK <n>` (how
+        // many candidates a quantized set re-scores, ADR-0049) and `FILTER
+        // <expr>` (ADR-0059), in any order. Flat ignores EF and RERANK.
+        //
+        // An option this binary does not know is refused. The releases before
+        // this one passed over it, so a `FILTER` sent to one answered as if
+        // there were none: a tenant scoping each user to its own folder would
+        // have read every folder. Refusing it here is what lets the next
+        // release turn filters on: a rollback from it lands on this one.
+        let (mut ef, mut rerank, mut filter_src): (Option<usize>, Option<usize>, Option<&[u8]>) =
+            (None, None, None);
+        let mut i = 4;
+        while i < args.len() {
+            let opt = args[i].to_ascii_uppercase();
+            let name = String::from_utf8_lossy(&opt);
+            let Some(val) = args.get(i + 1) else {
+                return err(&format!("ERR {name} needs a value"));
+            };
+            let number = || {
+                std::str::from_utf8(val)
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+            };
+            match opt.as_slice() {
+                b"EF" | b"RERANK" => {
+                    let Some(n) = number() else {
+                        return err(&format!("ERR {name} must be a non-negative integer"));
+                    };
+                    let slot = if opt == b"EF" { &mut ef } else { &mut rerank };
+                    if slot.replace(n).is_some() {
+                        return err(&format!("ERR {name} is given twice"));
+                    }
+                }
+                b"FILTER" => {
+                    if !self.filters {
+                        return err(FILTERS_OFF);
+                    }
+                    if filter_src.replace(val).is_some() {
+                        return err("ERR FILTER is given twice");
+                    }
+                }
+                _ => return err("ERR unknown VEC.SEARCH option (want EF, RERANK or FILTER)"),
+            }
+            i += 2;
+        }
+        let filter = match filter_src.map(|f| filter::parse(f, vs.fields())) {
+            None | Some(Ok(Expr::All)) => None,
+            Some(Ok(e)) => Some(e),
+            Some(Err(e)) => return err(&format!("ERR FILTER {e}")),
         };
-        let ef = opt(b"EF").unwrap_or(hnsw::EF_SEARCH_DEFAULT);
-        let rerank = opt(b"RERANK").unwrap_or(k.saturating_mul(vs.quant().rerank_multiple()));
+        let ef = ef.unwrap_or(hnsw::EF_SEARCH_DEFAULT);
+        let rerank = rerank.unwrap_or(k.saturating_mul(vs.quant().rerank_multiple()));
         // Expired-but-unswept ids still sit in the index and can outrank live
         // ones, so over-fetch by the expired count and drop them post-hoc: with
         // at most `expired` stale hits, k+expired candidates always yield k live
@@ -1528,6 +1726,7 @@ impl Store {
             k.saturating_add(expired),
             ef,
             rerank.saturating_add(expired),
+            filter.as_ref(),
         ) {
             Ok(found) => found,
             Err(e) => return err(&format!("ERR {e}")),
@@ -1586,6 +1785,17 @@ impl Store {
             Value::Integer(vs.disk_bytes() as i64),
             bulk("ram_spill_bytes"),
             Value::Integer(vs.spill_bytes() as i64),
+            // ADR-0059: the declared fields as name, type pairs, and what
+            // their values and index hold in RAM, which the meter charges.
+            bulk("fields"),
+            Value::Array(Some(
+                vs.fields()
+                    .iter()
+                    .flat_map(|f| [bulk(&f.name), bulk(f.kind.as_str())])
+                    .collect(),
+            )),
+            bulk("field_bytes"),
+            Value::Integer(vs.field_bytes() as i64),
         ]))
     }
 
@@ -1781,7 +1991,7 @@ mod tests {
                     assert_eq!(val, format!("2|l2|hnsw|{code}").into_bytes());
                     assert_eq!(
                         decode_config(&val),
-                        Some((2, Metric::L2, IndexKind::Hnsw, quant))
+                        Some((2, Metric::L2, IndexKind::Hnsw, quant, vec![]))
                     );
                 }
                 _ => panic!("create should plan a write"),
@@ -2263,11 +2473,11 @@ mod tests {
             Some((dim, metric, index))
         }
         assert_eq!(
-            encode_config(8, Metric::Cosine, IndexKind::Hnsw, Quant::None),
+            encode_config(8, Metric::Cosine, IndexKind::Hnsw, Quant::None, &[]),
             b"8|cosine|hnsw".to_vec(),
             "a plain set writes exactly what it always did"
         );
-        let quantized = encode_config(8, Metric::Cosine, IndexKind::Hnsw, Quant::Sq8);
+        let quantized = encode_config(8, Metric::Cosine, IndexKind::Hnsw, Quant::Sq8, &[]);
         assert_eq!(
             decode_before_adr_0049(&quantized),
             Some((8, Metric::Cosine, IndexKind::Hnsw)),
@@ -2275,17 +2485,17 @@ mod tests {
         );
         assert_eq!(
             decode_config(b"8|cosine|hnsw"),
-            Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None))
+            Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None, vec![]))
         );
         assert_eq!(
             decode_config(b"8|cosine|hnsw|later|96"),
-            Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None)),
+            Some((8, Metric::Cosine, IndexKind::Hnsw, Quant::None, vec![])),
             "a later binary's code loads unquantized, its further fields read past"
         );
         for q in [Quant::Sq8, Quant::Bin] {
             assert_eq!(
-                decode_config(&encode_config(8, Metric::Cosine, IndexKind::Hnsw, q)),
-                Some((8, Metric::Cosine, IndexKind::Hnsw, q))
+                decode_config(&encode_config(8, Metric::Cosine, IndexKind::Hnsw, q, &[])),
+                Some((8, Metric::Cosine, IndexKind::Hnsw, q, vec![]))
             );
         }
         assert_eq!(decode_config(b"8|cosine|bogus|sq8"), None);
@@ -2671,7 +2881,7 @@ mod tests {
                 assert_eq!(ttl_ms, None, "a set's config row never expires");
                 assert_eq!(
                     decode_config(&val),
-                    Some((4, Metric::Cosine, IndexKind::Flat, Quant::None))
+                    Some((4, Metric::Cosine, IndexKind::Flat, Quant::None, vec![]))
                 );
             }
             _ => panic!("create should plan a config Put"),
@@ -3180,6 +3390,7 @@ mod tests {
                 metric: Metric::L2,
                 index: IndexKind::Flat,
                 quant: Quant::None,
+                fields: Vec::new(),
             },
         );
         let row = encode_vec_row(&[9.0, 9.0], None, Some(500));
@@ -3334,5 +3545,384 @@ mod tests {
             run_at(&mut st, ns, &cmd(&["VEC.PERSIST", "s", "ghost"]), 1_000),
             Value::Integer(0)
         );
+    }
+
+    fn is_err(v: &Value, part: &str) -> bool {
+        matches!(v, Value::Error(e) if e.contains(part))
+    }
+
+    /// ADR-0059 release R: `VEC.SEARCH` refuses what it does not know, where
+    /// every release before it passed over it. Without `--vec-filters` that
+    /// includes `FILTER`, and `VEC.CREATE` refuses `FIELD`.
+    #[test]
+    fn search_refuses_an_option_it_does_not_know() {
+        let mut st = Store::new();
+        let ns = b"n";
+        run(
+            &mut st,
+            ns,
+            &cmd(&[
+                "VEC.CREATE",
+                "s",
+                "DIM",
+                "2",
+                "METRIC",
+                "l2",
+                "INDEX",
+                "hnsw",
+            ]),
+        );
+        run(&mut st, ns, &cmd(&["VEC.SET", "s", "a", "0,0"]));
+        let search = |st: &Store, extra: &[&str]| {
+            let mut c = cmd(&["VEC.SEARCH", "s", "0,0", "1"]);
+            c.extend(cmd(extra));
+            plan_reply(st, ns, &c, 0)
+        };
+        for (extra, part) in [
+            (&["FOO", "1"][..], "unknown VEC.SEARCH option"),
+            (
+                &["EF", "8", "WITHSCORES", "1"][..],
+                "unknown VEC.SEARCH option",
+            ),
+            (&["EF"][..], "EF needs a value"),
+            (&["EF", "many"][..], "EF must be a non-negative integer"),
+            (
+                &["RERANK", "-1"][..],
+                "RERANK must be a non-negative integer",
+            ),
+            (&["EF", "8", "ef", "9"][..], "EF is given twice"),
+            (
+                &["FILTER", "@t:{x}"][..],
+                "vector filters (FIELD and FILTER) are off",
+            ),
+        ] {
+            let got = search(&st, extra);
+            assert!(is_err(&got, part), "{extra:?}: {got:?}");
+        }
+        for extra in [
+            &[][..],
+            &["EF", "8"],
+            &["RERANK", "4", "EF", "8"],
+            &["ef", "0"],
+        ] {
+            assert_eq!(search_ids(&search(&st, extra)), vec![v("a")], "{extra:?}");
+        }
+        let create = cmd(&[
+            "VEC.CREATE",
+            "f",
+            "DIM",
+            "2",
+            "METRIC",
+            "l2",
+            "FIELD",
+            "t",
+            "TAG",
+        ]);
+        assert!(is_err(&run(&mut st, ns, &create), "are off"));
+        assert!(!st.stats().filters);
+    }
+
+    #[test]
+    fn create_checks_each_field() {
+        let mut st = Store::new();
+        st.set_filters(true);
+        let ns = b"n";
+        let create = |extra: &[&str]| {
+            let mut c = cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]);
+            c.extend(cmd(extra));
+            c
+        };
+        for (extra, part) in [
+            (&["FIELD", "t"][..], "FIELD <name> TAG|NUMERIC"),
+            (&["FIELD", "a-b", "TAG"][..], "letters, digits and _"),
+            (&["FIELD", "t", "TEXT"][..], "TAG or NUMERIC"),
+            (
+                &["FIELD", "t", "TAG", "FIELD", "t", "NUMERIC"][..],
+                "given twice",
+            ),
+            (
+                &["FIELD", "t", "TAG", "SORTABLE", "x"][..],
+                "unknown VEC.CREATE option",
+            ),
+        ] {
+            let got = run(&mut st, ns, &create(extra));
+            assert!(is_err(&got, part), "{extra:?}: {got:?}");
+        }
+        let mut many = Vec::new();
+        let names: Vec<String> = (0..=filter::MAX_FIELDS).map(|i| format!("f{i}")).collect();
+        for n in &names {
+            many.extend(["FIELD", n.as_str(), "TAG"]);
+        }
+        assert!(is_err(&run(&mut st, ns, &create(&many)), "at most 16"));
+        assert_eq!(st.set_count(), 0, "nothing refused was made");
+        // The fields ride the config row's fifth field, after `none`.
+        match plan0(
+            &st,
+            ns,
+            &create(&[
+                "FIELD", "folder", "tag", "INDEX", "hnsw", "FIELD", "price", "NUMERIC",
+            ]),
+        ) {
+            Plan::Write { persist, .. } => {
+                let Some(Persist::Put { val, .. }) = persist.into_iter().nth(1) else {
+                    panic!("the config row is CREATE's second step")
+                };
+                assert_eq!(val, b"2|l2|hnsw|none|folder:tag,price:numeric".to_vec());
+            }
+            _ => panic!("create should plan a write"),
+        }
+    }
+
+    /// Every kind of set answers a filtered search with the nearest matches,
+    /// and only matches, as an exact search over the matches would.
+    #[test]
+    fn a_filtered_search_answers_from_every_kind_of_set() {
+        for extra in [
+            &[][..],
+            &["INDEX", "hnsw"],
+            &["INDEX", "hnsw", "QUANT", "sq8"],
+            &["INDEX", "hnsw", "QUANT", "bin"],
+        ] {
+            let mut st = Store::new();
+            st.set_filters(true);
+            let ns = b"n";
+            let mut c = cmd(&[
+                "VEC.CREATE",
+                "s",
+                "DIM",
+                "2",
+                "METRIC",
+                "l2",
+                "FIELD",
+                "folder",
+                "TAG",
+                "FIELD",
+                "price",
+                "NUMERIC",
+            ]);
+            c.extend(cmd(extra));
+            assert_eq!(
+                run(&mut st, ns, &c),
+                Value::Simple("OK".into()),
+                "{extra:?}"
+            );
+            // Ten points along a line: folder `a` for the even ones, price
+            // its position, and one with no JSON at all.
+            for i in 0..10 {
+                let meta = format!(
+                    r#"{{"folder":"{}","price":{i}}}"#,
+                    if i % 2 == 0 { "a" } else { "b" }
+                );
+                let set = cmd(&[
+                    "VEC.SET",
+                    "s",
+                    &format!("p{i}"),
+                    &format!("{i},0"),
+                    "META",
+                    &meta,
+                ]);
+                assert_eq!(run(&mut st, ns, &set), Value::Simple("OK".into()));
+            }
+            run(
+                &mut st,
+                ns,
+                &cmd(&["VEC.SET", "s", "raw", "0,0", "META", "plain bytes"]),
+            );
+            let ids = |st: &Store, f: &str, k: &str| {
+                search_ids(&plan_reply(
+                    st,
+                    ns,
+                    &cmd(&["VEC.SEARCH", "s", "0,0", k, "FILTER", f]),
+                    0,
+                ))
+            };
+            let want = |names: &[&str]| -> Vec<Vec<u8>> { names.iter().map(|n| v(n)).collect() };
+            assert_eq!(
+                ids(&st, "@folder:{a}", "3"),
+                want(&["p0", "p2", "p4"]),
+                "{extra:?}"
+            );
+            assert_eq!(
+                ids(&st, "@folder:{b}", "2"),
+                want(&["p1", "p3"]),
+                "{extra:?}"
+            );
+            assert_eq!(
+                ids(&st, "@price:[(3 6]", "9"),
+                want(&["p4", "p5", "p6"]),
+                "{extra:?}"
+            );
+            assert_eq!(
+                ids(&st, "@folder:{a} @price:[5 +inf]", "9"),
+                want(&["p6", "p8"])
+            );
+            assert_eq!(
+                ids(&st, "(@folder:{b} | @price:[0 0])", "3"),
+                want(&["p0", "p1", "p3"])
+            );
+            assert_eq!(ids(&st, "-@folder:{a|b}", "3"), want(&["raw"]), "{extra:?}");
+            assert_eq!(ids(&st, "@folder:{c}", "3"), want(&[]));
+            assert_eq!(ids(&st, "*", "1").len(), 1);
+            let bad = plan_reply(
+                &st,
+                ns,
+                &cmd(&["VEC.SEARCH", "s", "0,0", "3", "FILTER", "@nope:{a}"]),
+                0,
+            );
+            assert!(is_err(&bad, "ERR FILTER names nope"), "{bad:?}");
+            // VEC.INFO says what it declared and what that holds.
+            let info = plan_reply(&st, ns, &cmd(&["VEC.INFO", "s"]), 0);
+            assert_eq!(
+                info_field(&info, "fields"),
+                Value::Array(Some(
+                    ["folder", "tag", "price", "numeric"]
+                        .iter()
+                        .map(|x| Value::Bulk(Some(v(x))))
+                        .collect()
+                ))
+            );
+            assert!(
+                matches!(info_field(&info, "field_bytes"), Value::Integer(n) if n > 0),
+                "{extra:?}"
+            );
+            // Deleting a match takes it out, and an upsert moves it.
+            run(&mut st, ns, &cmd(&["VEC.DEL", "s", "p0"]));
+            run(
+                &mut st,
+                ns,
+                &cmd(&["VEC.SET", "s", "p2", "2,0", "META", r#"{"folder":"b"}"#]),
+            );
+            assert_eq!(
+                ids(&st, "@folder:{a}", "3"),
+                want(&["p4", "p6", "p8"]),
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_vectors_stay_out_of_a_filtered_search() {
+        let mut st = Store::new();
+        st.set_filters(true);
+        let ns = b"n";
+        run(
+            &mut st,
+            ns,
+            &cmd(&[
+                "VEC.CREATE",
+                "s",
+                "DIM",
+                "2",
+                "METRIC",
+                "l2",
+                "INDEX",
+                "hnsw",
+                "FIELD",
+                "t",
+                "TAG",
+            ]),
+        );
+        let m = r#"{"t":"x"}"#;
+        run_at(
+            &mut st,
+            ns,
+            &cmd(&["VEC.SET", "s", "soon", "0,0", "META", m, "PX", "10"]),
+            0,
+        );
+        run_at(
+            &mut st,
+            ns,
+            &cmd(&["VEC.SET", "s", "kept", "5,0", "META", m]),
+            0,
+        );
+        let q = cmd(&["VEC.SEARCH", "s", "0,0", "1", "FILTER", "@t:{x}"]);
+        assert_eq!(search_ids(&plan_reply(&st, ns, &q, 5)), vec![v("soon")]);
+        assert_eq!(search_ids(&plan_reply(&st, ns, &q, 20)), vec![v("kept")]);
+    }
+
+    /// The fields ride the config row, so a rebuild indexes them again from
+    /// the vectors' rows; and a release from before ADR-0059 loads the same
+    /// set from the same rows, without them.
+    #[test]
+    fn a_set_with_fields_rebuilds_and_loads_on_a_release_before_them() {
+        fn decode_before_adr_0059(val: &[u8]) -> Option<(usize, Metric, IndexKind, Quant)> {
+            // rc.83's decode_config, which reads four fields.
+            let s = std::str::from_utf8(val).ok()?;
+            let mut it = s.split('|');
+            let dim = it.next()?.parse().ok()?;
+            let metric = Metric::parse(it.next()?.as_bytes())?;
+            let index = match it.next() {
+                Some(k) => IndexKind::parse(k.as_bytes())?,
+                None => IndexKind::Flat,
+            };
+            let quant = it
+                .next()
+                .and_then(|q| Quant::parse(q.as_bytes()))
+                .unwrap_or(Quant::None);
+            Some((dim, metric, index, quant))
+        }
+        let fields = vec![Field {
+            name: "t".into(),
+            kind: FieldKind::Tag,
+        }];
+        for (index, quant) in [
+            (IndexKind::Flat, Quant::None),
+            (IndexKind::Hnsw, Quant::None),
+            (IndexKind::Hnsw, Quant::Bin),
+        ] {
+            let row = encode_config(3, Metric::L2, index, quant, &fields);
+            assert_eq!(
+                decode_before_adr_0059(&row),
+                Some((3, Metric::L2, index, quant))
+            );
+            assert_eq!(
+                decode_config(&row),
+                Some((3, Metric::L2, index, quant, fields.clone()))
+            );
+        }
+        // A rebuild: the config row's fields, then each vector's row.
+        let row = encode_config(2, Metric::L2, IndexKind::Hnsw, Quant::None, &fields);
+        let (dim, metric, index, quant, fields) = decode_config(&row).expect("decodes");
+        let mut st = Store::new();
+        st.set_filters(true);
+        let ns = b"n";
+        st.commit(
+            ns,
+            Apply::CreateSet {
+                set: v("s"),
+                dim,
+                metric,
+                index,
+                quant,
+                fields,
+            },
+        );
+        for (id, x, t) in [("a", "0", "x"), ("b", "1", "y"), ("c", "2", "x")] {
+            let meta = format!(r#"{{"t":"{t}"}}"#);
+            let (vec, meta, expires_at) = decode_vec_row(&encode_packed_row(
+                &parse_vector(format!("{x},0").as_bytes()).expect("vec"),
+                Some(meta.as_bytes()),
+                None,
+            ))
+            .expect("row");
+            st.commit(
+                ns,
+                Apply::Insert {
+                    set: v("s"),
+                    id: v(id),
+                    vec,
+                    meta,
+                    expires_at,
+                },
+            );
+        }
+        let q = cmd(&["VEC.SEARCH", "s", "0,0", "5", "FILTER", "@t:{x}"]);
+        assert_eq!(
+            search_ids(&plan_reply(&st, ns, &q, 0)),
+            vec![v("a"), v("c")]
+        );
+        // With the flag off the set keeps its fields, and refuses the filter.
+        st.set_filters(false);
+        assert!(is_err(&plan_reply(&st, ns, &q, 0), "are off"));
     }
 }
