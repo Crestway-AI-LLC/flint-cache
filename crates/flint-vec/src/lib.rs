@@ -450,6 +450,7 @@ impl VectorSet {
         ef: usize,
         rerank: usize,
         filter: Option<&Expr>,
+        scan_cap: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, f32)>, String> {
         match (&self.index, filter) {
             (Index::Flat(m), None) => Ok(flat_search(m, self.metric, query, k, |_| true)),
@@ -457,7 +458,7 @@ impl VectorSet {
                 f.matches(e.vals.as_deref())
             })),
             (Index::Hnsw(h), None) => h.knn(query, k, ef, rerank),
-            (Index::Hnsw(h), Some(f)) => h.knn_where(query, k, ef, rerank, f),
+            (Index::Hnsw(h), Some(f)) => h.knn_where(query, k, ef, rerank, f, scan_cap),
         }
     }
 }
@@ -1083,6 +1084,10 @@ pub struct Store {
     /// with `--vec-filters`: one before that answers a `FILTER` as if there
     /// were none. A set that already has fields keeps them either way.
     filters: bool,
+    /// How many matches a filtered HNSW search scores one by one before it
+    /// walks the graph instead; `None` is the rule in `hnsw::scan_threshold`.
+    /// Set only to measure where that rule should be (`bench --filters`).
+    scan_cap: Option<usize>,
 }
 
 impl Store {
@@ -1128,6 +1133,14 @@ impl Store {
     /// Serve `VEC.CREATE ... FIELD` and `VEC.SEARCH ... FILTER` (ADR-0059).
     pub fn set_filters(&mut self, on: bool) {
         self.filters = on;
+    }
+
+    /// Fix how many matches a filtered HNSW search scores one by one, in place
+    /// of the square-root rule, or restore the rule with `None`. For
+    /// measurement only: `bench --filters` forces each path in turn to find
+    /// where they cost the same (ADR-0059's verification).
+    pub fn set_scan_threshold(&mut self, cap: Option<usize>) {
+        self.scan_cap = cap;
     }
 
     /// Write durable vector rows packed (ADR-0050 D5). Rows already written
@@ -1830,6 +1843,7 @@ impl Store {
             ef,
             rerank.saturating_add(expired),
             filter.as_ref(),
+            self.scan_cap,
         ) {
             Ok(found) => found,
             Err(e) => return err(&format!("ERR {e}")),

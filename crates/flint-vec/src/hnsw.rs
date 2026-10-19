@@ -1027,6 +1027,8 @@ impl Hnsw {
     /// [`scan_threshold`] of them, each is scored, which for an unquantized
     /// set is exact. Past it, the graph is walked as an unfiltered search
     /// walks it, through every node, but only matches are returned.
+    /// `cap` replaces [`scan_threshold`] when given, for measurement
+    /// (`bench --filters`).
     pub fn knn_where(
         &self,
         q: &[f32],
@@ -1034,8 +1036,9 @@ impl Hnsw {
         ef: usize,
         rerank: usize,
         filter: &Expr,
+        cap: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, f32)>, String> {
-        let cap = scan_threshold(self.live, ef.max(self.depth(k, rerank)));
+        let cap = cap.unwrap_or_else(|| scan_threshold(self.live, ef.max(self.depth(k, rerank))));
         self.knn_where_capped(q, k, ef, rerank, filter, cap)
     }
 

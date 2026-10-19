@@ -25,6 +25,13 @@
 //!                 across EF and RERANK; DIR holds base.fbin and query.fbin.
 //!                 CODE is sq8 or bin; `-disk` keeps the full vectors in
 //!                 --vec-dir)
+//!        bench --data DIR --arm ... --filters [--n N] [--queries Q]
+//!                (ADR-0059's verification: the same set with a NUMERIC field
+//!                 drawn apart from the vectors and two TAG fields that follow
+//!                 them, the nearest of 10 and of 100 centroid rows. Recall
+//!                 against brute force over each filter's matches, at 50% to
+//!                 0.1% matching, by the threshold rule and with each path
+//!                 forced, to find where scoring every match stops paying)
 //!        bench --edge HOST:PORT [--auth TOKEN] --data DIR --label L
 //!              [--set NAME] [--quant none|sq8|bin] [--n N] [--queries Q]
 //!              [--k 10] [--metric cosine] [--cold-dir D] [--window 64]
@@ -597,6 +604,251 @@ fn ground_truth(
     gt
 }
 
+/// A fixed-seed draw in [0, 1) for row `i` (splitmix64), apart from the
+/// vectors.
+fn draw(i: u64) -> f64 {
+    let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Each base row's labels for `--filters`: a number in [0, 1) drawn apart
+/// from the vectors, and which of 10 and of 100 centroid rows (picked by a
+/// fixed seed) it is nearest, so those tags follow where the vector lies.
+/// Cached in `dir`, as the ground truth is.
+fn labels(dir: &std::path::Path, base: &Fbin, n: usize, metric: &str) -> Vec<(f64, u16, u16)> {
+    let cache = dir.join(format!("labels-n{n}-{metric}.bin"));
+    if let Ok(bytes) = std::fs::read(&cache)
+        && bytes.len() == n * 4
+    {
+        let (pairs, _) = bytes.as_chunks::<4>();
+        return pairs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (
+                    draw(i as u64),
+                    u16::from_le_bytes([p[0], p[1]]),
+                    u16::from_le_bytes([p[2], p[3]]),
+                )
+            })
+            .collect();
+    }
+    let t0 = Instant::now();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let pick = |count: u64, salt: u64| -> Vec<usize> {
+        (0..count)
+            .map(|j| (draw(salt + j) * n as f64) as usize % n)
+            .collect()
+    };
+    let (c10, c100) = (pick(10, 1 << 40), pick(100, 2 << 40));
+    let nearest = |v: &[f32], vn: f32, cs: &[usize]| -> u16 {
+        let mut best = (f32::NEG_INFINITY, 0u16);
+        for (j, &c) in cs.iter().enumerate() {
+            let cv = base.row(c);
+            let s = exact_score(metric, v, vn, cv, norm(cv));
+            if s > best.0 {
+                best = (s, j as u16);
+            }
+        }
+        best.1
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
+    let rows: Vec<usize> = (0..n).collect();
+    let mut tags = vec![(0u16, 0u16); n];
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = rows
+            .chunks(n.div_ceil(threads).max(1))
+            .map(|chunk| {
+                let (c10, c100) = (&c10, &c100);
+                sc.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&i| {
+                            let v = base.row(i);
+                            let vn = norm(v);
+                            (i, (nearest(v, vn, c10), nearest(v, vn, c100)))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            for (i, t) in h.join().expect("label thread") {
+                tags[i] = t;
+            }
+        }
+    });
+    let bytes: Vec<u8> = tags
+        .iter()
+        .flat_map(|&(a, b)| [a.to_le_bytes(), b.to_le_bytes()].concat())
+        .collect();
+    let _ = std::fs::write(&cache, bytes);
+    eprintln!("labels: {n} rows in {:.0} s", t0.elapsed().as_secs_f64());
+    tags.iter()
+        .enumerate()
+        .map(|(i, &(a, b))| (draw(i as u64), a, b))
+        .collect()
+}
+
+/// The exact top-`k` of each query over the rows `admit` takes, by brute
+/// force on every core.
+#[allow(clippy::too_many_arguments)]
+fn truth_where(
+    base: &Fbin,
+    n: usize,
+    queries: &Fbin,
+    nq: usize,
+    k: usize,
+    metric: &str,
+    admit: &(dyn Fn(usize) -> bool + Sync),
+) -> Vec<Vec<u32>> {
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let rows: Vec<usize> = (0..n).filter(|&i| admit(i)).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
+    let qids: Vec<usize> = (0..nq).collect();
+    let mut gt = vec![Vec::new(); nq];
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = qids
+            .chunks(nq.div_ceil(threads).max(1))
+            .map(|chunk| {
+                let rows = &rows;
+                sc.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&qi| {
+                            let q = queries.row(qi);
+                            let qn = norm(q);
+                            let mut top: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+                            for &i in rows {
+                                let v = base.row(i);
+                                let s = exact_score(metric, q, qn, v, norm(v));
+                                if top.len() < k || s > top[top.len() - 1].0 {
+                                    let at = top.partition_point(|&(t, _)| t >= s);
+                                    top.insert(at, (s, i as u32));
+                                    top.truncate(k);
+                                }
+                            }
+                            (qi, top.into_iter().map(|(_, i)| i).collect::<Vec<u32>>())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            for (qi, ids) in h.join().expect("truth thread") {
+                gt[qi] = ids;
+            }
+        }
+    });
+    gt
+}
+
+/// `--filters`: each filter's recall@k against brute force over its matches,
+/// and its latency, by the threshold rule and with each path forced: `scan`
+/// scores every match, `walk` walks the graph from where `EF` matches are
+/// found. One line a filter and path.
+#[allow(clippy::too_many_arguments)]
+fn filtered_searches(
+    _dir: &std::path::Path,
+    st: &mut Store,
+    ns: &[u8],
+    base: &Fbin,
+    n: usize,
+    queries: &Fbin,
+    nq: usize,
+    k: usize,
+    metric: &str,
+    arm: &str,
+    labels: &[(f64, u16, u16)],
+) {
+    let ef = 64usize;
+    type Admit<'a> = Box<dyn Fn(usize) -> bool + Sync + 'a>;
+    let filters: Vec<(&str, String, Admit)> = vec![
+        ("r50", "@r:[0 (0.5]".into(), Box::new(|i| labels[i].0 < 0.5)),
+        ("r10", "@r:[0 (0.1]".into(), Box::new(|i| labels[i].0 < 0.1)),
+        (
+            "r1",
+            "@r:[0 (0.01]".into(),
+            Box::new(|i| labels[i].0 < 0.01),
+        ),
+        (
+            "r0.1",
+            "@r:[0 (0.001]".into(),
+            Box::new(|i| labels[i].0 < 0.001),
+        ),
+        ("c10", "@c10:{0}".into(), Box::new(|i| labels[i].1 == 0)),
+        ("c100", "@c100:{0}".into(), Box::new(|i| labels[i].2 == 0)),
+    ];
+    for (name, expr, admit) in &filters {
+        let matches = (0..n).filter(|&i| admit(i)).count();
+        let t = Instant::now();
+        let truth = truth_where(base, n, queries, nq, k, metric, admit.as_ref());
+        eprintln!(
+            "truth {name}: {matches} matches, {:.0} s",
+            t.elapsed().as_secs_f64()
+        );
+        // One untimed pass first: the first timed mode otherwise pays for the
+        // caches the ground truth's brute force left cold (130 us against 57
+        // for the same scan on 3,000 vectors).
+        st.set_scan_threshold(None);
+        for qi in 0..nq {
+            let _ = st.plan(
+                ns,
+                &[
+                    b("VEC.SEARCH"),
+                    b("s"),
+                    b(&vec_str(queries.row(qi))),
+                    b(&k.to_string()),
+                    b("FILTER"),
+                    b(expr),
+                ],
+                0,
+            );
+        }
+        for (mode, cap) in [
+            ("rule", None),
+            ("scan", Some(usize::MAX)),
+            ("walk", Some(ef)),
+        ] {
+            st.set_scan_threshold(cap);
+            let (mut hits, mut want, mut lat) = (0usize, 0usize, Vec::with_capacity(nq));
+            for (qi, tr) in truth.iter().enumerate().take(nq) {
+                let args = [
+                    b("VEC.SEARCH"),
+                    b("s"),
+                    b(&vec_str(queries.row(qi))),
+                    b(&k.to_string()),
+                    b("EF"),
+                    b(&ef.to_string()),
+                    b("FILTER"),
+                    b(expr),
+                ];
+                let t = Instant::now();
+                let reply = st.plan(ns, &args, 0);
+                lat.push(t.elapsed().as_micros());
+                let Plan::Reply(v) = reply else {
+                    panic!("a search is a reply")
+                };
+                hits += result_ids(&v)
+                    .iter()
+                    .filter_map(|id| std::str::from_utf8(id).ok()?.parse::<u32>().ok())
+                    .filter(|id| tr.contains(id))
+                    .count();
+                want += tr.len();
+            }
+            let (p50, p99, _) = stats(lat);
+            println!(
+                "arm={arm} n={n} filter={name} matches={matches} mode={mode} ef={ef} recall@{k}={:.4} p50_us={p50} p99_us={p99}",
+                hits as f64 / want.max(1) as f64
+            );
+        }
+    }
+    st.set_scan_threshold(None);
+}
+
 /// `--data`: ADR-0049 verifications 1 and 2 on a real corpus. One set a run
 /// (`--arm`), so this process's RSS growth is that set's alone.
 fn real_data(a: &[String]) {
@@ -616,6 +868,8 @@ fn real_data(a: &[String]) {
         .unwrap_or(200)
         .min(queries.n);
     let dim = base.dim;
+    let filtering = a.iter().any(|x| x == "--filters");
+    let labels = filtering.then(|| labels(&dir, &base, n, &metric));
     let gt = ground_truth(&dir, &base, n, &queries, nq, k, &metric);
     if a.iter().any(|x| x == "--gt-only") {
         return;
@@ -623,6 +877,7 @@ fn real_data(a: &[String]) {
 
     let ns = b("real");
     let mut st = Store::new();
+    st.set_filters(filtering);
     let (code, disk) = match arm.strip_suffix("-disk") {
         Some(c) => (c, true),
         None => (arm.as_str(), false),
@@ -650,23 +905,34 @@ fn real_data(a: &[String]) {
     if let Some(q) = quant {
         create.extend([b("QUANT"), b(q)]);
     }
+    if filtering {
+        for f in [
+            "FIELD", "r", "NUMERIC", "FIELD", "c10", "TAG", "FIELD", "c100", "TAG",
+        ] {
+            create.push(b(f));
+        }
+    }
     exec(&mut st, &ns, &create);
     let (rss0, heap0) = (rss_anon(), HEAP.load(Ordering::Relaxed));
     let t0 = Instant::now();
     // The slowest single VEC.SET, and when.
     let (mut slowest, mut slowest_at) = (0f64, 0usize);
     for i in 0..n {
+        let mut set = vec![
+            b("VEC.SET"),
+            b("s"),
+            b(&i.to_string()),
+            b(&vec_str(base.row(i))),
+        ];
+        if let Some(l) = &labels {
+            let (r, c10, c100) = l[i];
+            set.extend([
+                b("META"),
+                b(&format!(r#"{{"r":{r},"c10":"{c10}","c100":"{c100}"}}"#)),
+            ]);
+        }
         let t = Instant::now();
-        exec(
-            &mut st,
-            &ns,
-            &[
-                b("VEC.SET"),
-                b("s"),
-                b(&i.to_string()),
-                b(&vec_str(base.row(i))),
-            ],
-        );
+        exec(&mut st, &ns, &set);
         let took = t.elapsed().as_secs_f64();
         if took > slowest {
             (slowest, slowest_at) = (took, i + 1);
@@ -691,6 +957,12 @@ fn real_data(a: &[String]) {
         slowest * 1e3
     );
 
+    if let Some(l) = &labels {
+        filtered_searches(
+            &dir, &mut st, &ns, &base, n, &queries, nq, k, &metric, &arm, l,
+        );
+        return;
+    }
     // Verification 2's depths, 2k to 10k, and 20k for the codes that may need
     // more than that, unless --reranks names others; --efs likewise.
     let list = |flag: &str| -> Option<Vec<usize>> {
