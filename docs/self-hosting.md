@@ -210,6 +210,7 @@ placed-tenants off          # forbid `tenant add-on-pair` (on by default; ADR-00
 streams off                 # XADD creates no stream (on by default; ADR-0052, section 4)
 chunked-strings off         # store every string whole (on by default; ADR-0056, section 4)
 stream-groups off           # XGROUP CREATE makes no new group (on by default; ADR-0057, section 4)
+reserve-coproc-rows on      # only a co-processor's channel writes its rows (off by default; BUG-0265, section 4)
 vec-filters off             # refuse VEC.CREATE FIELD and VEC.SEARCH FILTER (on by default; ADR-0059, section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
@@ -1337,6 +1338,17 @@ Notes:
   rc.84's opt-in. While it is off, `FIELD` and `FILTER` are refused, and a
   set made with fields keeps them. An older `flint-vec` passes over either
   flag and loads such a set without its fields.
+
+- **The co-processor's reserved rows** (BUG-0265): with
+  `reserve-coproc-rows on` (each data seat runs with
+  `--reserve-coproc-rows`), a node refuses a tenant's write to a key that
+  starts with `\x00vec\x00`, where the vector co-processor keeps its durable
+  rows, and lets the co-processor's own channel write them. Off in the
+  release that introduces it, because a node refusing those writes needs
+  every proxy in front of it to mark its channel connections, which the
+  release before's proxies do not: turn it on once every proxy runs this
+  release. Only binaries from this release on know the flag, so set it off
+  before rolling back below this release with this flintctl.
 
 ## 5. Rotating credentials & keys
 

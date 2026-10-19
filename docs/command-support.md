@@ -506,6 +506,11 @@ unless the operator turns it off) takes the part of RediSearch's query syntax
 for `TAG` and `NUMERIC` fields, with three differences: tags match case and
 all, AND and OR do not mix without parentheses, and full-text, geo,
 tag-wildcard and `$parameter` terms are refused by name.
+The co-processor keeps its durable rows in your namespace under keys that
+start with `\x00vec\x00`. A fleet whose operator turns on
+`reserve-coproc-rows` refuses your own write to such a key, with any command
+or from a script, since writing one changes your vectors behind `VEC.*`
+(BUG-0265).
 
 ## Protocols: RESP2 and RESP3
 

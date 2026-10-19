@@ -83,4 +83,23 @@ amendment). The guard ADR-0060 puts on the node for an index's prefixes
 reserves the co-processor's own rows the same way: the node refuses a write
 to a `\x00vec\x00` key unless it comes over the co-processor's channel, and
 a script's writes are checked there too, which is what made A incomplete in
-the proxy. It is built with ADR-0060's guard, and closes this half then.
+the proxy.
+
+**Built 2026-10-19, the first of two releases.** For the co-processor's rows
+it needs none of ADR-0060's index machinery, so it is built first:
+- The proxy marks a co-processor channel's backend connections with
+  `FLINTCHANNEL` after the namespace pin. A node that predates it answers
+  `unknown command` and serves the connection as before, so the proxy may
+  roll before or after the nodes.
+- A node started with `--reserve-coproc-rows` (inventory
+  `reserve-coproc-rows on`) refuses a write naming a `\x00vec\x00` key on any
+  other connection: before it runs, or queues inside `MULTI`, which poisons
+  the transaction. It checks every argument, since no table says which of a
+  command's arguments are keys, so a value starting with those bytes is
+  refused too. A script's writes are checked at each row it writes, so a
+  key it builds and never declared is refused and the script's other writes
+  are discarded.
+- Off by default in this release, because the release before's proxies do
+  not mark their channel connections, and a node refusing the
+  co-processor's own writes mid-roll would fail every `VEC.SET`. The next
+  release turns it on, and this half is closed then.

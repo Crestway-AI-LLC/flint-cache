@@ -251,6 +251,17 @@ pub fn flush_args_ok(args: &[Vec<u8>]) -> bool {
     }
 }
 
+/// The key prefixes reserved to a co-processor's own durable rows (BUG-0265):
+/// the vector co-processor's, `flint-vec`'s `KEY_PREFIX`, which must stay the
+/// same bytes. A data node started with `--reserve-coproc-rows` lets only a
+/// co-processor's channel write a key that starts with one.
+pub const COPROC_RESERVED_PREFIXES: &[&[u8]] = &[b"\x00vec\x00"];
+
+/// Whether `key` starts with a prefix reserved to a co-processor's rows.
+pub fn is_coproc_reserved(key: &[u8]) -> bool {
+    COPROC_RESERVED_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
 /// True when `name` mutates the keyspace.
 pub fn is_write_command(name: &[u8]) -> bool {
     matches!(

@@ -168,6 +168,15 @@ struct Inventory {
     /// below that release driven by this flintctl needs `stream-groups off`
     /// first, or rc.82's seats refuse the flag and do not start.
     stream_groups: bool,
+    /// Start every data seat with `--reserve-coproc-rows`, so only a
+    /// co-processor's channel may write the keys reserved to its rows
+    /// (BUG-0265). Off unless the inventory says `reserve-coproc-rows on`,
+    /// in the release that introduces it: a node refusing those writes needs
+    /// every proxy in front of it to mark its channel connections, and the
+    /// proxies of the release before do not, so the co-processor's own
+    /// writes through one would be refused mid-roll. Only binaries from this
+    /// release on know the flag.
+    reserve_coproc_rows: bool,
     /// Failure domain per HOST (`zone <host> <name>`): an availability zone
     /// on a cloud, a rack or a power domain on your own hardware.
     ///
@@ -461,6 +470,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "streams" => inv.streams = on_or_off(key, val),
             "chunked-strings" => inv.chunked_strings = on_or_off(key, val),
             "stream-groups" => inv.stream_groups = on_or_off(key, val),
+            "reserve-coproc-rows" => inv.reserve_coproc_rows = on_or_off(key, val),
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
             "admin-token" => inv.admin_token = Some(val.to_string()),
@@ -3360,6 +3370,9 @@ fn reload(inv: &Inventory) {
     if !inv.stream_groups {
         restart_only.push("stream-groups");
     }
+    if inv.reserve_coproc_rows {
+        restart_only.push("reserve-coproc-rows");
+    }
     if !inv.vec_filters {
         restart_only.push("vec-filters");
     }
@@ -3465,6 +3478,10 @@ fn node_tuning_args(inv: &Inventory, replicated: bool) -> Vec<String> {
     // A switch, with no value (ADR-0057 D5).
     if inv.stream_groups {
         a.push("--stream-groups".to_string());
+    }
+    // A switch, with no value (BUG-0265).
+    if inv.reserve_coproc_rows {
+        a.push("--reserve-coproc-rows".to_string());
     }
     a
 }
@@ -11157,6 +11174,27 @@ mod cp_seat_liveness_tests {
             };
             assert!(has(&default) && has(&on));
             assert!(!has(&off));
+        }
+    }
+
+    /// BUG-0265: every data seat reserves the co-processor's rows only when
+    /// the inventory says `reserve-coproc-rows on`, in the release that
+    /// introduces it.
+    #[test]
+    fn reserve_coproc_rows_reaches_every_data_seat_only_when_on() {
+        let base = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+                    cp 10.0.0.1:7500\npair 10.0.0.1:7001,10.0.0.2:7002\n";
+        let default = inv_from(base, "reserve-default");
+        let on = inv_from(&format!("{base}reserve-coproc-rows on\n"), "reserve-on");
+        let off = inv_from(&format!("{base}reserve-coproc-rows off\n"), "reserve-off");
+        for replicated in [true, false] {
+            let has = |inv: &Inventory| {
+                node_tuning_args(inv, replicated)
+                    .iter()
+                    .any(|a| a == "--reserve-coproc-rows")
+            };
+            assert!(has(&on));
+            assert!(!has(&default) && !has(&off));
         }
     }
 

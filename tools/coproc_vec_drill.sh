@@ -33,7 +33,9 @@
 #     and refused with --no-vec-filters; a set's fields survive a restart with
 #     that flag and are indexed again by the next one without it
 #   - BUG-0265: a row of the wrong length that the tenant planted is left
-#     out of a QUANT bin set's rebuild, and said to be, where it panicked
+#     out of a QUANT bin set's rebuild, and said to be, where it panicked;
+#     and on a node with --reserve-coproc-rows the tenant cannot plant one,
+#     while the co-processor's channel still writes its rows
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
@@ -638,6 +640,36 @@ restart_vec vec11.log --vec-filters
 check_filters
 grep -qi "rebuilt ns" "$D/vec11.log" || { echo "FAIL: no rebuild logged"; exit 1; }
 echo "  a restart with --no-vec-filters refuses FILTER and keeps the fields; the next filters the same"
+
+echo "== BUG-0265: a node with --reserve-coproc-rows lets only the co-processor's channel write its rows"
+# The server again, reserving the rows; mem engine, so it starts empty. The
+# proxy marks the co-processor's channel connections with FLINTCHANNEL, and a
+# tenant's own connections not.
+fleet_signal_port 6676 -KILL; sleep 0.3
+$B --port 6676 --engine mem --reserve-coproc-rows 2>"$D/n-reserve.log" & fleet_wait_listen 6676; fleet_wait_ping 6676
+grep -q "reserve-coproc-rows: on" "$D/n-reserve.log" || { echo "FAIL: the node does not say it reserves the rows"; sed 's/^/    /' "$D/n-reserve.log"; exit 1; }
+restart_vec vec12.log
+[ "$(vexec VEC.CREATE rsv DIM 3 METRIC l2 INDEX hnsw)" = "OK " ] || { echo "FAIL (BUG-0265): the co-processor could not write its config row through a marked channel: $(vexec VEC.CREATE rsv DIM 3 METRIC l2 INDEX hnsw)"; exit 1; }
+[ "$(vexec VEC.SET rsv a 1,0,0)" = "OK " ] || { echo "FAIL (BUG-0265): the co-processor could not write a vector row"; exit 1; }
+case "$(vexec VEC.SEARCH rsv 1,0,0 1)" in *a*) : ;; *) echo "FAIL: search on the reserving node"; exit 1 ;; esac
+# A tenant's SET of a reserved key, through the proxy with the tenant's token.
+PLANT="$(python3 - <<'PY'
+import socket
+def enc(*a):
+    out = b"*%d\r\n" % len(a)
+    for x in a:
+        out += b"$%d\r\n%s\r\n" % (len(x), x)
+    return out
+s = socket.create_connection(("127.0.0.1", 6677))
+s.sendall(enc(b"AUTH", b"tok") + enc(b"SET", b"\x00vec\x00v\x00rsv\x00planted", b"1,2,3"))
+buf = b""
+while buf.count(b"\r\n") < 2:
+    buf += s.recv(4096)
+print(buf.split(b"\r\n")[1].decode(errors="replace"))
+PY
+)"
+case "$PLANT" in *"reserved for the vector co-processor"*) : ;; *) echo "FAIL (BUG-0265): a tenant's SET of a reserved key was not refused: $PLANT"; exit 1 ;; esac
+echo "  the co-processor writes its rows over its marked channel; the tenant's own SET of one is refused"
 
 echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 and bin on a local file), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"

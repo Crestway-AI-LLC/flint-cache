@@ -157,8 +157,10 @@ a proxy that is behind is redirected. The same works here:
   its data, so a failover's new master has them.
 - **The node refuses a write under an indexed prefix unless it comes over
   the co-processor's channel.** The proxy marks the backend connections it
-  opens for a channel in the `FLINTNS` handshake, as it marks async writes
-  with its `a` flag. Any other write is refused with `-INDEXED <prefix>`.
+  opens for a channel with `FLINTCHANNEL` after the `FLINTNS` handshake (not
+  a `FLINTNS` flag: `FLINTNS` refuses a flag it does not know, which would
+  fail every dial to an older node; built 2026-10-19 for BUG-0265). Any
+  other write is refused with `-INDEXED <prefix>`.
 - **A proxy that gets `-INDEXED` learns the prefix** and sends the write
   through the co-processor, as a proxy that gets `-MOVED` learns the new
   owner. Proxies converge on their own, and correctness never waits for

@@ -422,6 +422,82 @@ mod tests {
         addr
     }
 
+    /// A backend that answers the handshake as a node from before
+    /// `FLINTCHANNEL` would (an unknown command), and sends each command name
+    /// it read down `seen`.
+    async fn recording_backend(seen: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = l.local_addr().expect("addr").to_string();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = l.accept().await else {
+                return;
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let Ok(n) = sock.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                while let Ok(Decoded::Complete(v, used)) = decode(&buf) {
+                    buf.drain(..used);
+                    let name = match v {
+                        Value::Array(Some(parts)) => match parts.into_iter().next() {
+                            Some(Value::Bulk(Some(n))) => n,
+                            _ => Vec::new(),
+                        },
+                        _ => Vec::new(),
+                    };
+                    let reply: &[u8] = match name.as_slice() {
+                        b"HELLO" => b"%0\r\n",
+                        b"FLINTNS" => b"+OK\r\n",
+                        _ => b"-ERR unknown command\r\n",
+                    };
+                    let _ = seen.send(name);
+                    if sock.write_all(reply).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    /// BUG-0265: a co-processor channel's connection marks itself with
+    /// `FLINTCHANNEL` after the namespace pin, and a node that predates it
+    /// (`unknown command`) still gets a working connection. A tenant's
+    /// connection never sends it.
+    #[test]
+    fn a_channel_connection_marks_itself_and_an_older_node_still_serves_it() {
+        for channel in [true, false] {
+            run(async move {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let addr = recording_backend(tx).await;
+                let key = Key {
+                    lane: Lane::Write,
+                    addr,
+                    ns: b"t".to_vec(),
+                    whole: false,
+                    channel,
+                    async_writes: false,
+                };
+                dial_private(&key, &None)
+                    .await
+                    .expect("an older node's unknown command does not fail the dial");
+                let mut names = Vec::new();
+                while let Ok(n) = rx.try_recv() {
+                    names.push(n);
+                }
+                let marked = names.iter().any(|n| n == b"FLINTCHANNEL");
+                assert_eq!(marked, channel, "sent: {names:?}");
+                assert_eq!(names.first().map(|n| n.as_slice()), Some(&b"HELLO"[..]));
+            });
+        }
+    }
+
     /// A worker reuses its connection, and retiring it really replaces it.
     ///
     /// Reuse is the point of the registry: if every command dialled, this
@@ -437,6 +513,7 @@ mod tests {
                 addr: addr.clone(),
                 ns: b"0".to_vec(),
                 whole: false,
+                channel: false,
                 async_writes: false,
             };
 
@@ -516,6 +593,11 @@ pub(crate) struct Key {
     pub async_writes: bool,
     /// A placed tenant's connection (ADR-0053): pinned with `FLINTWHOLE`.
     pub whole: bool,
+    /// A co-processor channel's connection (ADR-0060, BUG-0265): marked with
+    /// `FLINTCHANNEL`, so the node lets it write the rows reserved to the
+    /// co-processor. Part of the key, so a tenant's own connection in the
+    /// same namespace is never one of these.
+    pub channel: bool,
     pub lane: Lane,
 }
 
@@ -604,6 +686,20 @@ async fn dial(
             &mut whole,
         );
         exchange(&mut s, &whole).await?;
+    }
+    // ADR-0060's amendment and BUG-0265: a co-processor channel's connection
+    // tells its seat so, and the seat lets it write the rows reserved to the
+    // co-processor. A seat that predates this answers `unknown command`, and
+    // reserves nothing, so the connection serves as before. Not a FLINTNS
+    // flag: FLINTNS refuses a flag it does not know, which would fail the
+    // dial to every seat older than this proxy.
+    if key.channel {
+        let mut mark = Vec::new();
+        flint_resp::encode(
+            &Value::Array(Some(vec![Value::Bulk(Some(b"FLINTCHANNEL".to_vec()))])),
+            &mut mark,
+        );
+        exchange(&mut s, &mark).await?;
     }
     Ok(s)
 }

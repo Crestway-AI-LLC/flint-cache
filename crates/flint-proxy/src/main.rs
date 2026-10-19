@@ -1426,6 +1426,10 @@ struct Backends {
     /// tenant's keyed and keyless commands only to its own pair, so a
     /// transaction or script of it never reaches another.
     whole: bool,
+    /// A co-processor channel's connections (BUG-0265): each tells its seat,
+    /// with `FLINTCHANNEL`, so the seat lets it write the co-processor's
+    /// reserved rows. A tenant's own connections never carry it.
+    channel: bool,
 }
 
 /// A CLIENT'S PRIVATE CONNECTIONS END WITH THE CLIENT (BUG-0199).
@@ -1471,12 +1475,19 @@ impl Backends {
             async_writes,
             fanout_timeout,
             whole: false,
+            channel: false,
         }
     }
 
     /// Mark these connections as a placed tenant's (ADR-0053).
     fn placed(mut self, whole: bool) -> Self {
         self.whole = whole;
+        self
+    }
+
+    /// Mark these connections as a co-processor channel's (BUG-0265).
+    fn channel(mut self, channel: bool) -> Self {
+        self.channel = channel;
         self
     }
 
@@ -1489,6 +1500,7 @@ impl Backends {
             ns: self.ns.clone(),
             async_writes: self.async_writes,
             whole: self.whole,
+            channel: self.channel,
             lane,
         }
     }
@@ -4105,6 +4117,7 @@ async fn data_command(
                 topo.fanout_timeout,
             )
             .placed(topo.placed_pair(ns).is_some())
+            .channel(is_channel)
         });
         let reply = null_as_array(
             args,
@@ -4147,6 +4160,7 @@ async fn data_command(
                     topo.fanout_timeout,
                 )
                 .placed(topo.placed_pair(ns).is_some())
+                .channel(is_channel)
             });
             return script_command(topo, b, ns, args, raw).await;
         }
@@ -4221,6 +4235,7 @@ async fn data_command(
                 topo.fanout_timeout,
             )
             .placed(topo.placed_pair(ns).is_some())
+            .channel(is_channel)
         });
         // BUG-0193: a queued write reaches no `cache_writeback`, so EXEC
         // drops what the transaction's writes name, whatever EXEC answered.
@@ -4278,6 +4293,7 @@ async fn data_command(
             topo.fanout_timeout,
         )
         .placed(topo.placed_pair(ns).is_some())
+        .channel(is_channel)
     });
     let reply = null_as_array(
         args,

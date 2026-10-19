@@ -1040,6 +1040,11 @@ pub fn flush(ns: &[u8]) {
     CACHE.flush(ns);
 }
 
+/// What a write to a co-processor's reserved rows answers, from a command or
+/// a script, on a node started with `--reserve-coproc-rows` (BUG-0265).
+pub const RESERVED_REFUSAL: &str =
+    "ERR key is reserved for the vector co-processor's own rows; write it with VEC.* (BUG-0265)";
+
 /// Where a row key belongs: `(namespace, user key)` for the metadata,
 /// subkey and zscore envelopes, which are every row a command writes.
 /// `None` for anything else, which the guard refuses.
@@ -1085,6 +1090,9 @@ pub struct KeyGuard<'a> {
     /// A placed tenant's namespace (ADR-0053): every key of it is on this
     /// seat's pair, so every slot counts as the declared keys' slot.
     whole: bool,
+    /// Refuse a write to a co-processor's reserved rows (BUG-0265): checked
+    /// at the row, so a key the script built and never declared is caught.
+    reserved: bool,
     strayed: Mutex<Option<Stray>>,
 }
 
@@ -1100,6 +1108,8 @@ pub enum Stray {
     /// Rows no one key owns: a command over the keyspace (`DBSIZE`, `SCAN`,
     /// `FLUSHALL`) or anything else a script has no business in.
     Keyspace,
+    /// A write to a key reserved to a co-processor's rows (BUG-0265).
+    Reserved(Vec<u8>),
 }
 
 impl Stray {
@@ -1125,6 +1135,7 @@ impl Stray {
                  (ADR-0052)"
                     .into(),
             ),
+            Stray::Reserved(_) => Value::Error(RESERVED_REFUSAL.into()),
         }
     }
 }
@@ -1145,7 +1156,30 @@ impl<'a> KeyGuard<'a> {
             slot: declared.iter().next().map(|k| slot_for_key(k)),
             every_writer,
             whole: false,
+            reserved: false,
             strayed: Mutex::new(None),
+        }
+    }
+
+    /// Refuse writes to a co-processor's reserved rows (BUG-0265).
+    pub fn reserved(mut self, yes: bool) -> Self {
+        self.reserved = yes;
+        self
+    }
+
+    /// Whether writing `row` is refused as a co-processor's reserved row,
+    /// recorded as the script's stray when it is.
+    fn refuses_write(&self, row: &[u8]) -> bool {
+        if !self.reserved {
+            return false;
+        }
+        match row_owner(row) {
+            Some((_, key)) if flint_commands::is_coproc_reserved(key) => {
+                let mut s = self.strayed.lock().unwrap_or_else(|e| e.into_inner());
+                s.get_or_insert(Stray::Reserved(key.to_vec()));
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1216,13 +1250,13 @@ impl Kv for KeyGuard<'_> {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) {
-        if self.allows(key) {
+        if self.allows(key) && !self.refuses_write(key) {
             self.under.put(key, value);
         }
     }
 
     fn delete(&self, key: &[u8]) -> bool {
-        self.allows(key) && self.under.delete(key)
+        self.allows(key) && !self.refuses_write(key) && self.under.delete(key)
     }
 
     fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {

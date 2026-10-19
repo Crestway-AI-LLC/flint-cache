@@ -301,6 +301,12 @@ pub struct Limits {
     /// every group command works on groups that exist either way, so a
     /// rollback to that release keeps consumers consuming.
     pub stream_groups: bool,
+    /// Whether this connection is refused a write to a co-processor's
+    /// reserved rows (BUG-0265, `--reserve-coproc-rows`). The node's setting
+    /// narrowed per connection: off for a co-processor's channel, which
+    /// `FLINTCHANNEL` marks, so the scripts and transactions it runs under
+    /// see the connection's answer, not the node's.
+    pub reserve_coproc_rows: bool,
 }
 
 impl Default for Limits {
@@ -312,6 +318,7 @@ impl Default for Limits {
             streams: false,
             chunked_strings: false,
             stream_groups: false,
+            reserve_coproc_rows: false,
         }
     }
 }
@@ -2162,7 +2169,8 @@ impl<'a> Dispatcher<'a> {
             let (reply, strayed) = {
                 let guard =
                     crate::script::KeyGuard::new(&overlay, &self.ns, &declared, self.every_writer)
-                        .whole(self.whole);
+                        .whole(self.whole)
+                        .reserved(self.limits.reserve_coproc_rows);
                 let reply = Dispatcher::with_limits(&guard, self.clock, self.limits, &self.ns)
                     .dispatch(cmd);
                 (reply, guard.strayed())

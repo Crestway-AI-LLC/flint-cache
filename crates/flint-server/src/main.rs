@@ -96,6 +96,9 @@ const ACCEPTED_FLAGS: &[&str] = &[
     "--replica-read-stale-ms",
     "--restore-from",
     "--rewind-snaps",
+    // A switch, which takes no value (BUG-0265): only a co-processor's
+    // channel may write the keys reserved to its rows.
+    "--reserve-coproc-rows",
     "--script-memory-limit-mb",
     "--script-time-limit-ms",
     // A switch, which takes no value (ADR-0057 D5): XGROUP CREATE may
@@ -3106,7 +3109,16 @@ fn main() -> std::io::Result<()> {
         // ADR-0057 D5: likewise, XGROUP CREATE makes a group only when an
         // operator says so, in the first release that serves groups.
         stream_groups: std::env::args().any(|a| a == "--stream-groups"),
+        // BUG-0265: only a co-processor's channel may write its reserved
+        // rows. Off in the release that first marks channel connections, so
+        // a fleet's proxies all mark them before any node refuses.
+        reserve_coproc_rows: std::env::args().any(|a| a == "--reserve-coproc-rows"),
     };
+    if limits.reserve_coproc_rows {
+        eprintln!(
+            "reserve-coproc-rows: on (only a co-processor's channel may write its reserved rows)"
+        );
+    }
     if limits.stream_groups {
         eprintln!(
             "stream-groups: on (XGROUP CREATE may create a consumer group; this fleet cannot roll back below this release while it holds one)"
@@ -4651,6 +4663,10 @@ pub(crate) struct TxnState {
     /// connection property, not a transaction's: `end` leaves it, and
     /// `FLINTNS` clears it.
     whole: bool,
+    /// `FLINTCHANNEL` (BUG-0265): this connection is a co-processor's
+    /// channel, which may write the co-processor's reserved rows. A
+    /// connection property like `whole`, and `FLINTNS` clears it.
+    channel: bool,
 }
 
 impl TxnState {
@@ -5675,7 +5691,51 @@ fn execute(
         }
         *conn_ns = ns.clone();
         conn_txn.whole = false;
+        conn_txn.channel = false;
         return Value::Simple("OK".into());
+    }
+    // FLINTCHANNEL (BUG-0265): this connection is a co-processor's channel,
+    // and may write the co-processor's reserved rows on a node started with
+    // `--reserve-coproc-rows`. Sent by the proxy right after FLINTNS, only on
+    // a channel's backend connections; a tenant cannot send it, since the
+    // proxy refuses every FLINT* command from a client.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTCHANNEL"))
+    {
+        if args.len() != 1 {
+            return Value::Error("ERR FLINTCHANNEL takes no arguments".into());
+        }
+        conn_txn.channel = true;
+        return Value::Simple("OK".into());
+    }
+    // The node's setting, narrowed to this connection: a co-processor's
+    // channel may write its reserved rows (BUG-0265). Everything below,
+    // a script's own dispatcher included, sees this connection's answer.
+    let limits = commands::Limits {
+        reserve_coproc_rows: limits.reserve_coproc_rows && !conn_txn.channel,
+        ..limits
+    };
+    // A write naming a reserved key is refused before it runs or queues.
+    // Any argument, not only the keys: no table says which argument of
+    // every command is a key, and a value that starts with these bytes is
+    // not one a tenant writes by chance. A script's writes are checked again
+    // at each row (`KeyGuard`), so a key it builds is caught too.
+    if limits.reserve_coproc_rows
+        && args
+            .first()
+            .is_some_and(|n| flint_commands::is_write_command(n))
+        && args
+            .iter()
+            .skip(1)
+            .any(|a| flint_commands::is_coproc_reserved(a))
+    {
+        // Inside MULTI, refused at queue time and the transaction poisoned,
+        // as a cross-slot command is (BUG-0181): EXEC applies none of it.
+        if let Some(txn) = conn_txn.open.as_mut() {
+            txn.poisoned = true;
+        }
+        return Value::Error(script::RESERVED_REFUSAL.into());
     }
     // FLINTWHOLE (ADR-0053): this connection's namespace is a placed
     // tenant's, and lives wholly on this seat's pair, so a transaction or a
@@ -8836,6 +8896,10 @@ mod serve_tests {
     /// and a pending `lock_all()` queues that read behind it (BUG-0243).
     /// Taken here so a new test cannot forget it.
     fn spawn_server() -> (std::net::SocketAddr, Serial) {
+        spawn_server_with(commands::Limits::default())
+    }
+
+    fn spawn_server_with(limits: commands::Limits) -> (std::net::SocketAddr, Serial) {
         let serial = crate::write_lock::test_serial();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -8854,7 +8918,7 @@ mod serve_tests {
                         None,
                         &Arc::new(ReplHub::default()),
                         &Arc::new(AtomicBool::new(false)),
-                        commands::Limits::default(),
+                        limits,
                         None,
                         &Arc::new(flint_storage::watch::WatchTable::new()),
                     );
@@ -8938,6 +9002,94 @@ mod serve_tests {
             taken >= 1,
             "the script touched an undeclared key without the lock over every writer"
         );
+    }
+
+    /// BUG-0265 over the wire: on a node started with `--reserve-coproc-rows`,
+    /// a connection that is not a co-processor's channel cannot write a key
+    /// reserved to the co-processor's rows: not with a command, not inside a
+    /// transaction (which is poisoned, so nothing in it applies), and not
+    /// from a script that builds the key, whose other writes are then
+    /// discarded. A read is not refused, and a connection marked
+    /// `FLINTCHANNEL` writes them.
+    #[test]
+    fn only_a_channel_writes_the_coprocessors_reserved_rows() {
+        let reserve = commands::Limits {
+            reserve_coproc_rows: true,
+            ..commands::Limits::default()
+        };
+        let row = "\u{0}vec\u{0}v\u{0}s\u{0}id";
+        let script = "local k = string.char(0) .. 'vec' .. string.char(0) .. '{t}b' \
+                      redis.call('set', KEYS[1], '1') redis.call('set', k, 'x') return 1";
+        let cmds: &[&[&str]] = &[
+            &["SET", row, "planted"],
+            &["MSET", "a", "1", row, "planted"],
+            &["GET", "a"],
+            &["MULTI"],
+            &["SET", "b", "1"],
+            &["SET", row, "planted"],
+            &["EXEC"],
+            &["GET", "b"],
+            &["EVAL", script, "1", "{t}a"],
+            &["GET", "{t}a"],
+            &["GET", row],
+            &["FLINTCHANNEL"],
+            &["SET", row, "the co-processor's"],
+            &["GET", row],
+        ];
+        let (addr, serial) = spawn_server_with(reserve);
+        let mut s = connect(addr);
+        let mut p = Vec::new();
+        for c in cmds {
+            let parts = c.iter().map(|x| Value::Bulk(Some(x.as_bytes().to_vec())));
+            encode(&Value::Array(Some(parts.collect())), &mut p);
+        }
+        s.write_all(&p).expect("send");
+        let f = read_frames(&mut s, cmds.len());
+        // A script's refusal carries the script's position after it, as any
+        // error a redis.call raises does.
+        let refused =
+            |v: &Value| matches!(v, Value::Error(e) if e.starts_with(script::RESERVED_REFUSAL));
+        assert!(refused(&f[0]), "SET: {:?}", f[0]);
+        assert!(refused(&f[1]), "MSET: {:?}", f[1]);
+        assert_eq!(
+            f[2],
+            Value::Bulk(None),
+            "the refused MSET wrote none of its keys"
+        );
+        assert!(refused(&f[5]), "queued SET: {:?}", f[5]);
+        assert!(
+            matches!(&f[6], Value::Error(e) if e.starts_with("EXECABORT")),
+            "EXEC of a poisoned transaction: {:?}",
+            f[6]
+        );
+        assert_eq!(
+            f[7],
+            Value::Bulk(None),
+            "nothing in the poisoned transaction applied"
+        );
+        assert!(refused(&f[8]), "a script that built the key: {:?}", f[8]);
+        assert_eq!(
+            f[9],
+            Value::Bulk(None),
+            "the script's other write was discarded"
+        );
+        assert_eq!(f[10], Value::Bulk(None), "a read is not refused");
+        assert_eq!(f[11], Value::Simple("OK".into()));
+        assert_eq!(f[12], Value::Simple("OK".into()), "a channel writes it");
+        assert_eq!(f[13], Value::Bulk(Some(b"the co-processor's".to_vec())));
+        // Without the switch, as every release before it, nothing is refused.
+        drop(serial);
+        let (addr, _serial) = spawn_server();
+        let mut s = connect(addr);
+        let mut p = Vec::new();
+        for c in [&["SET", row, "planted"][..], &["GET", row]] {
+            let parts = c.iter().map(|x| Value::Bulk(Some(x.as_bytes().to_vec())));
+            encode(&Value::Array(Some(parts.collect())), &mut p);
+        }
+        s.write_all(&p).expect("send");
+        let f = read_frames(&mut s, 2);
+        assert_eq!(f[0], Value::Simple("OK".into()));
+        assert_eq!(f[1], Value::Bulk(Some(b"planted".to_vec())));
     }
 
     /// ADR-0053 over the wire: a connection marked `FLINTWHOLE` (a placed
