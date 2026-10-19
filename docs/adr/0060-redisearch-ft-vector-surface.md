@@ -4,8 +4,9 @@ Status: **ACCEPTED 2026-10-19, option A** (Jeff: "go with your
 recommendation"), with the first release's scope and the two releases as
 recommended. The downloads its verification needs, to install and run the
 three clients' own tests, are still Jeff's to approve when it is built.
-Nothing is built yet. An amendment, the guard on the data node rather than on
-every proxy knowing, is PROPOSED below for Jeff before it is built.
+Nothing is built yet. The amendment below, the guard on the data node rather
+than on every proxy knowing, was ACCEPTED 2026-10-19 (Jeff: "Accept the node
+guard").
 
 Proposed 2026-10-19.
 
@@ -132,7 +133,7 @@ needs `FT.*` over keys it writes with scripts.
   the index. The next release turns it on, and a rollback from it lands on a
   release that routes them.
 
-## Amendment, 2026-10-19 (PROPOSED, for Jeff): the guard is on the data node
+## Amendment, 2026-10-19 (accepted the same day): the guard is on the data node
 
 Option A as written has the proxy route each write under an indexed prefix
 to the co-processor. A fleet has several proxies, and nothing confirms that

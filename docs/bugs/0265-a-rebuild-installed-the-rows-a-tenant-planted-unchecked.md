@@ -78,5 +78,9 @@ for other tenants and for the host's data seats. Three ways to close it:
   one. Complete, and a row-format change in two releases, as ADR-0050 D5
   was for packed rows.
 
-Recommended: **A** for the plain commands now, which leaves only scripts, and
-C if a script path turns out to matter. Not built: it is design, and Jeff's.
+**Chosen 2026-10-19: A, on the data node** (Jeff, accepting ADR-0060's
+amendment). The guard ADR-0060 puts on the node for an index's prefixes
+reserves the co-processor's own rows the same way: the node refuses a write
+to a `\x00vec\x00` key unless it comes over the co-processor's channel, and
+a script's writes are checked there too, which is what made A incomplete in
+the proxy. It is built with ADR-0060's guard, and closes this half then.
