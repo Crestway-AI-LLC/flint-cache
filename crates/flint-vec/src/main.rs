@@ -37,7 +37,7 @@
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_vec::filter::Field;
 use flint_vec::{
-    Apply, IndexKind, Metric, Persist, Plan, Quant, Store, decode_config, decode_vec_row,
+    Apply, IndexKind, LeftOut, Metric, Persist, Plan, Quant, Store, decode_config, decode_vec_row,
     parse_durable_key,
 };
 use std::collections::HashMap;
@@ -778,17 +778,46 @@ fn install(
             },
         );
     }
-    let n = vectors.len();
+    // Each row is held to the shape VEC.SET would have held it to (BUG-0265):
+    // the tenant can write these rows itself. What is left out is said, by
+    // reason, as an unreadable row is. The caps govern new writes only
+    // (ADR-0017 D3), so they are not checked here.
+    let mut n = 0usize;
+    let mut left: Vec<(LeftOut, usize, String)> = Vec::new();
     for (set, id, vec, meta, expires_at) in vectors {
-        st.commit(
-            ns,
-            Apply::Insert {
-                set,
-                id,
-                vec,
-                meta,
-                expires_at,
+        match st.check_vector(ns, &set, &id, vec.len()) {
+            Ok(()) => {
+                st.commit(
+                    ns,
+                    Apply::Insert {
+                        set,
+                        id,
+                        vec,
+                        meta,
+                        expires_at,
+                    },
+                );
+                n += 1;
+            }
+            Err(why) => match left.iter_mut().find(|(w, _, _)| *w == why) {
+                Some((_, count, _)) => *count += 1,
+                None => left.push((
+                    why,
+                    1,
+                    format!(
+                        "set {:?} id {:?}",
+                        String::from_utf8_lossy(&set),
+                        String::from_utf8_lossy(&id)
+                    ),
+                )),
             },
+        }
+    }
+    for (why, count, first) in left {
+        eprintln!(
+            "flint-vec: rebuild of ns {:?} left out {count} vector row(s) {}; first: {first}",
+            String::from_utf8_lossy(ns),
+            why.reason()
         );
     }
     n
@@ -1017,5 +1046,35 @@ mod tests {
         let vectors = vec![(b"s".to_vec(), b"id".to_vec(), vec![1.0, 2.0], None, None)];
         assert_eq!(install(&store, b"ns", before, configs, vectors), 0);
         assert_eq!(store.lock().expect("store lock").set_count(), 0);
+    }
+
+    /// BUG-0265: a rebuild installs a row only when VEC.SET would have taken
+    /// it, and counts the rest out.
+    #[test]
+    fn a_rebuild_leaves_out_a_row_of_the_wrong_length() {
+        let store: Arc<Mutex<Store>> = Arc::new(Mutex::new(Store::new()));
+        let configs = vec![(
+            b"s".to_vec(),
+            2,
+            Metric::L2,
+            IndexKind::Hnsw,
+            Quant::Bin,
+            vec![],
+        )];
+        let vectors = vec![
+            (b"s".to_vec(), b"ok".to_vec(), vec![1.0, 2.0], None, None),
+            (
+                b"s".to_vec(),
+                b"long".to_vec(),
+                vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                None,
+                None,
+            ),
+            (b"s".to_vec(), b"".to_vec(), vec![1.0, 2.0], None, None),
+            (b"x".to_vec(), b"noset".to_vec(), vec![1.0, 2.0], None, None),
+        ];
+        assert_eq!(install(&store, b"ns", 0, configs, vectors), 1);
+        let st = store.lock().expect("store lock");
+        assert_eq!(st.stats().vectors, 1);
     }
 }

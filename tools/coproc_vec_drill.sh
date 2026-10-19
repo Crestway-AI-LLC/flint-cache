@@ -32,6 +32,8 @@
 #     FILTER are refused without --vec-filters and served with it, through the
 #     proxy, to only the matches; a set's fields survive a restart without the
 #     flag and are indexed again by the next one with it
+#   - BUG-0265: a row of the wrong length that the tenant planted is left
+#     out of a QUANT bin set's rebuild, and said to be, where it panicked
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
@@ -543,6 +545,22 @@ case "$(vexec VEC.INFO pk)" in *"count 4 "*) : ;; *) echo "FAIL: the unreadable 
 grep -q 'left out 1 vector row(s) it cannot read; first: set "pk" id "d": packed vector row has unknown flags 0x80' "$D/vec7.log" \
   || { echo "FAIL: the rebuild did not say it left a row out:"; sed 's/^/    /' "$D/vec7.log"; exit 1; }
 echo "  a later-format row: left out of the index, and the rebuild says so"
+# BUG-0265: the tenant can write these rows itself, through the proxy, as the
+# helper above does with the tenant's own token. A row whose length is not
+# its set's DIM panicked a QUANT bin set's rebuild, under the store lock every
+# tenant shares. Now it is left out and said to be.
+[ "$(rows pk d 392c392c392c392c39)" = "packed=4 text=1" ] || { echo "FAIL: could not plant the 5-float row"; exit 1; }
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+sleep 0.3
+$VEC --port 6678 --vec-dir "$VD" 2>"$D/vec7b.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+R="$(vexec VEC.SEARCH pk 0.85,0.1,0.2 2)"
+[ "$R" = "$PREQ" ] || { echo "FAIL (BUG-0265): a planted row of the wrong length changed the set's results: [$R]"; sed 's/^/    /' "$D/vec7b.log"; exit 1; }
+kill -0 "$COPROC_PID" 2>/dev/null || { echo "FAIL (BUG-0265): the co-processor died rebuilding a planted row:"; sed 's/^/    /' "$D/vec7b.log"; exit 1; }
+grep -q "left out 1 vector row(s) whose length is not their set's DIM; first: set \"pk\" id \"d\"" "$D/vec7b.log" \
+  || { echo "FAIL (BUG-0265): the rebuild did not say it left the planted row out:"; sed 's/^/    /' "$D/vec7b.log"; exit 1; }
+case "$(vexec VEC.INFO pk)" in *"count 4 "*) : ;; *) echo "FAIL: the planted row was indexed: $(vexec VEC.INFO pk)"; exit 1 ;; esac
+echo "  a planted row of the wrong length: left out, said, and the co-processor serves on (BUG-0265)"
 
 echo "== BUG-0200: more writes on ONE client connection than the proxy has workers"
 # Every write above opens a connection of its own. A family command used to

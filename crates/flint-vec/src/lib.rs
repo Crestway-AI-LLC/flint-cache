@@ -986,6 +986,37 @@ fn err(msg: &str) -> Value {
     Value::Error(msg.to_string())
 }
 
+/// The cap a write would pass ([`Store::over_cap`]).
+enum Cap {
+    /// The namespace's (D4), with the bytes it already uses.
+    Namespace(usize),
+    /// Every namespace's together (ADR-0050 D2).
+    Server,
+}
+
+/// Why a rebuild left a durable vector row out of the index
+/// ([`Store::install_vector`], BUG-0265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftOut {
+    /// An empty set or id, or one with a NUL in it.
+    BadName,
+    /// No config row this binary could read names its set.
+    NoSet,
+    /// Its length is not its set's `DIM`.
+    WrongDim,
+}
+
+impl LeftOut {
+    /// How the rebuild's log line says it.
+    pub fn reason(self) -> &'static str {
+        match self {
+            LeftOut::BadName => "with an empty set or id",
+            LeftOut::NoSet => "whose set has no config row",
+            LeftOut::WrongDim => "whose length is not their set's DIM",
+        }
+    }
+}
+
 /// The refusal of `FIELD` or `FILTER` by a co-processor without
 /// `--vec-filters`.
 const FILTERS_OFF: &str = "ERR vector filters (FIELD and FILTER) are off on this server";
@@ -1529,28 +1560,22 @@ impl Store {
         // whose charge it gives back (BUG-0257): deleting and writing within
         // one set needs no more room than before.
         let old = vs.entry_cost(id).unwrap_or_else(|| vs.reuse_credit());
-        if self.index_cap > 0 {
-            let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
-            if used.saturating_add(new).saturating_sub(old) > self.index_cap {
+        match self.over_cap(ns, new, old) {
+            Some(Cap::Namespace(used)) => {
                 self.refused_ns.fetch_add(1, Relaxed);
                 return Plan::Reply(err(&format!(
                     "VECFULL index memory limit reached ({used} of {} bytes for this namespace)",
                     self.index_cap
                 )));
             }
-        }
-        // ADR-0050 D2: and every namespace together, so vector indexes cannot
-        // take the RAM this host's seats need. Summed per write rather than
-        // kept as a running total: one add per namespace, and nothing to drift.
-        // The refusal names no numbers, since they would be other tenants'.
-        if self.total_cap > 0 {
-            let total: usize = self.ns_bytes.values().sum();
-            if total.saturating_add(new).saturating_sub(old) > self.total_cap {
+            // The refusal names no numbers, since they would be other tenants'.
+            Some(Cap::Server) => {
                 self.refused_total.fetch_add(1, Relaxed);
                 return Plan::Reply(err(
                     "VECFULL vector index memory is full on this server; delete vectors from the set being written, or retry later",
                 ));
             }
+            None => {}
         }
         Plan::Write {
             persist: vec![
@@ -1577,6 +1602,84 @@ impl Store {
             },
             ok: Value::Simple("OK".into()),
         }
+    }
+
+    /// Which cap, if any, a write that adds `new` bytes to `ns` and gives back
+    /// `old` would take it past: the namespace's (D4), with what it uses, or
+    /// every namespace's together (ADR-0050 D2), so vector indexes cannot take
+    /// the RAM this host's seats need. Summed per write rather than kept as a
+    /// running total: one add per namespace, and nothing to drift.
+    fn over_cap(&self, ns: &[u8], new: usize, old: usize) -> Option<Cap> {
+        if self.index_cap > 0 {
+            let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
+            if used.saturating_add(new).saturating_sub(old) > self.index_cap {
+                return Some(Cap::Namespace(used));
+            }
+        }
+        if self.total_cap > 0 {
+            let total: usize = self.ns_bytes.values().sum();
+            if total.saturating_add(new).saturating_sub(old) > self.total_cap {
+                return Some(Cap::Server);
+            }
+        }
+        None
+    }
+
+    /// Install one vector a rebuild read from its durable row, or say why it
+    /// is left out (BUG-0265). The rows are in the tenant's namespace, where
+    /// the tenant can write them too: nothing reserves their prefix from it.
+    /// So a rebuild holds each row to the shape `VEC.SET` would have: a set
+    /// this binary loaded, a valid id and the set's `DIM`. Installed
+    /// unchecked, one row of the wrong length in a `QUANT bin` set panicked
+    /// under the store lock every tenant shares.
+    ///
+    /// The caps are NOT checked here: a rebuild loads every durable row
+    /// (ADR-0017 D3), and a cap governs only new writes, so a cap lowered
+    /// below what a namespace holds leaves its vectors searchable. That a
+    /// planted row can take a namespace past its cap the same way is the half
+    /// of BUG-0265 still open.
+    pub fn install_vector(
+        &mut self,
+        ns: &[u8],
+        set: Vec<u8>,
+        id: Vec<u8>,
+        vec: Vec<f32>,
+        meta: Option<Vec<u8>>,
+        expires_at: Option<u64>,
+    ) -> Result<(), LeftOut> {
+        self.check_vector(ns, &set, &id, vec.len())?;
+        self.commit(
+            ns,
+            Apply::Insert {
+                set,
+                id,
+                vec,
+                meta,
+                expires_at,
+            },
+        );
+        Ok(())
+    }
+
+    /// What [`Store::install_vector`] checks, without the row: so a caller
+    /// can name a row it leaves out without copying every row it installs.
+    pub fn check_vector(
+        &self,
+        ns: &[u8],
+        set: &[u8],
+        id: &[u8],
+        len: usize,
+    ) -> Result<(), LeftOut> {
+        if !valid_name(set) || !valid_name(id) {
+            return Err(LeftOut::BadName);
+        }
+        let Some(vs) = self.sets.get(&(ns.to_vec(), set.to_vec())) else {
+            return Err(LeftOut::NoSet);
+        };
+        if len != vs.dim() {
+            return Err(LeftOut::WrongDim);
+        }
+        Ok(())
     }
 
     /// VEC.DEL <set> <id>
@@ -3924,5 +4027,58 @@ mod tests {
         // With the flag off the set keeps its fields, and refuses the filter.
         st.set_filters(false);
         assert!(is_err(&plan_reply(&st, ns, &q, 0), "are off"));
+    }
+
+    /// BUG-0265: a rebuild holds each durable row to the shape `VEC.SET`
+    /// would have, since the tenant can write those rows too. Unchecked, a
+    /// 10-float row in a 3-d `QUANT bin` set panicked. The caps it leaves to
+    /// new writes (ADR-0017 D3), which `coproc_vec_drill.sh` holds it to.
+    #[test]
+    fn a_rebuild_holds_each_row_to_what_vec_set_would() {
+        for extra in [
+            &[][..],
+            &["INDEX", "hnsw"],
+            &["INDEX", "hnsw", "QUANT", "sq8"],
+            &["INDEX", "hnsw", "QUANT", "bin"],
+        ] {
+            let mut st = Store::new();
+            let ns = b"n";
+            let mut c = cmd(&["VEC.CREATE", "s", "DIM", "3", "METRIC", "l2"]);
+            c.extend(cmd(extra));
+            run(&mut st, ns, &c);
+            let put = |st: &mut Store, set: &str, id: &str, vec: Vec<f32>| {
+                st.install_vector(ns, v(set), v(id), vec, None, None)
+            };
+            assert_eq!(put(&mut st, "s", "a", vec![1.0, 0.0, 0.0]), Ok(()));
+            assert_eq!(
+                put(
+                    &mut st,
+                    "s",
+                    "b",
+                    vec![1.0, 0.0, 0.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 2.0]
+                ),
+                Err(LeftOut::WrongDim),
+                "{extra:?}"
+            );
+            assert_eq!(put(&mut st, "s", "c", vec![1.0]), Err(LeftOut::WrongDim));
+            assert_eq!(
+                put(&mut st, "nope", "d", vec![1.0, 0.0, 0.0]),
+                Err(LeftOut::NoSet)
+            );
+            assert_eq!(
+                put(&mut st, "s", "", vec![1.0, 0.0, 0.0]),
+                Err(LeftOut::BadName)
+            );
+            assert_eq!(
+                search_ids(&plan_reply(
+                    &st,
+                    ns,
+                    &cmd(&["VEC.SEARCH", "s", "1,0,0", "5"]),
+                    0
+                )),
+                vec![v("a")],
+                "{extra:?}: only the row that fits is searched"
+            );
+        }
     }
 }
