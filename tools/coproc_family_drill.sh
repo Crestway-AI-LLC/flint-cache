@@ -25,7 +25,10 @@
 #      after a removal that did not (an older flintctl's), `tenant add` makes
 #      it forget first; and a co-processor that cannot answer makes `tenant
 #      add` refuse rather than hand the namespace over;
-#   6. `stop` reaps the seat — an unswept co-processor holds its port and
+#   6. BUG-0266: `verify` checks every declared co-processor. With the seat
+#      dead it FAILS and names it, so ops verify-watch pages; up, it passes,
+#      which is the control for the failure being about the co-processor;
+#   7. `stop` reaps the seat — an unswept co-processor holds its port and
 #      the next `start` fails on a bind that looks unrelated.
 set -u
 cd "$(dirname "$0")/.."
@@ -265,7 +268,33 @@ grep -q "refusing to add a tenant on namespace vt4" "$STATE/refuse.log" || {
 mesh 7410 CPTENANTS | grep -q '^vt4 ' && { echo "FAIL: the refused add made tenant vt4 anyway"; exit 1; }
 echo "  a co-processor that cannot forget refuses the add, and no tenant is made"
 
-echo "== 6. stop reaps the co-processor seat"
+echo "== 6. BUG-0266: verify fails while the declared co-processor is down"
+# Up first: verify passes and says it asked. This is the control for the
+# arm below -- the same fleet, the same verify, one seat's state changed.
+OUT=$($CTL verify 2>&1) && echo "$OUT" | grep -q 'ok   co-processor up  VEC\. 127\.0\.0\.1:7402' || {
+  echo "FAIL: with flint-vec serving, verify did not pass with a co-processor line:"
+  echo "$OUT" | sed 's/^/    /'; exit 1; }
+pkill -9 -f "flint-vec --port 7402" 2>/dev/null
+sleep 0.3
+if OUT=$($CTL verify 2>&1); then
+  echo "FAIL: verify PASSED with the declared co-processor dead -- verify-watch"
+  echo "      pages only on a failed verify, so a dead flint-vec pages nobody:"
+  echo "$OUT" | sed 's/^/    /'; exit 1
+fi
+echo "$OUT" | grep -q 'FAIL co-processor up  VEC\. 127\.0\.0\.1:7402 does not answer' || {
+  echo "FAIL: verify failed but did not name the co-processor:"
+  echo "$OUT" | sed 's/^/    /'; exit 1; }
+$CTL start >/dev/null 2>&1
+for _ in $(seq 1 50); do
+  OUT=$($CTL verify 2>&1) && break
+  sleep 0.2
+done
+echo "$OUT" | grep -q 'VERIFY OK' || {
+  echo "FAIL: after start brought flint-vec back, verify still failed:"
+  echo "$OUT" | sed 's/^/    /'; exit 1; }
+echo "  verify names a dead co-processor and fails; up again, it passes"
+
+echo "== 7. stop reaps the co-processor seat"
 $CTL stop >/dev/null 2>&1
 sleep 0.5
 pgrep -f "flint-vec --port 7402" >/dev/null && {
@@ -275,4 +304,4 @@ pgrep -f "flint-vec --port 7402" >/dev/null && {
 }
 echo "  seat gone after stop"
 
-echo "PASS: co-processor family drill — an inventory-declared co-processor is spawned by flintctl, routed by the proxy over mesh mTLS, persists its vectors into the tenant namespace, answers VEC.SEARCH by distance, forgets a removed tenant's namespace before anyone else is given it (BUG-0255), and is reaped by stop"
+echo "PASS: co-processor family drill — an inventory-declared co-processor is spawned by flintctl, routed by the proxy over mesh mTLS, persists its vectors into the tenant namespace, answers VEC.SEARCH by distance, forgets a removed tenant's namespace before anyone else is given it (BUG-0255), fails verify while it is down (BUG-0266), and is reaped by stop"

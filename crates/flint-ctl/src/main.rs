@@ -2054,6 +2054,10 @@ fn refuse_wildcard_cp_target(name: &str, r: &Runner, args: &[String]) {
 /// was restarted. The suffix keeps `(pid N)` exactly where that expansion
 /// expects it, and `the_supervisor_can_still_read_the_pid` holds the contract
 /// from this side with the broken ordering as its control.
+///
+/// The SEAT NAME is the line's second word, and ops `supervise.sh` reads that
+/// too: it counts restarts per seat and pages on a restart loop (ops
+/// OPS-0406). Keep `started` and the name first.
 fn started_line(name: &str, pid: u32, build: Option<String>) -> String {
     format!(
         "  started {name} (pid {pid}) build {}",
@@ -6077,6 +6081,33 @@ fn verify_checks(
                 shown.join(" + "),
             );
         }
+    }
+
+    // BUG-0266: EVERY DECLARED CO-PROCESSOR ANSWERS. verify had no section
+    // for them, so a dead flint-vec left it green while every tenant's VEC.*
+    // failed, and ops verify-watch, which pages on a failed verify, said
+    // nothing. Asked the way `status` and `upgrade` ask: its own FLINTINFO
+    // over the mesh. Before the proxies, as `start` orders them, because a
+    // proxy routes the family to this seat.
+    if !inv.coprocs.is_empty() {
+        head("== co-processors");
+    }
+    for (fam, addr) in &inv.coprocs {
+        let failed = match call(addr, &tls, &["FLINTINFO"]) {
+            Ok(Value::Bulk(Some(_))) => None,
+            Ok(other) => Some(format!("FLINTINFO answered {other:?}")),
+            Err(e) => Some(e.to_string()),
+        };
+        note(
+            failed.is_none(),
+            "co-processor up",
+            match failed {
+                None => format!("{fam} {addr}"),
+                Some(why) => format!(
+                    "{fam} {addr} does not answer ({why}): every {fam}* command fails until it does"
+                ),
+            },
+        );
     }
 
     head("== proxies");
