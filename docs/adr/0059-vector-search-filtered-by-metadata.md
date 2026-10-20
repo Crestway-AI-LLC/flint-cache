@@ -234,12 +234,15 @@ client needs only B.
   from the descent alone returned fewer than `k`.
 - **The threshold** between scoring every match and walking is
   `sqrt(32 x EF x n)` matches, about 45,000 of 1,000,000 at the default `EF`:
-  where the two cost the same number of distances. That is arithmetic. The
-  999,000-vector run sets it.
+  where the two cost the same number of distances. That was arithmetic; the
+  999,000-vector run (below) kept it.
 - **Counting stops at the threshold.** The count reads the smallest TAG
-  term's set of slots (or a range's), checks each slot against the whole
-  filter, and stops one past the threshold. A filter with no such term (`*`,
-  a negation) is counted by a scan of every slot, which stops there too.
+  term's set of slots (or a range's) and stops one past the threshold. It
+  checks a slot against the whole filter only when those entries are not
+  exactly its matches, which is when an AND has other terms (BUG-0267: it
+  had checked every slot, at a cache miss each). A filter with no such term
+  (`*`, a negation) is counted by a scan of every slot, which stops there
+  too.
 - **The field index is HNSW's only.** A flat set scores every vector anyway,
   so it keeps each vector's values and checks them as it scans.
 - **The syntax:** blanks at a tag's ends are dropped, and a backslash keeps
@@ -256,6 +259,49 @@ client needs only B.
   value, each slot in a value's set, each numeric slot and each vector's
   values. `tests/meter.rs` holds it above what a set with fields holds, for
   TAG values each vector's own and values all of them share.
+
+## Measured on 999,000 vectors, 2026-10-19
+
+The `text-embedding-3-large` set that vectors.md's table was measured on:
+1,536 dimensions, cosine, HNSW at the default `EF` of 64, on an i4i.2xlarge.
+The filters (`bench --filters`):
+- `rN` is a NUMERIC range that N% of the vectors fall in, with the number
+  drawn apart from the vectors;
+- `c10` and `c100` are a TAG naming the nearest of 10, or of 100, centroid
+  rows, so the matches lie together.
+
+200 queries each, recall@10 against an exact search over the matches. p50
+in milliseconds, for the set's own choice (rule), scoring every match (scan)
+and walking (walk):
+
+| arm | filter | matches | rule recall | rule | scan | walk |
+|---|---|---|---|---|---|---|
+| plain | `r50` | 500,005 | 0.975 | 6.1 | 586 | 3.1 |
+| plain | `r10` | 100,046 | 0.991 | 15.8 | 116 | 11.1 |
+| plain | `c10` | 121,277 | 0.985 | 22.7 | 148 | 14.5 |
+| plain | `r1` | 10,249 | 1.000 | 11.5 | 11.6 | 79.2 |
+| plain | `c100` | 5,808 | 1.000 | 6.8 | 6.9 | 475 |
+| plain | `r0.1` | 1,014 | 1.000 | 0.55 | 0.54 | 534 |
+| sq8-disk | `r50` | 500,005 | 0.975 | 5.7 | 642 | 3.3 |
+| sq8-disk | `r1` | 10,249 | 1.000 | 11.7 | 11.5 | 79.2 |
+| bin-disk | `r50` | 500,005 | 0.983 | 6.9 | 259 | 2.2 |
+| bin-disk | `r1` | 10,249 | 1.000 | 4.5 | 4.4 | 48.6 |
+
+- **The rule chose the faster way at every point.** It scanned up to 10,249
+  matches, where scanning was 7 to 1,000 times faster than walking. It
+  walked from 100,046, where walking was 7 to nearly 200 times faster than
+  scanning. The crossover is between the two, and the threshold, about
+  45,000, is between them. It stays.
+- **Where it walked, it paid for its count on top of the walk:** up to
+  twice the walk alone (6.1 ms against 3.1 at `r50`). That is BUG-0267,
+  fixed: its count no longer checks entries that are exactly the matches.
+- **Recall** was at least 0.975 at every point and every arm, and 1.0
+  wherever the rule scanned. A walk with half the vectors matching recalled
+  0.975 plain, about what an unfiltered search at the same `EF` recalls on
+  this set (0.970, vectors.md).
+- **Building** the 999,000 took 97 minutes plain, 211 with `sq8` and its
+  full vectors on disk, and 33 with `bin`. The resident memory was 6,821,
+  2,223 and 841 bytes a vector; the meter charged 6,705, 2,412 and 806.
 
 ## What this does not decide
 

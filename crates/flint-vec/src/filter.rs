@@ -26,6 +26,7 @@
 
 use crate::hnsw::SlotSet;
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Bound;
 
 /// How many fields a set may declare.
 pub const MAX_FIELDS: usize = 16;
@@ -707,20 +708,35 @@ impl FieldIndex {
     /// (`false`), at which the search should walk the graph instead.
     /// `deleted` has one entry a slot.
     pub fn matching(&self, e: &Expr, cap: usize, deleted: &[bool]) -> (Vec<u32>, bool) {
+        let (out, all, _) = self.matching_checked(e, cap, deleted);
+        (out, all)
+    }
+
+    /// [`matching`](Self::matching), and how many slots it checked against
+    /// `e` one by one: none when the index entries it reads are exactly the
+    /// matches (BUG-0267). Each check reads that slot's values, a cache miss
+    /// on a large set, so a count of `cap` of them cost a filtered search
+    /// with many matches as much again as its walk.
+    fn matching_checked(&self, e: &Expr, cap: usize, deleted: &[bool]) -> (Vec<u32>, bool, usize) {
         let mut out = Vec::new();
+        let mut checked = 0usize;
         match self.sources(e) {
             None => {
                 for (slot, &dead) in deleted.iter().enumerate() {
                     let slot = slot as u32;
-                    if !dead && self.matches(e, slot) {
+                    if dead {
+                        continue;
+                    }
+                    checked += 1;
+                    if self.matches(e, slot) {
                         out.push(slot);
                         if out.len() > cap {
-                            return (out, false);
+                            return (out, false, checked);
                         }
                     }
                 }
             }
-            Some(sources) => {
+            Some((sources, exact)) => {
                 let several = sources.len() > 1;
                 let mut seen = SlotSet::default();
                 for src in sources {
@@ -732,58 +748,99 @@ impl FieldIndex {
                         if several && !seen.insert(slot) {
                             continue;
                         }
-                        if !deleted[slot as usize] && self.matches(e, slot) {
-                            out.push(slot);
-                            if out.len() > cap {
-                                return (out, false);
+                        if deleted[slot as usize] {
+                            continue;
+                        }
+                        if !exact {
+                            checked += 1;
+                            if !self.matches(e, slot) {
+                                continue;
                             }
+                        }
+                        out.push(slot);
+                        if out.len() > cap {
+                            return (out, false, checked);
                         }
                     }
                 }
             }
         }
-        (out, true)
+        (out, true, checked)
     }
 
-    /// Index entries whose slots include every match of `e`, or `None` when
-    /// only a scan of every slot can say (`*`, a negation, or an OR with
-    /// either in it).
-    fn sources(&self, e: &Expr) -> Option<Vec<Source<'_>>> {
+    /// Index entries whose slots include every match of `e`, and whether
+    /// they are exactly its matches, so that a slot read from them needs no
+    /// check against `e`: a TAG term, a range, or an OR of those. `None`
+    /// when only a scan of every slot can say (`*`, a negation, or an OR
+    /// with either in it).
+    fn sources(&self, e: &Expr) -> Option<(Vec<Source<'_>>, bool)> {
         match e {
             Expr::All | Expr::Not(_) => None,
-            Expr::Tag { field, any_of } => Some(
+            Expr::Tag { field, any_of } => Some((
                 any_of
                     .iter()
                     .filter_map(|t| self.tags[*field].get(t))
                     .map(Source::Tag)
                     .collect(),
-            ),
-            Expr::Range { field, lo, hi, .. } => Some(if lo > hi {
-                Vec::new()
-            } else {
-                vec![Source::Range(
-                    self.nums[*field].range((order_key(*lo), 0)..=(order_key(*hi), u32::MAX)),
-                )]
-            }),
+                true,
+            )),
+            Expr::Range {
+                field,
+                lo,
+                lo_incl,
+                hi,
+                hi_incl,
+            } => {
+                // `-0` is stored as `0`, so a bound of `-0` is one of `0`:
+                // `(-0` must leave out the zeros.
+                let zero = |x: f64| if x == 0.0 { 0.0 } else { x };
+                let (lo, hi) = (zero(*lo), zero(*hi));
+                // Empty, and a range the B-tree would refuse: its start past
+                // its end, as `(5 (5` makes.
+                if lo > hi || (lo == hi && !(*lo_incl && *hi_incl)) {
+                    return Some((Vec::new(), true));
+                }
+                let from = if *lo_incl {
+                    Bound::Included((order_key(lo), 0))
+                } else {
+                    Bound::Excluded((order_key(lo), u32::MAX))
+                };
+                let to = if *hi_incl {
+                    Bound::Included((order_key(hi), u32::MAX))
+                } else {
+                    Bound::Excluded((order_key(hi), 0))
+                };
+                Some((
+                    vec![Source::Range(self.nums[*field].range((from, to)))],
+                    true,
+                ))
+            }
             // Any one term's entries hold every match: the one with the
-            // fewest known slots, where a range counts as unknown.
-            Expr::And(es) => es
-                .iter()
-                .filter_map(|x| self.sources(x))
-                .min_by_key(|srcs| {
-                    srcs.iter()
-                        .map(|s| match s {
-                            Source::Tag(set) => set.len(),
-                            Source::Range(_) => usize::MAX / 2,
-                        })
-                        .fold(0usize, usize::saturating_add)
-                }),
+            // fewest known slots, where a range counts as unknown. The other
+            // terms still have to be checked, unless there are none.
+            Expr::And(es) => {
+                let (srcs, exact) =
+                    es.iter()
+                        .filter_map(|x| self.sources(x))
+                        .min_by_key(|(srcs, _)| {
+                            srcs.iter()
+                                .map(|s| match s {
+                                    Source::Tag(set) => set.len(),
+                                    Source::Range(_) => usize::MAX / 2,
+                                })
+                                .fold(0usize, usize::saturating_add)
+                        })?;
+                Some((srcs, exact && es.len() == 1))
+            }
             Expr::Or(es) => {
                 let mut all = Vec::new();
+                let mut exact = true;
                 for x in es {
-                    all.extend(self.sources(x)?);
+                    let (srcs, e) = self.sources(x)?;
+                    all.extend(srcs);
+                    exact &= e;
                 }
-                Some(all)
+                Some((all, exact))
             }
         }
     }
@@ -958,6 +1015,62 @@ mod tests {
         assert!(!valid_name(b"a-b"));
         assert!(!valid_name(b""));
         assert!(!valid_name(&[b'a'; MAX_NAME + 1]));
+    }
+
+    /// BUG-0267: a filter the index entries answer exactly is not checked
+    /// slot by slot, whether it is under the cap or past it; one they only
+    /// bound still is.
+    #[test]
+    fn exact_entries_are_not_checked_one_by_one() {
+        let mut fi = FieldIndex::new(fields().into_boxed_slice());
+        let n = 2_000u32;
+        for i in 0..n {
+            let doc = format!(r#"{{"folder":["f{}","all"],"price":{}}}"#, i % 4, i);
+            fi.put(i, Some(doc.as_bytes()));
+        }
+        let deleted = vec![false; n as usize];
+        let run = |f: &str, cap: usize| {
+            let e = parse(f.as_bytes(), fi.fields()).expect(f);
+            let (mut s, all, checked) = fi.matching_checked(&e, cap, &deleted);
+            s.sort();
+            (s, all, checked)
+        };
+        for f in [
+            "@folder:{f1}",
+            "@folder:{f1|f2}",
+            "@folder:{f1} | @price:[0 9]",
+            "@price:[100 199]",
+            "(@price:[100 199])",
+        ] {
+            let (_, all, checked) = run(f, 10);
+            assert!(!all, "{f}: past the cap");
+            assert_eq!(checked, 0, "{f}: past the cap, none checked");
+            let (_, all, checked) = run(f, 5_000);
+            assert!(all, "{f}: under the cap");
+            assert_eq!(checked, 0, "{f}: under the cap, none checked");
+        }
+        // Each still finds exactly its matches.
+        assert_eq!(run("@price:[(10 (13]", 100).0, vec![11, 12]);
+        assert_eq!(run("@price:[(10 13]", 100).0, vec![11, 12, 13]);
+        assert_eq!(run("@price:[10 (13]", 100).0, vec![10, 11, 12]);
+        assert_eq!(run("@price:[(5 (5]", 100).0, Vec::<u32>::new());
+        assert_eq!(run("@price:[(5 5]", 100).0, Vec::<u32>::new());
+        assert_eq!(run("@price:[5 5]", 100).0, vec![5]);
+        assert_eq!(run("@price:[(-0 1]", 100).0, vec![1], "(-0 leaves out 0");
+        assert_eq!(run("@price:[-inf (2]", 100).0, vec![0, 1]);
+        assert_eq!(
+            run("@folder:{f1|all}", 5_000).0.len(),
+            n as usize,
+            "a slot under two of a TAG's values is counted once"
+        );
+        // An AND's other terms are checked, on the smallest term's entries.
+        let (s, all, checked) = run("@folder:{f1} @price:[0 99]", 5_000);
+        assert!(all);
+        assert_eq!(s.len(), 25);
+        assert_eq!(
+            checked, 500,
+            "the f1 entries, each checked against the range"
+        );
     }
 
     #[test]
