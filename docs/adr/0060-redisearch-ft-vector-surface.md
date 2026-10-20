@@ -397,6 +397,12 @@ suites found a fifth item, the flush. Each part below is its own choice.
 - **Part 6.** Each document carries a sequence number, 8 bytes, which raises
   the meter's charge per document from 96 to 104 bytes. A KNN asks its set
   for 16 more neighbours than it answers, and breaks ties by the sequence.
+- **`coproc-ft` gates only `FT.CREATE`.** flintctl routes the `FT.` family
+  to every `VEC.` seat whether it is on or off. Before, off took the route
+  away too, so an index made while it was on stranded its prefixes: every
+  data seat refused the writes under them, and no `FT.DROPINDEX` could reach
+  the co-processor to release them. A seat of a release before `FT.*`
+  answers the family as an unknown command.
 - **Held by:**
   - unit tests:
     - `results_that_tie_come_in_write_order`;

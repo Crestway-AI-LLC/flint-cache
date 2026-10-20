@@ -1899,12 +1899,17 @@ fn families_arg(inv: &Inventory) -> Option<String> {
         return None;
     }
     let mut by_family: Vec<(String, Vec<String>)> = Vec::new();
-    // With `coproc-ft on`, each `VEC.` seat serves `FT.` too (ADR-0060), in
-    // the same order, so a namespace's FT.* and VEC.* reach one seat.
+    // Each `VEC.` seat serves `FT.` too (ADR-0060), in the same order, so a
+    // namespace's FT.* and VEC.* reach one seat. Whether `coproc-ft` is on or
+    // off: it decides only whether a seat makes an index (`--ft`). An index
+    // made while it was on is still searched, written and dropped after it is
+    // turned off, and its prefixes, which every data seat guards, are never
+    // left with no route to the co-processor that writes them. A seat of a
+    // release before `FT.*` answers it as an unknown command, as before.
     let ft = inv
         .coprocs
         .iter()
-        .filter(|(f, _)| inv.coproc_ft && f == "VEC.")
+        .filter(|(f, _)| f == "VEC.")
         .map(|(_, a)| ("FT.".to_string(), a.clone()));
     for (family, addr) in inv.coprocs.iter().cloned().chain(ft) {
         match by_family.iter_mut().find(|(f, _)| *f == family) {
@@ -11417,7 +11422,7 @@ mod cert_manifest_tests {
     /// proxy an `FT.` family on the same seats in the same order; off, as by
     /// default, neither.
     #[test]
-    fn coproc_ft_reaches_the_seats_and_the_proxies_only_when_on() {
+    fn coproc_ft_turns_on_ft_create_and_ft_is_routed_either_way() {
         let base = "statedir /var/lib/flint\n\
                     bins /opt/flint/bin\n\
                     cp 10.0.0.1:7500\n\
@@ -11427,9 +11432,11 @@ mod cert_manifest_tests {
                     coproc VEC. 127.0.0.1:7412\n";
         let off = inv_from(base, "ftoff");
         assert!(!coproc_args(&off, 0).iter().any(|a| a == "--ft"));
+        // Routed while off, so an index made while it was on can still be
+        // written and dropped, and its guarded prefixes never strand.
         assert_eq!(
             families_arg(&off).as_deref(),
-            Some("VEC.=127.0.0.1:7411,127.0.0.1:7412")
+            Some("VEC.=127.0.0.1:7411,127.0.0.1:7412;FT.=127.0.0.1:7411,127.0.0.1:7412")
         );
         let on = inv_from(&format!("{base}coproc-ft on\n"), "fton");
         assert!(coproc_args(&on, 0).iter().any(|a| a == "--ft"));

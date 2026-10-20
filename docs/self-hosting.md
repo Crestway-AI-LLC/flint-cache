@@ -1352,9 +1352,9 @@ Notes:
   before rolling back below this release with this flintctl.
 
 - **RediSearch's `FT.*`** (ADR-0060, `command-support.md`): with
-  `coproc-ft on`, each `VEC.` co-processor runs with `--ft`, and every proxy
-  routes the `FT.` family to the same seats. An index's documents are the
-  tenant's own HASH or JSON keys:
+  `coproc-ft on`, each `VEC.` co-processor runs with `--ft`, so `FT.CREATE`
+  makes an index. Every proxy routes the `FT.` family to the `VEC.` seats,
+  on or off. An index's documents are the tenant's own HASH or JSON keys:
   - every node keeps each namespace's index prefixes in a row of its own,
     `\x00flintidx\x00<namespace>`, which replication and slot moves carry;
   - a node refuses a write under one with `-INDEXED` unless it comes over
@@ -1366,9 +1366,7 @@ Notes:
   the row nor the routing, so after a rollback a tenant's writes would reach
   the pairs and the index would miss them: drop every FT index before
   rolling back below this release. Off, `FT.CREATE` is refused, and an index
-  made while it was on is still served, but its prefixes are routed only
-  while the `FT.` family is: drop the indexes before turning it off, or
-  writes under their prefixes are refused.
+  made while it was on is still searched, written and dropped.
 
 ## 5. Rotating credentials & keys
 
