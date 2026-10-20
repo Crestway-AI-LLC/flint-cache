@@ -4,9 +4,10 @@ Status: **ACCEPTED 2026-10-19, option A** (Jeff: "go with your
 recommendation"), with the first release's scope and the two releases as
 recommended. The downloads its verification needs, to install and run the
 three clients' own tests, are still Jeff's to approve when it is built.
-Nothing is built yet. The amendment below, the guard on the data node rather
-than on every proxy knowing, was ACCEPTED 2026-10-19 (Jeff: "Accept the node
-guard").
+The parser is built, on a branch. The amendment below, the guard on the
+data node rather than on every proxy knowing, was ACCEPTED 2026-10-19 (Jeff:
+"Accept the node guard"). Amendment 2, where each node keeps the prefixes,
+is PROPOSED 2026-10-19.
 
 Proposed 2026-10-19.
 
@@ -191,6 +192,67 @@ only when the co-processor has set prefixes, which only a co-processor
 started with the new flag does. A release before it ignores the prefix row,
 so after a rollback writes would reach the pairs unguarded. The rollback
 note is the same as the ADR's.
+
+## Amendment 2, 2026-10-19 (PROPOSED): where each node keeps the prefixes
+
+The first amendment says the prefixes are "a row in the namespace,
+replicated with its data". Building it showed that an ordinary row cannot
+do that. A key in the namespace lives on the one pair that owns its slot,
+but every pair has to refuse writes under the prefixes. The node's own
+`\x00flint\x00` rows are no better, because replication drops them by
+design: they are a node's identity, not data. Every pair has to hold the
+prefixes:
+- through a failover, so the new master already has them;
+- through a slot move to a pair that never had them, as when the fleet
+  scales out;
+- through a roll, including a replica that runs the older release.
+
+### A. A node row of its own, outside `\x00flint\x00` (recommended)
+
+- **The row.** `\x00flintidx\x00<ns>` holds the namespace's prefixes, and
+  each node keeps it in memory for its write path. The prefix
+  `\x00flintidx\x00` is not under `\x00flint\x00`, so replication's filter
+  passes it, and a replica on either release applies it as it applies any
+  other row.
+- **Writing it.** `FLINTINDEXED <prefix>...` writes the row, from a channel
+  only. The proxy fans it out to every master, as it does `DBSIZE`, and
+  reports any pair it could not reach.
+- **Where else it comes from.** A checkpoint full sync copies it with
+  everything else. A slot move carries it: the destination asks the source
+  for the namespace's row before it takes the slot's first key.
+- **Rebuilds.** The co-processor writes the row again on every rebuild, as
+  well as at `FT.CREATE` and `FT.DROPINDEX`, so a pair that lost it, such
+  as one restored from an older backup, gets it back the next time the
+  co-processor starts.
+- **The memory copy.** A node loads it at start. It updates the copy when
+  `FLINTINDEXED` writes the row or a replication batch applies it, and
+  reloads after a full sync and on promotion.
+
+Cost:
+- one small row per namespace per node;
+- a fan-out at `FT.CREATE` and `FT.DROPINDEX`;
+- one extra step at the start of a slot move;
+- a namespace lookup on each write, for a namespace that has the row.
+
+### B. One row per slot
+
+The co-processor writes the prefixes once for each of a namespace's 16,384
+slots, as ordinary keys whose hash tags pick the slots. Each row then moves
+with its slot and replicates with it, and nothing new is needed in the node.
+But one `FT.CREATE` costs 16,384 writes, about 64 channels at a channel's
+256-command budget, and so does every change of the prefixes.
+
+### C. The control plane pushes the prefixes to every node
+
+This is how per-seat settings such as `--evictable-ns` reach a node today.
+But the control plane does not record which version each node has applied.
+That is the gap the first amendment exists to close, so C brings it back
+for the nodes.
+
+**Recommendation: A.** It is the only one of the three that reaches every
+pair through failover, scale-out and a roll without a cost per slot, and
+it reuses replication, full sync and the slot move as they are. The
+rollback note does not change: a release before the guard ignores the row.
 
 ## Verification
 

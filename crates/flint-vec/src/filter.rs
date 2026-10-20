@@ -42,6 +42,14 @@ pub enum FieldKind {
     Tag,
     /// A number: `@f:[lo hi]`.
     Numeric,
+    /// RediSearch's TAG as `FT.CREATE` declares it without `CASESENSITIVE`
+    /// (ADR-0060): its values, and a filter's, are compared case-folded.
+    /// `VEC.CREATE` declares none: its tags match case and all.
+    FoldedTag,
+    /// RediSearch's TEXT, matched only as an exact phrase (ADR-0060):
+    /// `@f:("a b")` matches a value holding those words in that order, split
+    /// as RediSearch splits them and lowercased. `FT.CREATE` only.
+    Text,
 }
 
 impl FieldKind {
@@ -54,8 +62,9 @@ impl FieldKind {
     }
     pub fn as_str(self) -> &'static str {
         match self {
-            FieldKind::Tag => "tag",
+            FieldKind::Tag | FieldKind::FoldedTag => "tag",
             FieldKind::Numeric => "numeric",
+            FieldKind::Text => "text",
         }
     }
 }
@@ -119,6 +128,74 @@ pub enum Val {
     /// A NUMERIC field's value. Never NaN, since JSON has none, and `-0` is
     /// stored as `0`.
     Num(f64),
+    /// A TEXT field's words, in order, as [`tokenize`] splits them.
+    Text(Box<[Box<[u8]>]>),
+}
+
+/// The bytes RediSearch splits text on by default, besides whitespace.
+const SEPARATORS: &[u8] = b",.<>{}[]\"':;!@#$%^&*()-+=~";
+
+/// A TEXT value's words, as RediSearch splits them by default and folded to
+/// lower case: what an exact phrase is matched against.
+pub fn tokenize(text: &[u8]) -> Vec<Box<[u8]>> {
+    text.split(|b| b.is_ascii_whitespace() || SEPARATORS.contains(b))
+        .filter(|w| !w.is_empty())
+        .map(fold)
+        .collect()
+}
+
+/// `raw` folded to lower case: Unicode's folding when it is UTF-8, ASCII's
+/// otherwise.
+pub fn fold(raw: &[u8]) -> Box<[u8]> {
+    match std::str::from_utf8(raw) {
+        Ok(s) => s.to_lowercase().into_bytes().into_boxed_slice(),
+        Err(_) => raw.to_ascii_lowercase().into_boxed_slice(),
+    }
+}
+
+/// One field's value from a HASH field's bytes (ADR-0060): a TAG field
+/// split on `separator` with blanks trimmed, a NUMERIC one read as a number,
+/// a TEXT one split into words.
+pub fn hash_val(kind: FieldKind, raw: &[u8], separator: u8) -> Val {
+    match kind {
+        FieldKind::Tag | FieldKind::FoldedTag => {
+            let mut ts: Vec<Box<[u8]>> = raw
+                .split(|b| *b == separator)
+                .map(|t| t.trim_ascii())
+                .filter(|t| !t.is_empty())
+                .map(|t| {
+                    if kind == FieldKind::FoldedTag {
+                        fold(t)
+                    } else {
+                        t.into()
+                    }
+                })
+                .collect();
+            ts.sort();
+            ts.dedup();
+            if ts.is_empty() {
+                Val::Missing
+            } else {
+                Val::Tags(ts.into_boxed_slice())
+            }
+        }
+        FieldKind::Numeric => match std::str::from_utf8(raw)
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+        {
+            Some(x) if x.is_nan() => Val::Missing,
+            Some(x) => Val::Num(if x == 0.0 { 0.0 } else { x }),
+            None => Val::Missing,
+        },
+        FieldKind::Text => {
+            let ws = tokenize(raw);
+            if ws.is_empty() {
+                Val::Missing
+            } else {
+                Val::Text(ws.into_boxed_slice())
+            }
+        }
+    }
 }
 
 /// One vector's values, in the order its set declares its fields.
@@ -157,6 +234,26 @@ pub fn extract(fields: &[Field], meta: Option<&[u8]>) -> Option<Vals> {
                         Val::Tags(ts.into_boxed_slice())
                     }
                 }
+                (FieldKind::FoldedTag, Some(serde_json::Value::String(s))) => {
+                    hash_val(FieldKind::FoldedTag, s.as_bytes(), 0)
+                }
+                (FieldKind::FoldedTag, Some(serde_json::Value::Array(a))) => {
+                    let mut ts: Vec<Box<[u8]>> = a
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| fold(s.as_bytes()))
+                        .collect();
+                    ts.sort();
+                    ts.dedup();
+                    if ts.is_empty() {
+                        Val::Missing
+                    } else {
+                        Val::Tags(ts.into_boxed_slice())
+                    }
+                }
+                (FieldKind::Text, Some(serde_json::Value::String(s))) => {
+                    hash_val(FieldKind::Text, s.as_bytes(), 0)
+                }
                 (FieldKind::Numeric, Some(serde_json::Value::Number(n))) => match n.as_f64() {
                     // `-0` is stored as `0`, so the two sort as one value.
                     Some(x) => Val::Num(if x == 0.0 { 0.0 } else { x }),
@@ -178,7 +275,7 @@ pub fn vals_bytes(vals: Option<&[Val]>) -> usize {
     };
     let mut b = std::mem::size_of_val(v);
     for x in v {
-        if let Val::Tags(ts) = x {
+        if let Val::Tags(ts) | Val::Text(ts) = x {
             b += std::mem::size_of_val(&**ts) + ts.iter().map(|t| t.len()).sum::<usize>();
         }
     }
@@ -202,6 +299,11 @@ pub enum Expr {
         lo_incl: bool,
         hi: f64,
         hi_incl: bool,
+    },
+    /// `@f:("a b")`: TEXT field `field` holds `words`, in order, together.
+    Phrase {
+        field: usize,
+        words: Vec<Box<[u8]>>,
     },
     Not(Box<Expr>),
     And(Vec<Expr>),
@@ -229,6 +331,10 @@ impl Expr {
                     (if *lo_incl { x >= lo } else { x > lo })
                         && (if *hi_incl { x <= hi } else { x < hi })
                 }
+                _ => false,
+            },
+            Expr::Phrase { field, words } => match at(*field) {
+                Some(Val::Text(ts)) => ts.windows(words.len()).any(|w| w == words.as_slice()),
                 _ => false,
             },
             Expr::Not(e) => !e.matches(vals),
@@ -389,30 +495,84 @@ impl Parser<'_> {
         self.i += 1;
         self.ws();
         let kind = self.fields[field].kind;
+        let tag = matches!(kind, FieldKind::Tag | FieldKind::FoldedTag);
         match (self.peek(), kind) {
-            (Some(b'{'), FieldKind::Tag) => {
+            (Some(b'{'), _) if tag => {
                 self.i += 1;
-                self.tags(field)
+                self.tags(field, kind == FieldKind::FoldedTag)
             }
             (Some(b'['), FieldKind::Numeric) => {
                 self.i += 1;
                 self.range(field)
             }
+            (Some(b'(') | Some(b'"'), FieldKind::Text) => self.phrase(field),
             (Some(b'{'), FieldKind::Numeric) => Err(format!(
                 "uses @{name_s}:{{...}}, but {name_s} is NUMERIC: use @{name_s}:[lo hi]"
             )),
-            (Some(b'['), FieldKind::Tag) => Err(format!(
+            (Some(b'['), _) if tag => Err(format!(
                 "uses @{name_s}:[...], but {name_s} is a TAG: use @{name_s}:{{a | b}}"
             )),
-            (Some(b'('), _) | (Some(b'"'), _) => {
+            (Some(b'{') | Some(b'['), FieldKind::Text) => Err(format!(
+                "uses @{name_s} as a TAG or NUMERIC, but {name_s} is TEXT: use @{name_s}:(\"a phrase\")"
+            )),
+            (Some(b'(') | Some(b'"'), _) => {
                 Err("full-text search is not supported: fields are TAG or NUMERIC".into())
             }
             _ => Err(format!("needs {{...}} or [...] after @{name_s}:")),
         }
     }
 
-    /// After `{`: tags split by `|`, to the closing `}`.
-    fn tags(&mut self, field: usize) -> Result<Expr, String> {
+    /// At `("...")` or `"..."` after a TEXT field: the phrase, to its closing
+    /// quote, and the `)` when it opened with `(`. Only a quoted phrase: an
+    /// unquoted `(a b)` is RediSearch's AND of two words, with stemming,
+    /// which is full-text search and not served.
+    fn phrase(&mut self, field: usize) -> Result<Expr, String> {
+        let paren = self.peek() == Some(b'(');
+        if paren {
+            self.i += 1;
+            self.ws();
+        }
+        if self.peek() != Some(b'"') {
+            return Err(
+                "supports TEXT only as an exact phrase in quotes: @f:(\"a phrase\")".into(),
+            );
+        }
+        self.i += 1;
+        let mut text: Vec<u8> = Vec::new();
+        loop {
+            let Some(c) = self.peek() else {
+                return Err("has a '\"' with no '\"' after it".into());
+            };
+            self.i += 1;
+            match c {
+                b'\\' => {
+                    let Some(n) = self.peek() else {
+                        return Err("ends with a '\\'".into());
+                    };
+                    self.i += 1;
+                    text.push(n);
+                }
+                b'"' => break,
+                c => text.push(c),
+            }
+        }
+        if paren {
+            self.ws();
+            if self.peek() != Some(b')') {
+                return Err("has a '(' with no ')' after it".into());
+            }
+            self.i += 1;
+        }
+        let words = tokenize(&text);
+        if words.is_empty() {
+            return Err("has an empty phrase".into());
+        }
+        Ok(Expr::Phrase { field, words })
+    }
+
+    /// After `{`: tags split by `|`, to the closing `}`, folded to lower case
+    /// for a field whose values are (`fold`).
+    fn tags(&mut self, field: usize, fold_case: bool) -> Result<Expr, String> {
         let mut any_of: Vec<Box<[u8]>> = Vec::new();
         let mut cur: Vec<u8> = Vec::new();
         // How much of `cur` ends in escaped bytes, which trimming keeps.
@@ -438,7 +598,12 @@ impl Parser<'_> {
                     if cur.is_empty() {
                         return Err("has an empty tag".into());
                     }
-                    any_of.push(std::mem::take(&mut cur).into_boxed_slice());
+                    let t = std::mem::take(&mut cur);
+                    any_of.push(if fold_case {
+                        fold(&t)
+                    } else {
+                        t.into_boxed_slice()
+                    });
                     kept = 0;
                     if c == b'}' {
                         break;
@@ -628,7 +793,9 @@ impl FieldIndex {
                     self.nums[f].insert((order_key(*x), slot));
                     self.num_postings += 1;
                 }
-                Val::Missing => {}
+                // A TEXT value has no index entry: a phrase is checked
+                // against each candidate's words.
+                Val::Missing | Val::Text(_) => {}
             }
         }
         self.vals_heap += vals_bytes(Some(&v));
@@ -660,7 +827,9 @@ impl FieldIndex {
                         self.num_postings -= 1;
                     }
                 }
-                Val::Missing => {}
+                // A TEXT value has no index entry: a phrase is checked
+                // against each candidate's words.
+                Val::Missing | Val::Text(_) => {}
             }
         }
         self.vals_heap -= vals_bytes(Some(&v));
@@ -697,7 +866,9 @@ impl FieldIndex {
                         .sum::<usize>()
                 }
                 Val::Num(_) => b += NUM_POSTING,
-                Val::Missing => {}
+                // A TEXT value has no index entry: a phrase is checked
+                // against each candidate's words.
+                Val::Missing | Val::Text(_) => {}
             }
         }
         b
@@ -771,11 +942,11 @@ impl FieldIndex {
     /// Index entries whose slots include every match of `e`, and whether
     /// they are exactly its matches, so that a slot read from them needs no
     /// check against `e`: a TAG term, a range, or an OR of those. `None`
-    /// when only a scan of every slot can say (`*`, a negation, or an OR
-    /// with either in it).
+    /// when only a scan of every slot can say (`*`, a negation, a TEXT
+    /// phrase, or an OR with one of them in it).
     fn sources(&self, e: &Expr) -> Option<(Vec<Source<'_>>, bool)> {
         match e {
-            Expr::All | Expr::Not(_) => None,
+            Expr::All | Expr::Not(_) | Expr::Phrase { .. } => None,
             Expr::Tag { field, any_of } => Some((
                 any_of
                     .iter()

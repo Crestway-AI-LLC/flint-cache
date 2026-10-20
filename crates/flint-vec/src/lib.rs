@@ -23,6 +23,8 @@
 //! `VEC.SEARCH ... FILTER` matches before it ranks, in a fifth config field.
 
 pub mod filter;
+pub mod ft;
+pub mod ftindex;
 mod hnsw;
 mod kernel;
 mod quant;
