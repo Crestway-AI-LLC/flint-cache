@@ -602,6 +602,33 @@ ephemeral ports in 20 seconds, and 14 tests failed `COPROCUNAVAIL` or
 - **Not served,** for later ADRs: vector range queries (8 tests), fuzzy and
   prefix text terms (4), `GEO` (3), `WITHSCORES` (1).
 
+### The three suites again, after amendment 3 (7df3a801, 2026-10-20)
+
+| suite | passed | failed | errors | before |
+|---|---|---|---|---|
+| redisvl's 18 files | 204 | 40 | 65 | 202 / 51 / 65 |
+| langchain-redis, RESP3 | 141 | 40 | 23 | 124 / 57 / 23 |
+| langchain-redis, RESP2 (`?protocol=2`) | 179 | 24 | 1 | not run |
+| LlamaIndex | 18 | 1 | 0 | 18 / 1 / 0 |
+
+- **redisvl** now skips 12 tests, which read `MODULE LIST` to decide what
+  to run.
+- **Still no wrong answer.** What is left:
+  - the features not served: `GEO`, `WITHSCORES` and full text, vector
+    range queries, `FT.AGGREGATE`;
+  - langchain-redis's own RESP3 parsing;
+  - transactions across slots;
+  - one more, below.
+- **The first command after a flush answers `-LOADING`.**
+  - BUG-0268 has every co-processor forget the namespace after a flush, and
+    rebuild it, now empty, at its next touch. That touch answers
+    `-LOADING`, as ADR-0017 D3 has warming answer.
+  - The frameworks do not retry it, so the first test after each flush in
+    the suites fails: LlamaIndex's one failure, and 1 to 3 in the others.
+  - Serving a command whose lent channel finishes the rebuild would end
+    this. It changes what D3 shows, so it is a question for Jeff, not part
+    of this ADR.
+
 ## Verification
 
 - **The clients' own tests against Flint:** `redisvl`'s, and LangChain's and
