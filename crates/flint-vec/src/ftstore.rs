@@ -514,16 +514,23 @@ impl Store {
                         crate::filter::FieldKind::Text => "TEXT",
                     }),
                 ];
+                // RediSearch's layout, which redisvl reads back: the
+                // valued options from the seventh element, then the flags.
                 if matches!(
                     a.field.kind,
                     crate::filter::FieldKind::Tag | crate::filter::FieldKind::FoldedTag
                 ) {
                     v.push(s("SEPARATOR"));
                     v.push(bulk(&[a.separator]));
-                    if a.field.kind == crate::filter::FieldKind::Tag {
-                        v.push(s("CASESENSITIVE"));
-                    }
                 }
+                if a.field.kind == crate::filter::FieldKind::Text {
+                    v.push(s("WEIGHT"));
+                    v.push(s(a.weight.as_deref().unwrap_or("1")));
+                }
+                if a.field.kind == crate::filter::FieldKind::Tag {
+                    v.push(s("CASESENSITIVE"));
+                }
+                v.extend(a.flags.iter().map(|f| s(f)));
                 if a.noindex {
                     v.push(s("NOINDEX"));
                 }
@@ -531,51 +538,74 @@ impl Store {
             })
             .collect();
         if let Some(v) = &def.vector {
-            attrs.push(Value::Array(Some(vec![
-                s("identifier"),
-                s(&v.path),
-                s("attribute"),
-                s(&v.name),
-                s("type"),
-                s("VECTOR"),
-                s("algorithm"),
-                s(&v.index.as_str().to_ascii_uppercase()),
-                s("data_type"),
-                s("FLOAT32"),
-                s("dim"),
-                int(v.dim),
-                s("distance_metric"),
-                s(&v.metric.as_str().to_ascii_uppercase()),
-            ])));
+            attrs.push(Value::Array(Some(
+                vec![
+                    s("identifier"),
+                    s(&v.path),
+                    s("attribute"),
+                    s(&v.name),
+                    s("type"),
+                    s("VECTOR"),
+                    s("algorithm"),
+                    s(&v.index.as_str().to_ascii_uppercase()),
+                    s("data_type"),
+                    s("FLOAT32"),
+                    s("dim"),
+                    int(v.dim),
+                    s("distance_metric"),
+                    s(&v.metric.as_str().to_ascii_uppercase()),
+                ]
+                .into_iter()
+                .chain(v.hints.iter().flat_map(|(k, x)| {
+                    // RediSearch spells `M` so, and the others in lower case.
+                    let k = if &**k == "M" {
+                        "M".to_string()
+                    } else {
+                        k.to_ascii_lowercase()
+                    };
+                    [s(&k), s(x)]
+                }))
+                .collect(),
+            )));
         }
-        Value::Array(Some(vec![
-            s("index_name"),
-            bulk(index),
-            s("index_options"),
-            Value::Array(Some(Vec::new())),
-            s("index_definition"),
-            Value::Array(Some(vec![
-                s("key_type"),
-                s(match def.on {
-                    On::Hash => "HASH",
-                    On::Json => "JSON",
-                }),
-                s("prefixes"),
-                Value::Array(Some(def.prefixes.iter().map(|p| bulk(p)).collect())),
-                s("default_score"),
-                s("1"),
-            ])),
-            s("attributes"),
-            Value::Array(Some(attrs)),
-            s("num_docs"),
-            int(ix.len()),
-            s("hash_indexing_failures"),
-            int(ix.failures() as usize),
-            s("indexing"),
-            int(usize::from(!ix.ready())),
-            s("percent_indexed"),
-            s(if ix.ready() { "1" } else { "0" }),
-        ]))
+        Value::Array(Some(
+            vec![
+                s("index_name"),
+                bulk(index),
+                s("index_options"),
+                Value::Array(Some(Vec::new())),
+                s("index_definition"),
+                Value::Array(Some(vec![
+                    s("key_type"),
+                    s(match def.on {
+                        On::Hash => "HASH",
+                        On::Json => "JSON",
+                    }),
+                    s("prefixes"),
+                    Value::Array(Some(def.prefixes.iter().map(|p| bulk(p)).collect())),
+                    s("default_score"),
+                    s("1"),
+                ])),
+                s("attributes"),
+                Value::Array(Some(attrs)),
+                s("num_docs"),
+                int(ix.len()),
+                s("hash_indexing_failures"),
+                int(ix.failures() as usize),
+                s("indexing"),
+                int(usize::from(!ix.ready())),
+                s("percent_indexed"),
+                s(if ix.ready() { "1" } else { "0" }),
+            ]
+            .into_iter()
+            .chain(def.stopwords.iter().flat_map(|sw| {
+                [
+                    s("stopwords_list"),
+                    Value::Array(Some(sw.iter().map(|w| s(w)).collect())),
+                ]
+            }))
+            .collect(),
+        ))
     }
 }
 
@@ -737,7 +767,10 @@ mod tests {
     #[test]
     fn an_index_is_made_only_with_ft_and_served_either_way() {
         let mut s = store();
-        create(&mut s, &["FT.CREATE", "i", "PREFIX", "1", "p:", "SCHEMA", "a", "TAG"]);
+        create(
+            &mut s,
+            &["FT.CREATE", "i", "PREFIX", "1", "p:", "SCHEMA", "a", "TAG"],
+        );
         s.set_ft(false);
         let e = reply_err(s.plan_ft(
             b"ns",

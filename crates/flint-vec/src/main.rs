@@ -771,7 +771,14 @@ fn rebuild_chunk_inner(
         // With `--ft` or without: an index made while it was on is loaded and
         // served either way (ADR-0060).
         Ok(
-            match ft_chunk(&mut ch, ns, store, ftchan::FtLoad::Defs, generation, installed) {
+            match ft_chunk(
+                &mut ch,
+                ns,
+                store,
+                ftchan::FtLoad::Defs,
+                generation,
+                installed,
+            ) {
                 Chunk::Done(_) => Chunk::Done(total),
                 more => more,
             },

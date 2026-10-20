@@ -30,6 +30,10 @@ pub struct VectorField {
     pub metric: Metric,
     /// HNSW's `EF_RUNTIME`, a search's default `EF`, when declared.
     pub ef_runtime: Option<usize>,
+    /// The engine hints declared and passed over (`M`, `EF_CONSTRUCTION`,
+    /// `EPSILON`, `INITIAL_CAP`, `BLOCK_SIZE`), as given, so `FT.INFO`
+    /// answers the schema a client made.
+    pub hints: Vec<(Box<str>, Box<str>)>,
 }
 
 /// A TAG, NUMERIC or TEXT attribute.
@@ -43,6 +47,12 @@ pub struct Attr {
     pub separator: u8,
     /// `NOINDEX`: returned and sortable, but not filtered on.
     pub noindex: bool,
+    /// The flags declared that change no answer here (`SORTABLE`, `UNF`,
+    /// `NOSTEM`, `WITHSUFFIXTRIE`), in order, and a TEXT field's `WEIGHT`:
+    /// kept so `FT.INFO` answers the schema a client made, which `redisvl`
+    /// reads back to rebuild it.
+    pub flags: Vec<Box<str>>,
+    pub weight: Option<Box<str>>,
 }
 
 /// What `FT.CREATE` declared.
@@ -56,6 +66,9 @@ pub struct IndexDef {
     pub attrs: Vec<Attr>,
     /// At most one; an index with none answers filter-only searches.
     pub vector: Option<VectorField>,
+    /// `STOPWORDS` as declared, for `FT.INFO`'s `stopwords_list`. An exact
+    /// phrase keeps every word either way.
+    pub stopwords: Option<Vec<Box<str>>>,
 }
 
 impl IndexDef {
@@ -77,6 +90,8 @@ impl IndexDef {
                     "path": &*a.path,
                     "sep": a.separator,
                     "noindex": a.noindex,
+                    "flags": a.flags.iter().map(|f| &**f).collect::<Vec<_>>(),
+                    "weight": a.weight.as_deref(),
                 })
             })
             .collect();
@@ -88,6 +103,7 @@ impl IndexDef {
                 "dim": v.dim,
                 "metric": v.metric.as_str(),
                 "ef_runtime": v.ef_runtime,
+                "hints": v.hints.iter().map(|(k, x)| [&**k, &**x]).collect::<Vec<_>>(),
             })
         });
         json!({
@@ -95,6 +111,7 @@ impl IndexDef {
             "prefixes": self.prefixes,
             "attrs": attrs,
             "vector": vector,
+            "stopwords": self.stopwords,
         })
         .to_string()
     }
@@ -127,6 +144,11 @@ impl IndexDef {
                 path: a.get("path")?.as_str()?.into(),
                 separator: u8::try_from(a.get("sep")?.as_u64()?).ok()?,
                 noindex: a.get("noindex")?.as_bool()?,
+                flags: strings(a.get("flags"))?,
+                weight: match a.get("weight") {
+                    None | Some(Value::Null) => None,
+                    Some(w) => Some(w.as_str()?.into()),
+                },
             });
         }
         let vector = match v.get("vector")? {
@@ -143,14 +165,42 @@ impl IndexDef {
                     Value::Null => None,
                     n => Some(usize::try_from(n.as_u64()?).ok()?),
                 },
+                hints: match x.get("hints") {
+                    None => Vec::new(),
+                    Some(h) => h
+                        .as_array()?
+                        .iter()
+                        .map(|kv| {
+                            let kv = kv.as_array()?;
+                            Some((kv.first()?.as_str()?.into(), kv.get(1)?.as_str()?.into()))
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                },
             }),
+        };
+        let stopwords = match v.get("stopwords") {
+            None | Some(Value::Null) => None,
+            Some(sw) => Some(strings(Some(sw))?),
         };
         Some(IndexDef {
             on,
             prefixes,
             attrs,
             vector,
+            stopwords,
         })
+    }
+}
+
+/// A JSON array of strings; absent is empty.
+fn strings(v: Option<&Value>) -> Option<Vec<Box<str>>> {
+    match v {
+        None => Some(Vec::new()),
+        Some(v) => v
+            .as_array()?
+            .iter()
+            .map(|x| x.as_str().map(Into::into))
+            .collect(),
     }
 }
 
@@ -209,7 +259,10 @@ pub struct Search {
 /// distance for L2, as RediSearch's own engine reports them.
 pub fn distance(metric: Metric, score: f32) -> f32 {
     match metric {
-        Metric::Cosine | Metric::Ip => 1.0 - score,
+        // A cosine distance is at least 0; a vector's own, computed, can
+        // come out a rounding error below it.
+        Metric::Cosine => (1.0 - score).max(0.0),
+        Metric::Ip => 1.0 - score,
         Metric::L2 => -score,
     }
 }
@@ -250,6 +303,7 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
         .to_vec();
     let mut on = On::Hash;
     let mut prefixes: Vec<Vec<u8>> = Vec::new();
+    let mut stopwords: Option<Vec<Box<str>>> = None;
     let mut i = 2;
     loop {
         let Some(opt) = arg(args, i) else {
@@ -289,7 +343,31 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                 if args.len() < i + 2 + n {
                     return Err("FT.CREATE STOPWORDS <n> needs n words".into());
                 }
+                stopwords = Some(
+                    args[i + 2..i + 2 + n]
+                        .iter()
+                        .map(|w| text(w).map(Into::into))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
                 i += 2 + n;
+            }
+            // The documents' default score, and the fields that set each
+            // one's score, language and payload: full-text ranking and
+            // stemming, which an exact phrase does not use. redis-py's
+            // IndexDefinition sends `SCORE 1.0` on every index.
+            b"SCORE" => {
+                arg(args, i + 1)
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|v| (0.0..=1.0).contains(v))
+                    .ok_or("FT.CREATE SCORE needs a number from 0 to 1")?;
+                i += 2;
+            }
+            b"LANGUAGE" | b"LANGUAGE_FIELD" | b"SCORE_FIELD" | b"PAYLOAD_FIELD" => {
+                if arg(args, i + 1).is_none() {
+                    return Err("an FT.CREATE option needs a value".into());
+                }
+                i += 2;
             }
             b"SCHEMA" => {
                 i += 1;
@@ -357,14 +435,17 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             }
         };
         let (mut separator, mut noindex) = (b',', false);
+        let (mut flags, mut weight): (Vec<Box<str>>, Option<Box<str>>) = (Vec::new(), None);
         // The field's options, up to the next field: a word that is none of
         // them starts the next field.
         while let Some(o) = arg(args, i) {
             let tag = matches!(kind, FieldKind::FoldedTag | FieldKind::Tag);
             match upper(o).as_slice() {
                 b"SORTABLE" => {
+                    flags.push("SORTABLE".into());
                     i += 1;
                     if arg(args, i).is_some_and(|a| a.eq_ignore_ascii_case(b"UNF")) {
+                        flags.push("UNF".into());
                         i += 1;
                     }
                 }
@@ -384,10 +465,22 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                     i += 1;
                 }
                 // Full-text ranking and stemming, which an exact phrase
-                // does not use.
-                b"WEIGHT" if kind == FieldKind::Text => i += 2,
-                b"NOSTEM" if kind == FieldKind::Text => i += 1,
-                o @ (b"PHONETIC" | b"WITHSUFFIXTRIE" | b"INDEXMISSING" | b"INDEXEMPTY") => {
+                // does not use, and the suffix trie that infix and suffix
+                // terms use, which are refused.
+                b"WEIGHT" if kind == FieldKind::Text => {
+                    weight =
+                        Some(text(arg(args, i + 1).ok_or("TEXT WEIGHT needs a value")?)?.into());
+                    i += 2;
+                }
+                b"NOSTEM" if kind == FieldKind::Text => {
+                    flags.push("NOSTEM".into());
+                    i += 1;
+                }
+                b"WITHSUFFIXTRIE" if tag || kind == FieldKind::Text => {
+                    flags.push("WITHSUFFIXTRIE".into());
+                    i += 1;
+                }
+                o @ (b"PHONETIC" | b"INDEXMISSING" | b"INDEXEMPTY") => {
                     return Err(format!(
                         "SCHEMA option {} is not supported (ADR-0060)",
                         String::from_utf8_lossy(o)
@@ -410,6 +503,8 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             path: path.into(),
             separator,
             noindex,
+            flags,
+            weight,
         });
     }
     if attrs.is_empty() && vector.is_none() {
@@ -422,6 +517,7 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             prefixes,
             attrs,
             vector,
+            stopwords,
         },
     ))
 }
@@ -444,6 +540,7 @@ fn parse_vector(
         return Err("VECTOR <algorithm> <n> needs n words, in name and value pairs".into());
     }
     let (mut dim, mut metric, mut ty, mut ef_runtime) = (None, None, None, None);
+    let mut hints: Vec<(Box<str>, Box<str>)> = Vec::new();
     for kv in args[i + 2..i + 2 + n].chunks(2) {
         let v = kv[1].as_slice();
         match upper(&kv[0]).as_slice() {
@@ -460,7 +557,9 @@ fn parse_vector(
             b"EF_RUNTIME" => ef_runtime = Some(number(Some(v), "VECTOR EF_RUNTIME")?),
             // Build-time and capacity hints for RediSearch's own engine. This
             // one's HNSW sets its own (ADR-0017); they change no answer.
-            b"M" | b"EF_CONSTRUCTION" | b"EPSILON" | b"INITIAL_CAP" | b"BLOCK_SIZE" => {}
+            h @ (b"M" | b"EF_CONSTRUCTION" | b"EPSILON" | b"INITIAL_CAP" | b"BLOCK_SIZE") => {
+                hints.push((String::from_utf8_lossy(h).into(), text(v)?.into()));
+            }
             other => {
                 return Err(format!(
                     "VECTOR attribute {} is not supported (ADR-0060)",
@@ -491,6 +590,7 @@ fn parse_vector(
             dim,
             metric,
             ef_runtime,
+            hints,
         },
         i + 2 + n,
     ))
@@ -538,6 +638,14 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
             b"NOCONTENT" => {
                 s.nocontent = true;
                 i += 1;
+            }
+            // The full-text scoring function: no search here is ranked by a
+            // text score, so it changes no answer. redisvl sends it.
+            b"SCORER" => {
+                if arg(args, i + 1).is_none() {
+                    return Err("FT.SEARCH SCORER needs a scorer".into());
+                }
+                i += 2;
             }
             b"RETURN" => {
                 let n = number(arg(args, i + 1), "FT.SEARCH RETURN")?;
@@ -617,15 +725,28 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
     };
     let fields = def.fields();
     let f = filter_part.trim();
+    if let Some(v) = &def.vector
+        && f.contains(&format!("@{}:", v.name))
+    {
+        return Err(format!(
+            "the query filters on the VECTOR field {}: vector range queries (VECTOR_RANGE) \
+             are not supported (ADR-0060)",
+            v.name
+        ));
+    }
     if f != "*" {
-        let e = filter::parse(f.as_bytes(), &fields).map_err(|e| format!("the query {e}"))?;
-        for a in def.attrs.iter().filter(|a| a.noindex) {
-            if mentions(&e, &fields, &a.field.name) {
-                return Err(format!(
-                    "the query filters on {}, which is NOINDEX",
-                    a.field.name
-                ));
-            }
+        let mut e = filter::parse(f.as_bytes(), &fields).map_err(|e| format!("the query {e}"))?;
+        // A term on a NOINDEX field matches no document, as RediSearch
+        // answers it: the field is returned and sorted on, never searched.
+        let noindex: Vec<usize> = def
+            .attrs
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.noindex)
+            .map(|(at, _)| at)
+            .collect();
+        if !noindex.is_empty() {
+            e = unindexed(e, &noindex);
         }
         if e != Expr::All {
             s.filter = Some(e);
@@ -653,16 +774,20 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
     Ok(s)
 }
 
-/// Whether `e` names the attribute `name`.
-fn mentions(e: &Expr, fields: &[Field], name: &str) -> bool {
-    let at = fields.iter().position(|f| &*f.name == name);
+/// `e` with each term on a field in `noindex` replaced by one that matches
+/// nothing.
+fn unindexed(e: Expr, noindex: &[usize]) -> Expr {
+    let none = || Expr::Not(Box::new(Expr::All));
     match e {
-        Expr::All => false,
-        Expr::Tag { field, .. } | Expr::Range { field, .. } | Expr::Phrase { field, .. } => {
-            Some(*field) == at
+        Expr::Tag { field, .. } | Expr::Range { field, .. } | Expr::Phrase { field, .. }
+            if noindex.contains(&field) =>
+        {
+            none()
         }
-        Expr::Not(x) => mentions(x, fields, name),
-        Expr::And(xs) | Expr::Or(xs) => xs.iter().any(|x| mentions(x, fields, name)),
+        Expr::Not(x) => Expr::Not(Box::new(unindexed(*x, noindex))),
+        Expr::And(xs) => Expr::And(xs.into_iter().map(|x| unindexed(x, noindex)).collect()),
+        Expr::Or(xs) => Expr::Or(xs.into_iter().map(|x| unindexed(x, noindex)).collect()),
+        other => other,
     }
 }
 
@@ -819,6 +944,25 @@ mod tests {
         ]))
         .expect("parses");
         assert_eq!(name, b"idx".to_vec());
+        // redis-py's IndexDefinition adds `SCORE 1.0` to every index.
+        let (_, with_score) = parse_create(&a(&[
+            "FT.CREATE",
+            "s",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCORE",
+            "1.0",
+            "LANGUAGE",
+            "english",
+            "SCHEMA",
+            "user",
+            "TAG",
+        ]))
+        .expect("SCORE and LANGUAGE are accepted");
+        assert_eq!(with_score.attrs.len(), 1);
         def
     }
 
@@ -1151,11 +1295,10 @@ mod tests {
             "NOINDEX",
         ]))
         .expect("parses");
-        assert!(
-            parse_search(&a(&["FT.SEARCH", "n", "@a:{x}"]), &noidx)
-                .expect_err("NOINDEX")
-                .contains("NOINDEX")
-        );
+        // A term on a NOINDEX field matches nothing, as in RediSearch.
+        let s = parse_search(&a(&["FT.SEARCH", "n", "@a:{x}"]), &noidx).expect("parses");
+        let vals = [filter::hash_val(FieldKind::FoldedTag, b"x", b',')];
+        assert!(!s.filter.expect("a filter").matches(Some(&vals[..])));
         assert_eq!(
             parse_drop(&a(&["FT.DROPINDEX", "i", "dd"])),
             Ok((b"i".to_vec(), true))

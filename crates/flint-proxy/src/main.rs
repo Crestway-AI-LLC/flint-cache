@@ -3815,7 +3815,7 @@ async fn family_command_for(
     // it instead, and `_slot` bounds how many it holds at once.
     let (t, wait) = (Arc::clone(topo), topo.family_deadline);
     match tokio::task::spawn_blocking(move || t.coproc_call(&endpoints, &frame, wait)).await {
-        Ok(Ok(v)) => v,
+        Ok(Ok(v)) => ft_by_proto(args, v),
         Ok(Err(())) | Err(_) => unavail(),
     }
 }
@@ -3856,6 +3856,136 @@ async fn forget_in_coprocs(topo: &Arc<Topology>, ns: &[u8]) -> Result<(), String
         }
     }
     Ok(())
+}
+
+/// RediSearch answers `FT.SEARCH` and `FT.INFO` in another structure under
+/// RESP3: a map, its results and attributes maps too. A RESP3 client parses
+/// that one, and redis-py 8 negotiates RESP3 by default. The co-processor
+/// answers RESP2's, and the proxy, which knows its client's protocol,
+/// carries both (ADR-0060).
+fn ft_by_proto(args: &[Vec<u8>], v: Value) -> Value {
+    if matches!(v, Value::Error(_)) {
+        return v;
+    }
+    let resp3 = match args.first().map(|n| n.to_ascii_uppercase()).as_deref() {
+        Some(b"FT.SEARCH") => ft_search_resp3(args, &v),
+        Some(b"FT.INFO") => ft_info_resp3(&v),
+        _ => None,
+    };
+    match resp3 {
+        Some(r3) => Value::ByProto {
+            resp2: Box::new(v),
+            resp3: Box::new(r3),
+        },
+        None => v,
+    }
+}
+
+fn map_key(s: &str) -> Value {
+    Value::Simple(s.into())
+}
+
+/// `[total, key, [field, value, ...], ...]`, or with `NOCONTENT` `[total,
+/// key, ...]`, as RESP3's `{total_results, results: [{id,
+/// extra_attributes, values}], ...}`.
+fn ft_search_resp3(args: &[Vec<u8>], v: &Value) -> Option<Value> {
+    let Value::Array(Some(items)) = v else {
+        return None;
+    };
+    let Value::Integer(total) = items.first()? else {
+        return None;
+    };
+    let nocontent = args
+        .iter()
+        .skip(3)
+        .any(|a| a.eq_ignore_ascii_case(b"NOCONTENT"));
+    let mut results = Vec::new();
+    let mut it = items[1..].iter().peekable();
+    while let Some(id) = it.next() {
+        let mut entry = vec![(map_key("id"), id.clone())];
+        if !nocontent && let Some(Value::Array(Some(fields))) = it.peek() {
+            let pairs = fields
+                .chunks_exact(2)
+                .map(|c| (c[0].clone(), c[1].clone()))
+                .collect();
+            entry.push((map_key("extra_attributes"), Value::Map(pairs)));
+            it.next();
+        }
+        entry.push((map_key("values"), Value::Array(Some(Vec::new()))));
+        results.push(Value::Map(entry));
+    }
+    Some(Value::Map(vec![
+        (map_key("attributes"), Value::Array(Some(Vec::new()))),
+        (map_key("warning"), Value::Array(Some(Vec::new()))),
+        (map_key("total_results"), Value::Integer(*total)),
+        (map_key("format"), map_key("STRING")),
+        (map_key("results"), Value::Array(Some(results))),
+    ]))
+}
+
+fn value_text(v: &Value) -> Option<&[u8]> {
+    match v {
+        Value::Bulk(Some(b)) => Some(b),
+        Value::Simple(s) => Some(s.as_bytes()),
+        _ => None,
+    }
+}
+
+/// `FT.INFO`'s flat pairs as a map, its `index_definition` a map, and each
+/// attribute a map of its valued options with its bare flags under `flags`.
+fn ft_info_resp3(v: &Value) -> Option<Value> {
+    let Value::Array(Some(items)) = v else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for c in items.chunks(2) {
+        let [k, val] = c else {
+            return None;
+        };
+        let val = match (value_text(k)?, val) {
+            (b"index_definition", Value::Array(Some(d))) => Value::Map(
+                d.chunks_exact(2)
+                    .map(|p| (p[0].clone(), p[1].clone()))
+                    .collect(),
+            ),
+            (b"attributes", Value::Array(Some(attrs))) => {
+                Value::Array(Some(attrs.iter().map(ft_attr_resp3).collect()))
+            }
+            _ => val.clone(),
+        };
+        out.push((k.clone(), val));
+    }
+    Some(Value::Map(out))
+}
+
+fn ft_attr_resp3(a: &Value) -> Value {
+    const FLAGS: &[&[u8]] = &[
+        b"SORTABLE",
+        b"UNF",
+        b"NOSTEM",
+        b"CASESENSITIVE",
+        b"NOINDEX",
+        b"WITHSUFFIXTRIE",
+        b"INDEXMISSING",
+        b"INDEXEMPTY",
+    ];
+    let Value::Array(Some(xs)) = a else {
+        return a.clone();
+    };
+    let (mut m, mut flags) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < xs.len() {
+        let flag = value_text(&xs[i]).is_some_and(|t| FLAGS.contains(&t));
+        if flag || i + 1 == xs.len() {
+            flags.push(xs[i].clone());
+            i += 1;
+        } else {
+            m.push((xs[i].clone(), xs[i + 1].clone()));
+            i += 2;
+        }
+    }
+    m.push((map_key("flags"), Value::Array(Some(flags))));
+    Value::Map(m)
 }
 
 /// Releases a family-command in-flight slot on drop, so every return path from

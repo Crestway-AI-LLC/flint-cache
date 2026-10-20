@@ -316,6 +316,82 @@ Branch `adr0060-ft`, held by `coproc_ft_drill`. Two pairs, a proxy and
 - **Not yet measured:** recall and latency of `FT.SEARCH` against
   `VEC.SEARCH`, and the indexed write rate against a pair's.
 
+## Verification against redisvl's own suite, 2026-10-20
+
+Downloads approved by Jeff (2026-10-20):
+- redisvl 0.28.0's source distribution from PyPI, sha256-checked. It
+  carries its tests; langchain-redis's and the LlamaIndex store's do not,
+  and theirs are only on GitHub, a source not yet approved.
+- redis-py 8.1.0, pytest and pytest-timeout, in a fresh Python 3.14
+  virtualenv on the laptop.
+
+The run:
+- **The suites:** redisvl's integration suites for indexes, queries,
+  results, storage, message history and field options, 18 files and 321
+  tests.
+- **The fleet:** two `mem` pairs, `flint-vec --ft` and a proxy routing `VEC.`
+  and `FT.`.
+- **Changed:** only the test harness, so that it reaches that fleet rather
+  than starting Redis in Docker.
+- **Left out:** the suites that need a model, a service or a cluster
+  (vectorizers, rerankers, LLM caches, routers, SQL, migrations, cluster,
+  SVS, MCP).
+
+| run | passed | failed | errors |
+|---|---|---|---|
+| as built, `test_search_index.py` alone | 6 of 49 | 40 | 3 |
+| after the fixes below, all 18 files | 202 | 51 | 65 |
+| the same, with the tests' `GEO` fields removed, for discovery only | 223 | 78 | 17 |
+
+**No failure is a wrong answer.** Every one is a refusal of what is not
+served, or a test that needs `sentence-transformers`. Where Flint answers,
+it answers what the tests expect.
+
+**Fixed from the suite:**
+- **`FT.CREATE`** takes `SCORE`, which redis-py's index definition sends on
+  every index, and `LANGUAGE`, `LANGUAGE_FIELD`, `SCORE_FIELD`,
+  `PAYLOAD_FIELD` and a field's `WITHSUFFIXTRIE`. All of these shape
+  full-text scoring, stemming or suffix queries, none of which is served.
+- **`FT.SEARCH`** takes `SCORER`, which picks the text scoring function.
+- **`FT.INFO` answers the schema as declared**, which redisvl reads back to
+  rebuild it:
+  - each field's `SORTABLE`, `UNF`, `NOSTEM`, `WITHSUFFIXTRIE` and `WEIGHT`;
+  - the vector's `M`, `ef_construction` and `epsilon`;
+  - `stopwords_list`.
+- **RESP3.** redis-py 8 negotiates RESP3 by default, and RediSearch answers
+  `FT.SEARCH` and `FT.INFO` in another structure there. The proxy carries
+  both shapes, from the co-processor's RESP2 reply.
+- **A cosine distance is never below 0.** A vector's distance to itself came
+  out at -1.2e-7.
+- **A term on a `NOINDEX` field matches no document**, as in RediSearch,
+  rather than being refused.
+- **A vector range query is refused by name.** Before, it read as a filter
+  on an unknown field.
+
+**Not served, by count of failing tests, each a proposal for Jeff:**
+- **`WITHSCORES`** (22). Each result's text score. No search here is ranked
+  by one.
+- **`GEO` fields** (most of the 65 setup errors, and 6 queries).
+  redisvl's shared test schema has one.
+- **Vector range queries, `VECTOR_RANGE`** (12).
+- **`MODULE LIST`** (9). The tests read it to decide what to run; the
+  proxy answers it as an unknown command.
+- **`FT.AGGREGATE`** (8). redisvl iterates documents by a filter with it,
+  `WITHCURSOR`.
+- **redisvl's upsert script** (4), an `EVAL` over a document's key. The
+  co-processor does not run scripts, and the node refuses one on an indexed
+  key.
+- **`EXPIRE` inside `MULTI`** (2). redisvl's `expire_keys` sends them as a
+  transaction, which the node refuses.
+- **A page of results larger than a channel's budget** (2). Each result is
+  read back with one command, and a channel has 256.
+- **`SORTBY` on a TEXT field** (2).
+- **Aliases** (1), and full-text terms (2).
+- **The first command after a co-processor restarts** answers `-LOADING`,
+  which redis-py does not retry. ADR-0017 D3 makes warming visible on
+  purpose, and `coproc_vec_drill` holds it so. A proxy that retried for a few
+  seconds would hide it from the frameworks, which do not retry.
+
 ## Verification
 
 - **The clients' own tests against Flint:** `redisvl`'s, and LangChain's and
