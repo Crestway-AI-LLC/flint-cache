@@ -671,6 +671,23 @@ PY
 case "$PLANT" in *"reserved for the vector co-processor"*) : ;; *) echo "FAIL (BUG-0265): a tenant's SET of a reserved key was not refused: $PLANT"; exit 1 ;; esac
 echo "  the co-processor writes its rows over its marked channel; the tenant's own SET of one is refused"
 
+echo "== BUG-0268: a tenant's FLUSHALL empties its vector sets, and a set made after it survives a restart"
+[ "$(vexec VEC.CREATE fl DIM 3 METRIC l2)" = "OK " ] || { echo "FAIL: VEC.CREATE fl"; exit 1; }
+[ "$(vexec VEC.SET fl a 1,0,0)" = "OK " ] || { echo "FAIL: VEC.SET fl a"; exit 1; }
+[ "$($A FLUSHALL 2>&1 | tr -d '\r')" = "OK" ] || { echo "FAIL: FLUSHALL"; exit 1; }
+# The flush deleted the set's durable rows; the co-processor's memory must
+# not go on answering from them.
+AFTER="$(vexec VEC.SEARCH fl 1,0,0 1)"
+case "$AFTER" in *"no such set"*) : ;; *) echo "FAIL (BUG-0268): after FLUSHALL the set still answers: $AFTER"; exit 1 ;; esac
+WRITE="$(vexec VEC.SET fl b 0,1,0)"
+case "$WRITE" in *"no such set"*) : ;; *) echo "FAIL (BUG-0268): after FLUSHALL a write to the flushed set answered: $WRITE"; exit 1 ;; esac
+# Made again after the flush, its writes are durable: a restart finds them.
+[ "$(vexec VEC.CREATE fl DIM 3 METRIC l2)" = "OK " ] || { echo "FAIL (BUG-0268): VEC.CREATE after FLUSHALL"; exit 1; }
+[ "$(vexec VEC.SET fl b 0,1,0)" = "OK " ] || { echo "FAIL (BUG-0268): VEC.SET after FLUSHALL"; exit 1; }
+restart_vec vec13.log
+case "$(vexec VEC.SEARCH fl 0,1,0 1)" in *b*) : ;; *) echo "FAIL (BUG-0268): a vector written after FLUSHALL is gone after a restart: $(vexec VEC.SEARCH fl 0,1,0 1)"; exit 1 ;; esac
+echo "  after FLUSHALL the set is gone, as its rows are; one made again survives a restart"
+
 echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 and bin on a local file), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
 echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
@@ -683,3 +700,4 @@ echo "      co-processor rebuild in the next (ADR-0050 D5), an overall cap bound
 echo "      tenant's index together and is exported (D2), and the seat listens where told (BUG-0203)."
 echo "      VEC.SEARCH refuses an option it does not know, and filters are served, through the"
 echo "      proxy, unless --no-vec-filters, to only the matches, across a restart (ADR-0059)."
+echo "      A tenant's FLUSHALL empties its vector sets as it does their rows (BUG-0268)."

@@ -3746,6 +3746,44 @@ async fn family_command(topo: &Arc<Topology>, ns: &[u8], args: &[Vec<u8>]) -> Va
     }
 }
 
+/// BUG-0268: a flush deleted the namespace's co-processor rows with the rest
+/// of its keys, so each co-processor forgets what it holds of the namespace
+/// (`FLINTNSDROP`, BUG-0255) and builds it again, from the rows that are left,
+/// at its next touch. Before this, a vector set went on answering from memory
+/// after its rows were gone, and a write to it after the flush was lost at the
+/// next restart. Every endpoint of every family is told, since any of them may
+/// have served the namespace. `Err` names one that could not be: the flush
+/// has happened, and only a retry tells it.
+async fn forget_in_coprocs(topo: &Arc<Topology>, ns: &[u8]) -> Result<(), String> {
+    let mut addrs: Vec<String> = topo
+        .families
+        .read()
+        .map(|f| f.iter().flat_map(|(_, a)| a.iter().cloned()).collect())
+        .unwrap_or_default();
+    addrs.sort();
+    addrs.dedup();
+    let frame = encode_cmd(&[b"FLINTNSDROP", ns]);
+    for addr in addrs {
+        let (t, f, a, wait) = (
+            Arc::clone(topo),
+            frame.clone(),
+            addr.clone(),
+            topo.family_deadline,
+        );
+        match tokio::task::spawn_blocking(move || t.coproc_call(&[a], &f, wait)).await {
+            Ok(Ok(Value::Integer(_))) => {}
+            other => {
+                return Err(format!(
+                    "ERR the keys are flushed, but the co-processor at {addr} could not be told \
+                     ({other:?}), so its vector sets answer from memory until it is: send the \
+                     flush again (BUG-0268)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Releases a family-command in-flight slot on drop, so every return path from
 /// `family_command` — shed, error, or success — decrements the counter (D3).
 struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -5592,7 +5630,7 @@ async fn handle(
             Value::Error("ERR syntax error".into())
         }
         b"FLUSHALL" | b"FLUSHDB" => {
-            fan_out(topo, backends, raw, |replies| {
+            let flushed = fan_out(topo, backends, raw, |replies| {
                 for r in replies {
                     if !matches!(&r, Value::Simple(s) if s == "OK") {
                         return Value::Error(format!("ERR flushall fan-out: {r:?}"));
@@ -5600,7 +5638,13 @@ async fn handle(
                 }
                 Value::Simple("OK".into())
             })
-            .await
+            .await;
+            if matches!(flushed, Value::Simple(_))
+                && let Err(e) = forget_in_coprocs(topo, ns).await
+            {
+                return Value::Error(e);
+            }
+            flushed
         }
         _ => forward(topo, backends, ns, args, raw, read_replica).await,
     }
