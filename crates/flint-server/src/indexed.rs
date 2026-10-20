@@ -119,6 +119,7 @@ impl Indexed {
     }
 
     /// Install a row a slot move carried from its source, as `set` would.
+    #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
     pub fn install_row(&self, store: &dyn Kv, ns: &[u8], raw: &[u8]) -> bool {
         match decode(raw) {
             Some(prefixes) => {
