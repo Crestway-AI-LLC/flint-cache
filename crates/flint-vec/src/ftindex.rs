@@ -42,6 +42,10 @@ pub struct FtIndex {
     /// Documents left out since the index was made, as RediSearch counts
     /// `hash_indexing_failures`: a vector that is not `DIM` float32s.
     failures: u64,
+    /// Whether it holds every document under its prefixes: false while
+    /// `FT.CREATE`'s backfill or a rebuild is still reading them, when a
+    /// search is not answered (a partial answer is a wrong one).
+    ready: bool,
 }
 
 /// One search's answer before the documents are read: how many matched, and
@@ -64,7 +68,16 @@ impl FtIndex {
             docs: HashMap::new(),
             set,
             failures: 0,
+            ready: false,
         }
+    }
+
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn set_ready(&mut self) {
+        self.ready = true;
     }
 
     pub fn def(&self) -> &IndexDef {
@@ -177,22 +190,46 @@ impl FtIndex {
         gone.len()
     }
 
-    /// What the index costs the D4 meter: each document's entry and values,
-    /// and the vector set's entries.
+    /// What `key` costs the D4 meter now: its document's entry and values,
+    /// and its entry in the vector set. 0 when it is not a document.
+    pub fn charge(&self, key: &[u8]) -> usize {
+        let Some(d) = self.docs.get(key) else {
+            return 0;
+        };
+        DOC_BYTES
+            + key.len()
+            + filter::vals_bytes(d.vals.as_deref())
+            + self
+                .set
+                .as_ref()
+                .and_then(|s| s.entry_cost(key))
+                .unwrap_or(0)
+    }
+
+    /// What the vector set holds beyond its live entries: deleted HNSW
+    /// slots, which wait for its next insert (BUG-0257).
+    pub fn held(&self) -> usize {
+        self.set.as_ref().map_or(0, |s| s.held())
+    }
+
+    /// What the whole index costs the D4 meter: every document's
+    /// [`charge`](Self::charge), and what the vector set holds.
     pub fn bytes(&self) -> usize {
-        let docs: usize = self
-            .docs
+        self.docs.keys().map(|k| self.charge(k)).sum::<usize>() + self.held()
+    }
+
+    /// Every document's key, for a rebuild's or `FT.DROPINDEX DD`'s walk.
+    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.docs.keys().map(|k| k.as_slice())
+    }
+
+    /// Documents whose TTL has passed as of `now`.
+    pub fn expired(&self, now: u64) -> Vec<Vec<u8>> {
+        self.docs
             .iter()
-            .map(|(k, d)| DOC_BYTES + k.len() + filter::vals_bytes(d.vals.as_deref()))
-            .sum();
-        let set = self.set.as_ref().map_or(0, |s| {
-            self.docs
-                .keys()
-                .filter_map(|k| s.entry_cost(k))
-                .sum::<usize>()
-                + s.held()
-        });
-        docs + set
+            .filter(|(_, d)| d.expires_at.is_some_and(|e| e <= now))
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     fn live(&self, doc: &Doc, now: u64) -> bool {

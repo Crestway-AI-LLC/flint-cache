@@ -25,6 +25,7 @@
 pub mod filter;
 pub mod ft;
 pub mod ftindex;
+pub mod ftstore;
 mod hnsw;
 mod kernel;
 mod quant;
@@ -1090,6 +1091,11 @@ pub struct Store {
     /// walks the graph instead; `None` is the rule in `hnsw::scan_threshold`.
     /// Set only to measure where that rule should be (`bench --filters`).
     scan_cap: Option<usize>,
+    /// The `FT.*` indexes (ADR-0060), by namespace and name.
+    ft: HashMap<(Vec<u8>, Vec<u8>), ftindex::FtIndex>,
+    /// Serve `FT.*`. Off for a bare `Store`; the binary turns it on with
+    /// `--ft`, in the release that brings it.
+    ft_on: bool,
 }
 
 impl Store {
@@ -1204,6 +1210,7 @@ impl Store {
     pub fn drop_namespace(&mut self, ns: &[u8]) -> usize {
         let before = self.sets.len();
         self.sets.retain(|(n, _), _| n.as_slice() != ns);
+        self.ft.retain(|(n, _), _| n.as_slice() != ns);
         self.ns_bytes.remove(ns);
         *self.generations.entry(ns.to_vec()).or_default() += 1;
         before - self.sets.len()
@@ -1338,7 +1345,7 @@ impl Store {
     /// credit what that frees to each namespace: a flat set's entries, and an
     /// HNSW set's slots only when it is emptied, since until then they are
     /// held for its next inserts (BUG-0257). Returns how many vectors were
-    /// removed. This is a RAM-reclamation path, not a correctness
+    /// removed, with `FT.*` documents. This is a RAM-reclamation path, not a correctness
     /// one: `get`/`search` already mask an expired id the instant its deadline
     /// passes, and the durable row carries its own PX, so a sweep that runs late
     /// only holds memory longer — it can never serve or resurrect an expired
@@ -1376,7 +1383,7 @@ impl Store {
         for key in &emptied {
             self.reset_set(key);
         }
-        swept
+        swept + self.ft_sweep(now)
     }
 
     /// VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip> [INDEX flat|hnsw]
