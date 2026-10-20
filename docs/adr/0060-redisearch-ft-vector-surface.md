@@ -4,7 +4,7 @@ Status: **ACCEPTED 2026-10-19, option A** (Jeff: "go with your
 recommendation"), with the first release's scope and the two releases as
 recommended. The downloads its verification needs, to install and run the
 three clients' own tests, are still Jeff's to approve when it is built.
-The parser is built, on a branch. The amendment below, the guard on the
+Release N is built, on a branch (As built, below). The amendment below, the guard on the
 data node rather than on every proxy knowing, was ACCEPTED 2026-10-19 (Jeff:
 "Accept the node guard"). Amendment 2, where each node keeps the prefixes,
 was ACCEPTED 2026-10-19, option A (Jeff: "A: node row").
@@ -253,6 +253,68 @@ for the nodes.
 pair through failover, scale-out and a roll without a cost per slot, and
 it reuses replication, full sync and the slot move as they are. The
 rollback note does not change: a release before the guard ignores the row.
+
+## As built, release N (2026-10-19)
+
+Branch `adr0060-ft`, held by `coproc_ft_drill`. Two pairs, a proxy and
+`flint-vec --ft`, over HASH and JSON documents.
+
+- **`--ft` gates `FT.CREATE` only.** An index made while it was on is still
+  loaded, searched, written and dropped without it. Otherwise its prefixes
+  would stay guarded on every pair with no one to serve their writes, and
+  the tenant could not drop the index to free them.
+- **`FT.CREATE` takes the amendment's three steps on its own channel:**
+  1. `PROXYINDEXED` with the namespace's prefixes, which the proxy fans out
+     to every master as `FLINTINDEXED`, failing if one cannot be reached;
+  2. the definition rows;
+  3. a backfill, a `SCAN` of each prefix over the channel.
+
+  A backfill that outlasts its channel's budget resumes on the channel of
+  the next `FT.SEARCH` or `FT.INFO` of that index. Until it ends, the search
+  answers `-LOADING`.
+- **A routed write takes its keys' locks** across a document-list `SADD`,
+  the write itself, and a read-back (`HGETALL` or `JSON.GET key $`, then
+  `PTTL`), and indexes what it read. That is up to five channel commands for
+  one key. A write that landed but could not be read back takes the key out
+  of its indexes and answers an error, so a search never returns what is no
+  longer there.
+- **A delete needs no read-back.** Under its lock, nothing writes the key
+  again.
+- **The proxy learns a prefix from `-INDEXED`** and sends writes under it to
+  the `FT.` co-processor for 10 minutes, learning it again after that. A
+  dropped index's prefix costs the extra hop until then.
+- **The first write after a proxy learns a prefix may be split.** If it is a
+  multi-key `DEL` across pairs, the pairs without the guarded key delete
+  theirs before the co-processor deletes them all, and the reply's count can
+  be short.
+- **A node finds a command's keys with `flint_commands::written_keys`,** a
+  superset by command: `MSET`'s every other argument, `RENAME`'s two, the
+  `*STORE` destinations, and so on. A value is never mistaken for a key.
+- **Scripts are checked twice:** their declared keys before they run, and
+  each row as they write it, so a key a script builds is caught.
+- **`FLUSHALL` and `FLUSHDB` are refused in a namespace with an index.**
+  RediSearch drops its indexes on a flush, and the clients' test suites flush
+  between tests. Serving a flush through the co-processor, which would drop
+  the indexes and their prefixes with it, is the obvious next step and is not
+  built.
+- **Known differences from RediSearch, to check against the clients' own
+  tests** (the downloads are still Jeff's to approve):
+  - an exact phrase keeps its stop words;
+  - replies are RESP2's shape only;
+  - L2 distances are squared;
+  - the missing-index errors are `Unknown index name` (`FT.INFO`),
+    `Unknown Index name` (`FT.DROPINDEX`) and `<index>: no such index`
+    (`FT.SEARCH`), RediSearch's wording as recalled, not read from its
+    source or the clients'.
+- **A rebuild that cannot register its prefixes** on every pair leaves the
+  namespace `-LOADING`, `VEC.*` included, until it can. A failed
+  registration is never served as if it had worked.
+- **Cost:** a namespace's rebuild reads every document twice over the
+  channel (its document and its TTL), about 120 documents per channel at the
+  default budget of 256, so a large FT namespace rebuilds slower than a
+  vector set of the same size.
+- **Not yet measured:** recall and latency of `FT.SEARCH` against
+  `VEC.SEARCH`, and the indexed write rate against a pair's.
 
 ## Verification
 
