@@ -2,8 +2,9 @@
 
 **Status:** **FIXED 2026-10-19.** Found by ADR-0059's 999,000-vector run,
 the first measurement of its rule on real embeddings. Held by
-`filter::tests::exact_entries_are_not_checked_one_by_one` and, on a
-300,000-vector synthetic set, by `bench --filters` before and after (below).
+`filter::tests::exact_entries_are_not_checked_one_by_one`, and measured
+before and after with `bench --filters` on 1,000,000 synthetic vectors
+(below).
 **Severity:** low. Answers were right. A filtered `VEC.SEARCH` whose filter
 matched more vectors than the threshold took up to twice the time of the walk
 it ended in: 6.1 ms instead of 3.1 ms at p50, with half the set matching.
@@ -88,4 +89,26 @@ filters are written that way.
     `-inf` each find exactly their matches.
 - `the_index_finds_every_match_or_says_there_are_too_many`, unchanged,
   passes.
-- `bench --filters`: see the next section.
+- `bench --filters` on 1,000,000 synthetic vectors (16 dimensions, 256
+  clusters), on the laptop, public main against this fix. Each side was
+  built in its own target directory, and the two binaries' md5s differ. Two
+  rounds each, alternating. p50 in microseconds:
+
+  | filter | matches | rule, before | rule, after | walk |
+  |---|---|---|---|---|
+  | `r50` | 500,478 | 1,249 / 1,042 | 386 / 385 | 217 to 309 |
+  | `r10` | 100,133 | 2,578 / 1,548 | 801 / 784 | 580 to 649 |
+  | `c10` | 78,651 | 9,503 / 9,650 | 5,532 / 5,497 | 5,014 to 5,600 |
+  | `c100` | 10,401 | 754 / 616 | 372 / 371 | (scanned) |
+  | `r1` | 10,257 | 453 / 448 | 372 / 370 | (scanned) |
+
+  - **Where the rule walks,** it now costs the walk and its count. A run that
+    timed the two apart put the count at 170 to 220 µs. Before, the rule
+    cost 0.8 to 4.6 ms more than the walk here, and 2.3 to 8.2 ms more on the
+    999,000 real vectors.
+  - **Where it scans,** collecting the matches got faster as well, since
+    each match is no longer checked as it is collected.
+  - **Recall was the same before and after,** at every point.
+  - **A first comparison was void.** It reported no change, but its two
+    binaries, built from both trees through one target directory, were
+    byte-identical.
