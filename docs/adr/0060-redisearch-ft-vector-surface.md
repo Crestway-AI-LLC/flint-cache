@@ -7,7 +7,8 @@ three clients' own tests, are still Jeff's to approve when it is built.
 Release N is built, on a branch (As built, below). The amendment below, the guard on the
 data node rather than on every proxy knowing, was ACCEPTED 2026-10-19 (Jeff:
 "Accept the node guard"). Amendment 2, where each node keeps the prefixes,
-was ACCEPTED 2026-10-19, option A (Jeff: "A: node row").
+was ACCEPTED 2026-10-19, option A (Jeff: "A: node row"). Amendment 3,
+what the frameworks' suites need next, is PROPOSED 2026-10-20.
 
 Proposed 2026-10-19.
 
@@ -254,6 +255,115 @@ pair through failover, scale-out and a roll without a cost per slot, and
 it reuses replication, full sync and the slot move as they are. The
 rollback note does not change: a release before the guard ignores the row.
 
+## Amendment 3, 2026-10-20 (PROPOSED): what the frameworks' own suites need next
+
+Jeff set its scope on 2026-10-20 ("Amend ADR-0060, cheap set"):
+- `MODULE LIST`;
+- writes inside `MULTI`;
+- pages past a channel's budget;
+- aliases.
+
+`GEO`, vector range queries, `FT.AGGREGATE`, `WITHSCORES` and full text, and
+redisvl's upsert script, are left to ADRs of their own. `-LOADING` stays
+visible as ADR-0017 D3 has it. The three suites (Verification, below)
+measured each item. Two measurements change what is worth building, and the
+suites found a fifth item, the flush. Each part below is its own choice.
+
+### 1. A page of results larger than a channel's budget (recommended)
+
+- **What fails.** `FT.SEARCH` reads each result back over its one channel,
+  and refuses a page that does not fit: about 250 results at the default
+  `--family-budget` of 256. redisvl's `clear()` and `paginate()` ask for
+  pages of 500, so `clear()` fails on any index of more than about 250
+  documents.
+- **Why not more channels.** The proxy mints one single-use grant per
+  family command (ADR-0010 D2), so one `FT.SEARCH` has one channel.
+- **The change.** The proxy sizes `FT.SEARCH`'s grant to its page: the
+  commands its results need plus a margin, at least `--family-budget`, and
+  at most what 10,000 results need. Its deadline grows with it, by the same
+  share. A page past 10,000 is refused with today's error. RediSearch's own
+  default ceiling is far higher (`MAXSEARCHRESULTS`), but the largest page
+  the suites ask for is 500.
+- **Rollout.** Proxy only: a co-processor of either release uses the budget
+  it is given. A proxy before it refuses as today.
+
+### 2. Writes inside `MULTI` (recommended: not built)
+
+- **What fails.** redisvl's `expire_keys` sends its `EXPIRE`s as one
+  transaction, and langchain-redis's chat history `clear()` its `DEL`s. The
+  node refuses a write under an indexed prefix at queue time.
+- **What building it would fix.** None of the suites' failing transactions.
+  Every one names keys in different slots (`rvl:1`, `rvl:2`), which a
+  transaction through the proxy refuses with `CROSSSLOT` whether or not the
+  keys are indexed (`docs/command-support.md`). Serving indexed writes in a
+  one-slot transaction would need the co-processor to run `MULTI` over its
+  channel under every key's lock. That is real work for a case the
+  frameworks do not send.
+- **Instead:** document the case in `docs/command-support.md`, beside
+  `CROSSSLOT`.
+
+### 3. `MODULE LIST` (recommended: answer it when `FT.` is served)
+
+- **What reads it.** redisvl reads it only to decide whether SVS-VAMANA
+  indexes exist (`search` at 20810 or later). Its test suite reads it to
+  skip what an older module lacks. langchain-redis and LlamaIndex do not
+  read it.
+- **The change.** When the proxy declares an `FT.` family, `MODULE LIST`
+  answers one module, `search` at version 20600: the RediSearch whose
+  `FT.SEARCH` dialect 2 and vector fields the frameworks require
+  (redisvl's `DEFAULT_REQUIRED_MODULES`). It is below 20810, so redisvl does
+  not try SVS-VAMANA, which is not served. Without an `FT.` family it stays
+  an unknown command.
+- **The risk.** A client that reads a version as a promise of every feature
+  of that version would try what is not served, such as `GEO`. It is then
+  refused by name, as today.
+
+### 4. Aliases (recommended)
+
+- `FT.ALIASADD`, `FT.ALIASUPDATE` and `FT.ALIASDEL`, and an alias accepted
+  wherever an index name is (`FT.SEARCH`, `FT.INFO`, `FT.DROPINDEX`).
+- An alias is a durable row of the index list's kind, in the namespace, and
+  is rebuilt with it. `FT.DROPINDEX` removes its aliases, as RediSearch does.
+- One suite test needs it. It is cheap, and an alias is how a schema changes
+  without the clients changing: build the new index, then move the alias.
+
+### 5. A flush drops the namespace's indexes (found by the suites; recommended)
+
+- **What fails.** `FLUSHALL` and `FLUSHDB` are refused in a namespace with an
+  index (As built, below). RediSearch frees every index when a flush starts
+  (its `onFlush`), and langchain-redis's and redisvl's suites flush between
+  tests.
+- **The change.**
+  - The node lets a tenant's flush through when the namespace has
+    prefixes, and the flush deletes the namespace's
+    `\x00flintidx\x00<ns>` row with its keys. The row is outside the
+    namespace, so the flush names it. Its delete replicates as the row's
+    writes do.
+  - After the flush, the proxy's FLINTNSDROP (BUG-0268) makes the
+    co-processor forget the namespace's indexes with its sets.
+  - A write under a dropped prefix that the proxy still sends through the
+    co-processor, for up to its 10 minutes, is written through
+    unindexed.
+- **Rollout.** A node before it refuses the flush with `-INDEXED`, as today,
+  so a mixed pair refuses rather than half-flushing.
+
+### 6. Results that tie come in write order (found by the suites; recommended)
+
+- **What differs.** RediSearch orders results that tie, on distance or on a
+  `SORTBY` value, and results with no order asked for, by its internal
+  document ids, which it assigns at each write. Flint orders them by key.
+  LlamaIndex's test embeds every text as the same vector (`MockEmbedding`,
+  `[0.5] * dim`) and expects the
+  first document written. It passes on Flint only when the keys, which are
+  random, happen to sort that way.
+- **The change.** Each document carries the sequence number of its last
+  write, and ties are broken by it, as RediSearch's document ids break
+  them. For a KNN, the k-th place among ties goes to the earliest write on a
+  `FLAT` index. On `HNSW` the walk decides which tied documents are found at
+  all, as in RediSearch.
+- **Cost:** 8 bytes per document. A rebuild assigns numbers in the order it
+  reads the documents, as RediSearch's reload assigns new ids.
+
 ## As built, release N (2026-10-19)
 
 Branch `adr0060-ft`, held by `coproc_ft_drill`. Two pairs, a proxy and
@@ -300,7 +410,7 @@ Branch `adr0060-ft`, held by `coproc_ft_drill`. Two pairs, a proxy and
 - **Known differences from RediSearch, to check against the clients' own
   tests** (the downloads are still Jeff's to approve):
   - an exact phrase keeps its stop words;
-  - replies are RESP2's shape only;
+  - replies were RESP2's shape only (RESP3's added from redisvl's suite, below);
   - L2 distances are squared;
   - the missing-index errors are `Unknown index name` (`FT.INFO`),
     `Unknown Index name` (`FT.DROPINDEX`) and `<index>: no such index`
@@ -391,6 +501,66 @@ it answers what the tests expect.
   which redis-py does not retry. ADR-0017 D3 makes warming visible on
   purpose, and `coproc_vec_drill` holds it so. A proxy that retried for a few
   seconds would hide it from the frameworks, which do not retry.
+
+## Verification against langchain-redis's and LlamaIndex's suites, 2026-10-20
+
+Downloads approved by Jeff (2026-10-20): their tests from GitHub, one file at
+a time, and their packages and test dependencies from PyPI, each in a fresh
+Python 3.14 virtualenv. Both packages declare Python below 3.14, so they
+were installed with `--ignore-requires-python`.
+- **langchain-redis:** the tests at tag `libs/redis/v0.2.6` (110f379b, 28
+  files). The package is 0.2.6, with redisvl 0.28.0 and redis-py 8.1.0, so
+  RESP3.
+- **LlamaIndex:** `llama-index-vector-stores-redis`'s tests from
+  llama_index's main (619d7466, 3 files, unchanged since March). The package
+  is 0.9.0, with redisvl 0.4.1 and redis-py 5.3.1, so RESP2.
+
+The run:
+- **The fleet:** the one redisvl's suite used.
+- **Changed:** only how the tests reach it. langchain-redis reads
+  `REDIS_URL`. LlamaIndex's conftest started a Docker container, and now
+  connects to the fleet.
+- **Left out:** langchain-redis's LangCache file, which needs that service,
+  and its unit tests, which mock Redis.
+
+| suite | passed | failed | errors |
+|---|---|---|---|
+| langchain-redis's integration tests, as built | 124 | 57 | 23 |
+| LlamaIndex's | 18 | 1 | 0 |
+
+**One wrong answer, fixed.** A JSON TAG field ignored a declared
+`SEPARATOR`. langchain-redis declares `|` and writes `"category": "a|b"`, so
+`@category:{a}` matched nothing, in 8 tests. RediSearch gives a JSON TAG no
+separator unless one is declared (`TAG_FIELD_DEFAULT_JSON_SEP` is none), and
+splits each string, and each element of an array, on a declared one. Flint
+now does the same, and `FT.INFO` answers a JSON TAG's absent separator as
+`""`, as RediSearch does.
+
+**A fault in released code:** BUG-0269. Each indexed write, like each
+`VEC.SET`, dials its own channel, and the co-processor's closes left one
+TIME_WAIT socket per write. The suite's pipelined loads ran the laptop out of
+ephemeral ports in 20 seconds, and 14 tests failed `COPROCUNAVAIL` or
+`Errno 49`.
+
+**The rest:**
+- **A cascade, 42 of the chat history's 44 failures, from langchain-redis's
+  own parsing.** Its chat history reads `FT.INFO`'s `index_definition` as a
+  flat list (`.index("prefixes")`). Under RESP3, RediSearch answers it as a
+  map (`RedisModule_ReplyKV_Map` in its `info_command.c`), as Flint does, and
+  redis-py 8's default adapter leaves the map in place. So the second
+  history on one index fails, against Redis as against Flint, and its test
+  leaves the index behind for every later setup to fail on.
+  - Over RESP2 (`?protocol=2`) the same file passes 47 of 54. Six of the
+    rest need `WITHSCORES` (its `search_messages`), and one a page past the
+    channel's budget (amendment 3, part 1).
+- **`CROSSSLOT`:** langchain-redis's cache `clear()` deletes its keys in one
+  transaction across slots, which the proxy refuses
+  (`docs/command-support.md`).
+- **A flush is refused** in a namespace with an index. Amendment 3, part 5.
+- **Ties come in key order,** not write order: LlamaIndex's one failure,
+  flaky between runs. Amendment 3, part 6.
+- **Not served,** for later ADRs: vector range queries (8 tests), fuzzy and
+  prefix text terms (4), `GEO` (3), `WITHSCORES` (1).
 
 ## Verification
 
