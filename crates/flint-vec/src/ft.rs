@@ -43,7 +43,8 @@ pub struct Attr {
     pub field: Field,
     /// Where it is in a document: a HASH field, or a JSON path.
     pub path: Box<str>,
-    /// A HASH TAG's separator (`,` unless `SEPARATOR` says otherwise).
+    /// A TAG's separator: `,` on a HASH index and none (0) on a JSON one,
+    /// unless `SEPARATOR` says otherwise, as in RediSearch.
     pub separator: u8,
     /// `NOINDEX`: returned and sortable, but not filtered on.
     pub noindex: bool,
@@ -434,7 +435,10 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                 ));
             }
         };
-        let (mut separator, mut noindex) = (b',', false);
+        // RediSearch splits a JSON TAG's strings only on a declared
+        // separator (`TAG_FIELD_DEFAULT_JSON_SEP` is none).
+        let mut separator = if on == On::Json { 0 } else { b',' };
+        let mut noindex = false;
         let (mut flags, mut weight): (Vec<Box<str>>, Option<Box<str>>) = (Vec::new(), None);
         // The field's options, up to the next field: a word that is none of
         // them starts the next field.

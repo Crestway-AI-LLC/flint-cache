@@ -334,7 +334,7 @@ impl FtIndex {
             .def
             .attrs
             .iter()
-            .map(|a| json_val(a.field.kind, json_at(doc, &a.path)))
+            .map(|a| json_val(a.field.kind, a.separator, json_at(doc, &a.path)))
             .collect();
         let vector = match &self.def.vector {
             None => Ok(None),
@@ -358,27 +358,13 @@ fn json_at<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
 /// A JSON attribute's value: a TAG from a string or an array of strings, a
 /// NUMERIC from a number, a TEXT from a string. Anything else is missing,
 /// as RediSearch indexes nothing for it.
-fn json_val(kind: FieldKind, v: Option<&Value>) -> Val {
+fn json_val(kind: FieldKind, separator: u8, v: Option<&Value>) -> Val {
     match (kind, v) {
         (FieldKind::Tag | FieldKind::FoldedTag, Some(Value::String(s))) => {
-            filter::hash_val(kind, s.as_bytes(), 0)
+            json_tags(kind, separator, std::iter::once(s.as_str()))
         }
         (FieldKind::Tag | FieldKind::FoldedTag, Some(Value::Array(a))) => {
-            let mut ts: Vec<Box<[u8]>> = a
-                .iter()
-                .filter_map(|x| x.as_str())
-                .map(|s| match kind {
-                    FieldKind::FoldedTag => filter::fold(s.as_bytes()),
-                    _ => s.as_bytes().into(),
-                })
-                .collect();
-            ts.sort();
-            ts.dedup();
-            if ts.is_empty() {
-                Val::Missing
-            } else {
-                Val::Tags(ts.into_boxed_slice())
-            }
+            json_tags(kind, separator, a.iter().filter_map(|x| x.as_str()))
         }
         (FieldKind::Numeric, Some(Value::Number(n))) => match n.as_f64() {
             Some(x) => Val::Num(if x == 0.0 { 0.0 } else { x }),
@@ -386,6 +372,31 @@ fn json_val(kind: FieldKind, v: Option<&Value>) -> Val {
         },
         (FieldKind::Text, Some(Value::String(s))) => filter::hash_val(kind, s.as_bytes(), 0),
         _ => Val::Missing,
+    }
+}
+
+/// A JSON TAG's strings as RediSearch reads them: each whole, unless the
+/// field declared a separator, which splits each as a HASH field's is split.
+fn json_tags<'a>(kind: FieldKind, separator: u8, strs: impl Iterator<Item = &'a str>) -> Val {
+    let mut ts: Vec<Box<[u8]>> = Vec::new();
+    for s in strs {
+        if separator != 0 {
+            if let Val::Tags(t) = filter::hash_val(kind, s.as_bytes(), separator) {
+                ts.extend(t.into_vec());
+            }
+        } else if !s.is_empty() {
+            ts.push(match kind {
+                FieldKind::FoldedTag => filter::fold(s.as_bytes()),
+                _ => s.as_bytes().into(),
+            });
+        }
+    }
+    ts.sort();
+    ts.dedup();
+    if ts.is_empty() {
+        Val::Missing
+    } else {
+        Val::Tags(ts.into_boxed_slice())
     }
 }
 
@@ -728,5 +739,83 @@ mod tests {
         // A HASH where the index reads JSON is not a document of it.
         ix.put(b"j:2", Source::Hash(&[]), None).expect("skipped");
         assert_eq!(ix.len(), 1);
+    }
+
+    /// RediSearch splits a JSON TAG's strings only on a declared separator,
+    /// and then each element of an array too. LangChain declares `|` and
+    /// writes `"a|b"`.
+    #[test]
+    fn a_json_tag_is_split_only_on_a_declared_separator() {
+        let index = |sep: Option<&str>| {
+            let mut args = vec![
+                "FT.CREATE",
+                "j",
+                "ON",
+                "JSON",
+                "PREFIX",
+                "1",
+                "j:",
+                "SCHEMA",
+                "$.c",
+                "AS",
+                "c",
+                "TAG",
+            ];
+            if let Some(s) = sep {
+                args.extend(["SEPARATOR", s]);
+            }
+            args.extend([
+                "$.v",
+                "AS",
+                "v",
+                "VECTOR",
+                "FLAT",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "2",
+                "DISTANCE_METRIC",
+                "L2",
+            ]);
+            let (_, def) = parse_create(&a(&args)).expect("parses");
+            let mut ix = FtIndex::new(def);
+            for (k, d) in [
+                (b"j:1", r#"{"c":"a|b","v":[1,0]}"#),
+                (b"j:2", r#"{"c":["x|Y","z"],"v":[0,1]}"#),
+                (b"j:3", r#"{"c":"a,b","v":[1,1]}"#),
+            ] {
+                let d: Value = serde_json::from_str(d).expect("json");
+                ix.put(k, Source::Json(&d), None).expect("indexed");
+            }
+            ix
+        };
+        let hits = |ix: &FtIndex, tag: &str| {
+            let q = format!("(@c:{{{tag}}})=>[KNN 5 @v $v]");
+            let h = search(ix, &["FT.SEARCH", "j", &q], Some(&[1.0, 0.0]));
+            let mut k = keys(&h);
+            k.sort();
+            k
+        };
+        let piped = index(Some("|"));
+        assert_eq!(piped.def.attrs[0].separator, b'|');
+        assert_eq!(hits(&piped, "a"), ["j:1"]);
+        assert_eq!(hits(&piped, "y"), ["j:2"]);
+        assert_eq!(hits(&piped, "z"), ["j:2"]);
+        let whole = index(None);
+        assert_eq!(whole.def.attrs[0].separator, 0, "JSON's default is none");
+        assert!(hits(&whole, "a").is_empty());
+        assert_eq!(hits(&whole, "z"), ["j:2"]);
+        // A `|` in a query's braces is an OR, so the whole strings are
+        // read here rather than searched for.
+        let tags = |sep: u8, d: &str| {
+            let d: Value = serde_json::from_str(d).expect("json");
+            json_val(FieldKind::FoldedTag, sep, Some(&d))
+        };
+        let t = |xs: &[&str]| Val::Tags(xs.iter().map(|x| x.as_bytes().into()).collect());
+        assert_eq!(tags(0, r#""a|B""#), t(&["a|b"]));
+        assert_eq!(tags(0, r#"["x|y", " z "]"#), t(&[" z ", "x|y"]));
+        assert_eq!(tags(b'|', r#""a,b""#), t(&["a,b"]));
+        assert_eq!(tags(b',', r#"["a, b", "c"]"#), t(&["a", "b", "c"]));
     }
 }

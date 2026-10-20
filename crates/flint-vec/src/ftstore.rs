@@ -521,7 +521,12 @@ impl Store {
                     crate::filter::FieldKind::Tag | crate::filter::FieldKind::FoldedTag
                 ) {
                     v.push(s("SEPARATOR"));
-                    v.push(bulk(&[a.separator]));
+                    // RediSearch answers a JSON TAG's absent one as "".
+                    v.push(bulk(if a.separator == 0 {
+                        &[]
+                    } else {
+                        std::slice::from_ref(&a.separator)
+                    }));
                 }
                 if a.field.kind == crate::filter::FieldKind::Text {
                     v.push(s("WEIGHT"));
