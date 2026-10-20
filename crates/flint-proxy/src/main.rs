@@ -568,6 +568,11 @@ struct Topology {
     /// is NOT a known read or write — takes the family path instead of routing
     /// to a backend; anything unregistered routes exactly as before.
     families: RwLock<Vec<(Vec<u8>, Vec<String>)>>,
+    /// Each namespace's FT index prefixes this proxy has been told of by a
+    /// node's `-INDEXED` (ADR-0060 amendment 2), and when: a write under one
+    /// goes straight to the `FT.` co-processor until [`INDEXED_TTL`] after.
+    /// Correctness never waits on it, since the node refuses what it misses.
+    indexed: RwLock<Learned>,
     /// Co-processor connection pool (ADR-0010 D6): endpoint -> idle connections.
     /// Proxy-GLOBAL and shared across clients — a co-processor connection carries
     /// no per-tenant state (the namespace rides the channel token, not the
@@ -598,7 +603,59 @@ struct Topology {
     family_deadline: Duration,
 }
 
+/// Each namespace's learned FT index prefixes, and when each was learned.
+type Learned = HashMap<Vec<u8>, Vec<(Vec<u8>, Instant)>>;
+
+/// How long a prefix a node answered `-INDEXED` for is sent straight to the
+/// `FT.` co-processor before a write under it is tried on its pair again
+/// (ADR-0060 amendment 2). A dropped index's prefix stops costing the extra
+/// hop after this, and a live one is learned again at its next write.
+const INDEXED_TTL: Duration = Duration::from_secs(600);
+
+/// The prefix a node's `-INDEXED <hex> ...` names.
+fn indexed_prefix(e: &str) -> Option<Vec<u8>> {
+    let hex = e.strip_prefix("INDEXED ")?.split(' ').next()?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 impl Topology {
+    /// Remember that `ns` has an FT index over `prefix`.
+    fn learn_indexed(&self, ns: &[u8], prefix: Vec<u8>) {
+        let Ok(mut m) = self.indexed.write() else {
+            return;
+        };
+        let now = Instant::now();
+        let ps = m.entry(ns.to_vec()).or_default();
+        ps.retain(|(p, at)| *p != prefix && now.duration_since(*at) < INDEXED_TTL);
+        ps.push((prefix, now));
+    }
+
+    /// Whether `args`, a write, writes a key under a prefix `ns` is known to
+    /// have an FT index over.
+    fn indexed_covers(&self, ns: &[u8], args: &[Vec<u8>]) -> bool {
+        let Ok(m) = self.indexed.read() else {
+            return false;
+        };
+        let Some(ps) = m.get(ns) else {
+            return false;
+        };
+        let now = Instant::now();
+        let under = |k: &[u8]| {
+            ps.iter()
+                .any(|(p, at)| now.duration_since(*at) < INDEXED_TTL && k.starts_with(p))
+        };
+        match flint_commands::written_keys(args) {
+            Some(flint_commands::Written::Keys(ks)) => ks.iter().any(|k| under(k)),
+            _ => false,
+        }
+    }
+
     /// True if `name` matches a registered family prefix (ADR-0010 D1).
     /// Case-insensitive on the name, since the wire is. Callers gate this
     /// behind "not a known read/write" so the resolution order holds:
@@ -3681,13 +3738,30 @@ const FAMILY_CHANNEL_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// command earns from the master (reading one as the other is how an outage is
 /// misdiagnosed, D3).
 async fn family_command(topo: &Arc<Topology>, ns: &[u8], args: &[Vec<u8>]) -> Value {
+    let Some(name) = args.first() else {
+        return Value::Error(
+            "COPROCUNAVAIL no co-processor is available for this command family".into(),
+        );
+    };
+    family_command_for(topo, ns, args, name).await
+}
+
+/// `family_command`, sent to the co-processor of the family `family` names
+/// rather than `args[0]`'s: a data write under an FT index's prefix goes to
+/// the `FT.` co-processor (ADR-0060).
+async fn family_command_for(
+    topo: &Arc<Topology>,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    family: &[u8],
+) -> Value {
     let unavail = || {
         Value::Error("COPROCUNAVAIL no co-processor is available for this command family".into())
     };
     let Some(name) = args.first() else {
         return unavail();
     };
-    let endpoints = topo.family_endpoints(name);
+    let endpoints = topo.family_endpoints(family);
     if endpoints.is_empty() {
         return unavail();
     }
@@ -4133,6 +4207,53 @@ async fn data_command(
     prefetch: Prefetch,
     idle: &mut dyn Idle,
 ) -> Value {
+    let in_txn = txn.open;
+    let reply = data_command_inner(
+        topo,
+        backends,
+        txn,
+        ns,
+        args,
+        raw,
+        replica_reads,
+        local_cache,
+        async_writes,
+        is_channel,
+        prefetch,
+        idle,
+    )
+    .await;
+    // ADR-0060 amendment 2: a node refused the write as under an FT index's
+    // prefix, so it wrote nothing. Learn the prefix, and send this write,
+    // and the ones after it, through the FT co-processor, as a proxy that
+    // gets -MOVED learns the new owner.
+    if !is_channel
+        && !in_txn
+        && let Value::Error(e) = &reply
+        && let Some(prefix) = indexed_prefix(e)
+        && topo.family_registered(b"FT.")
+    {
+        topo.learn_indexed(ns, prefix);
+        return family_command_for(topo, ns, args, b"FT.").await;
+    }
+    reply
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn data_command_inner(
+    topo: &Arc<Topology>,
+    backends: &mut Option<Backends>,
+    txn: &mut ProxyTxn,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+    replica_reads: bool,
+    local_cache: bool,
+    async_writes: bool,
+    is_channel: bool,
+    prefetch: Prefetch,
+    idle: &mut dyn Idle,
+) -> Value {
     // Decisions the prefetch pass already took are final — re-running the
     // quota gate here would charge the tenant's bucket twice for one command.
     let prefetched = match prefetch {
@@ -4241,6 +4362,17 @@ async fn data_command(
             );
         }
         return family_command(topo, ns, args).await;
+    }
+    // ADR-0060 amendment 2: a write under a prefix a node has said is an FT
+    // index's goes to the FT co-processor, which writes it and indexes it.
+    // Not inside a transaction, which the node refuses whole instead.
+    if is_write
+        && !is_channel
+        && !txn.open
+        && topo.indexed_covers(ns, args)
+        && topo.family_registered(b"FT.")
+    {
+        return family_command_for(topo, ns, args, b"FT.").await;
     }
     // M5 quota gate: a shed command must not touch the cache, a backend, or
     // the bucket-bypassing fast paths. Only data commands are charged
@@ -5571,6 +5703,28 @@ async fn handle(
             };
             info_reply(&args[1..], &build_version(), policy)
         }
+        // ADR-0060 amendment 2: a co-processor's channel sets its
+        // namespace's FT index prefixes on every master, and fails if any
+        // pair cannot be reached. The proxy writes the FLINTINDEXED itself;
+        // no client's bytes reach a node as FLINT*.
+        b"PROXYINDEXED" => {
+            if !backends.channel {
+                return Value::Error("ERR PROXYINDEXED is a co-processor channel's command".into());
+            }
+            let mut parts: Vec<&[u8]> = vec![b"FLINTINDEXED"];
+            parts.extend(args[1..].iter().map(|a| a.as_slice()));
+            let frame = encode_cmd(&parts);
+            fan_out(topo, backends, &frame, |replies| {
+                replies
+                    .into_iter()
+                    .find(|r| !matches!(r, Value::Simple(s) if s == "OK"))
+                    .map_or(Value::Simple("OK".into()), |r| match r {
+                        e @ Value::Error(_) => e,
+                        other => Value::Error(format!("ERR FLINTINDEXED answered {other:?}")),
+                    })
+            })
+            .await
+        }
         // The data-plane admin surface stays internal; the proxy is the
         // tenant boundary.
         _ if upper.starts_with(b"FLINT") => {
@@ -6133,6 +6287,7 @@ fn main() -> std::io::Result<()> {
         last_promote_hint: RwLock::new(String::new()),
         channel_tokens: std::sync::Mutex::new(HashMap::new()),
         families: RwLock::new(parse_families(&arg("--families").unwrap_or_default())),
+        indexed: RwLock::new(HashMap::new()),
         coproc_pool: std::sync::Mutex::new(HashMap::new()),
         edge_advertise: arg("--edge-advertise"),
         coproc_inflight: std::sync::atomic::AtomicUsize::new(0),
@@ -6803,6 +6958,7 @@ mod route_tests {
             last_promote_hint: RwLock::new(String::new()),
             channel_tokens: std::sync::Mutex::new(HashMap::new()),
             families: RwLock::new(Vec::new()),
+            indexed: RwLock::new(HashMap::new()),
             coproc_pool: std::sync::Mutex::new(HashMap::new()),
             edge_advertise: None,
             coproc_inflight: std::sync::atomic::AtomicUsize::new(0),

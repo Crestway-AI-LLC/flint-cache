@@ -411,6 +411,94 @@ pub fn is_write_command(name: &[u8]) -> bool {
     )
 }
 
+/// What a write command may write, for a node's guard over an FT index's
+/// prefixes (ADR-0060's amendments). It must be a superset: a key left out
+/// here is a write the index misses with nothing said, and one too many is
+/// a write refused out loud.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Written<'a> {
+    /// These keys.
+    Keys(Vec<&'a [u8]>),
+    /// Every key of the namespace: `FLUSHALL`, `FLUSHDB`.
+    All,
+    /// A script's declared keys. Its commands' rows are checked again as
+    /// they are written, since a script may build a key it never declared.
+    Script(Vec<&'a [u8]>),
+}
+
+/// The keys `args` may write, or `None` for a command that is not a write
+/// ([`is_write_command`]).
+pub fn written_keys(args: &[Vec<u8>]) -> Option<Written<'_>> {
+    let name = args.first()?;
+    if !is_write_command(name) {
+        return None;
+    }
+    let all = |from: usize| {
+        args.get(from..)
+            .unwrap_or_default()
+            .iter()
+            .map(|k| k.as_slice())
+    };
+    let every = |from: usize, step: usize| {
+        args.get(from..)
+            .unwrap_or_default()
+            .iter()
+            .step_by(step)
+            .map(|k| k.as_slice())
+            .collect::<Vec<_>>()
+    };
+    let counted = |at: usize| -> Vec<&[u8]> {
+        let n = args
+            .get(at)
+            .and_then(|c| std::str::from_utf8(c).ok())
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        all(at + 1).take(n).collect()
+    };
+    Some(Written::Keys(match name.to_ascii_uppercase().as_slice() {
+        b"FLUSHALL" | b"FLUSHDB" => return Some(Written::All),
+        b"EVAL" | b"EVALSHA" => {
+            return Some(Written::Script(
+                eval_keys(args)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|k| k.as_slice())
+                    .collect(),
+            ));
+        }
+        // Every argument a key.
+        b"DEL" | b"UNLINK" | b"PFCOUNT" => all(1).collect(),
+        // Keys and values in turn.
+        b"MSET" => every(1, 2),
+        // Key, path, value.
+        b"JSON.MSET" => every(1, 3),
+        // Two keys, both written.
+        b"RENAME" | b"RENAMENX" | b"COPY" | b"SMOVE" | b"LMOVE" | b"BLMOVE" | b"RPOPLPUSH"
+        | b"BRPOPLPUSH" => all(1).take(2).collect(),
+        // Keys, then a timeout.
+        b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" => {
+            all(1).take(args.len().saturating_sub(2)).collect()
+        }
+        // A count, then keys; or a timeout, a count, then keys.
+        b"LMPOP" | b"ZMPOP" => counted(1),
+        b"BLMPOP" | b"BZMPOP" => counted(2),
+        // The destination; its operator comes first.
+        b"BITOP" => all(2).take(1).collect(),
+        // What its STORE or STOREDIST options name.
+        b"GEORADIUS" | b"GEORADIUSBYMEMBER" => georadius_store_keys(args),
+        // A group's state on each stream it reads.
+        b"XREADGROUP" | b"FLINTXREADGROUP" => xreadgroup_keys(args)
+            .unwrap_or_default()
+            .iter()
+            .map(|k| k.as_slice())
+            .collect(),
+        b"XGROUP" => subcommand_key(args).flatten().into_iter().collect(),
+        // Every other write writes its first argument, the *STORE commands
+        // their destination among them.
+        _ => all(1).take(1).collect(),
+    }))
+}
+
 /// The keys an `EVAL` or `EVALSHA` names (`KEYS[...]`), or `None` when the
 /// command is neither or its key count is malformed (ADR-0050, ADR-0051).
 /// A script's keys are what it routes by, locks, and may touch; `args[1]`
@@ -524,6 +612,82 @@ pub fn is_read_command(name: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn written_keys_names_every_key_a_write_writes() {
+        let a = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+        };
+        let keys = |parts: &[&str]| -> Option<Vec<String>> {
+            let args = a(parts);
+            match written_keys(&args)? {
+                Written::Keys(ks) | Written::Script(ks) => Some(
+                    ks.iter()
+                        .map(|k| String::from_utf8_lossy(k).into_owned())
+                        .collect(),
+                ),
+                Written::All => Some(vec!["*".into()]),
+            }
+        };
+        let k = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(keys(&["GET", "a"]), None, "a read writes nothing");
+        assert_eq!(
+            keys(&["SET", "a", "doc:1"]),
+            k(&["a"]),
+            "a value is not a key"
+        );
+        assert_eq!(keys(&["HSET", "doc:1", "f", "v"]), k(&["doc:1"]));
+        assert_eq!(keys(&["DEL", "a", "doc:1"]), k(&["a", "doc:1"]));
+        assert_eq!(
+            keys(&["MSET", "a", "doc:x", "doc:1", "v"]),
+            k(&["a", "doc:1"])
+        );
+        assert_eq!(
+            keys(&["JSON.MSET", "a", "$", "{}", "doc:1", "$", "{}"]),
+            k(&["a", "doc:1"])
+        );
+        assert_eq!(keys(&["RENAME", "a", "doc:1"]), k(&["a", "doc:1"]));
+        assert_eq!(keys(&["COPY", "a", "doc:1", "REPLACE"]), k(&["a", "doc:1"]));
+        assert_eq!(keys(&["BLPOP", "a", "doc:1", "0"]), k(&["a", "doc:1"]));
+        assert_eq!(
+            keys(&["LMPOP", "2", "a", "doc:1", "LEFT"]),
+            k(&["a", "doc:1"])
+        );
+        assert_eq!(
+            keys(&["BZMPOP", "1", "2", "a", "doc:1", "MIN"]),
+            k(&["a", "doc:1"])
+        );
+        assert_eq!(keys(&["BITOP", "AND", "doc:1", "a", "b"]), k(&["doc:1"]));
+        assert_eq!(keys(&["SUNIONSTORE", "doc:1", "a", "b"]), k(&["doc:1"]));
+        assert_eq!(
+            keys(&["GEORADIUS", "g", "1", "2", "3", "km", "STORE", "doc:1"]),
+            k(&["doc:1"])
+        );
+        assert_eq!(
+            keys(&[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "STREAMS",
+                "a",
+                "doc:1",
+                ">",
+                ">"
+            ]),
+            k(&["a", "doc:1"])
+        );
+        assert_eq!(
+            keys(&["XGROUP", "CREATE", "doc:1", "g", "$"]),
+            k(&["doc:1"])
+        );
+        assert_eq!(
+            keys(&["EVAL", "return 1", "1", "doc:1", "arg"]),
+            k(&["doc:1"])
+        );
+        assert_eq!(keys(&["FLUSHDB"]), k(&["*"]));
+        assert_eq!(keys(&["JSON.SET", "doc:1", "$", "{}"]), k(&["doc:1"]));
+    }
+
     use super::*;
 
     #[test]

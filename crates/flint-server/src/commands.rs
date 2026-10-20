@@ -373,6 +373,10 @@ pub struct Dispatcher<'a> {
     /// process's. A probing dispatcher answers as it would and leaves both
     /// alone (BUG-0254).
     probing: bool,
+    /// The namespace's FT index prefixes on this node, for a connection that
+    /// is not a co-processor's channel (ADR-0060 amendment 2): a script's
+    /// write under one is refused at the row.
+    indexed: Option<crate::indexed::Prefixes>,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -407,7 +411,15 @@ impl<'a> Dispatcher<'a> {
             wants_every_writer: std::cell::Cell::new(false),
             whole: false,
             probing: false,
+            indexed: None,
         }
+    }
+
+    /// The namespace's FT index prefixes a script may not write under: see
+    /// `indexed`.
+    pub fn indexed(mut self, prefixes: Option<crate::indexed::Prefixes>) -> Self {
+        self.indexed = prefixes;
+        self
     }
 
     /// Make this dispatcher a probe: see `probing`.
@@ -2170,7 +2182,8 @@ impl<'a> Dispatcher<'a> {
                 let guard =
                     crate::script::KeyGuard::new(&overlay, &self.ns, &declared, self.every_writer)
                         .whole(self.whole)
-                        .reserved(self.limits.reserve_coproc_rows);
+                        .reserved(self.limits.reserve_coproc_rows)
+                        .indexed(self.indexed.clone());
                 let reply = Dispatcher::with_limits(&guard, self.clock, self.limits, &self.ns)
                     .dispatch(cmd);
                 (reply, guard.strayed())

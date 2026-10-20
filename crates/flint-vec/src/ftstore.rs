@@ -16,9 +16,13 @@ use flint_resp::Value;
 use serde_json::Value as Json;
 use std::sync::atomic::Ordering::Relaxed;
 
-/// The refusal while the co-processor runs without `--ft`: the release that
-/// brings `FT.*` serves it only when asked to (ADR-0060, two releases).
-pub const FT_OFF: &str = "ERR FT.* is not enabled on this co-processor: it needs --ft (ADR-0060)";
+/// `FT.CREATE`'s refusal while the co-processor runs without `--ft`: the
+/// release that brings `FT.*` makes an index only when asked to (ADR-0060,
+/// two releases). An index made while it was on is still served, so it can
+/// be searched, written and dropped, and its prefixes are never left
+/// guarding writes no one serves.
+pub const FT_OFF: &str =
+    "ERR FT.* is not enabled on this co-processor: FT.CREATE needs --ft (ADR-0060)";
 
 /// The durable list of a namespace's index names (`kind = b'f'`).
 pub fn ft_list_key() -> Vec<u8> {
@@ -148,8 +152,8 @@ fn int(n: usize) -> Value {
 }
 
 impl Store {
-    /// Serve `FT.*` (ADR-0060). Off for a bare `Store`; the binary turns it
-    /// on with `--ft`.
+    /// Make `FT.*` indexes (ADR-0060). Off for a bare `Store`; the binary
+    /// turns it on with `--ft`. Off, only `FT.CREATE` is refused.
     pub fn set_ft(&mut self, on: bool) {
         self.ft_on = on;
     }
@@ -204,13 +208,11 @@ impl Store {
 
     /// Plan one `FT.*` command or routed write. `args[0]` is its name.
     pub fn plan_ft(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> FtPlan {
-        if !self.ft_on {
-            return FtPlan::Reply(err(FT_OFF));
-        }
         let Some(name) = args.first() else {
             return FtPlan::Reply(err("ERR empty command"));
         };
         match name.to_ascii_uppercase().as_slice() {
+            b"FT.CREATE" if !self.ft_on => FtPlan::Reply(err(FT_OFF)),
             b"FT.CREATE" => self.plan_ft_create(ns, args),
             b"FT.SEARCH" => self.plan_ft_search(ns, args, now),
             b"FT.DROPINDEX" => self.plan_ft_drop(ns, args),
@@ -733,10 +735,29 @@ mod tests {
     }
 
     #[test]
-    fn ft_is_refused_until_the_co_processor_is_started_with_it() {
-        let s = Store::new();
-        let e = reply_err(s.plan_ft(b"ns", &a(&["FT._LIST"]), 0));
+    fn an_index_is_made_only_with_ft_and_served_either_way() {
+        let mut s = store();
+        create(&mut s, &["FT.CREATE", "i", "PREFIX", "1", "p:", "SCHEMA", "a", "TAG"]);
+        s.set_ft(false);
+        let e = reply_err(s.plan_ft(
+            b"ns",
+            &a(&["FT.CREATE", "j", "PREFIX", "1", "q:", "SCHEMA", "a", "TAG"]),
+            0,
+        ));
         assert!(e.contains("--ft"), "{e}");
+        // The one made while it was on is still searched, written and dropped.
+        assert!(matches!(
+            s.plan_ft(b"ns", &a(&["FT.SEARCH", "i", "*"]), 0),
+            FtPlan::Search(_)
+        ));
+        assert!(matches!(
+            s.plan_ft(b"ns", &a(&["HSET", "p:1", "a", "x"]), 0),
+            FtPlan::Write(_)
+        ));
+        assert!(matches!(
+            s.plan_ft(b"ns", &a(&["FT.DROPINDEX", "i"]), 0),
+            FtPlan::Drop { .. }
+        ));
     }
 
     #[test]

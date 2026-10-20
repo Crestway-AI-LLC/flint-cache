@@ -14,6 +14,7 @@ mod commands;
 mod diskguard;
 mod glob;
 mod heat;
+mod indexed;
 mod json_path;
 mod migrate;
 mod pubsub;
@@ -2996,6 +2997,10 @@ fn main() -> std::io::Result<()> {
         store,
         Arc::clone(&watch),
     ));
+    // ADR-0060 amendment 2: every namespace's FT index prefixes on this
+    // node, read here and again on promotion.
+    let indexed = Arc::new(indexed::Indexed::default());
+    indexed.load(store.as_ref());
 
     // RPO knobs: --lag-soft-ms delays writes, --lag-hard-ms sheds them.
     // The hard cap is the advertised worst-case failover RPO (per-tenant
@@ -3691,6 +3696,7 @@ fn main() -> std::io::Result<()> {
         let migration_active = Arc::clone(&migration_active);
         let write_queue = write_queue.clone();
         let watch = Arc::clone(&watch);
+        let indexed = Arc::clone(&indexed);
         // Snapshot the CURRENT leaf per connection — a hot-reload between
         // connections is picked up here (ADR-0006 D4).
         let internal_tls = internal_reload.as_ref().and_then(|r| r.current());
@@ -3738,6 +3744,7 @@ fn main() -> std::io::Result<()> {
                 limits,
                 write_queue.as_ref(),
                 &watch,
+                &indexed,
             );
         });
     }
@@ -4291,6 +4298,7 @@ fn serve(
     limits: commands::Limits,
     write_queue: Option<&Arc<write_queue::WriteQueue>>,
     watch: &Arc<flint_storage::watch::WatchTable>,
+    indexed: &Arc<indexed::Indexed>,
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = prefix;
     buf.reserve(16 * 1024);
@@ -4390,6 +4398,7 @@ fn serve(
                         &mut conn_proto,
                         &mut conn_txn,
                         watch,
+                        indexed,
                         &args,
                         None,
                     ),
@@ -4520,6 +4529,7 @@ fn serve(
                             &mut conn_proto,
                             &mut conn_txn,
                             watch,
+                            indexed,
                             &args,
                             Some(&b.kv),
                         );
@@ -4578,6 +4588,7 @@ fn serve(
                             &mut conn_proto,
                             &mut conn_txn,
                             watch,
+                            indexed,
                             &args,
                             None,
                         ),
@@ -4713,6 +4724,7 @@ fn transaction_control(
     conn_ns: &[u8],
     conn_txn: &mut TxnState,
     watch: &Arc<flint_storage::watch::WatchTable>,
+    guarded: Option<&indexed::Prefixes>,
     args: &[Vec<u8>],
 ) -> Option<Value> {
     let name = args
@@ -4822,6 +4834,7 @@ fn transaction_control(
                 watch,
                 txn,
                 conn_txn.whole,
+                guarded,
             ));
         }
         _ => {}
@@ -5222,6 +5235,7 @@ fn exec_transaction(
     watch: &flint_storage::watch::WatchTable,
     txn: Txn,
     whole: bool,
+    guarded: Option<&indexed::Prefixes>,
 ) -> Value {
     if txn.queued.is_empty() {
         return Value::Array(Some(Vec::new()));
@@ -5280,6 +5294,7 @@ fn exec_transaction(
                 // or in any slot for a placed tenant (ADR-0053).
                 .holding_every_writer(true)
                 .whole(whole)
+                .indexed(guarded.cloned())
                 .dispatch(cmd),
             );
         }
@@ -5636,6 +5651,7 @@ fn execute(
     conn_proto: &mut flint_resp::Proto,
     conn_txn: &mut TxnState,
     watch: &Arc<flint_storage::watch::WatchTable>,
+    indexed: &Arc<indexed::Indexed>,
     args: &[Vec<u8>],
     batch_kv: Option<&dyn Kv>,
 ) -> Value {
@@ -5737,6 +5753,64 @@ fn execute(
         }
         return Value::Error(script::RESERVED_REFUSAL.into());
     }
+    // FLINTINDEXED <prefix>... (ADR-0060 amendment 2): make these the
+    // namespace's FT index prefixes on this node. From a co-processor's
+    // channel only, which is what writes the keys under them; the proxy fans
+    // it out to every master. None clears them.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTINDEXED"))
+    {
+        if !conn_txn.channel {
+            return Value::Error("ERR FLINTINDEXED is a co-processor channel's command".into());
+        }
+        if read_only.load(Ordering::Relaxed) {
+            return Value::Error("READONLY You can't write against a read only replica.".into());
+        }
+        if args[1..].iter().any(|p| p.is_empty()) {
+            return Value::Error("ERR FLINTINDEXED takes non-empty prefixes".into());
+        }
+        indexed.set(store, conn_ns, args[1..].to_vec());
+        return Value::Simple("OK".into());
+    }
+    // FLINTINDEXEDROW <ns>: that namespace's row as stored, or nil, for a
+    // slot move's destination to install before it takes the slot's first
+    // key (ADR-0060 amendment 2). A node-to-node read.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTINDEXEDROW"))
+    {
+        let [_, ns] = args else {
+            return Value::Error("ERR FLINTINDEXEDROW <namespace>".into());
+        };
+        return Value::Bulk(indexed::Indexed::row(store, ns));
+    }
+    // A write under one of them, from anything but a channel, is refused
+    // before it runs or queues, as a reserved row's is above. The proxy sends
+    // it again through the co-processor, which indexes what it writes. A
+    // script's rows are checked again as it writes them (`KeyGuard`), for a
+    // key it builds and never declares.
+    let guarded = if conn_txn.channel {
+        None
+    } else {
+        indexed.of(conn_ns)
+    };
+    if let Some(prefixes) = &guarded
+        && let Some(w) = flint_commands::written_keys(args)
+    {
+        let hit = match &w {
+            flint_commands::Written::Keys(ks) | flint_commands::Written::Script(ks) => {
+                ks.iter().find_map(|k| indexed::under(prefixes, k))
+            }
+            flint_commands::Written::All => prefixes.first().map(|p| p.as_slice()),
+        };
+        if let Some(p) = hit {
+            if let Some(txn) = conn_txn.open.as_mut() {
+                txn.poisoned = true;
+            }
+            return Value::Error(indexed::refusal(p));
+        }
+    }
     // FLINTWHOLE (ADR-0053): this connection's namespace is a placed
     // tenant's, and lives wholly on this seat's pair, so a transaction or a
     // script of it may name keys in any slot: it runs under the lock over
@@ -5768,6 +5842,7 @@ fn execute(
         conn_ns,
         conn_txn,
         watch,
+        guarded.as_ref(),
         args,
     ) {
         return reply;
@@ -6015,7 +6090,13 @@ fn execute(
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTPROMOTE"))
     {
-        return flintpromote(read_only, tailer_stop, lease_deadline, hub, rocks, args);
+        let reply = flintpromote(read_only, tailer_stop, lease_deadline, hub, rocks, args);
+        // As a replica this node received the indexed-prefix rows; it guards
+        // them from the first write it takes (ADR-0060 amendment 2).
+        if !matches!(reply, Value::Error(_)) {
+            indexed.load(store);
+        }
+        return reply;
     }
     if args
         .first()
@@ -6070,7 +6151,7 @@ fn execute(
         if ro {
             return Value::Error("READONLY cannot migrate into a replica".into());
         }
-        return migrate::flintmigratein(rocks, migration_active, args);
+        return migrate::flintmigratein(rocks, migration_active, indexed, args);
     }
     // FLINTSLOTMOVED <slot> <host:port>: durably mark this slot handed off to
     // `peer`; subsequent commands for a key in it answer -MOVED. This is the
@@ -6288,7 +6369,8 @@ fn execute(
                     conn_ns,
                 )
                 .holding_every_writer(every_writer)
-                .whole(conn_txn.whole);
+                .whole(conn_txn.whole)
+                .indexed(guarded.clone());
                 let reply = d.dispatch(args);
                 if !d.wants_every_writer() || every_writer {
                     drop(d);
@@ -8921,6 +9003,7 @@ mod serve_tests {
                         limits,
                         None,
                         &Arc::new(flint_storage::watch::WatchTable::new()),
+                        &Arc::new(indexed::Indexed::default()),
                     );
                 });
             }
@@ -9448,6 +9531,7 @@ mod serve_tests {
                         commands::Limits::default(),
                         None,
                         &Arc::new(flint_storage::watch::WatchTable::new()),
+                        &Arc::new(indexed::Indexed::default()),
                     );
                 });
             }
@@ -9498,6 +9582,7 @@ mod serve_tests {
                         commands::Limits::default(),
                         None,
                         &watch,
+                        &Arc::new(indexed::Indexed::default()),
                     );
                 });
             }

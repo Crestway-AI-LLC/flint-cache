@@ -280,6 +280,7 @@ fn migrate_in(
     self_addr: Option<&str>,
     migration_active: &Arc<AtomicBool>,
     ns: &[u8],
+    indexed: &crate::indexed::Indexed,
 ) -> Value {
     use flint_storage::manifest::{self, MigrationPhase};
 
@@ -363,6 +364,30 @@ fn migrate_in(
         }
     };
 
+    // ADR-0060 amendment 2: the namespace's FT index prefixes come before
+    // its slot's first key, so a write that lands here once the slot is
+    // ours is guarded as it was on the source. A source that does not know
+    // the command (a release before the guard) has no row to give.
+    match call_retrying(
+        src,
+        &[b"FLINTINDEXEDROW", ns],
+        3,
+        std::time::Duration::from_secs(5),
+    ) {
+        Ok(Value::Bulk(Some(raw))) => {
+            if !indexed.install_row(kv.as_ref(), ns, &raw) {
+                rollback();
+                return Value::Error(format!(
+                    "ERR migrate: {src}'s indexed-prefix row for this namespace is unreadable"
+                ));
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            rollback();
+            return Value::Error(format!("ERR migrate: indexed prefixes from {src}: {e}"));
+        }
+    }
     let mut stream = match internal_connect(src) {
         Ok(s) => s,
         Err(e) => {
@@ -706,6 +731,7 @@ fn classify_source_phase(rows: &[Value], slot: u16, ns: &[u8]) -> SourcePhase {
 pub(crate) fn flintmigratein(
     rocks: &Option<RocksHandle>,
     migration_active: &Arc<AtomicBool>,
+    indexed: &crate::indexed::Indexed,
     args: &[Vec<u8>],
 ) -> Value {
     let Some(kv) = rocks else {
@@ -721,13 +747,14 @@ pub(crate) fn flintmigratein(
     };
     let self_addr = args.get(3).and_then(|r| std::str::from_utf8(r).ok());
     let ns: &[u8] = args.get(4).map(|v| v.as_slice()).unwrap_or(b"0");
-    migrate_in(kv, src, slot, self_addr, migration_active, ns)
+    migrate_in(kv, src, slot, self_addr, migration_active, ns, indexed)
 }
 
 #[cfg(not(feature = "rocks"))]
 pub(crate) fn flintmigratein(
     _rocks: &Option<RocksHandle>,
     _migration_active: &Arc<AtomicBool>,
+    _indexed: &crate::indexed::Indexed,
     _args: &[Vec<u8>],
 ) -> Value {
     Value::Error("ERR FLINTMIGRATEIN requires a build with --features rocks".into())

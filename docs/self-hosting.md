@@ -212,6 +212,7 @@ chunked-strings off         # store every string whole (on by default; ADR-0056,
 stream-groups off           # XGROUP CREATE makes no new group (on by default; ADR-0057, section 4)
 reserve-coproc-rows on      # only a co-processor's channel writes its rows (off by default; BUG-0265, section 4)
 vec-filters off             # refuse VEC.CREATE FIELD and VEC.SEARCH FILTER (on by default; ADR-0059, section 4)
+coproc-ft on                # also serve RediSearch's FT.* from each VEC. co-processor (off by default; ADR-0060, section 4)
 agent HOST:9464             # (managed plane) metrics/automation add-on
 capacity <bytes>            # per-node NVMe budget (fill %/expansion math)
 admin-token <tok>           # gate the PROXY*/operator surface
@@ -1349,6 +1350,25 @@ Notes:
   release before's proxies do not: turn it on once every proxy runs this
   release. Only binaries from this release on know the flag, so set it off
   before rolling back below this release with this flintctl.
+
+- **RediSearch's `FT.*`** (ADR-0060, `command-support.md`): with
+  `coproc-ft on`, each `VEC.` co-processor runs with `--ft`, and every proxy
+  routes the `FT.` family to the same seats. An index's documents are the
+  tenant's own HASH or JSON keys:
+  - every node keeps each namespace's index prefixes in a row of its own,
+    `\x00flintidx\x00<namespace>`, which replication and slot moves carry;
+  - a node refuses a write under one with `-INDEXED` unless it comes over
+    the co-processor's channel;
+  - the proxy sends such a write through the co-processor, which writes it
+    and indexes it.
+
+  Off in the release that introduces it. A release before it knows neither
+  the row nor the routing, so after a rollback a tenant's writes would reach
+  the pairs and the index would miss them: drop every FT index before
+  rolling back below this release. Off, `FT.CREATE` is refused, and an index
+  made while it was on is still served, but its prefixes are routed only
+  while the `FT.` family is: drop the indexes before turning it off, or
+  writes under their prefixes are refused.
 
 ## 5. Rotating credentials & keys
 

@@ -1093,6 +1093,9 @@ pub struct KeyGuard<'a> {
     /// Refuse a write to a co-processor's reserved rows (BUG-0265): checked
     /// at the row, so a key the script built and never declared is caught.
     reserved: bool,
+    /// Refuse a write under one of the namespace's FT index prefixes
+    /// (ADR-0060 amendment 2), at the row for the same reason.
+    indexed: Option<crate::indexed::Prefixes>,
     strayed: Mutex<Option<Stray>>,
 }
 
@@ -1110,6 +1113,9 @@ pub enum Stray {
     Keyspace,
     /// A write to a key reserved to a co-processor's rows (BUG-0265).
     Reserved(Vec<u8>),
+    /// A write under an FT index's prefix, which goes through the
+    /// co-processor (ADR-0060 amendment 2): the prefix.
+    Indexed(Vec<u8>),
 }
 
 impl Stray {
@@ -1136,6 +1142,7 @@ impl Stray {
                     .into(),
             ),
             Stray::Reserved(_) => Value::Error(RESERVED_REFUSAL.into()),
+            Stray::Indexed(p) => Value::Error(crate::indexed::refusal(p)),
         }
     }
 }
@@ -1157,6 +1164,7 @@ impl<'a> KeyGuard<'a> {
             every_writer,
             whole: false,
             reserved: false,
+            indexed: None,
             strayed: Mutex::new(None),
         }
     }
@@ -1167,20 +1175,36 @@ impl<'a> KeyGuard<'a> {
         self
     }
 
-    /// Whether writing `row` is refused as a co-processor's reserved row,
-    /// recorded as the script's stray when it is.
+    /// Refuse writes under these FT index prefixes (ADR-0060 amendment 2).
+    pub fn indexed(mut self, prefixes: Option<crate::indexed::Prefixes>) -> Self {
+        self.indexed = prefixes;
+        self
+    }
+
+    /// Whether writing `row` is refused, as a co-processor's reserved row or
+    /// as one under an FT index's prefix, recorded as the script's stray when
+    /// it is.
     fn refuses_write(&self, row: &[u8]) -> bool {
-        if !self.reserved {
+        if !self.reserved && self.indexed.is_none() {
             return false;
         }
-        match row_owner(row) {
-            Some((_, key)) if flint_commands::is_coproc_reserved(key) => {
-                let mut s = self.strayed.lock().unwrap_or_else(|e| e.into_inner());
-                s.get_or_insert(Stray::Reserved(key.to_vec()));
-                true
-            }
-            _ => false,
-        }
+        let Some((_, key)) = row_owner(row) else {
+            return false;
+        };
+        let stray = if self.reserved && flint_commands::is_coproc_reserved(key) {
+            Stray::Reserved(key.to_vec())
+        } else if let Some(p) = self
+            .indexed
+            .as_deref()
+            .and_then(|ps| crate::indexed::under(ps, key))
+        {
+            Stray::Indexed(p.to_vec())
+        } else {
+            return false;
+        };
+        let mut s = self.strayed.lock().unwrap_or_else(|e| e.into_inner());
+        s.get_or_insert(stray);
+        true
     }
 
     /// A placed tenant's script (ADR-0053): any key of the namespace, in any

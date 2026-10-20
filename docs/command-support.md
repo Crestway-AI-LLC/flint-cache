@@ -500,8 +500,8 @@ GEORADIUSBYMEMBER (STORE, STOREDIST), GEORADIUS_RO, GEORADIUSBYMEMBER_RO.
 `VEC.CREATE`, `VEC.SET`, `VEC.GET`, `VEC.DEL`, `VEC.SEARCH`, `VEC.INFO`,
 `VEC.TTL`, `VEC.EXPIRE`, `VEC.PEXPIRE`, `VEC.PERSIST`. Flint's own surface,
 served by the vector co-processor rather than the data nodes, and documented
-in `vectors.md`. It is not RediSearch's `FT.*` and not Redis 8's vector
-sets; neither of those is implemented. `VEC.SEARCH ... FILTER` (ADR-0059,
+in `vectors.md`. It is not RediSearch's `FT.*` (below) and not Redis 8's
+vector sets, which is not implemented. `VEC.SEARCH ... FILTER` (ADR-0059,
 unless the operator turns it off) takes the part of RediSearch's query syntax
 for `TAG` and `NUMERIC` fields, with three differences: tags match case and
 all, AND and OR do not mix without parentheses, and full-text, geo,
@@ -511,6 +511,44 @@ start with `\x00vec\x00`. A fleet whose operator turns on
 `reserve-coproc-rows` refuses your own write to such a key, with any command
 or from a script, since writing one changes your vectors behind `VEC.*`
 (BUG-0265).
+
+### RediSearch's vector surface: `FT.*` (preview, off unless the operator turns it on)
+
+`FT.CREATE`, `FT.SEARCH`, `FT.INFO`, `FT._LIST`, `FT.DROPINDEX [DD]`: the
+part of RediSearch that `redisvl`, `langchain-redis` and the LlamaIndex Redis
+store use (ADR-0060). It is served by the same co-processor as `VEC.*`, and
+only on a fleet whose operator sets `coproc-ft on`.
+
+- **Indexes:**
+  - `ON HASH` or `ON JSON`, with `PREFIX` required.
+  - `TAG`, matched without case unless `CASESENSITIVE`, with `SEPARATOR` for a
+    HASH.
+  - `NUMERIC`.
+  - `TEXT`, matched only as an exact phrase, `@f:("a phrase")`: its words in
+    that order, lowercased, with no stemming, stop words or scoring.
+  - `VECTOR FLAT` or `HNSW` with `TYPE FLOAT32` and `L2`, `IP` or `COSINE`.
+- **Searches:**
+  - ADR-0059's filter, or `*`.
+  - `=>[KNN k @field $param [EF_RUNTIME n] [AS name]]`, answering its distance
+    as RediSearch does: squared L2, `1 - dot`, or `1 - cos`.
+  - `PARAMS`, `RETURN ... AS`, and `SORTBY` on the distance or a `NUMERIC`
+    or `TAG` field.
+  - `LIMIT`, `NOCONTENT`, and `DIALECT 2`.
+  - Replies are RESP2's shape.
+- **Writing documents.** Write them with `HSET`, `HDEL`, `DEL`, `UNLINK`,
+  `EXPIRE` and its variants, `PERSIST`, `JSON.SET` and `JSON.DEL`. Those
+  writes go through the co-processor, which indexes each document as it
+  lands. Any other write to a key under an index's prefix is refused while
+  the index exists, with `-INDEXED <prefix in hex>`:
+  - commands such as `RENAME`, `HINCRBY` and `JSON.NUMINCRBY`;
+  - a script that writes such a key;
+  - a transaction that includes one;
+  - `FLUSHDB` and `FLUSHALL`.
+- **An index over keys that already exist is built from them** before it
+  answers. Until it is, a search answers `-LOADING`.
+- **Refused by name:** `FT.AGGREGATE`, `FT.CURSOR`, `FT.ALTER`, aliases,
+  suggestions and spelling, `GEO` fields, `RANGE` vector queries, any other
+  full-text term, `DIALECT 1` and every other `FT.SEARCH` option.
 
 ## Protocols: RESP2 and RESP3
 

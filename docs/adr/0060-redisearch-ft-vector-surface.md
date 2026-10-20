@@ -7,7 +7,7 @@ three clients' own tests, are still Jeff's to approve when it is built.
 The parser is built, on a branch. The amendment below, the guard on the
 data node rather than on every proxy knowing, was ACCEPTED 2026-10-19 (Jeff:
 "Accept the node guard"). Amendment 2, where each node keeps the prefixes,
-is PROPOSED 2026-10-19.
+was ACCEPTED 2026-10-19, option A (Jeff: "A: node row").
 
 Proposed 2026-10-19.
 
@@ -193,7 +193,7 @@ started with the new flag does. A release before it ignores the prefix row,
 so after a rollback writes would reach the pairs unguarded. The rollback
 note is the same as the ADR's.
 
-## Amendment 2, 2026-10-19 (PROPOSED): where each node keeps the prefixes
+## Amendment 2, 2026-10-19 (accepted the same day, option A): where each node keeps the prefixes
 
 The first amendment says the prefixes are "a row in the namespace,
 replicated with its data". Building it showed that an ordinary row cannot

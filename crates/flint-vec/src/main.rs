@@ -36,6 +36,7 @@
 
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_vec::filter::Field;
+use flint_vec::ftstore;
 use flint_vec::{
     Apply, IndexKind, LeftOut, Metric, Persist, Plan, Quant, Store, decode_config, decode_vec_row,
     parse_durable_key,
@@ -45,6 +46,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod ftchan;
 
 /// Per-namespace load state: absent = never touched; `Loading` = a rebuild is
 /// in flight or paused between channels (commands get `-LOADING`); `Loaded` = the
@@ -86,6 +89,8 @@ enum Phase {
     },
     /// Enumeration finished; fetching rows from `next` onward.
     Fetch { keys: Vec<Vec<u8>>, next: usize },
+    /// The vectors are in; loading the `FT.*` indexes (ADR-0060).
+    Ft(ftchan::FtLoad),
 }
 
 impl Phase {
@@ -137,7 +142,7 @@ fn flintinfo(s: &flint_vec::StoreStats, loading: usize) -> String {
         "build:{}\r\nrole:coproc\r\nindex_bytes:{}\r\nindex_cap_ns_bytes:{}\r\n\
          index_cap_total_bytes:{}\r\nnamespaces:{}\r\nnamespaces_loading:{loading}\r\n\
          sets:{}\r\nvectors:{}\r\nvecfull_ns_total:{}\r\nvecfull_server_total:{}\r\n\
-         packed_rows:{}\r\nvec_filters:{}\r\n",
+         packed_rows:{}\r\nvec_filters:{}\r\nft:{}\r\nft_indexes:{}\r\nft_docs:{}\r\n",
         build_version(),
         s.index_bytes,
         s.index_cap,
@@ -149,6 +154,9 @@ fn flintinfo(s: &flint_vec::StoreStats, loading: usize) -> String {
         s.refused_total,
         u8::from(s.packed_rows),
         u8::from(s.filters),
+        u8::from(s.ft),
+        s.ft_indexes,
+        s.ft_docs,
     )
 }
 
@@ -211,6 +219,13 @@ fn main() {
     // `--vec-filters` is still accepted and now changes nothing.
     let filters = !args.iter().any(|a| a == "--no-vec-filters");
     initial.set_filters(filters);
+    // ADR-0060, the first of two releases: an `FT.*` index is made only with
+    // `--ft`. A release before this one does not route writes under an
+    // index's prefix through the co-processor, so after a rollback they would
+    // reach the pairs and the index would miss them. One made while it was
+    // on is served without it, so it can still be dropped.
+    let ft = args.iter().any(|a| a == "--ft");
+    initial.set_ft(ft);
     // ADR-0049 D2: where a quantized set keeps its full vectors. The files are
     // derived like the index, so every one found here is deleted before
     // serving and the rebuild writes them again. The lock is what makes that
@@ -251,8 +266,9 @@ fn main() {
         "text rows"
     };
     let filters_note = if filters { "filters on" } else { "filters off" };
+    let ft_note = if ft { "FT.* on" } else { "FT.* off" };
     eprintln!(
-        "flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note}, {vec_note}, {rows_note}, {filters_note})"
+        "flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note}, {vec_note}, {rows_note}, {filters_note}, {ft_note})"
     );
 
     // Background reclamation of expired vectors. Reads/searches already mask an
@@ -432,6 +448,7 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
         let mut lk = loads.lock().expect("loads lock");
         lk.remove(ns);
         let dropped = store.lock().expect("store lock").drop_namespace(ns);
+        ftchan::forget(ns);
         drop(lk);
         eprintln!(
             "flint-vec: dropped ns {:?} ({dropped} set(s)); its next touch rebuilds from durable rows",
@@ -485,6 +502,10 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
         }
     }
 
+    // ADR-0060: FT.* and the writes a proxy sends for an indexed key.
+    if ftstore::is_ft_command(&cmd_args[0]) {
+        return ftchan::handle(ns, token, callback, &cmd_args, store, &tls.edge);
+    }
     let plan = store
         .lock()
         .expect("store lock")
@@ -555,6 +576,7 @@ fn rebuild_chunk(
                     vectors.len()
                 ),
                 Phase::Fetch { keys, next } => format!("{next}/{} keys fetched", keys.len()),
+                Phase::Ft(_) => "vectors in, loading FT.* indexes".to_string(),
             };
             eprintln!(
                 "flint-vec: ns {name:?} rebuild chunk loaded {installed}; {where_}; resuming on the next channel"
@@ -621,6 +643,7 @@ fn rebuild_chunk_inner(
     // budget is discovered the same way Phase 2 discovers it: an exhausted
     // channel answers an error naming it, which is the EXPECTED end of a chunk.
     let (keys, next) = match phase {
+        Phase::Ft(at) => return Ok(ft_chunk(&mut ch, ns, store, at, generation, 0)),
         Phase::Fetch { keys, next } => (keys, next),
         Phase::Discover {
             mut sets,
@@ -745,12 +768,49 @@ fn rebuild_chunk_inner(
             .iter()
             .filter(|k| matches!(parse_durable_key(k), Some((b'v', _, _))))
             .count();
-        Ok(Chunk::Done(total))
+        // With `--ft` or without: an index made while it was on is loaded and
+        // served either way (ADR-0060).
+        Ok(
+            match ft_chunk(&mut ch, ns, store, ftchan::FtLoad::Defs, generation, installed) {
+                Chunk::Done(_) => Chunk::Done(total),
+                more => more,
+            },
+        )
     } else {
         Ok(Chunk::More {
             phase: Phase::Fetch { keys, next: i },
             installed,
         })
+    }
+}
+
+/// One chunk of the `FT.*` half of a rebuild (ADR-0060), from `at`. A failed
+/// chunk resumes from the index list on the next channel: reading a document
+/// again gives the same index.
+fn ft_chunk(
+    ch: &mut flint_tls::Stream,
+    ns: &[u8],
+    store: &Arc<Mutex<Store>>,
+    at: ftchan::FtLoad,
+    generation: u64,
+    installed: usize,
+) -> Chunk {
+    match ftchan::load_chunk(ch, ns, store, at, generation) {
+        Ok(None) => Chunk::Done(0),
+        Ok(Some(at)) => Chunk::More {
+            phase: Phase::Ft(at),
+            installed,
+        },
+        Err(e) => {
+            eprintln!(
+                "flint-vec: ns {:?} FT.* rebuild chunk failed: {e}; resuming from the index list",
+                String::from_utf8_lossy(ns)
+            );
+            Chunk::More {
+                phase: Phase::Ft(ftchan::FtLoad::Defs),
+                installed,
+            }
+        }
     }
 }
 
@@ -880,7 +940,12 @@ fn perform_persist(
     {
         return Err(err(&format!("COPROCUNAVAIL channel refused: {e}")));
     }
+    run_persist(&mut ch, persist)
+}
 
+/// Perform `persist` in order on an open channel, stopping at the first
+/// error, which is relayed.
+fn run_persist(ch: &mut flint_tls::Stream, persist: &[Persist]) -> Result<(), Value> {
     // A TTL'd row is written `SET key val PX <ms>`, so the durable copy expires on
     // the same deadline the index does — the data-plane key's own metering and
     // quota reclamation then come for free. `ttl_buf` outlives the borrow in the
@@ -905,12 +970,12 @@ fn perform_persist(
             Persist::SAdd { key, member } => vec![b"SADD", key, member],
             Persist::SRem { key, member } => vec![b"SREM", key, member],
         };
-        send_cmd(&mut ch, &dcmd)
+        send_cmd(ch, &dcmd)
             .map_err(|e| err(&format!("COPROCUNAVAIL channel write failed: {e}")))?;
         // Relay the channel's own error verbatim — a -QUOTA (over storage quota)
         // is a truer, more actionable answer than a blanket COPROCUNAVAIL.
-        if let r @ Value::Error(_) = read_reply(&mut ch)
-            .map_err(|e| err(&format!("COPROCUNAVAIL channel write failed: {e}")))?
+        if let r @ Value::Error(_) =
+            read_reply(ch).map_err(|e| err(&format!("COPROCUNAVAIL channel write failed: {e}")))?
         {
             return Err(r);
         }

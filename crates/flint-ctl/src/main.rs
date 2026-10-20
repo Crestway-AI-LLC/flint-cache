@@ -124,6 +124,14 @@ struct Inventory {
     /// it passes `--no-vec-filters`. A `flint-vec` passes over a flag it does
     /// not know, so either reaches any release.
     vec_filters: bool,
+    /// coproc: each `VEC.` co-processor also serves RediSearch's `FT.*`
+    /// (ADR-0060), as the `FT.` family on the same seats: flintctl passes
+    /// `--ft`, and every proxy routes `FT.*` and the writes a node refuses
+    /// as under an index's prefix there. Off unless the inventory says
+    /// `coproc-ft on`: the release that brings it serves it only when
+    /// asked, since a release before it does not route those writes and an
+    /// index would miss them after a rollback.
+    coproc_ft: bool,
     /// Billing journal path (agent --billing): the append-only per-tenant
     /// usage record a metering reporter aggregates from. Absent = the
     /// agent keeps no billing journal (self-hosters who do not bill).
@@ -433,6 +441,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "coproc-index-bytes" => inv.coproc_index_bytes = val.parse().ok(),
             "coproc-index-total-bytes" => inv.coproc_index_total_bytes = val.parse().ok(),
             "vec-filters" => inv.vec_filters = on_or_off(key, val),
+            "coproc-ft" => inv.coproc_ft = on_or_off(key, val),
             "coproc" => {
                 let mut it = val.split_whitespace();
                 match (it.next(), it.next(), it.next()) {
@@ -1857,6 +1866,9 @@ fn coproc_args(inv: &Inventory, i: usize) -> Vec<String> {
         }
         .to_string(),
     );
+    if inv.coproc_ft {
+        args.push("--ft".to_string());
+    }
     if inv.tls {
         args.extend([
             "--internal-ca".to_string(),
@@ -1887,10 +1899,17 @@ fn families_arg(inv: &Inventory) -> Option<String> {
         return None;
     }
     let mut by_family: Vec<(String, Vec<String>)> = Vec::new();
-    for (family, addr) in &inv.coprocs {
-        match by_family.iter_mut().find(|(f, _)| f == family) {
-            Some((_, addrs)) => addrs.push(addr.clone()),
-            None => by_family.push((family.clone(), vec![addr.clone()])),
+    // With `coproc-ft on`, each `VEC.` seat serves `FT.` too (ADR-0060), in
+    // the same order, so a namespace's FT.* and VEC.* reach one seat.
+    let ft = inv
+        .coprocs
+        .iter()
+        .filter(|(f, _)| inv.coproc_ft && f == "VEC.")
+        .map(|(_, a)| ("FT.".to_string(), a.clone()));
+    for (family, addr) in inv.coprocs.iter().cloned().chain(ft) {
+        match by_family.iter_mut().find(|(f, _)| *f == family) {
+            Some((_, addrs)) => addrs.push(addr),
+            None => by_family.push((family, vec![addr])),
         }
     }
     Some(
@@ -3379,6 +3398,9 @@ fn reload(inv: &Inventory) {
     }
     if !inv.vec_filters {
         restart_only.push("vec-filters");
+    }
+    if inv.coproc_ft {
+        restart_only.push("coproc-ft");
     }
     if inv.ctl_poll_ms.is_some() || inv.ctl_confirm.is_some() {
         restart_only.push("controller timing (poll-ms/confirm)");
@@ -11389,6 +11411,32 @@ mod cert_manifest_tests {
         assert_eq!(flags("", "vfdefault"), ["--vec-filters"], "on by default");
         assert_eq!(flags("vec-filters on\n", "vfon"), ["--vec-filters"]);
         assert_eq!(flags("vec-filters off\n", "vfoff"), ["--no-vec-filters"]);
+    }
+
+    /// ADR-0060: `coproc-ft on` gives each `VEC.` seat `--ft`, and every
+    /// proxy an `FT.` family on the same seats in the same order; off, as by
+    /// default, neither.
+    #[test]
+    fn coproc_ft_reaches_the_seats_and_the_proxies_only_when_on() {
+        let base = "statedir /var/lib/flint\n\
+                    bins /opt/flint/bin\n\
+                    cp 10.0.0.1:7500\n\
+                    pair 10.0.0.2:7001,10.0.0.3:7002\n\
+                    proxy 0.0.0.0:7379\n\
+                    coproc VEC. 127.0.0.1:7411\n\
+                    coproc VEC. 127.0.0.1:7412\n";
+        let off = inv_from(base, "ftoff");
+        assert!(!coproc_args(&off, 0).iter().any(|a| a == "--ft"));
+        assert_eq!(
+            families_arg(&off).as_deref(),
+            Some("VEC.=127.0.0.1:7411,127.0.0.1:7412")
+        );
+        let on = inv_from(&format!("{base}coproc-ft on\n"), "fton");
+        assert!(coproc_args(&on, 0).iter().any(|a| a == "--ft"));
+        assert_eq!(
+            families_arg(&on).as_deref(),
+            Some("VEC.=127.0.0.1:7411,127.0.0.1:7412;FT.=127.0.0.1:7411,127.0.0.1:7412")
+        );
     }
 
     /// BUG-0227: `start` decides a co-processor is running by an exact token of

@@ -1045,6 +1045,11 @@ pub struct StoreStats {
     /// Whether `VEC.CREATE ... FIELD` and `VEC.SEARCH ... FILTER` are served
     /// (ADR-0059, `--vec-filters`).
     pub filters: bool,
+    /// Whether `FT.*` is served (ADR-0060, `--ft`), its indexes over every
+    /// namespace, and the documents in them.
+    pub ft: bool,
+    pub ft_indexes: usize,
+    pub ft_docs: usize,
 }
 
 /// The co-processor's per-tenant, per-set state. One `Store` per running
@@ -1135,6 +1140,9 @@ impl Store {
             refused_total: self.refused_total.load(Relaxed),
             packed_rows: self.packed_rows,
             filters: self.filters,
+            ft: self.ft_on,
+            ft_indexes: self.ft.len(),
+            ft_docs: self.ft.values().map(ftindex::FtIndex::len).sum(),
         }
     }
 
