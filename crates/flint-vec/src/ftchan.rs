@@ -142,6 +142,9 @@ pub(crate) fn open(
         .map_err(|e| err(&format!("COPROCUNAVAIL channel dial failed: {e}")))?;
     let _ = ch.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = ch.set_write_timeout(Some(Duration::from_secs(5)));
+    // Closed with a reset when it drops, after its last reply is read, so
+    // a write's channel leaves no TIME_WAIT here (BUG-0269).
+    let _ = ch.set_abortive_close();
     send_cmd(&mut ch, &[b"PROXYCHAN", token])
         .map_err(|e| err(&format!("COPROCUNAVAIL channel open failed: {e}")))?;
     if let Value::Error(e) =
