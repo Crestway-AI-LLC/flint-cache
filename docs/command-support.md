@@ -514,15 +514,17 @@ or from a script, since writing one changes your vectors behind `VEC.*`
 
 ### RediSearch's vector surface: `FT.*` (preview, off unless the operator turns it on)
 
-`FT.CREATE`, `FT.SEARCH`, `FT.INFO`, `FT._LIST`, `FT.DROPINDEX [DD]`: the
-part of RediSearch that `redisvl`, `langchain-redis` and the LlamaIndex Redis
-store use (ADR-0060). It is served by the same co-processor as `VEC.*`, and
+`FT.CREATE`, `FT.SEARCH`, `FT.INFO`, `FT._LIST`, `FT.DROPINDEX [DD]`,
+`FT.ALIASADD`, `FT.ALIASUPDATE` and `FT.ALIASDEL`: the part of RediSearch
+that `redisvl`, `langchain-redis` and the LlamaIndex Redis store use
+(ADR-0060). It is served by the same co-processor as `VEC.*`, and
 only on a fleet whose operator sets `coproc-ft on`.
 
 - **Indexes:**
   - `ON HASH` or `ON JSON`, with `PREFIX` required.
-  - `TAG`, matched without case unless `CASESENSITIVE`, with `SEPARATOR` for a
-    HASH.
+  - `TAG`, matched without case unless `CASESENSITIVE`. `SEPARATOR` splits a
+    HASH field, at `,` unless it says otherwise, and a JSON string or each
+    string of a JSON array only when it is declared, as in RediSearch.
   - `NUMERIC`.
   - `TEXT`, matched only as an exact phrase, `@f:("a phrase")`: its words in
     that order, lowercased, with no stemming, stop words or scoring.
@@ -533,8 +535,15 @@ only on a fleet whose operator sets `coproc-ft on`.
     as RediSearch does: squared L2, `1 - dot`, or `1 - cos`.
   - `PARAMS`, `RETURN ... AS`, and `SORTBY` on the distance or a `NUMERIC`
     or `TAG` field.
-  - `LIMIT`, `NOCONTENT`, and `DIALECT 2`.
-  - Replies are RESP2's shape.
+  - `LIMIT`, up to 10,000 results a page, `NOCONTENT`, and `DIALECT 2`.
+  - Results that tie, and results with no order asked for, come in the
+    order their documents were last written, as RediSearch's document ids
+    order them.
+  - Replies are RESP2's or RESP3's shape, as the client negotiated.
+- **Aliases** are accepted wherever an index name is, and go with their index
+  when it is dropped.
+- **`MODULE LIST`** answers one module, `search` at version 20600, while
+  `FT.*` is served. Without it, `MODULE` is an unknown command.
 - **Writing documents.** Write them with `HSET`, `HDEL`, `DEL`, `UNLINK`,
   `EXPIRE` and its variants, `PERSIST`, `JSON.SET` and `JSON.DEL`. Those
   writes go through the co-processor, which indexes each document as it
@@ -542,12 +551,17 @@ only on a fleet whose operator sets `coproc-ft on`.
   the index exists, with `-INDEXED <prefix in hex>`:
   - commands such as `RENAME`, `HINCRBY` and `JSON.NUMINCRBY`;
   - a script that writes such a key;
-  - a transaction that includes one;
-  - `FLUSHDB` and `FLUSHALL`.
+  - a transaction that includes one, even of keys in one slot. The
+    frameworks' own transactions, such as redisvl's `expire_keys` and
+    langchain-redis's `clear()`, name keys in different slots, which the
+    proxy refuses with `CROSSSLOT` whether or not they are indexed.
+- **`FLUSHDB` and `FLUSHALL` drop the namespace's indexes** with its keys, as
+  RediSearch's do. Inside a transaction they are refused, in any namespace
+  (above).
 - **An index over keys that already exist is built from them** before it
   answers. Until it is, a search answers `-LOADING`.
-- **Refused by name:** `FT.AGGREGATE`, `FT.CURSOR`, `FT.ALTER`, aliases,
-  suggestions and spelling, `GEO` fields, `RANGE` vector queries, any other
+- **Refused by name:** `FT.AGGREGATE`, `FT.CURSOR`, `FT.ALTER`, suggestions
+  and spelling, `GEO` fields, `RANGE` vector queries, any other
   full-text term, `DIALECT 1` and every other `FT.SEARCH` option.
 
 ## Protocols: RESP2 and RESP3

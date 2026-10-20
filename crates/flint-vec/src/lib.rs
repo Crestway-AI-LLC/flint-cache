@@ -1098,6 +1098,9 @@ pub struct Store {
     scan_cap: Option<usize>,
     /// The `FT.*` indexes (ADR-0060), by namespace and name.
     ft: HashMap<(Vec<u8>, Vec<u8>), ftindex::FtIndex>,
+    /// The `FT.*` aliases, by namespace and alias, each to its index's name
+    /// (ADR-0060 amendment 3, part 4).
+    ft_aliases: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
     /// Serve `FT.*`. Off for a bare `Store`; the binary turns it on with
     /// `--ft`, in the release that brings it.
     ft_on: bool,
@@ -1219,6 +1222,7 @@ impl Store {
         let before = self.sets.len();
         self.sets.retain(|(n, _), _| n.as_slice() != ns);
         self.ft.retain(|(n, _), _| n.as_slice() != ns);
+        self.ft_aliases.retain(|(n, _), _| n.as_slice() != ns);
         self.ns_bytes.remove(ns);
         *self.generations.entry(ns.to_vec()).or_default() += 1;
         before - self.sets.len()

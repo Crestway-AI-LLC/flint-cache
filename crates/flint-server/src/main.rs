@@ -5802,6 +5802,19 @@ fn execute(
             flint_commands::Written::Keys(ks) | flint_commands::Written::Script(ks) => {
                 ks.iter().find_map(|k| indexed::under(prefixes, k))
             }
+            // A flush drops the namespace's indexes, as RediSearch's frees
+            // its own (ADR-0060 amendment 3, part 5). The row goes first,
+            // here; after the flush the proxy's FLINTNSDROP has the
+            // co-processor forget them. A replica takes the row's delete as
+            // it took its writes, and reads it at promotion. Inside MULTI it
+            // is refused as before: the row cannot wait on an EXEC that may
+            // never come.
+            flint_commands::Written::All if conn_txn.open.is_none() => {
+                if flint_commands::flush_args_ok(args) && !read_only.load(Ordering::Relaxed) {
+                    indexed.set(store, conn_ns, Vec::new());
+                }
+                None
+            }
             flint_commands::Written::All => prefixes.first().map(|p| p.as_slice()),
         };
         if let Some(p) = hit {

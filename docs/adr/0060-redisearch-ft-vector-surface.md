@@ -366,6 +366,44 @@ suites found a fifth item, the flush. Each part below is its own choice.
 - **Cost:** 8 bytes per document. A rebuild assigns numbers in the order it
   reads the documents, as RediSearch's reload assigns new ids.
 
+### Amendment 3, as built (2026-10-20, rides with release N)
+
+- **Part 1.** The proxy's `family_grant` gives `FT.SEARCH` a budget of its
+  `LIMIT`'s count plus 16, at least `--family-budget`, for at most 10,000
+  results. Its deadline grows by 1 ms for each command past the budget,
+  about 15 seconds at 10,000. Growing it "by the same share", as part 1
+  says, would allow 391 seconds there. The `LIMIT` is read with the
+  `PARAMS` and `RETURN` blocks stepped over, so a parameter named `LIMIT` is
+  not one.
+- **Part 2.** Documented in `docs/command-support.md`, beside `CROSSSLOT`.
+- **Part 3.** The proxy answers `MODULE LIST` while an `FT.` family is
+  declared: `search` at 20600, keyed with bulk strings as Redis answers it.
+- **Part 4.**
+  - Aliases are one durable set (`kind = b'a'`). Each member is
+    `<alias length>:<alias><index>`, so a rebuild reads every alias with one
+    command.
+  - `FT.ALIASUPDATE` removes the old member before it adds the new one, so
+    a crash between them leaves the alias naming nothing rather than the
+    wrong index.
+  - The refusals are RediSearch's:
+    - `Alias already exists`;
+    - `Unknown index name (or name is an alias itself)`;
+    - `Alias conflicts with an existing index name`;
+    - `Alias does not exist`.
+- **Part 5.** Outside `MULTI`, the node lets a tenant's `FLUSHALL` or
+  `FLUSHDB` through and deletes the namespace's `\x00flintidx\x00<ns>` row
+  first. The proxy's `FLINTNSDROP` after the flush (BUG-0268) has the
+  co-processor forget the indexes. Inside `MULTI` the flush is still refused.
+- **Part 6.** Each document carries a sequence number, 8 bytes, which raises
+  the meter's charge per document from 96 to 104 bytes. A KNN asks its set
+  for 16 more neighbours than it answers, and breaks ties by the sequence.
+- **Held by:**
+  - unit tests:
+    - `results_that_tie_come_in_write_order`;
+    - `an_alias_names_its_index_and_goes_with_it`;
+    - `an_ft_search_is_granted_a_channel_for_its_page`;
+  - `coproc_ft_drill`'s `amend3`, `aliassame` and `flush` sections.
+
 ## As built, release N (2026-10-19)
 
 Branch `adr0060-ft`, held by `coproc_ft_drill`. Two pairs, a proxy and

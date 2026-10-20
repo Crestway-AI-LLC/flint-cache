@@ -41,6 +41,30 @@ pub fn ft_backfill_key(index: &[u8]) -> Vec<u8> {
     durable_key(b'b', index, b"")
 }
 
+/// The durable set of a namespace's aliases (`kind = b'a'`), each member an
+/// [`alias_member`], so one read gives a rebuild every alias with its index
+/// (ADR-0060 amendment 3, part 4).
+pub fn ft_alias_list_key() -> Vec<u8> {
+    durable_key(b'a', b"", b"")
+}
+
+/// `<alias length>:<alias><index>`: both names in one member, so moving an
+/// alias is a remove and an add, never a read and a rewrite.
+pub fn alias_member(alias: &[u8], index: &[u8]) -> Vec<u8> {
+    let mut m = format!("{}:", alias.len()).into_bytes();
+    m.extend_from_slice(alias);
+    m.extend_from_slice(index);
+    m
+}
+
+/// An [`alias_member`]'s alias and index.
+pub fn parse_alias_member(m: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let colon = m.iter().position(|&b| b == b':')?;
+    let len: usize = std::str::from_utf8(&m[..colon]).ok()?.parse().ok()?;
+    let rest = &m[colon + 1..];
+    (len > 0 && len < rest.len()).then(|| (rest[..len].to_vec(), rest[len..].to_vec()))
+}
+
 /// One bucket of the durable list of the documents the co-processor has
 /// written under any index's prefix (`kind = b'k'`), which a rebuild reads
 /// them back from. Bucketed as a set's ids are (`INDEX_BUCKETS`).
@@ -115,6 +139,13 @@ pub enum FtPlan {
         persist: Vec<Persist>,
         docs: Option<Vec<Vec<u8>>>,
     },
+    /// `FT.ALIASADD`, `FT.ALIASUPDATE` and `FT.ALIASDEL`: write `persist`,
+    /// then point `alias` at `index`, or with `None` remove it.
+    Alias {
+        alias: Vec<u8>,
+        index: Option<Vec<u8>>,
+        persist: Vec<Persist>,
+    },
     /// `FT.SEARCH`: the hits, then each document read for the reply.
     Search(SearchPlan),
     /// A data write to keys an index may cover.
@@ -164,6 +195,42 @@ impl Store {
 
     fn ft_index(&self, ns: &[u8], index: &[u8]) -> Option<&FtIndex> {
         self.ft.get(&(ns.to_vec(), index.to_vec()))
+    }
+
+    /// The index `name` names: an index of that name, or the one an alias of
+    /// that name points at, as RediSearch looks a name up.
+    pub fn ft_resolve(&self, ns: &[u8], name: &[u8]) -> Option<Vec<u8>> {
+        if self.ft_index(ns, name).is_some() {
+            return Some(name.to_vec());
+        }
+        let index = self.ft_aliases.get(&(ns.to_vec(), name.to_vec()))?;
+        self.ft_index(ns, index).map(|_| index.clone())
+    }
+
+    /// The aliases pointing at `index`.
+    fn ft_aliases_of(&self, ns: &[u8], index: &[u8]) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = self
+            .ft_aliases
+            .iter()
+            .filter(|((n, _), i)| n.as_slice() == ns && i.as_slice() == index)
+            .map(|((_, a), _)| a.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Point `alias` at `index`, or with `None` remove it, once its rows
+    /// landed.
+    pub fn ft_set_alias(&mut self, ns: &[u8], alias: Vec<u8>, index: Option<Vec<u8>>) {
+        let k = (ns.to_vec(), alias);
+        match index {
+            Some(i) => {
+                self.ft_aliases.insert(k, i);
+            }
+            None => {
+                self.ft_aliases.remove(&k);
+            }
+        }
     }
 
     /// The indexes of `ns`, by name.
@@ -216,6 +283,7 @@ impl Store {
             b"FT.CREATE" => self.plan_ft_create(ns, args),
             b"FT.SEARCH" => self.plan_ft_search(ns, args, now),
             b"FT.DROPINDEX" => self.plan_ft_drop(ns, args),
+            b"FT.ALIASADD" | b"FT.ALIASUPDATE" | b"FT.ALIASDEL" => self.plan_ft_alias(ns, args),
             b"FT.INFO" => FtPlan::Reply(self.ft_info(ns, args, now)),
             b"FT._LIST" => FtPlan::Reply(Value::Array(Some(
                 self.ft_names(ns).iter().map(|n| bulk(n)).collect(),
@@ -223,7 +291,7 @@ impl Store {
             n if routed_write(n) => self.plan_ft_write(ns, args),
             other => FtPlan::Reply(err(&format!(
                 "ERR {} is not supported (ADR-0060 serves FT.CREATE, FT.SEARCH, FT.INFO, \
-                 FT._LIST and FT.DROPINDEX)",
+                 FT._LIST, FT.DROPINDEX and the FT.ALIAS commands)",
                 String::from_utf8_lossy(other)
             ))),
         }
@@ -278,12 +346,16 @@ impl Store {
             Ok(x) => x,
             Err(e) => return FtPlan::Reply(err(&format!("ERR {e}"))),
         };
-        let Some(ix) = self.ft_index(ns, &index) else {
+        // An alias names its index here too, as in RediSearch.
+        let Some((index, ix)) = self
+            .ft_resolve(ns, &index)
+            .and_then(|i| self.ft_index(ns, &i).map(|ix| (i, ix)))
+        else {
             return FtPlan::Reply(err("ERR Unknown Index name"));
         };
         // The list member first: a crash after it leaves a definition row
         // no rebuild reads, never an index the tenant dropped coming back.
-        let persist = vec![
+        let mut persist = vec![
             Persist::SRem {
                 key: ft_list_key(),
                 member: index.clone(),
@@ -295,6 +367,15 @@ impl Store {
                 key: ft_backfill_key(&index),
             },
         ];
+        // Its aliases go with it, as RediSearch clears them.
+        persist.extend(
+            self.ft_aliases_of(ns, &index)
+                .into_iter()
+                .map(|a| Persist::SRem {
+                    key: ft_alias_list_key(),
+                    member: alias_member(&a, &index),
+                }),
+        );
         let docs = dd.then(|| {
             let mut ks: Vec<Vec<u8>> = ix.keys().map(<[u8]>::to_vec).collect();
             ks.sort();
@@ -307,11 +388,68 @@ impl Store {
         }
     }
 
+    /// `FT.ALIASADD <alias> <index>`, `FT.ALIASUPDATE <alias> <index>` and
+    /// `FT.ALIASDEL <alias>`, refused as RediSearch refuses them (ADR-0060
+    /// amendment 3, part 4).
+    fn plan_ft_alias(&self, ns: &[u8], args: &[Vec<u8>]) -> FtPlan {
+        let cmd = args[0].to_ascii_uppercase();
+        let del = cmd.as_slice() == b"FT.ALIASDEL";
+        if args.len() != if del { 2 } else { 3 } {
+            return FtPlan::Reply(err(&format!(
+                "ERR wrong number of arguments for '{}' command",
+                String::from_utf8_lossy(&args[0])
+            )));
+        }
+        let alias = args[1].clone();
+        let now = self.ft_aliases.get(&(ns.to_vec(), alias.clone())).cloned();
+        let index = if del {
+            if now.is_none() {
+                return FtPlan::Reply(err("ERR Alias does not exist"));
+            }
+            None
+        } else {
+            let index = args[2].clone();
+            if self.ft_index(ns, &index).is_none() {
+                return FtPlan::Reply(err("ERR Unknown index name (or name is an alias itself)"));
+            }
+            if self.ft_index(ns, &alias).is_some() {
+                return FtPlan::Reply(err("ERR Alias conflicts with an existing index name"));
+            }
+            if now.is_some() && cmd.as_slice() == b"FT.ALIASADD" {
+                return FtPlan::Reply(err("ERR Alias already exists"));
+            }
+            Some(index)
+        };
+        // Off its old index first: a crash between the two leaves the alias
+        // naming nothing, never the wrong index.
+        let mut persist: Vec<Persist> = now
+            .iter()
+            .map(|old| Persist::SRem {
+                key: ft_alias_list_key(),
+                member: alias_member(&alias, old),
+            })
+            .collect();
+        if let Some(i) = &index {
+            persist.push(Persist::SAdd {
+                key: ft_alias_list_key(),
+                member: alias_member(&alias, i),
+            });
+        }
+        FtPlan::Alias {
+            alias,
+            index,
+            persist,
+        }
+    }
+
     fn plan_ft_search(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> FtPlan {
         let Some(index) = args.get(1) else {
             return FtPlan::Reply(err("ERR FT.SEARCH <index> <query> [options]"));
         };
-        let Some(ix) = self.ft_index(ns, index) else {
+        let Some(ix) = self
+            .ft_resolve(ns, index)
+            .and_then(|i| self.ft_index(ns, &i))
+        else {
             return FtPlan::Reply(err(&format!(
                 "ERR {}: no such index",
                 String::from_utf8_lossy(index)
@@ -423,6 +561,8 @@ impl Store {
         let Some(ix) = self.ft.remove(&(ns.to_vec(), index.to_vec())) else {
             return false;
         };
+        self.ft_aliases
+            .retain(|(n, _), i| !(n.as_slice() == ns && i.as_slice() == index));
         let freed = ix.bytes();
         if let Some(e) = self.ns_bytes.get_mut(ns) {
             *e = e.saturating_sub(freed);
@@ -488,12 +628,17 @@ impl Store {
     /// `FT.INFO <index>`: RediSearch's field names for what this index has,
     /// the ones `redisvl` reads to rebuild a schema and to count documents.
     fn ft_info(&self, ns: &[u8], args: &[Vec<u8>], _now: u64) -> Value {
-        let [_, index] = args else {
+        let [_, name] = args else {
             return err("ERR FT.INFO <index>");
         };
-        let Some(ix) = self.ft_index(ns, index) else {
+        // An alias answers for its index, under the index's own name.
+        let Some((index, ix)) = self
+            .ft_resolve(ns, name)
+            .and_then(|i| self.ft_index(ns, &i).map(|ix| (i, ix)))
+        else {
             return err("ERR Unknown index name");
         };
+        let index = index.as_slice();
         let def = ix.def();
         let s = |x: &str| bulk(x.as_bytes());
         let mut attrs: Vec<Value> = def
@@ -767,6 +912,105 @@ mod tests {
             FtPlan::Reply(Value::Error(e)) => e,
             _ => panic!("not an error reply"),
         }
+    }
+
+    /// Plan an `FT.ALIAS*` and commit it as the binary does once its rows
+    /// land; the members it removes and adds.
+    fn alias(s: &mut Store, parts: &[&str]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        match s.plan_ft(b"ns", &a(parts), 0) {
+            FtPlan::Alias {
+                alias,
+                index,
+                persist,
+            } => {
+                let (mut gone, mut added) = (Vec::new(), Vec::new());
+                for p in persist {
+                    match p {
+                        Persist::SRem { key, member } if key == ft_alias_list_key() => {
+                            gone.push(member)
+                        }
+                        Persist::SAdd { key, member } if key == ft_alias_list_key() => {
+                            added.push(member)
+                        }
+                        _ => panic!("an alias writes only its list"),
+                    }
+                }
+                s.ft_set_alias(b"ns", alias, index);
+                (gone, added)
+            }
+            _ => panic!("not an alias plan"),
+        }
+    }
+
+    /// ADR-0060 amendment 3, part 4: an alias names its index wherever an
+    /// index name is read, is refused as RediSearch refuses it, moves, and
+    /// goes with its index.
+    #[test]
+    fn an_alias_names_its_index_and_goes_with_it() {
+        let mut s = store();
+        for i in ["i", "j"] {
+            let p = format!("{i}:");
+            create(
+                &mut s,
+                &["FT.CREATE", i, "PREFIX", "1", &p, "SCHEMA", "a", "TAG"],
+            );
+        }
+        let m = |a: &str, i: &str| alias_member(a.as_bytes(), i.as_bytes());
+        assert_eq!(
+            alias(&mut s, &["FT.ALIASADD", "live", "i"]),
+            (vec![], vec![m("live", "i")])
+        );
+        assert!(matches!(
+            s.plan_ft(b"ns", &a(&["FT.SEARCH", "live", "*"]), 0),
+            FtPlan::Search(_)
+        ));
+        let Value::Array(Some(info)) = s.ft_info(b"ns", &a(&["FT.INFO", "live"]), 0) else {
+            panic!("FT.INFO through an alias");
+        };
+        assert_eq!(info[1], bulk(b"i"), "answered under the index's own name");
+        let refused = |s: &Store, parts: &[&str]| reply_err(s.plan_ft(b"ns", &a(parts), 0));
+        assert!(refused(&s, &["FT.ALIASADD", "live", "j"]).contains("Alias already exists"));
+        assert!(refused(&s, &["FT.ALIASADD", "x", "live"]).contains("name is an alias itself"));
+        assert!(
+            refused(&s, &["FT.ALIASADD", "j", "i"]).contains("conflicts with an existing index")
+        );
+        assert!(refused(&s, &["FT.ALIASDEL", "nope"]).contains("Alias does not exist"));
+        assert!(refused(&s, &["FT.ALIASADD", "live"]).contains("wrong number of arguments"));
+        // Moved: off the old index, onto the new.
+        assert_eq!(
+            alias(&mut s, &["FT.ALIASUPDATE", "live", "j"]),
+            (vec![m("live", "i")], vec![m("live", "j")])
+        );
+        assert_eq!(s.ft_resolve(b"ns", b"live"), Some(b"j".to_vec()));
+        alias(&mut s, &["FT.ALIASADD", "also", "j"]);
+        // Dropping through an alias drops the index, and its aliases.
+        let FtPlan::Drop { index, persist, .. } =
+            s.plan_ft(b"ns", &a(&["FT.DROPINDEX", "live"]), 0)
+        else {
+            panic!("not a drop");
+        };
+        assert_eq!(index, b"j");
+        let gone: Vec<_> = persist
+            .iter()
+            .filter_map(|p| match p {
+                Persist::SRem { key, member } if *key == ft_alias_list_key() => {
+                    Some(member.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gone, [m("also", "j"), m("live", "j")]);
+        s.ft_drop(b"ns", &index);
+        assert_eq!(s.ft_resolve(b"ns", b"live"), None);
+        assert_eq!(s.ft_resolve(b"ns", b"also"), None);
+        assert_eq!(s.ft_resolve(b"ns", b"i"), Some(b"i".to_vec()));
+        // A member carries both names, whatever is in them.
+        let odd = alias_member(b"a:1", b"b:2");
+        assert_eq!(
+            parse_alias_member(&odd),
+            Some((b"a:1".to_vec(), b"b:2".to_vec()))
+        );
+        assert_eq!(parse_alias_member(b"9:short"), None);
     }
 
     #[test]

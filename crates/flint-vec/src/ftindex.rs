@@ -27,11 +27,20 @@ struct Doc {
     vals: Option<Vals>,
     /// Absolute expiry in ms since epoch, from the key's own TTL.
     expires_at: Option<u64>,
+    /// The order of its last write among the index's documents. Results
+    /// that tie come in this order, as RediSearch's document ids, which it
+    /// assigns at each write, order them (amendment 3, part 6).
+    seq: u64,
 }
 
 /// What a document map entry costs the D4 meter beyond its key and values:
 /// the `Doc`, its key's box and its slot in the map.
-const DOC_BYTES: usize = 96;
+const DOC_BYTES: usize = 104;
+
+/// How many more neighbours a KNN asks its set for than it answers, so that
+/// documents tied at its k-th distance are chosen by write order rather than
+/// by however the set found them.
+const TIE_SLACK: usize = 16;
 
 pub struct FtIndex {
     def: IndexDef,
@@ -46,6 +55,8 @@ pub struct FtIndex {
     /// `FT.CREATE`'s backfill or a rebuild is still reading them, when a
     /// search is not answered (a partial answer is a wrong one).
     ready: bool,
+    /// The next document write's `seq`.
+    next_seq: u64,
 }
 
 /// One search's answer before the documents are read: how many matched, and
@@ -69,6 +80,7 @@ impl FtIndex {
             set,
             failures: 0,
             ready: false,
+            next_seq: 0,
         }
     }
 
@@ -142,7 +154,16 @@ impl FtIndex {
                 }
             }
         }
-        self.docs.insert(key.to_vec(), Doc { vals, expires_at });
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.docs.insert(
+            key.to_vec(),
+            Doc {
+                vals,
+                expires_at,
+                seq,
+            },
+        );
         Ok(())
     }
 
@@ -236,6 +257,11 @@ impl FtIndex {
         doc.expires_at.is_none_or(|e| e > now)
     }
 
+    /// `key`'s write order, or last for a key the index does not hold.
+    fn seq(&self, key: &[u8]) -> u64 {
+        self.docs.get(key).map_or(u64::MAX, |d| d.seq)
+    }
+
     /// The documents `s` asks for, as of `now`: the `k` nearest the filter
     /// matches for a KNN, else every match; then sorted, then paged.
     pub fn search(&self, s: &Search, now: u64) -> Result<Hits, String> {
@@ -243,19 +269,21 @@ impl FtIndex {
             (Some(knn), Some(set), Some(v)) => {
                 let expired = set.expired_count(now);
                 let ef = knn.ef.or(v.ef_runtime).unwrap_or(hnsw::EF_SEARCH_DEFAULT);
-                set.search(
-                    &knn.vector,
-                    knn.k.saturating_add(expired),
-                    ef,
-                    knn.k.saturating_add(expired),
-                    s.filter.as_ref(),
-                    None,
-                )?
-                .into_iter()
-                .filter(|(id, _)| !set.is_expired(id, now))
-                .take(knn.k)
-                .map(|(id, score)| (id, Some(distance(v.metric, score))))
-                .collect()
+                let ask = knn.k.saturating_add(expired).saturating_add(TIE_SLACK);
+                let mut near: Vec<(Vec<u8>, Option<f32>)> = set
+                    .search(&knn.vector, ask, ef, ask, s.filter.as_ref(), None)?
+                    .into_iter()
+                    .filter(|(id, _)| !set.is_expired(id, now))
+                    .map(|(id, score)| (id, Some(distance(v.metric, score))))
+                    .collect();
+                // Nearest first, and a tie to the earlier write.
+                near.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| self.seq(&a.0).cmp(&self.seq(&b.0)))
+                });
+                near.truncate(knn.k);
+                near
             }
             (Some(_), _, _) => return Err("this index has no VECTOR field".into()),
             (None, _, _) => {
@@ -270,10 +298,9 @@ impl FtIndex {
                     })
                     .map(|(k, _)| (k.clone(), None))
                     .collect();
-                // In key order, so a page is the same page each time it is
-                // asked for. RediSearch's own order, with no SORTBY, is its
-                // internal document ids'; no client depends on it.
-                keys.sort_by(|a, b| a.0.cmp(&b.0));
+                // In write order, as RediSearch's document ids order them,
+                // so a page is the same page each time it is asked for.
+                keys.sort_by_key(|(k, _)| self.seq(k));
                 keys
             }
         };
@@ -289,7 +316,7 @@ impl FtIndex {
                 let val = |k: &[u8]| self.docs.get(k).and_then(|d| d.vals.as_ref()?.get(at));
                 hits.sort_by(|a, b| {
                     let o = sort_order(val(&a.0), val(&b.0), *asc);
-                    o.then_with(|| a.0.cmp(&b.0))
+                    o.then_with(|| self.seq(&a.0).cmp(&self.seq(&b.0)))
                 });
             }
         }
@@ -576,6 +603,44 @@ mod tests {
             .iter()
             .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
             .collect()
+    }
+
+    /// Amendment 3, part 6: results that tie come in write order, as
+    /// RediSearch's document ids order them, and a rewrite moves a document
+    /// to the end. LlamaIndex's test embeds every text as one vector and
+    /// expects the first document written.
+    #[test]
+    fn results_that_tie_come_in_write_order() {
+        let mut ix = hash_index();
+        // Written in an order unlike their keys' order, all at one point.
+        for k in ["doc:3", "doc:1", "doc:2"] {
+            put_hash(&mut ix, k, "u", "5", &[1.0, 1.0]);
+        }
+        let knn = |ix: &FtIndex, k: &str| {
+            let q = format!("*=>[KNN {k} @embedding $v]");
+            keys(&search(ix, &["FT.SEARCH", "idx", &q], Some(&[1.0, 1.0])))
+        };
+        assert_eq!(
+            knn(&ix, "1"),
+            ["doc:3"],
+            "the k-th place goes to the first write"
+        );
+        assert_eq!(knn(&ix, "3"), ["doc:3", "doc:1", "doc:2"]);
+        let all = |ix: &FtIndex| keys(&search(ix, &["FT.SEARCH", "idx", "*"], None));
+        assert_eq!(all(&ix), ["doc:3", "doc:1", "doc:2"], "no order asked for");
+        let by_price = |ix: &FtIndex| {
+            let args = ["FT.SEARCH", "idx", "*", "SORTBY", "price", "ASC"];
+            keys(&search(ix, &args, None))
+        };
+        assert_eq!(by_price(&ix), ["doc:3", "doc:1", "doc:2"], "a SORTBY tie");
+        // A rewrite is a new write.
+        put_hash(&mut ix, "doc:3", "u", "5", &[1.0, 1.0]);
+        assert_eq!(knn(&ix, "1"), ["doc:1"]);
+        assert_eq!(all(&ix), ["doc:1", "doc:2", "doc:3"]);
+        // A nearer document comes before a farther one written earlier.
+        put_hash(&mut ix, "doc:9", "u", "5", &[1.0, 1.1]);
+        put_hash(&mut ix, "doc:0", "u", "5", &[1.0, 1.0]);
+        assert_eq!(knn(&ix, "4"), ["doc:1", "doc:2", "doc:3", "doc:0"]);
     }
 
     #[test]

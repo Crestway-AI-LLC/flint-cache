@@ -186,7 +186,9 @@ if which == "write":
     want(cmd(px, "PEXPIRE", "doc:1", "300"), 1, "PEXPIRE doc:1")
     time.sleep(0.6)
     r = cmd(px, "FT.SEARCH", "idx", "@user:{alice}", "NOCONTENT")
-    want(r, [2, b"doc:2", b"doc:3"], "after DEL, HSET and an expiry")
+    # In write order, as RediSearch's document ids order them: doc:2 was
+    # written again after doc:3 (amendment 3, part 6).
+    want(r, [2, b"doc:3", b"doc:2"], "after DEL, HSET and an expiry")
     print("  HSET, DEL, PEXPIRE through the proxy; KNN, range, phrase, LIMIT and FT.INFO answer")
 
 if which == "json":
@@ -232,6 +234,77 @@ if which == "drop":
     want(cmd(px, "GET", "plain"), b"x", "the control key is untouched")
     print("  a dropped index's prefixes are written directly again; DD deleted its documents")
 
+if which == "amend3":
+    # MODULE LIST answers RediSearch's module, at 2.6 (part 3).
+    want(cmd(px, "MODULE", "LIST"),
+         [[b"name", b"search", b"ver", 20600, b"path", b"", b"args", []]], "MODULE LIST")
+    # Aliases (part 4), refused as RediSearch refuses them.
+    want(cmd(px, "FT.ALIASADD", "live", "idx"), "OK", "FT.ALIASADD")
+    want(cmd(px, "FT.SEARCH", "live", "@price:[10 30]", "SORTBY", "price", "DESC", "NOCONTENT"),
+         [2, b"doc:3", b"doc:2"], "a search through an alias")
+    info = cmd(px, "FT.INFO", "live")
+    want(info[info.index(b"index_name") + 1], b"idx", "FT.INFO through an alias names the index")
+    refused(cmd(px, "FT.ALIASADD", "live", "jx"), "ERR Alias already exists", "a second ALIASADD")
+    refused(cmd(px, "FT.ALIASADD", "x", "live"), "ERR Unknown index name", "an alias of an alias")
+    refused(cmd(px, "FT.ALIASDEL", "nope"), "ERR Alias does not exist", "ALIASDEL of nothing")
+    want(cmd(px, "FT.ALIASADD", "tmp", "jx"), "OK", "a second alias")
+    want(cmd(px, "FT.ALIASUPDATE", "tmp", "idx"), "OK", "FT.ALIASUPDATE")
+    want(cmd(px, "FT.SEARCH", "tmp", "@price:[10 30]", "NOCONTENT")[0], 2, "the moved alias")
+    want(cmd(px, "FT.ALIASDEL", "tmp"), "OK", "FT.ALIASDEL")
+    refused(cmd(px, "FT.SEARCH", "tmp", "*"), "ERR tmp: no such index", "a deleted alias")
+    # A page past the channel's default budget of 256 (part 1), and ties
+    # in write order (part 6): 600 documents at one point, written last key
+    # first, so key order and write order disagree.
+    want(cmd(px, "FT.CREATE", "big", "ON", "HASH", "PREFIX", "1", "b:", "SCHEMA", "n", "NUMERIC",
+             "v", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", "2", "DISTANCE_METRIC", "L2"),
+         "OK", "FT.CREATE big")
+    for i in reversed(range(600)):
+        want(cmd(px, "HSET", "b:%03d" % i, "n", i, "v", vec(1.0, 1.0)), 2, "HSET b:%03d" % i)
+    r = cmd(px, "FT.SEARCH", "big", "*", "LIMIT", "0", "500", "RETURN", "1", "n")
+    want(r[0], 600, "the total of a 500-result page")
+    want(len(keys(r)), 500, "a 500-result page is answered whole")
+    want(keys(r)[:3], ["b:599", "b:598", "b:597"], "no order asked for: write order")
+    r = cmd(px, "FT.SEARCH", "big", "*=>[KNN 2 @v $q]", "PARAMS", "2", "q", vec(1.0, 1.0),
+            "NOCONTENT", "DIALECT", "2")
+    want(r, [2, b"b:599", b"b:598"], "a KNN tie goes to the earlier writes")
+    want(cmd(px, "FT.DROPINDEX", "big", "DD"), "OK", "FT.DROPINDEX big DD")
+    print("  MODULE LIST, aliases, a 500-result page, and ties in write order (amendment 3)")
+
+if which == "aliassame":
+    want(cmd(px, "FT.SEARCH", "live", "@price:[10 30]", "NOCONTENT")[0], 2,
+         "after the restart, the alias")
+    print("  the alias is rebuilt with its index")
+
+if which == "flush":
+    want(cmd(px, "FT.CREATE", "fx", "ON", "HASH", "PREFIX", "1", "fx:", "SCHEMA", "a", "TAG"),
+         "OK", "FT.CREATE fx")
+    want(cmd(px, "HSET", "fx:1", "a", "x"), 1, "HSET fx:1")
+    for i, n in enumerate(nodes):
+        refused(raw(n, "HSET", "fx:direct", "a", "x"), "INDEXED", "pair %d guards fx:" % i)
+    # Inside MULTI the proxy refuses a flush in any namespace, before a node
+    # sees it (a node refuses it too while the namespace has an index).
+    t = conn(6542, auth="tok")
+    want(raw(t, "MULTI"), "OK", "MULTI")
+    refused(raw(t, "FLUSHALL"), "ERR FLUSHALL inside a transaction", "FLUSHALL inside MULTI")
+    want(raw(t, "DISCARD"), "OK", "DISCARD")
+    want(cmd(px, "FT._LIST"), [b"fx"], "the refused flush kept the index")
+    # Outside it, a flush drops the namespace's indexes, as RediSearch's
+    # does (part 5), and every pair writes the prefix directly again.
+    want(cmd(px, "FLUSHALL"), "OK", "FLUSHALL")
+    want(cmd(px, "FT._LIST"), [], "no index after the flush")
+    refused(cmd(px, "FT.SEARCH", "fx", "*"), "ERR fx: no such index", "a search after the flush")
+    for i, n in enumerate(nodes):
+        want(raw(n, "HSET", "fx:direct", "a", "x"), 1, "pair %d no longer guards fx:" % i)
+        want(raw(n, "DEL", "fx:direct"), 1, "pair %d: the direct write taken back" % i)
+    want(cmd(px, "EXISTS", "fx:1"), 0, "the flush deleted the document")
+    want(cmd(px, "HSET", "fx:2", "a", "y"), 1, "a write after the flush, under no index")
+    want(cmd(px, "FT.CREATE", "fx", "ON", "HASH", "PREFIX", "1", "fx:", "SCHEMA", "a", "TAG"),
+         "OK", "FT.CREATE after the flush")
+    want(cmd(px, "FT.SEARCH", "fx", "*", "NOCONTENT"), [1, b"fx:2"],
+         "the new index backfills what was written after the flush")
+    want(cmd(px, "FT.DROPINDEX", "fx", "DD"), "OK", "FT.DROPINDEX fx DD")
+    print("  a flush drops the namespace's indexes and their prefixes; inside MULTI it is refused")
+
 if which == "off":
     refused(cmd(px, "FT.CREATE", "z", "PREFIX", "1", "z:", "SCHEMA", "a", "TAG"),
             "ERR FT.* is not enabled", "FT.CREATE without --ft")
@@ -246,18 +319,25 @@ step write || exit 1
 echo "== an index over JSON documents that already exist on both pairs"
 step json || exit 1
 
+echo "== ADR-0060 amendment 3: MODULE LIST, aliases, a page past the default budget, ties"
+step amend3 || exit 1
+
 echo "== a co-processor restart rebuilds every index and registers its prefixes again"
 kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec --ft
 step same || exit 1
+step aliassame || exit 1
 grep -q "FT\.\* on" "$D/vec.log" || { echo "FAIL: flint-vec did not say FT.* is on"; exit 1; }
 
 echo "== FT.DROPINDEX takes the prefixes off every pair"
 step drop || exit 1
+
+echo "== a flush drops the namespace's indexes, as RediSearch's does (amendment 3, part 5)"
+step flush || exit 1
 
 echo "== the first of two releases: without --ft, FT.* is refused"
 kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec
 step off || exit 1
 
-echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers, a drop releases its prefixes, and --ft gates it (ADR-0060)"
+echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, and --ft gates it (ADR-0060, amendment 3)"

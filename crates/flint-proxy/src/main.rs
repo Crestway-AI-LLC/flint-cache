@@ -3785,8 +3785,9 @@ async fn family_command_for(
         return shed;
     }
     // Mint the single-use channel token the co-processor will PROXYCHAN with.
-    let deadline = Instant::now() + topo.family_deadline;
-    let Some(token) = topo.mint_channel_token(ns, topo.family_budget, deadline) else {
+    let (budget, wait) = family_grant(topo, args);
+    let deadline = Instant::now() + wait;
+    let Some(token) = topo.mint_channel_token(ns, budget, deadline) else {
         return unavail();
     };
     // FLINTFAM <token> <callback> <ns> <original command…>. FLINTFAM is safe as
@@ -3813,11 +3814,76 @@ async fn family_command_for(
     // `--workers` and waited out its token's deadline, so every 8th VEC.SET on
     // a client connection failed after 5 s (BUG-0200). The blocking pool holds
     // it instead, and `_slot` bounds how many it holds at once.
-    let (t, wait) = (Arc::clone(topo), topo.family_deadline);
+    let t = Arc::clone(topo);
     match tokio::task::spawn_blocking(move || t.coproc_call(&endpoints, &frame, wait)).await {
         Ok(Ok(v)) => ft_by_proto(args, v),
         Ok(Err(())) | Err(_) => unavail(),
     }
+}
+
+/// `MODULE LIST` with an `FT.` family served: one module, `search` at 20600
+/// (RediSearch 2.6), redisvl's `DEFAULT_REQUIRED_MODULES`. It is below the
+/// 20810 at which redisvl tries SVS-VAMANA indexes, which are not served
+/// (ADR-0060 amendment 3, part 3).
+fn module_list_reply() -> Value {
+    // A map of bulk strings, as Redis answers it, which RESP2 renders as
+    // the flat list of pairs.
+    let b = |s: &[u8]| Value::Bulk(Some(s.to_vec()));
+    Value::Array(Some(vec![Value::Map(vec![
+        (b(b"name"), b(b"search")),
+        (b(b"ver"), Value::Integer(20600)),
+        (b(b"path"), b(b"")),
+        (b(b"args"), Value::Array(Some(Vec::new()))),
+    ])]))
+}
+
+/// The most results one `FT.SEARCH` page is given a channel for (ADR-0060
+/// amendment 3, part 1). RediSearch's own ceiling is far higher; the
+/// frameworks' largest page is 500.
+const FT_PAGE_MAX: u64 = 10_000;
+
+/// A family command's channel budget and deadline. `FT.SEARCH` reads each
+/// result of its page back over its one channel, a command each, so its
+/// grant is sized to its `LIMIT`: at least `--family-budget`, with a
+/// millisecond more of deadline for each command past it. redisvl's
+/// `clear()` asks for pages of 500, past the default budget of 256
+/// (ADR-0060 amendment 3, part 1).
+fn family_grant(topo: &Topology, args: &[Vec<u8>]) -> (u64, Duration) {
+    let base = (topo.family_budget, topo.family_deadline);
+    if !args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FT.SEARCH"))
+    {
+        return base;
+    }
+    let budget = topo
+        .family_budget
+        .max(ft_search_page(args).min(FT_PAGE_MAX) + 16);
+    let past = budget - topo.family_budget;
+    (budget, topo.family_deadline + Duration::from_millis(past))
+}
+
+/// `FT.SEARCH`'s page size: the `num` of `LIMIT <offset> <num>`, or
+/// RediSearch's default of 10. The counted blocks (`PARAMS`, `RETURN`) are
+/// stepped over, so a parameter's value is never read as an option.
+fn ft_search_page(args: &[Vec<u8>]) -> u64 {
+    let n = |i: usize| {
+        args.get(i)
+            .and_then(|a| std::str::from_utf8(a).ok()?.parse::<u64>().ok())
+    };
+    let (mut page, mut i) = (10, 3);
+    while let Some(a) = args.get(i) {
+        if a.eq_ignore_ascii_case(b"LIMIT") {
+            page = n(i + 2).unwrap_or(page);
+            i += 3;
+        } else if a.eq_ignore_ascii_case(b"PARAMS") || a.eq_ignore_ascii_case(b"RETURN") {
+            let count = usize::try_from(n(i + 1).unwrap_or(0)).unwrap_or(usize::MAX);
+            i = i.saturating_add(2).saturating_add(count);
+        } else {
+            i += 1;
+        }
+    }
+    page
 }
 
 /// BUG-0268: a flush deleted the namespace's co-processor rows with the rest
@@ -5822,6 +5888,17 @@ async fn handle(
         },
         b"ECHO" if args.len() == 2 => Value::Bulk(Some(args[1].clone())),
         b"QUIT" => Value::Simple("OK".into()),
+        // ADR-0060 amendment 3, part 3: with an `FT.` family served, the
+        // module RediSearch is, at the version whose `FT.SEARCH` dialect 2
+        // and vector fields the frameworks require. Otherwise it goes on to
+        // the node, which does not know `MODULE`, as before.
+        b"MODULE"
+            if args.len() == 2
+                && args[1].eq_ignore_ascii_case(b"LIST")
+                && !topo.family_endpoints(b"FT.").is_empty() =>
+        {
+            module_list_reply()
+        }
         // Answered HERE, never forwarded: see `info_reply` (BUG-0176). Its
         // one per-tenant field is asked of the tenant's own seat, and only
         // when the section holding it is wanted (BUG-0192).
@@ -7039,6 +7116,64 @@ mod info_tests {
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    /// ADR-0060 amendment 3, part 1: an `FT.SEARCH` is granted a channel for
+    /// its page, and every other family command the configured budget.
+    #[test]
+    fn an_ft_search_is_granted_a_channel_for_its_page() {
+        let t = topo(vec![], vec![]);
+        let a = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+        };
+        let (base, wait) = (t.family_budget, t.family_deadline);
+        assert_eq!(
+            family_grant(&t, &a(&["VEC.SET", "s", "a", "1,0"])),
+            (base, wait)
+        );
+        assert_eq!(
+            family_grant(&t, &a(&["FT.SEARCH", "i", "*"])),
+            (base, wait),
+            "10 results fit the configured budget"
+        );
+        let (b, w) = family_grant(&t, &a(&["FT.SEARCH", "i", "*", "LIMIT", "0", "500"]));
+        assert_eq!(b, 516);
+        assert_eq!(w, wait + Duration::from_millis(516 - base));
+        let (b, _) = family_grant(&t, &a(&["ft.search", "i", "*", "limit", "0", "99999999"]));
+        assert_eq!(b, FT_PAGE_MAX + 16, "a page past 10,000 is granted 10,000");
+        // A parameter's value, or a returned field, named LIMIT is not one.
+        let q = [
+            "FT.SEARCH",
+            "i",
+            "*",
+            "PARAMS",
+            "2",
+            "LIMIT",
+            "9999",
+            "RETURN",
+            "1",
+            "LIMIT",
+        ];
+        assert_eq!(ft_search_page(&a(&q)), 10);
+        let q = [
+            "FT.SEARCH",
+            "i",
+            "*",
+            "RETURN",
+            "2",
+            "a",
+            "b",
+            "LIMIT",
+            "10",
+            "300",
+        ];
+        assert_eq!(ft_search_page(&a(&q)), 300);
+        let q = ["FT.SEARCH", "i", "*", "PARAMS", "18446744073709551615", "x"];
+        assert_eq!(
+            ft_search_page(&a(&q)),
+            10,
+            "a huge count steps past the end"
+        );
+    }
 
     /// A minimal Topology: one cluster view with the given pairs/masters/
     /// ranges, everything else inert. The routing logic under test reads

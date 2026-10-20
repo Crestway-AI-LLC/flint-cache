@@ -15,8 +15,8 @@ use flint_resp::Value;
 use flint_vec::Store;
 use flint_vec::ft::IndexDef;
 use flint_vec::ftstore::{
-    self, DocRead, FtPlan, Reads, SearchPlan, WritePlan, ft_backfill_key, ft_def_key, ft_docs_key,
-    ft_list_key,
+    self, DocRead, FtPlan, Reads, SearchPlan, WritePlan, ft_alias_list_key, ft_backfill_key,
+    ft_def_key, ft_docs_key, ft_list_key,
 };
 use flint_vec::{INDEX_BUCKETS, bucket_of};
 use std::collections::HashMap;
@@ -250,10 +250,33 @@ pub(crate) fn handle(
             // to spare.
             let lend = matches!(&v, Value::Error(e) if e.starts_with("LOADING"))
                 || args[0].eq_ignore_ascii_case(b"FT.INFO");
-            if lend && let Some(index) = args.get(1) {
-                lend_to_fill(ns, index, token, callback, store, edge);
+            if lend && let Some(name) = args.get(1) {
+                let index = store
+                    .lock()
+                    .expect("store lock")
+                    .ft_resolve(ns, name)
+                    .unwrap_or_else(|| name.clone());
+                lend_to_fill(ns, &index, token, callback, store, edge);
             }
             v
+        }
+        FtPlan::Alias {
+            alias,
+            index,
+            persist,
+        } => {
+            let mut ch = match open(callback, token, edge) {
+                Ok(ch) => ch,
+                Err(e) => return e,
+            };
+            if let Err(e) = run_persist(&mut ch, &persist) {
+                return e;
+            }
+            store
+                .lock()
+                .expect("store lock")
+                .ft_set_alias(ns, alias, index);
+            Value::Simple("OK".into())
         }
         FtPlan::Create {
             index,
@@ -634,12 +657,28 @@ pub(crate) fn load_chunk(
                     }
                     defs.push((name, def));
                 }
+                // Every alias, with its index, in one read (amendment 3, part 4).
+                let aliases: Vec<(Vec<u8>, Vec<u8>)> =
+                    match call(ch, &[b"SMEMBERS", &ft_alias_list_key()])? {
+                        Got::Spent => return Ok(Some(FtLoad::Defs)),
+                        Got::Reply(Value::Array(Some(ms))) => ms
+                            .into_iter()
+                            .filter_map(|v| match v {
+                                Value::Bulk(Some(b)) => ftstore::parse_alias_member(&b),
+                                _ => None,
+                            })
+                            .collect(),
+                        Got::Reply(_) => Vec::new(),
+                    };
                 if !current() {
                     return Ok(None);
                 }
                 let mut st = store.lock().expect("store lock");
                 for (name, def) in defs {
                     st.ft_create(ns, name, def);
+                }
+                for (alias, index) in aliases {
+                    st.ft_set_alias(ns, alias, Some(index));
                 }
                 if st.ft_names(ns).is_empty() {
                     return Ok(None);
