@@ -8,7 +8,9 @@ Release N is built, on a branch (As built, below). The amendment below, the guar
 data node rather than on every proxy knowing, was ACCEPTED 2026-10-19 (Jeff:
 "Accept the node guard"). Amendment 2, where each node keeps the prefixes,
 was ACCEPTED 2026-10-19, option A (Jeff: "A: node row"). Amendment 3,
-what the frameworks' suites need next, is PROPOSED 2026-10-20.
+what the frameworks' suites need next, was ACCEPTED 2026-10-20 as
+recommended (Jeff: "As recommended"): parts 1, 3, 4, 5 and 6 are built,
+and part 2 is documented only.
 
 Proposed 2026-10-19.
 
@@ -255,7 +257,7 @@ pair through failover, scale-out and a roll without a cost per slot, and
 it reuses replication, full sync and the slot move as they are. The
 rollback note does not change: a release before the guard ignores the row.
 
-## Amendment 3, 2026-10-20 (PROPOSED): what the frameworks' own suites need next
+## Amendment 3, 2026-10-20 (accepted the same day, as recommended): what the frameworks' own suites need next
 
 Jeff set its scope on 2026-10-20 ("Amend ADR-0060, cheap set"):
 - `MODULE LIST`;
