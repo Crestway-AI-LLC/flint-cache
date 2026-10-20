@@ -688,6 +688,27 @@ restart_vec vec13.log
 case "$(vexec VEC.SEARCH fl 0,1,0 1)" in *b*) : ;; *) echo "FAIL (BUG-0268): a vector written after FLUSHALL is gone after a restart: $(vexec VEC.SEARCH fl 0,1,0 1)"; exit 1 ;; esac
 echo "  after FLUSHALL the set is gone, as its rows are; one made again survives a restart"
 
+echo "== BUG-0269: a write's channel leaves no TIME_WAIT on the co-processor's side"
+# Each write's durable half dials the proxy edge over its own PROXYCHAN
+# channel. The co-processor closed each first, so each left a socket in
+# TIME_WAIT toward the edge, and a bulk load ran the host's ephemeral ports
+# out. The writes go over ONE client connection here, so the client adds at
+# most one of its own.
+tw_toward() {   # TIME_WAIT sockets whose remote port is $1
+  if command -v ss >/dev/null 2>&1; then
+    ss -Htan state time-wait "( dport = :$1 )" | wc -l
+  else
+    netstat -an -p tcp | awk -v p=".$1" '$6 == "TIME_WAIT" && substr($5, length($5) - length(p) + 1) == p' | wc -l
+  fi
+}
+[ "$(vexec VEC.CREATE tw DIM 3 METRIC l2)" = "OK " ] || { echo "FAIL: VEC.CREATE tw"; exit 1; }
+TW0=$(tw_toward 6677)
+OKS=$(for i in $(seq 1 300); do printf 'VEC.SET tw v%s 1,0,0\n' "$i"; done | $A 2>&1 | tr -d '\r' | grep -c '^OK$' || true)
+TW1=$(tw_toward 6677)
+[ "$OKS" = 300 ] || { echo "FAIL (BUG-0269): $OKS of 300 VEC.SET answered OK"; exit 1; }
+[ $((TW1 - TW0)) -lt 30 ] || { echo "FAIL (BUG-0269): 300 writes left $((TW1 - TW0)) TIME_WAIT sockets toward the proxy edge, one per write's channel"; exit 1; }
+echo "  300 writes left $((TW1 - TW0)) new TIME_WAIT sockets toward the edge, not one per write"
+
 echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 and bin on a local file), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
 echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
@@ -700,4 +721,5 @@ echo "      co-processor rebuild in the next (ADR-0050 D5), an overall cap bound
 echo "      tenant's index together and is exported (D2), and the seat listens where told (BUG-0203)."
 echo "      VEC.SEARCH refuses an option it does not know, and filters are served, through the"
 echo "      proxy, unless --no-vec-filters, to only the matches, across a restart (ADR-0059)."
-echo "      A tenant's FLUSHALL empties its vector sets as it does their rows (BUG-0268)."
+echo "      A tenant's FLUSHALL empties its vector sets as it does their rows (BUG-0268), and a"
+echo "      write's channel leaves no TIME_WAIT behind on the co-processor's side (BUG-0269)."

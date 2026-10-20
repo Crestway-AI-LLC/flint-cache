@@ -683,6 +683,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "x509-parser",

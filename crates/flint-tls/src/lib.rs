@@ -333,6 +333,17 @@ impl Stream {
         self.sock().set_write_timeout(d)
     }
 
+    /// Make closing this connection send a reset rather than a FIN
+    /// (`SO_LINGER` 0), so this side holds no TIME_WAIT afterwards. Only for
+    /// a connection closed after its last reply has been read, since a close
+    /// then discards whatever is still unsent. A connection dialled for one
+    /// command and closed by the dialler otherwise leaves one TIME_WAIT
+    /// socket per command on the dialling host, and a burst of them runs its
+    /// ephemeral ports out (BUG-0269).
+    pub fn set_abortive_close(&self) -> io::Result<()> {
+        socket2::SockRef::from(self.sock()).set_linger(Some(std::time::Duration::ZERO))
+    }
+
     /// Read WITHOUT first flushing pending TLS write data.
     ///
     /// `rustls::StreamOwned::read` (the `Read` impl above) completes prior
@@ -975,7 +986,35 @@ mod cert_days_unknown {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONNECT_BACKSTOP, connect_within};
+    use super::{CONNECT_BACKSTOP, Stream, connect_within};
+
+    /// BUG-0269: a connection set to close abortively reaches its peer as a
+    /// reset, which leaves no TIME_WAIT on the closing side; one closed the
+    /// ordinary way reaches it as an end of stream, the control.
+    #[test]
+    fn an_abortive_close_resets_where_an_ordinary_one_ends_the_stream() {
+        use std::io::{ErrorKind, Read};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = l.local_addr().expect("addr");
+        let peer_reads = |abortive: bool| {
+            let c = Stream::Plain(std::net::TcpStream::connect(addr).expect("connect"));
+            let (mut server, _) = l.accept().expect("accept");
+            server
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("timeout");
+            if abortive {
+                c.set_abortive_close().expect("SO_LINGER");
+            }
+            drop(c);
+            server.read(&mut [0u8; 1]).map_err(|e| e.kind())
+        };
+        assert_eq!(
+            peer_reads(false),
+            Ok(0),
+            "an ordinary close is an end of stream"
+        );
+        assert_eq!(peer_reads(true), Err(ErrorKind::ConnectionReset));
+    }
 
     /// BUG-0123: a caller's dial budget must actually bound the dial.
     ///

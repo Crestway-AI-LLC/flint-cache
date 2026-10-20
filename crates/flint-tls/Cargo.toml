@@ -13,6 +13,9 @@ ring = "0.17"
 # via the process-default provider.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 x509-parser = "0.18.1"
+# `SO_LINGER` for `Stream::set_abortive_close` (BUG-0269); already in the
+# lock through tokio.
+socket2 = "0.6"
 # Async stream helpers (ADR-0021), feature-gated so the many blocking
 # consumers of this crate — server, controller, ctl, chaos — do not pull a
 # runtime they never enter. Same rustls 0.23 / ring provider as above, and the

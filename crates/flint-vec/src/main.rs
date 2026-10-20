@@ -594,6 +594,8 @@ fn rebuild_chunk_inner(
     let mut ch = flint_tls::connect_edge(addr, edge).map_err(|e| format!("channel dial: {e}"))?;
     let _ = ch.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = ch.set_write_timeout(Some(Duration::from_secs(5)));
+    // Closed with a reset when it drops, on every path out (BUG-0269).
+    let _ = ch.set_abortive_close();
     send_cmd(&mut ch, &[b"PROXYCHAN", token]).map_err(|e| format!("channel open: {e}"))?;
     if let Value::Error(e) = read_reply(&mut ch).map_err(|e| format!("channel open: {e}"))? {
         return Err(format!("channel refused: {e}"));
@@ -865,6 +867,11 @@ fn perform_persist(
         .map_err(|e| err(&format!("COPROCUNAVAIL channel dial failed: {e}")))?;
     let _ = ch.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = ch.set_write_timeout(Some(Duration::from_secs(5)));
+    // A channel per write, closed by this side, left a TIME_WAIT socket per
+    // write here: a bulk load ran out of ephemeral ports and its writes
+    // failed COPROCUNAVAIL. Every reply is read before it drops, so a reset
+    // loses nothing (BUG-0269).
+    let _ = ch.set_abortive_close();
 
     send_cmd(&mut ch, &[b"PROXYCHAN", token])
         .map_err(|e| err(&format!("COPROCUNAVAIL channel open failed: {e}")))?;
