@@ -172,8 +172,13 @@ echo "  coproc.crt minted serverAuth-only; ca, int and edge files unchanged"
 # replaces a proxy's --families, and only bootstrap registered families with
 # it, so the argv above was right while VEC.* answered "unknown command".
 # Ask the edge itself, as a tenant.
-grep -q "co-processor families on the control plane: VEC.=127.0.0.1:7974" "$D/upgrade.log" \
-  || { echo "FAIL: the upgrade did not register VEC. with the control plane:"; grep -n "famil" "$D/upgrade.log" | sed 's/^/  | /'; exit 1; }
+# Each VEC. seat serves FT. too (ADR-0060), so the line names both, in
+# whichever order the table gives them.
+fam=$(grep "co-processor families on the control plane:" "$D/upgrade.log")
+case "$fam" in *"VEC.=127.0.0.1:7974"*) ;; *)
+  echo "FAIL: the upgrade did not register VEC. with the control plane:"; grep -n "famil" "$D/upgrade.log" | sed 's/^/  | /'; exit 1 ;; esac
+case "$fam" in *"FT.=127.0.0.1:7974"*) ;; *)
+  echo "FAIL: the upgrade did not route FT. to the VEC. seat (ADR-0060):"; grep -n "famil" "$D/upgrade.log" | sed 's/^/  | /'; exit 1 ;; esac
 $CTL tenant add er tok-er er 1 >/dev/null 2>&1 || { echo "FAIL: tenant add"; exit 1; }
 # vec <args>: one command through the TLS edge as tenant er, retrying the
 # -LOADING a namespace answers while the co-processor rebuilds it.
@@ -232,8 +237,11 @@ grep -v '^coproc VEC\. 127\.0\.0\.1:7974$' "$INV" > "$INV.new" && mv "$INV.new" 
 TAG3=edge-roll-11
 $CTL upgrade --version-tag "$TAG3" --soak-ms 1500 >"$D/upgrade3.log" 2>&1 \
   || { tail -12 "$D/upgrade3.log" | sed 's/^/  | /'; echo "FAIL: the third upgrade exited $?"; exit 1; }
-grep -q "co-processor families on the control plane: VEC. cleared" "$D/upgrade3.log" \
-  || { echo "FAIL: removing the coproc line did not clear VEC. on the control plane:"; grep -n "famil" "$D/upgrade3.log" | sed 's/^/  | /'; exit 1; }
+fam=$(grep "co-processor families on the control plane:" "$D/upgrade3.log")
+case "$fam" in *"VEC. cleared"*) ;; *)
+  echo "FAIL: removing the coproc line did not clear VEC. on the control plane:"; grep -n "famil" "$D/upgrade3.log" | sed 's/^/  | /'; exit 1 ;; esac
+case "$fam" in *"FT. cleared"*) ;; *)
+  echo "FAIL: removing the coproc line did not clear FT., which rode its seat (ADR-0060):"; grep -n "famil" "$D/upgrade3.log" | sed 's/^/  | /'; exit 1 ;; esac
 # The undeclared seat is not the upgrade's to stop (it no longer knows it);
 # stop it as an operator does, so nothing could answer if a route remained.
 fleet_kill vec
