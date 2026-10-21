@@ -2,10 +2,11 @@
 
 Status: **ACCEPTED 2026-10-19, option A** (Jeff: "go with your
 recommendation"), with the first release's scope and the two releases as
-recommended. The downloads its verification needs, to install and run the
-three clients' own tests, are still Jeff's to approve when it is built.
-Release N is built, on a branch (As built, below). The amendment below, the guard on the
-data node rather than on every proxy knowing, was ACCEPTED 2026-10-19 (Jeff:
+recommended. Jeff approved the downloads its verification needs, to install
+and run the three clients' own tests, on 2026-10-20 ("Yes, both"). Release
+N is built (As built, below) and on public main after v0.1.0-rc.85. The
+amendment below, the guard on the data node rather than on every proxy
+knowing, was ACCEPTED 2026-10-19 (Jeff:
 "Accept the node guard"). Amendment 2, where each node keeps the prefixes,
 was ACCEPTED 2026-10-19, option A (Jeff: "A: node row"). Amendment 3,
 what the frameworks' suites need next, was ACCEPTED 2026-10-20 as

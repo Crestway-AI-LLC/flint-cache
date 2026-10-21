@@ -8,7 +8,7 @@ before and after with `bench --filters` on 1,000,000 synthetic vectors
 **Severity:** low. Answers were right. A filtered `VEC.SEARCH` whose filter
 matched more vectors than the threshold took up to twice the time of the walk
 it ended in: 6.1 ms instead of 3.1 ms at p50, with half the set matching.
-Filters are served by default from the release after rc.84 (ADR-0059 R+1).
+Filters are served by default from v0.1.0-rc.85 (ADR-0059 R+1).
 **Area:** `crates/flint-vec/src/filter.rs`, `FieldIndex::matching` and
 `sources`.
 

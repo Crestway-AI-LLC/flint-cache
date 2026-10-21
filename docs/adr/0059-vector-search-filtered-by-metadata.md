@@ -14,8 +14,7 @@ it differs from the text below is under *As built*. It ships in v0.1.0-rc.84.
 **Release R+1 built 2026-10-19:** `flint-vec` serves filters unless started
 with `--no-vec-filters`, and flintctl passes `--vec-filters` unless the
 inventory says `vec-filters off`, so a rollback to rc.84's `flint-vec`,
-whose own default is off, keeps them served. It lands only after rc.84 is
-tagged, so that the two halves ship in two releases.
+whose own default is off, keeps them served. It ships in v0.1.0-rc.85.
 
 Proposed 2026-10-17.
 

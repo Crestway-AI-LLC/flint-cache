@@ -4,8 +4,8 @@ Status: **ACCEPTED 2026-10-20, option C** (Jeff: "Accept option C");
 **built 2026-10-21** (As built, below), stacked on ADR-0060's release N.
 **Proposed 2026-10-20:** Jeff chose this as the next `FT.*` gap to design
 ("Vector range queries", 2026-10-20). It builds on ADR-0060's `FT.*`
-surface, release N and amendment 3, which are built on the branch
-`adr0060-ft` and ride after v0.1.0-rc.85.
+surface, release N and amendment 3, which are on public main after
+v0.1.0-rc.85 with it.
 
 ## Context
 
