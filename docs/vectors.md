@@ -114,7 +114,8 @@ VEC.SEARCH docs 0.011,-0.265,... 10 FILTER "@folder:{contracts | invoices} @pric
 
 - **`-LOADING`** after the co-processor restarts (an upgrade, a crash). It
   rebuilds your sets from their durable rows on first touch; retry until
-  the command answers. Nothing is lost.
+  the command answers. Nothing is lost. A namespace with no sets, such as
+  one just flushed, rebuilds within its first command, which is answered.
 - **`-VECFULL ... for this namespace`**: your namespace's index has reached
   its memory cap. The write is refused before anything is stored. To make
   room, delete vectors in the set you are writing to, let them expire, or

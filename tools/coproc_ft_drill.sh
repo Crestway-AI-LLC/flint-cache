@@ -291,7 +291,10 @@ if which == "flush":
     # Outside it, a flush drops the namespace's indexes, as RediSearch's
     # does (part 5), and every pair writes the prefix directly again.
     want(cmd(px, "FLUSHALL"), "OK", "FLUSHALL")
-    want(cmd(px, "FT._LIST"), [], "no index after the flush")
+    # Asked once, not retried: the emptied namespace rebuilds on this
+    # command's channel, and the command is answered, not -LOADING
+    # (ADR-0017's D3 amendment).
+    want(raw(px, "FT._LIST"), [], "the first command after the flush, answered")
     refused(cmd(px, "FT.SEARCH", "fx", "*"), "ERR fx: no such index", "a search after the flush")
     for i, n in enumerate(nodes):
         want(raw(n, "HSET", "fx:direct", "a", "x"), 1, "pair %d no longer guards fx:" % i)

@@ -464,10 +464,13 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
 
     // Load gate (D3): serve only a fully-warm namespace. A cold or paused
     // namespace claims THIS command's channel to run one rebuild chunk (resuming
-    // where the previous channel's budget ran out) and answers -LOADING; the
+    // where the previous channel's budget ran out). If the chunk finishes the
+    // namespace within WARM_WAIT, the command is served on what is left of that
+    // channel (ADR-0017's D3 amendment); otherwise it answers -LOADING, and the
     // client retries, donating another channel, until the whole set is in. `keys`
     // being cloned into both the state and the thread lets a concurrent retry see
     // `running` without waiting on the chunk.
+    let mut warm: Option<flint_tls::Stream> = None;
     {
         let mut lk = loads.lock().expect("loads lock");
         let resume = match lk.get(ns) {
@@ -493,37 +496,91 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
             // this chunk or makes it install nothing (BUG-0255).
             let generation = store.lock().expect("store lock").generation(ns);
             drop(lk);
-            let (ns, token, callback) = (ns.to_vec(), token.to_vec(), callback.to_vec());
-            let (store, loads, edge) = (store.clone(), loads.clone(), tls.edge.clone());
-            std::thread::spawn(move || {
-                rebuild_chunk(ns, token, callback, store, loads, edge, phase, generation)
-            });
-            return err("LOADING vector index is warming, retry");
-        }
-    }
-
-    // ADR-0060: FT.* and the writes a proxy sends for an indexed key.
-    if ftstore::is_ft_command(&cmd_args[0]) {
-        return ftchan::handle(ns, token, callback, &cmd_args, store, &tls.edge);
-    }
-    let plan = store
-        .lock()
-        .expect("store lock")
-        .plan(ns, &cmd_args, now_ms());
-    match plan {
-        Plan::Reply(v) => v,
-        Plan::Write { persist, apply, ok } => {
-            match perform_persist(callback, token, &persist, &tls.edge) {
-                Ok(()) => {
-                    store.lock().expect("store lock").commit(ns, apply);
-                    ok
-                }
-                // A shed or failed durable write (e.g. -QUOTA on an over-quota
-                // tenant) is relayed; the index is left untouched.
-                Err(e) => e,
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            {
+                let (ns, token, callback) = (ns.to_vec(), token.to_vec(), callback.to_vec());
+                let (store, loads, edge) = (store.clone(), loads.clone(), tls.edge.clone());
+                std::thread::spawn(move || {
+                    rebuild_chunk(
+                        ns, token, callback, store, loads, edge, phase, generation, tx,
+                    )
+                });
+            }
+            match rx.recv_timeout(WARM_WAIT) {
+                Ok(ch) => warm = Some(ch),
+                Err(_) => return err("LOADING vector index is warming, retry"),
             }
         }
     }
+
+    let served_warm = warm.is_some();
+    let mut g = ftchan::Grant {
+        token,
+        callback,
+        edge: &tls.edge,
+        warm,
+    };
+    // ADR-0060: FT.* and the writes a proxy sends for an indexed key.
+    let reply = if ftstore::is_ft_command(&cmd_args[0]) {
+        ftchan::handle(ns, &cmd_args, store, &mut g)
+    } else {
+        let plan = store
+            .lock()
+            .expect("store lock")
+            .plan(ns, &cmd_args, now_ms());
+        match plan {
+            Plan::Reply(v) => v,
+            Plan::Write { persist, apply, ok } => {
+                let landed = match g.warm.take() {
+                    Some(mut ch) => run_persist(&mut ch, &persist),
+                    None => perform_persist(callback, token, &persist, &tls.edge),
+                };
+                match landed {
+                    Ok(()) => {
+                        store.lock().expect("store lock").commit(ns, apply);
+                        ok
+                    }
+                    // A shed or failed durable write (e.g. -QUOTA on an over-quota
+                    // tenant) is relayed; the index is left untouched.
+                    Err(e) => e,
+                }
+            }
+        }
+    };
+    // Served on a channel the rebuild handed back: if the rebuild spent its
+    // budget, the command answers -LOADING, and its retry, warm now, is served.
+    // A write stopped part way left its rows recoverable and the index
+    // untouched (`run_persist`), so the retry writes it again.
+    if served_warm && matches!(&reply, Value::Error(e) if e.contains("budget")) {
+        return err("LOADING vector index is warming, retry");
+    }
+    reply
+}
+
+/// How long a cold namespace's first command waits for the rebuild chunk it
+/// lends its channel to. A chunk that finishes the namespace in this time, as
+/// an empty or small one's does, hands the channel back and the command is
+/// served on it (ADR-0017's D3 amendment); otherwise the command answers
+/// -LOADING as before.
+const WARM_WAIT: Duration = Duration::from_millis(100);
+
+/// Open `token`'s channel for a rebuild chunk.
+fn open_channel(
+    token: &[u8],
+    callback: &[u8],
+    edge: &Option<Arc<flint_tls::ClientConfig>>,
+) -> Result<flint_tls::Stream, String> {
+    let addr = std::str::from_utf8(callback).map_err(|_| "bad callback".to_string())?;
+    let mut ch = flint_tls::connect_edge(addr, edge).map_err(|e| format!("channel dial: {e}"))?;
+    let _ = ch.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = ch.set_write_timeout(Some(Duration::from_secs(5)));
+    // Closed with a reset when it drops, on every path out (BUG-0269).
+    let _ = ch.set_abortive_close();
+    send_cmd(&mut ch, &[b"PROXYCHAN", token]).map_err(|e| format!("channel open: {e}"))?;
+    if let Value::Error(e) = read_reply(&mut ch).map_err(|e| format!("channel open: {e}"))? {
+        return Err(format!("channel refused: {e}"));
+    }
+    Ok(ch)
 }
 
 /// Run ONE rebuild chunk on `token`'s channel: continue the SCAN (first chunk)
@@ -548,9 +605,14 @@ fn rebuild_chunk(
     edge: Option<Arc<flint_tls::ClientConfig>>,
     phase: Phase,
     generation: u64,
+    handback: std::sync::mpsc::SyncSender<flint_tls::Stream>,
 ) {
     let name = String::from_utf8_lossy(&ns).into_owned();
-    let result = rebuild_chunk_inner(&ns, &token, &callback, &store, &edge, phase, generation);
+    let mut ch = open_channel(&token, &callback, &edge);
+    let result = match &mut ch {
+        Ok(ch) => rebuild_chunk_inner(ch, &ns, &store, phase, generation),
+        Err(e) => Err(e.clone()),
+    };
     let mut lk = loads.lock().expect("loads lock");
     if store.lock().expect("store lock").generation(&ns) != generation {
         eprintln!(
@@ -562,6 +624,13 @@ fn rebuild_chunk(
         Ok(Chunk::Done(total)) => {
             eprintln!("flint-vec: rebuilt ns {name:?} ({total} vectors) from durable rows");
             lk.insert(ns, LoadState::Loaded);
+            drop(lk);
+            // ADR-0017's D3 amendment: the command that lent this channel may
+            // still be waiting, and is served on what is left of it. It has
+            // gone when the send finds no one; the channel then closes here.
+            if let Ok(ch) = ch {
+                let _ = handback.try_send(ch);
+            }
         }
         Ok(Chunk::More { phase, installed }) => {
             let where_ = match &phase {
@@ -604,25 +673,12 @@ fn rebuild_chunk(
 /// row lands, [`Chunk::More`] when the budget runs out mid-set (resume point
 /// attached), or `Err` for a transient failure the caller should retry.
 fn rebuild_chunk_inner(
+    ch: &mut flint_tls::Stream,
     ns: &[u8],
-    token: &[u8],
-    callback: &[u8],
     store: &Arc<Mutex<Store>>,
-    edge: &Option<Arc<flint_tls::ClientConfig>>,
     phase: Phase,
     generation: u64,
 ) -> Result<Chunk, String> {
-    let addr = std::str::from_utf8(callback).map_err(|_| "bad callback".to_string())?;
-    let mut ch = flint_tls::connect_edge(addr, edge).map_err(|e| format!("channel dial: {e}"))?;
-    let _ = ch.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = ch.set_write_timeout(Some(Duration::from_secs(5)));
-    // Closed with a reset when it drops, on every path out (BUG-0269).
-    let _ = ch.set_abortive_close();
-    send_cmd(&mut ch, &[b"PROXYCHAN", token]).map_err(|e| format!("channel open: {e}"))?;
-    if let Value::Error(e) = read_reply(&mut ch).map_err(|e| format!("channel open: {e}"))? {
-        return Err(format!("channel refused: {e}"));
-    }
-
     // Phase 1: build the key list from the co-processor's OWN durable indexes,
     // configs before vectors so a set exists before its Inserts commit.
     //
@@ -643,7 +699,7 @@ fn rebuild_chunk_inner(
     // budget is discovered the same way Phase 2 discovers it: an exhausted
     // channel answers an error naming it, which is the EXPECTED end of a chunk.
     let (keys, next) = match phase {
-        Phase::Ft(at) => return Ok(ft_chunk(&mut ch, ns, store, at, generation, 0)),
+        Phase::Ft(at) => return Ok(ft_chunk(ch, ns, store, at, generation, 0)),
         Phase::Fetch { keys, next } => (keys, next),
         Phase::Discover {
             mut sets,
@@ -654,7 +710,7 @@ fn rebuild_chunk_inner(
             // The set index itself, once. Its cost is one command, and a fleet
             // has a handful of vector sets, so it is never the bottleneck.
             if sets.is_none() {
-                match smembers(&mut ch, &flint_vec::sets_index_key())? {
+                match smembers(ch, &flint_vec::sets_index_key())? {
                     Some(names) => {
                         configs.extend(names.iter().map(|n| flint_vec::config_key(n)));
                         sets = Some(names);
@@ -676,7 +732,7 @@ fn rebuild_chunk_inner(
             // Walk buckets of the front set until the channel is spent.
             while let Some(set) = remaining.first().cloned() {
                 while bucket < flint_vec::INDEX_BUCKETS {
-                    match smembers(&mut ch, &flint_vec::index_key(&set, bucket))? {
+                    match smembers(ch, &flint_vec::index_key(&set, bucket))? {
                         Some(ids) => {
                             vectors.extend(ids.iter().map(|id| flint_vec::vector_key(&set, id)));
                             bucket += 1;
@@ -719,8 +775,8 @@ fn rebuild_chunk_inner(
             i += 1;
             continue;
         };
-        send_cmd(&mut ch, &[b"GET", &keys[i]]).map_err(|e| format!("GET send: {e}"))?;
-        match read_reply(&mut ch).map_err(|e| format!("GET read: {e}"))? {
+        send_cmd(ch, &[b"GET", &keys[i]]).map_err(|e| format!("GET send: {e}"))?;
+        match read_reply(ch).map_err(|e| format!("GET read: {e}"))? {
             Value::Bulk(Some(val)) if kind == b'c' => {
                 if let Some((dim, metric, index, quant, fields)) = decode_config(&val) {
                     configs.push((set, dim, metric, index, quant, fields));
@@ -771,14 +827,7 @@ fn rebuild_chunk_inner(
         // With `--ft` or without: an index made while it was on is loaded and
         // served either way (ADR-0060).
         Ok(
-            match ft_chunk(
-                &mut ch,
-                ns,
-                store,
-                ftchan::FtLoad::Defs,
-                generation,
-                installed,
-            ) {
+            match ft_chunk(ch, ns, store, ftchan::FtLoad::Defs, generation, installed) {
                 Chunk::Done(_) => Chunk::Done(total),
                 more => more,
             },

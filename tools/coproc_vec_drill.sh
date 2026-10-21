@@ -676,8 +676,11 @@ echo "== BUG-0268: a tenant's FLUSHALL empties its vector sets, and a set made a
 [ "$(vexec VEC.SET fl a 1,0,0)" = "OK " ] || { echo "FAIL: VEC.SET fl a"; exit 1; }
 [ "$($A FLUSHALL 2>&1 | tr -d '\r')" = "OK" ] || { echo "FAIL: FLUSHALL"; exit 1; }
 # The flush deleted the set's durable rows; the co-processor's memory must
-# not go on answering from them.
-AFTER="$(vexec VEC.SEARCH fl 1,0,0 1)"
+# not go on answering from them. Asked once, not retried: the namespace is
+# empty now, so the chunk this command lends its channel to finishes it, and
+# the command is answered, not -LOADING (ADR-0017's D3 amendment).
+AFTER="$($A VEC.SEARCH fl 1,0,0 1 2>&1 | tr -d '\r' | tr '\n' ' ')"
+case "$AFTER" in *LOADING*) echo "FAIL (ADR-0017 D3 amendment): the first command after a flush answered -LOADING"; exit 1 ;; esac
 case "$AFTER" in *"no such set"*) : ;; *) echo "FAIL (BUG-0268): after FLUSHALL the set still answers: $AFTER"; exit 1 ;; esac
 WRITE="$(vexec VEC.SET fl b 0,1,0)"
 case "$WRITE" in *"no such set"*) : ;; *) echo "FAIL (BUG-0268): after FLUSHALL a write to the flushed set answered: $WRITE"; exit 1 ;; esac

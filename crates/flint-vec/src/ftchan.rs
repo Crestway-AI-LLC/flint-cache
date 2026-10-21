@@ -155,6 +155,26 @@ pub(crate) fn open(
     Ok(ch)
 }
 
+/// A family command's one channel: the one its grant opens, or one a rebuild
+/// chunk opened on the same grant and handed back once it finished the
+/// namespace (ADR-0017's D3 amendment). A grant opens one channel only.
+pub(crate) struct Grant<'a> {
+    pub(crate) token: &'a [u8],
+    pub(crate) callback: &'a [u8],
+    pub(crate) edge: &'a Option<Arc<flint_tls::ClientConfig>>,
+    pub(crate) warm: Option<flint_tls::Stream>,
+}
+
+impl Grant<'_> {
+    /// The channel: the one handed back, else this grant's own.
+    pub(crate) fn open(&mut self) -> Result<flint_tls::Stream, Value> {
+        match self.warm.take() {
+            Some(ch) => Ok(ch),
+            None => open(self.callback, self.token, self.edge),
+        }
+    }
+}
+
 /// Make `prefixes` the namespace's FT index prefixes on every pair
 /// (ADR-0060 amendment 2): the proxy fans `FLINTINDEXED` out to every master
 /// and fails if any cannot be reached. Every write under them that does not
@@ -232,11 +252,9 @@ fn read_doc(
 /// channel.
 pub(crate) fn handle(
     ns: &[u8],
-    token: &[u8],
-    callback: &[u8],
     args: &[Vec<u8>],
     store: &Arc<Mutex<Store>>,
-    edge: &Option<Arc<flint_tls::ClientConfig>>,
+    g: &mut Grant<'_>,
 ) -> Value {
     let plan = store
         .lock()
@@ -256,7 +274,7 @@ pub(crate) fn handle(
                     .expect("store lock")
                     .ft_resolve(ns, name)
                     .unwrap_or_else(|| name.clone());
-                lend_to_fill(ns, &index, token, callback, store, edge);
+                lend_to_fill(ns, &index, store, g);
             }
             v
         }
@@ -265,7 +283,7 @@ pub(crate) fn handle(
             index,
             persist,
         } => {
-            let mut ch = match open(callback, token, edge) {
+            let mut ch = match g.open() {
                 Ok(ch) => ch,
                 Err(e) => return e,
             };
@@ -283,7 +301,7 @@ pub(crate) fn handle(
             def,
             persist,
         } => {
-            let mut ch = match open(callback, token, edge) {
+            let mut ch = match g.open() {
                 Ok(ch) => ch,
                 Err(e) => return e,
             };
@@ -315,7 +333,7 @@ pub(crate) fn handle(
             persist,
             docs,
         } => {
-            let mut ch = match open(callback, token, edge) {
+            let mut ch = match g.open() {
                 Ok(ch) => ch,
                 Err(e) => return e,
             };
@@ -356,22 +374,17 @@ pub(crate) fn handle(
             }
             Value::Simple("OK".into())
         }
-        FtPlan::Search(plan) => search(&plan, token, callback, edge),
-        FtPlan::Write(plan) => write(ns, &plan, token, callback, store, edge),
+        FtPlan::Search(plan) => search(&plan, g),
+        FtPlan::Write(plan) => write(ns, &plan, store, g),
     }
 }
 
 /// `FT.SEARCH`: read each hit back for the reply.
-fn search(
-    plan: &SearchPlan,
-    token: &[u8],
-    callback: &[u8],
-    edge: &Option<Arc<flint_tls::ClientConfig>>,
-) -> Value {
+fn search(plan: &SearchPlan, g: &mut Grant<'_>) -> Value {
     if plan.nocontent || plan.hits.keys.is_empty() {
         return ftstore::search_reply(plan, &[]);
     }
-    let mut ch = match open(callback, token, edge) {
+    let mut ch = match g.open() {
         Ok(ch) => ch,
         Err(e) => return e,
     };
@@ -396,17 +409,10 @@ fn search(
 
 /// A routed write: the document list, the write, then each key it covers
 /// read back and indexed, all under the keys' locks.
-fn write(
-    ns: &[u8],
-    plan: &WritePlan,
-    token: &[u8],
-    callback: &[u8],
-    store: &Arc<Mutex<Store>>,
-    edge: &Option<Arc<flint_tls::ClientConfig>>,
-) -> Value {
+fn write(ns: &[u8], plan: &WritePlan, store: &Arc<Mutex<Store>>, g: &mut Grant<'_>) -> Value {
     let keys: Vec<&[u8]> = plan.keys.iter().map(|(k, _)| k.as_slice()).collect();
     let _held = LOCKS.lock(ns, &keys);
-    let mut ch = match open(callback, token, edge) {
+    let mut ch = match g.open() {
         Ok(ch) => ch,
         Err(e) => return e,
     };
@@ -579,14 +585,7 @@ fn run_fill(ch: &mut flint_tls::Stream, ns: &[u8], fill: Fill, store: &Arc<Mutex
 
 /// Lend this command's channel to `index`'s backfill, when one is waiting
 /// and none is running.
-fn lend_to_fill(
-    ns: &[u8],
-    index: &[u8],
-    token: &[u8],
-    callback: &[u8],
-    store: &Arc<Mutex<Store>>,
-    edge: &Option<Arc<flint_tls::ClientConfig>>,
-) {
+fn lend_to_fill(ns: &[u8], index: &[u8], store: &Arc<Mutex<Store>>, g: &mut Grant<'_>) {
     let key = (ns.to_vec(), index.to_vec());
     let fill = {
         let mut f = FILLS.lock().expect("fills lock");
@@ -598,7 +597,7 @@ fn lend_to_fill(
             _ => return,
         }
     };
-    match open(callback, token, edge) {
+    match g.open() {
         Ok(mut ch) => run_fill(&mut ch, ns, fill, store),
         Err(_) => {
             if let Some((_, running)) = FILLS.lock().expect("fills lock").get_mut(&key) {
