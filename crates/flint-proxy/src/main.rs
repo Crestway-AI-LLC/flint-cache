@@ -3971,8 +3971,10 @@ fn ft_search_resp3(args: &[Vec<u8>], v: &Value) -> Option<Value> {
         let mut entry = vec![(map_key("id"), id.clone())];
         if !nocontent && let Some(Value::Array(Some(fields))) = it.peek() {
             let pairs = fields
-                .chunks_exact(2)
-                .map(|c| (c[0].clone(), c[1].clone()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[k, v]| (k.clone(), v.clone()))
                 .collect();
             entry.push((map_key("extra_attributes"), Value::Map(pairs)));
             it.next();
@@ -4010,8 +4012,10 @@ fn ft_info_resp3(v: &Value) -> Option<Value> {
         };
         let val = match (value_text(k)?, val) {
             (b"index_definition", Value::Array(Some(d))) => Value::Map(
-                d.chunks_exact(2)
-                    .map(|p| (p[0].clone(), p[1].clone()))
+                d.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[k, v]| (k.clone(), v.clone()))
                     .collect(),
             ),
             (b"attributes", Value::Array(Some(attrs))) => {
