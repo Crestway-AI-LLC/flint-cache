@@ -160,6 +160,31 @@ under the same syntax.
   whose `ef` is raised to its `k`. The test holds floors of 0.90 (0.80 on
   IP), and says nothing of sets larger than these.
 
+### The clients' suites, as built (66a7687c, 2026-10-21)
+
+Against a local fleet of two pairs, `flint-vec --ft` and a proxy, beside
+the run after ADR-0017's D3 amendment (ADR-0060, verification):
+
+| suite | passed before | passed now | failed now | errors now |
+|---|---|---|---|---|
+| redisvl | 205 | 207 | 37 | 65 |
+| langchain-redis, RESP3 | 141 | 149 | 32 | 23 |
+| langchain-redis, RESP2 | 179 | 187 | 16 | 1 |
+| LlamaIndex | 19 | 19 | 0 | 0 |
+
+- **langchain-redis:** 8 more pass in each protocol, the 8 range tests:
+  - its semantic cache's 4: `test_redis_semantic_cache_with_preconfigured_client`,
+    `test_set_llm`, `test_async_semantic_cache_update_and_lookup` and
+    `test_redis_cache`;
+  - the `distance_threshold` searches, `test_similarity_search_limit_distance`
+    and `test_similarity_search_with_score_with_limit_distance`, over HASH
+    and JSON.
+- **redisvl:** 2 more pass, `test_range_query_returns_both_prefixes` and
+  `test_range_query_skip_decode`. Its one range test still not run,
+  `test_vector_range_query_with_raw_string_union_filter`, errors in its
+  fixture, which makes an index with a `GEO` field.
+- **No test newly fails,** and no failure left in any suite is a range query.
+
 ## Verification
 
 - **Parsing:** redisvl's and langchain-redis's query strings as they send
