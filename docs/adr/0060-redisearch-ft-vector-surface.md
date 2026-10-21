@@ -632,8 +632,13 @@ ephemeral ports in 20 seconds, and 14 tests failed `COPROCUNAVAIL` or
   - The frameworks do not retry it, so the first test after each flush in
     the suites fails: LlamaIndex's one failure, and 1 to 3 in the others.
   - Serving a command whose lent channel finishes the rebuild would end
-    this. It changes what D3 shows, so it is a question for Jeff, not part
-    of this ADR.
+    this. It changes what D3 shows, so it was a question for Jeff, not part
+    of this ADR. He accepted it as ADR-0017's D3 amendment (2026-10-20),
+    built at 228a1dfc. With it:
+    - LlamaIndex passes all 19;
+    - redisvl passes 205, with 39 failed and 65 errors;
+    - langchain-redis is as above;
+    - no suite loses a test to `-LOADING`.
 
 ## Verification
 
