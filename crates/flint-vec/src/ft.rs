@@ -236,6 +236,9 @@ pub struct Knn {
     pub ef: Option<usize>,
     /// The distance's name in the reply (`AS`), `__<field>_score` when none.
     pub alias: Box<str>,
+    /// A vector range query's radius (ADR-0061): every document within it,
+    /// as a KNN cut at it, `k` being the page's end. `None` for a KNN.
+    pub range: Option<f32>,
 }
 
 /// What `FT.SEARCH` asked for.
@@ -723,6 +726,10 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
         }
     }
     let query = text(query)?;
+    // ADR-0061: a vector range term comes out of the query before the rest
+    // is read as a filter.
+    let (rest, range) = take_range(query, def, &params)?;
+    let query = rest.as_str();
     let (filter_part, knn_part) = match query.rfind("=>") {
         Some(at) => (&query[..at], Some(&query[at + 2..])),
         None => (query, None),
@@ -733,9 +740,9 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
         && f.contains(&format!("@{}:", v.name))
     {
         return Err(format!(
-            "the query filters on the VECTOR field {}: vector range queries (VECTOR_RANGE) \
-             are not supported (ADR-0060)",
-            v.name
+            "the query filters on the VECTOR field {}: only as one \
+             @{}:[VECTOR_RANGE <radius> $<param>] term (ADR-0061)",
+            v.name, v.name
         ));
     }
     if f != "*" {
@@ -757,7 +764,13 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
         }
     }
     if let Some(k) = knn_part {
+        if range.is_some() {
+            return Err("a vector range query cannot also be a KNN (ADR-0061)".into());
+        }
         s.knn = Some(parse_knn(k, def, &params)?);
+    }
+    if range.is_some() {
+        s.knn = range;
     }
     if let Some((by, _)) = &s.sortby {
         let by_distance = s.knn.as_ref().is_some_and(|k| k.alias == *by);
@@ -776,6 +789,152 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
         }
     }
     Ok(s)
+}
+
+/// The query without its vector range term, `@<field>:[VECTOR_RANGE
+/// <radius> $<param>]=>{$YIELD_DISTANCE_AS: <name>; $EPSILON: <e>}`, and
+/// the term as a [`Knn`] cut at its radius (ADR-0061). The term may stand
+/// alone or be ANDed with a filter, in either order, as redisvl writes it;
+/// under `|` or `-`, twice, or beside a KNN it is refused by name.
+fn take_range(
+    query: &str,
+    def: &IndexDef,
+    params: &HashMap<String, Vec<u8>>,
+) -> Result<(String, Option<Knn>), String> {
+    let up = query.to_ascii_uppercase();
+    let Some(vr) = up.find("VECTOR_RANGE") else {
+        return Ok((query.to_string(), None));
+    };
+    if up[vr + 1..].contains("VECTOR_RANGE") {
+        return Err("a query takes one vector range term (ADR-0061)".into());
+    }
+    let Some(v) = &def.vector else {
+        return Err("this index has no VECTOR field".into());
+    };
+    let shape = "a vector range term is @<field>:[VECTOR_RANGE <radius> $<param>]";
+    let at = query[..vr].rfind('@').ok_or(shape)?;
+    let (field, open) = query[at + 1..vr].split_once(':').ok_or(shape)?;
+    if open.trim() != "[" {
+        return Err(shape.into());
+    }
+    if field.trim() != &*v.name {
+        return Err(format!(
+            "VECTOR_RANGE names @{}, which is not this index's VECTOR field",
+            field.trim()
+        ));
+    }
+    let close = vr + query[vr..].find(']').ok_or(shape)?;
+    let toks: Vec<&str> = query[vr..close].split_ascii_whitespace().collect();
+    let [_, radius, vector] = toks.as_slice() else {
+        return Err(shape.into());
+    };
+    let radius: f32 = std::str::from_utf8(&param(radius, params)?)
+        .ok()
+        .and_then(|r| r.trim().parse().ok())
+        .filter(|r: &f32| r.is_finite())
+        .ok_or("a vector range's radius is a number")?;
+    if radius < 0.0 {
+        return Err("a vector range's radius is at least 0".into());
+    }
+    let blob = match vector.strip_prefix('$') {
+        Some(_) => param(vector, params)?,
+        None => return Err("VECTOR_RANGE needs a $parameter for the query vector".into()),
+    };
+    let vector = vector_from_bytes(&blob, v.dim).map_err(|e| format!("the query {e}"))?;
+    let mut knn = Knn {
+        k: 0,
+        vector,
+        ef: None,
+        alias: format!("__{}_score", v.name).into(),
+        range: Some(radius),
+    };
+    let mut end = close + 1;
+    if let Some(attrs) = query[end..].strip_prefix("=>{") {
+        let len = attrs
+            .find('}')
+            .ok_or("a vector range's attributes end with }")?;
+        for a in attrs[..len]
+            .split(';')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            let (k, val) = a
+                .split_once(':')
+                .ok_or("a vector range's attribute is $<name>: <value>")?;
+            match k.trim().to_ascii_uppercase().as_str() {
+                "$YIELD_DISTANCE_AS" => knn.alias = val.trim().into(),
+                // HNSW's boundary factor; a range here is cut from a KNN,
+                // so it changes no answer. redisvl may send it.
+                "$EPSILON" => {
+                    val.trim()
+                        .parse::<f32>()
+                        .map_err(|_| "a vector range's $EPSILON is a number")?;
+                }
+                other => {
+                    return Err(format!(
+                        "the vector range attribute {other} is not supported (ADR-0061)"
+                    ));
+                }
+            }
+        }
+        end += 3 + len + 1;
+    }
+    // A conjunct of the whole query, so that taking it out leaves the filter
+    // it is ANDed with. redisvl wraps the two in one group, which comes off.
+    let (mut before, mut after) = (query[..at].trim(), query[end..].trim());
+    if let (Some(b), Some(a)) = (before.strip_prefix('('), after.strip_suffix(')'))
+        && !breaks_a_conjunction(b)
+        && !breaks_a_conjunction(a)
+    {
+        (before, after) = (b.trim(), a.trim());
+    }
+    if breaks_a_conjunction(before)
+        || breaks_a_conjunction(after)
+        || before.ends_with(['-', '~'])
+        || after.contains("=>[")
+    {
+        return Err(
+            "a vector range term stands alone or is ANDed with a filter, \
+                    not under |, - or ~, nor beside a KNN (ADR-0061)"
+                .into(),
+        );
+    }
+    let rest = format!("{before} {after}");
+    let rest = rest.trim();
+    Ok((
+        if rest.is_empty() { "*" } else { rest }.to_string(),
+        Some(knn),
+    ))
+}
+
+/// Whether `s`, the query on one side of a vector range term, keeps the term
+/// out of a plain AND: a `|` outside every group, tag set, numeric range and
+/// quote, or a group it opens and does not close, or closes and did not open.
+fn breaks_a_conjunction(s: &str) -> bool {
+    let (mut depth, mut until) = (0i32, None);
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (until, c) {
+            (_, '\\') => {
+                chars.next();
+            }
+            (Some(end), c) if c == end => until = None,
+            (Some(_), _) => {}
+            (None, '{') => until = Some('}'),
+            (None, '[') => until = Some(']'),
+            (None, '"') => until = Some('"'),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            (None, '|') if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    depth != 0 || until.is_some()
 }
 
 /// `e` with each term on a field in `noindex` replaced by one that matches
@@ -853,6 +1012,7 @@ fn parse_knn(
         vector,
         ef: None,
         alias: format!("__{}_score", v.name).into(),
+        range: None,
     };
     let mut j = 4;
     while let Some(t) = toks.get(j) {
@@ -1239,6 +1399,91 @@ mod tests {
         assert!(matches!(s.filter, Some(Expr::Phrase { .. })));
         assert_eq!(s.returns, Some(vec![("price".into(), "p".into())]));
         assert_eq!(s.sortby, Some(("price".into(), false)));
+    }
+
+    /// ADR-0061: a vector range term, as redisvl and langchain-redis write
+    /// it, parses as a KNN cut at its radius, alone or ANDed with a filter;
+    /// the shapes it does not serve are refused by name.
+    #[test]
+    fn a_vector_range_term_parses_as_a_knn_cut_at_its_radius() {
+        let def = redisvl_hash();
+        let q = [1.0f32, 0.0, 0.0];
+        let range = |query: &str| -> Result<Search, String> {
+            let mut args = a(&[
+                "FT.SEARCH",
+                "idx",
+                query,
+                "SORTBY",
+                "vector_distance",
+                "ASC",
+                "LIMIT",
+                "0",
+                "3",
+                "DIALECT",
+                "2",
+                "PARAMS",
+                "4",
+                "distance_threshold",
+                "0.25",
+                "vector",
+            ]);
+            args.push(blob(&q));
+            parse_search(&args, &def)
+        };
+        let s = range("@embedding:[VECTOR_RANGE $distance_threshold $vector]=>{$YIELD_DISTANCE_AS: vector_distance}")
+            .expect("redisvl's range alone");
+        let knn = s.knn.as_ref().expect("a range is a KNN");
+        assert_eq!((knn.range, &*knn.alias), (Some(0.25), "vector_distance"));
+        assert_eq!(knn.vector, q.to_vec());
+        assert!(s.filter.is_none());
+        let s = range(
+            "@embedding:[VECTOR_RANGE $distance_threshold $vector]=>{$YIELD_DISTANCE_AS: vector_distance; $EPSILON: 0.01} (@user:{alice})",
+        )
+        .expect("redisvl's range with a filter and EPSILON");
+        assert!(s.filter.is_some());
+        // redisvl's own shape with a filter: the two in one group.
+        let s = range(
+            "(@embedding:[VECTOR_RANGE $distance_threshold $vector]=>{$YIELD_DISTANCE_AS: vector_distance} (@user:{alice}))",
+        )
+        .expect("redisvl's range and filter in one group");
+        assert!(s.filter.is_some());
+        let s =
+            range("(@user:{alice} @embedding:[VECTOR_RANGE 0.5 $vector]=>{$YIELD_DISTANCE_AS: vector_distance})")
+                .expect("filter first");
+        assert_eq!(s.knn.as_ref().and_then(|k| k.range), Some(0.5));
+        assert!(s.filter.is_some());
+        // A `|` inside a tag set or a group is the filter's own.
+        for q in [
+            "@user:{alice|bob} @embedding:[VECTOR_RANGE 0.5 $vector]=>{$YIELD_DISTANCE_AS: vector_distance}",
+            "(@user:{alice} | @user:{bob}) @embedding:[VECTOR_RANGE 0.5 $vector]=>{$YIELD_DISTANCE_AS: vector_distance}",
+        ] {
+            assert!(range(q).expect(q).filter.is_some(), "{q}");
+        }
+        let refused = |query: &str| range(query).expect_err(query);
+        for q in [
+            "@user:{a} | @embedding:[VECTOR_RANGE 0.5 $vector]",
+            "@user:{a} @embedding:[VECTOR_RANGE 0.5 $vector] | @user:{b}",
+            "(@embedding:[VECTOR_RANGE 0.5 $vector]) | @user:{b}",
+            "(@user:{a} @embedding:[VECTOR_RANGE 0.5 $vector]) | @user:{b}",
+            "@user:{a} | (@embedding:[VECTOR_RANGE 0.5 $vector])",
+            "-@embedding:[VECTOR_RANGE 0.5 $vector]",
+            "-(@embedding:[VECTOR_RANGE 0.5 $vector])",
+            "~@embedding:[VECTOR_RANGE 0.5 $vector]",
+            "@embedding:[VECTOR_RANGE 0.5 $vector]=>[KNN 2 @embedding $vector]",
+        ] {
+            assert!(refused(q).contains("ADR-0061"), "{q}: {}", refused(q));
+        }
+        assert!(
+            refused("@embedding:[VECTOR_RANGE 0.5 $vector] @embedding:[VECTOR_RANGE 0.6 $vector]")
+                .contains("one vector range")
+        );
+        assert!(
+            refused("@embedding:[VECTOR_RANGE 0.5 $vector]=>{$SEARCH_WINDOW_SIZE: 4}")
+                .contains("SEARCH_WINDOW_SIZE")
+        );
+        assert!(refused("@embedding:[VECTOR_RANGE -1 $vector]").contains("at least 0"));
+        assert!(refused("@other:[VECTOR_RANGE 0.5 $vector]").contains("not this index's VECTOR"));
+        assert!(refused("@embedding:[VECTOR_RANGE 0.5 vector]").contains("$parameter"));
     }
 
     #[test]

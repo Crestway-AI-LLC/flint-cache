@@ -42,6 +42,11 @@ const DOC_BYTES: usize = 104;
 /// by however the set found them.
 const TIE_SLACK: usize = 16;
 
+/// The most documents a vector range query counts (ADR-0061): a range of
+/// more reports this many, its pages exact up to it. The page ceiling of
+/// ADR-0060 amendment 3, part 1.
+const RANGE_CAP: usize = 10_000;
+
 pub struct FtIndex {
     def: IndexDef,
     fields: Box<[Field]>,
@@ -58,6 +63,9 @@ pub struct FtIndex {
     /// The next document write's `seq`.
     next_seq: u64,
 }
+
+/// Keys with their distance from a KNN's vector, nearest first.
+type Ranked = Vec<(Vec<u8>, Option<f32>)>;
 
 /// One search's answer before the documents are read: how many matched, and
 /// the page asked for, each key with its distance when the search was a KNN.
@@ -269,21 +277,44 @@ impl FtIndex {
             (Some(knn), Some(set), Some(v)) => {
                 let expired = set.expired_count(now);
                 let ef = knn.ef.or(v.ef_runtime).unwrap_or(hnsw::EF_SEARCH_DEFAULT);
-                let ask = knn.k.saturating_add(expired).saturating_add(TIE_SLACK);
-                let mut near: Vec<(Vec<u8>, Option<f32>)> = set
-                    .search(&knn.vector, ask, ef, ask, s.filter.as_ref(), None)?
-                    .into_iter()
-                    .filter(|(id, _)| !set.is_expired(id, now))
-                    .map(|(id, score)| (id, Some(distance(v.metric, score))))
-                    .collect();
-                // Nearest first, and a tie to the earlier write.
-                near.sort_by(|a, b| {
-                    a.1.partial_cmp(&b.1)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| self.seq(&a.0).cmp(&self.seq(&b.0)))
-                });
-                near.truncate(knn.k);
-                near
+                // The `k` nearest live matches, nearest first, a tie to the
+                // earlier write.
+                let nearest = |k: usize| -> Result<Ranked, String> {
+                    let ask = k.saturating_add(expired).saturating_add(TIE_SLACK);
+                    let mut near: Ranked = set
+                        .search(&knn.vector, ask, ef, ask, s.filter.as_ref(), None)?
+                        .into_iter()
+                        .filter(|(id, _)| !set.is_expired(id, now))
+                        .map(|(id, score)| (id, Some(distance(v.metric, score))))
+                        .collect();
+                    near.sort_by(|a, b| {
+                        a.1.partial_cmp(&b.1)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| self.seq(&a.0).cmp(&self.seq(&b.0)))
+                    });
+                    near.truncate(k);
+                    Ok(near)
+                };
+                match knn.range {
+                    None => nearest(knn.k)?,
+                    // ADR-0061 C: a range is a KNN cut at its radius. It is
+                    // asked for the page's end, then for twice as many
+                    // until its farthest is past the radius, every vector is
+                    // in, or the ceiling is reached; the total is what lies
+                    // within it.
+                    Some(radius) => {
+                        let mut k = s.offset.saturating_add(s.num).clamp(1, RANGE_CAP);
+                        loop {
+                            let mut near = nearest(k)?;
+                            let got = near.len();
+                            near.retain(|(_, d)| d.is_some_and(|d| d <= radius));
+                            if near.len() < got || got < k || k >= RANGE_CAP {
+                                break near;
+                            }
+                            k = k.saturating_mul(2).min(RANGE_CAP);
+                        }
+                    }
+                }
             }
             (Some(_), _, _) => return Err("this index has no VECTOR field".into()),
             (None, _, _) => {
@@ -603,6 +634,264 @@ mod tests {
             .iter()
             .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
             .collect()
+    }
+
+    /// Floats in [-1, 1), from a fixed sequence per `seed`.
+    fn floats(seed: u64) -> impl FnMut() -> f32 {
+        let mut seed = seed;
+        move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        }
+    }
+
+    /// A `kind` (FLAT or HNSW) index over a `t` TAG and a `dim`-d `v` of
+    /// `metric`, with `n` vectors from a fixed sequence, each value in
+    /// [-scale, scale) and every third vector tagged `a`; and the vectors, the
+    /// i-th under `d:<i>`.
+    fn range_index(
+        kind: &str,
+        metric: &str,
+        n: usize,
+        dim: usize,
+        scale: f32,
+    ) -> (FtIndex, Vec<Vec<f32>>) {
+        let dims = dim.to_string();
+        let (_, def) = parse_create(&a(&[
+            "FT.CREATE",
+            "r",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "d:",
+            "SCHEMA",
+            "t",
+            "TAG",
+            "v",
+            "VECTOR",
+            kind,
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            &dims,
+            "DISTANCE_METRIC",
+            metric,
+        ]))
+        .expect("parses");
+        let mut ix = FtIndex::new(def);
+        let mut rnd = floats(7);
+        let mut vecs = Vec::with_capacity(n);
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| rnd() * scale).collect();
+            let t = if i.is_multiple_of(3) { "a" } else { "b" };
+            let fields = vec![
+                (b"t".to_vec(), t.as_bytes().to_vec()),
+                (b"v".to_vec(), blob(&v)),
+            ];
+            ix.put(format!("d:{i:05}").as_bytes(), Source::Hash(&fields), None)
+                .expect("indexed");
+            vecs.push(v);
+        }
+        (ix, vecs)
+    }
+
+    /// RediSearch's distance of `v` from `q`, by brute force: squared L2,
+    /// `1 - dot`, or `1 - cos`.
+    fn measure(metric: &str, q: &[f32], v: &[f32]) -> f32 {
+        let dot: f32 = q.iter().zip(v).map(|(a, b)| a * b).sum();
+        let norm = |x: &[f32]| x.iter().map(|a| a * a).sum::<f32>().sqrt();
+        match metric {
+            "L2" => q.iter().zip(v).map(|(a, b)| (a - b) * (a - b)).sum(),
+            "IP" => 1.0 - dot,
+            _ => 1.0 - dot / (norm(q) * norm(v)),
+        }
+    }
+
+    /// The index `i` of a `d:<i>` key.
+    fn doc_no(k: &[u8]) -> usize {
+        std::str::from_utf8(&k[2..])
+            .ok()
+            .and_then(|i| i.parse().ok())
+            .expect("d:<i>")
+    }
+
+    /// ADR-0061 C, its verification: on FLAT a range is every document within
+    /// the radius by a brute-force measure, nearest first, its total
+    /// included, over 10,000 vectors, for each metric, from no document in
+    /// range to all of them, with and without a filter, and paged. A document
+    /// within 1e-4 of the radius may fall either side, as the two ways of
+    /// summing its distance round.
+    #[test]
+    fn a_vector_range_on_flat_is_every_document_within_its_radius() {
+        let q = [0.3f32, -0.2, 0.5];
+        for metric in ["L2", "IP", "COSINE"] {
+            let (ix, vecs) = range_index("FLAT", metric, RANGE_CAP, 3, 1.0);
+            let measured: Vec<f32> = vecs.iter().map(|v| measure(metric, &q, v)).collect();
+            for filter in ["", " (@t:{a})"] {
+                let matches = |i: usize| filter.is_empty() || i.is_multiple_of(3);
+                for radius in [0.0f32, 0.05, 0.3, 1.0, 100.0] {
+                    let what = format!("{metric} radius {radius}{filter}");
+                    let query =
+                        format!("@v:[VECTOR_RANGE {radius} $v]=>{{$YIELD_DISTANCE_AS: d}}{filter}");
+                    let got = search(
+                        &ix,
+                        &[
+                            "FT.SEARCH",
+                            "r",
+                            &query,
+                            "SORTBY",
+                            "d",
+                            "LIMIT",
+                            "0",
+                            "10000",
+                        ],
+                        Some(&q),
+                    );
+                    let mut found = vec![false; vecs.len()];
+                    for (k, d) in &got.keys {
+                        let i = doc_no(k);
+                        let d = d.expect("a range answers its distance");
+                        assert!(matches(i), "{what}: d:{i} is not a match");
+                        assert!((d - measured[i]).abs() <= 1e-4, "{what}: d:{i} at {d}");
+                        assert!(measured[i] <= radius + 1e-4, "{what}: d:{i} is past it");
+                        found[i] = true;
+                    }
+                    for (i, &d) in measured.iter().enumerate() {
+                        if matches(i) && d <= radius - 1e-4 {
+                            assert!(found[i], "{what}: d:{i} at {d} is missing");
+                        }
+                    }
+                    assert_eq!(got.total, got.keys.len(), "{what}: total");
+                    assert!(
+                        got.keys.windows(2).all(|w| w[0].1 <= w[1].1),
+                        "{what}: nearest first"
+                    );
+                    // A page smaller than the range still counts all of it,
+                    // by doubling, and is the range's own page.
+                    let page = search(
+                        &ix,
+                        &["FT.SEARCH", "r", &query, "SORTBY", "d", "LIMIT", "1", "2"],
+                        Some(&q),
+                    );
+                    assert_eq!(page.total, got.total, "{what}: paged total");
+                    let want: Vec<String> = keys(&got).into_iter().skip(1).take(2).collect();
+                    assert_eq!(keys(&page), want, "{what}: page");
+                }
+            }
+        }
+    }
+
+    /// ADR-0061 C, its verification on HNSW: the recall of a range against
+    /// the brute-force answer, at the default EF_RUNTIME and RediSearch's
+    /// default page of 10, beside the recall of a KNN of as many as the range
+    /// holds, over the same 2,000 vectors. A range is cut from a KNN of at
+    /// least that many, so it recalls at least as well. The values are small
+    /// enough that `1 - dot` stays positive, as a radius must be.
+    #[test]
+    fn a_vector_range_on_hnsw_recalls_as_its_knn_does() {
+        let (n, dim, scale) = (2000, 16, 0.25);
+        for (metric, floor) in [("L2", 0.90), ("COSINE", 0.90), ("IP", 0.80)] {
+            let (ix, vecs) = range_index("HNSW", metric, n, dim, scale);
+            let mut rnd = floats(11);
+            let (mut truths, mut in_range, mut in_knn, mut page_hits, mut page_truths) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            for _ in 0..20 {
+                let q: Vec<f32> = (0..dim).map(|_| rnd() * scale).collect();
+                let mut by: Vec<(f32, usize)> = vecs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (measure(metric, &q, v), i))
+                    .collect();
+                by.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for size in [10, 50, 200] {
+                    // Between the size-th nearest and the next, so that no
+                    // document sits on it.
+                    let radius = (by[size - 1].0 + by[size].0) / 2.0;
+                    assert!(radius >= 0.0, "{metric}: radius {radius}");
+                    let truth: Vec<usize> = by
+                        .iter()
+                        .take_while(|(d, _)| *d <= radius)
+                        .map(|(_, i)| *i)
+                        .collect();
+                    let query = format!("@v:[VECTOR_RANGE {radius} $v]=>{{$YIELD_DISTANCE_AS: d}}");
+                    let got = search(
+                        &ix,
+                        &["FT.SEARCH", "r", &query, "SORTBY", "d"],
+                        Some(q.as_slice()),
+                    );
+                    // Every one it holds is within the radius, so its total
+                    // is the range's recall.
+                    truths += truth.len();
+                    in_range += got.total;
+                    let top: Vec<usize> = truth.iter().take(10).copied().collect();
+                    page_truths += top.len();
+                    page_hits += got
+                        .keys
+                        .iter()
+                        .filter(|(k, _)| top.contains(&doc_no(k)))
+                        .count();
+                    let kq = format!("*=>[KNN {} @v $v AS d]", truth.len());
+                    let lim = truth.len().to_string();
+                    let knn = search(
+                        &ix,
+                        &["FT.SEARCH", "r", &kq, "LIMIT", "0", &lim],
+                        Some(q.as_slice()),
+                    );
+                    in_knn += knn
+                        .keys
+                        .iter()
+                        .filter(|(k, _)| truth.contains(&doc_no(k)))
+                        .count();
+                }
+            }
+            let (range, knn, page) = (
+                in_range as f64 / truths as f64,
+                in_knn as f64 / truths as f64,
+                page_hits as f64 / page_truths as f64,
+            );
+            eprintln!("{metric}: range recall {range:.3}, its first page {page:.3}, KNN {knn:.3}");
+            assert!(
+                range >= floor && page >= floor,
+                "{metric}: range {range}, page {page}"
+            );
+            assert!(
+                range + 0.01 >= knn,
+                "{metric}: range {range} below its KNN {knn}"
+            );
+        }
+    }
+
+    /// ADR-0061 C: a range of more than 10,000 documents reports 10,000, and
+    /// its first page is still the nearest.
+    #[test]
+    fn a_vector_range_counts_to_its_ceiling() {
+        let (ix, _) = range_index("FLAT", "L2", RANGE_CAP + 5, 2, 1.0);
+        let q = [0.0f32, 0.0];
+        let got = search(
+            &ix,
+            &[
+                "FT.SEARCH",
+                "r",
+                "@v:[VECTOR_RANGE 100 $v]=>{$YIELD_DISTANCE_AS: d}",
+                "SORTBY",
+                "d",
+                "LIMIT",
+                "0",
+                "3",
+            ],
+            Some(&q),
+        );
+        assert_eq!(got.total, RANGE_CAP);
+        let knn = search(
+            &ix,
+            &["FT.SEARCH", "r", "*=>[KNN 3 @v $v AS d]", "SORTBY", "d"],
+            Some(&q),
+        );
+        assert_eq!(keys(&got), keys(&knn));
     }
 
     /// Amendment 3, part 6: results that tie come in write order, as

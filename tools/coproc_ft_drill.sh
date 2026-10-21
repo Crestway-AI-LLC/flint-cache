@@ -308,6 +308,27 @@ if which == "flush":
     want(cmd(px, "FT.DROPINDEX", "fx", "DD"), "OK", "FT.DROPINDEX fx DD")
     print("  a flush drops the namespace's indexes and their prefixes; inside MULTI it is refused")
 
+if which == "range":
+    # ADR-0061: a vector range query, as redisvl's SemanticCache and
+    # langchain-redis's distance_threshold write it: every document within
+    # the radius, nearest first, alone or ANDed with a filter. Left in idx:
+    # doc:2 at a squared distance of 3.61 from q, doc:3 at 0.81.
+    q = vec(2.9, 0.0)
+    def rng(query, *opts):
+        return cmd(px, "FT.SEARCH", "idx", query, *opts, "SORTBY", "vector_distance", "ASC",
+                   "DIALECT", "2", "PARAMS", "4", "distance_threshold", "4.0", "vector", q)
+    base = "@v:[VECTOR_RANGE $distance_threshold $vector]=>{$YIELD_DISTANCE_AS: vector_distance}"
+    r = rng(base, "NOCONTENT")
+    want(r, [2, b"doc:3", b"doc:2"], "the documents within the radius, nearest first")
+    r = rng(base + " (@price:[25 +inf])", "NOCONTENT")
+    want(r, [1, b"doc:3"], "a range ANDed with a filter")
+    r = rng(base, "RETURN", "1", "vector_distance", "LIMIT", "0", "1")
+    want(r[0], 2, "a page of one still counts the range")
+    if abs(float(r[2][1]) - 0.81) > 1e-4:
+        raise SystemExit("FAIL: the range's distance: %r" % r[2])
+    refused(rng("@user:{x} | " + base), "ERR a vector range term stands alone", "a range under |")
+    print("  VECTOR_RANGE: within the radius, nearest first, with a filter, counted past its page")
+
 if which == "off":
     refused(cmd(px, "FT.CREATE", "z", "PREFIX", "1", "z:", "SCHEMA", "a", "TAG"),
             "ERR FT.* is not enabled", "FT.CREATE without --ft")
@@ -324,12 +345,16 @@ step json || exit 1
 
 echo "== ADR-0060 amendment 3: MODULE LIST, aliases, a page past the default budget, ties"
 step amend3 || exit 1
+echo "== ADR-0061: a vector range query"
+step range || exit 1
 
 echo "== a co-processor restart rebuilds every index and registers its prefixes again"
 kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec --ft
 step same || exit 1
 step aliassame || exit 1
+echo "== ADR-0061: the same range, on the indexes the restart rebuilt"
+step range || exit 1
 grep -q "FT\.\* on" "$D/vec.log" || { echo "FAIL: flint-vec did not say FT.* is on"; exit 1; }
 
 echo "== FT.DROPINDEX takes the prefixes off every pair"
@@ -343,4 +368,4 @@ kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec
 step off || exit 1
 
-echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, and --ft gates it (ADR-0060, amendment 3)"
+echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), and --ft gates it (ADR-0060, amendment 3)"

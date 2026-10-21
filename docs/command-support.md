@@ -533,6 +533,11 @@ only on a fleet whose operator sets `coproc-ft on`.
   - ADR-0059's filter, or `*`.
   - `=>[KNN k @field $param [EF_RUNTIME n] [AS name]]`, answering its distance
     as RediSearch does: squared L2, `1 - dot`, or `1 - cos`.
+  - A vector range, `@field:[VECTOR_RANGE <radius> $param]`, with
+    `=>{$YIELD_DISTANCE_AS: <name>}` and `$EPSILON` (ADR-0061), alone or
+    ANDed with a filter: every document within the radius, measured as the
+    KNN measures, nearest first. A range of more than 10,000 documents
+    reports a total of 10,000.
   - `PARAMS`, `RETURN ... AS`, and `SORTBY` on the distance or a `NUMERIC`
     or `TAG` field.
   - `LIMIT`, up to 10,000 results a page, `NOCONTENT`, and `DIALECT 2`.
@@ -561,8 +566,9 @@ only on a fleet whose operator sets `coproc-ft on`.
 - **An index over keys that already exist is built from them** before it
   answers. Until it is, a search answers `-LOADING`.
 - **Refused by name:** `FT.AGGREGATE`, `FT.CURSOR`, `FT.ALTER`, suggestions
-  and spelling, `GEO` fields, `RANGE` vector queries, any other
-  full-text term, `DIALECT 1` and every other `FT.SEARCH` option.
+  and spelling, `GEO` fields, a vector range under `|`, `-` or `~` or beside
+  a KNN, any other full-text term, `DIALECT 1` and every other `FT.SEARCH`
+  option.
 
 ## Protocols: RESP2 and RESP3
 
