@@ -1,9 +1,10 @@
 # ADR-0061: Vector range queries in `FT.SEARCH`, for the frameworks' semantic caches
 
-Status: **ACCEPTED 2026-10-20, option C** (Jeff: "Accept option C"), to be
-built after ADR-0060's release N. **Proposed 2026-10-20:** Jeff chose this
-as the next `FT.*` gap to design ("Vector range queries", 2026-10-20). It builds on ADR-0060's
-`FT.*` surface, release N and amendment 3, which are built on the branch
+Status: **ACCEPTED 2026-10-20, option C** (Jeff: "Accept option C");
+**built 2026-10-21** (As built, below), stacked on ADR-0060's release N.
+**Proposed 2026-10-20:** Jeff chose this as the next `FT.*` gap to design
+("Vector range queries", 2026-10-20). It builds on ADR-0060's `FT.*`
+surface, release N and amendment 3, which are built on the branch
 `adr0060-ft` and ride after v0.1.0-rc.85.
 
 ## Context
@@ -114,6 +115,50 @@ under the same syntax.
   that release refuses by name as today.
 - **Not `VEC.SEARCH`.** A radius for `VEC.*` can follow under the same rule
   if a tenant asks.
+
+## As built (2026-10-21, stacked on ADR-0060's release N, after v0.1.0-rc.85)
+
+- **The query.** `take_range` (`flint-vec/src/ft.rs`) takes the range term
+  out of the query before the rest is read as ADR-0059's filter.
+  - The term must be one conjunct of the whole query, so that taking it out
+    leaves exactly the filter it is ANDed with. redisvl's own shape, the term
+    and its filter in one group, comes off whole.
+  - Refused by name:
+    - a `|` beside it outside every group, tag set, numeric range and quote;
+    - a group around it that is not the whole query;
+    - `-` or `~` before it, or a KNN beside it;
+    - two range terms;
+    - an attribute other than `$YIELD_DISTANCE_AS` and `$EPSILON`.
+  - A `|` inside a tag set (`@user:{a|b}`) or inside a group of the filter
+    is the filter's own.
+  - A negative radius is refused, as RediSearch refuses it.
+- **The answer.** The term becomes a KNN with a radius (`Knn.range`).
+  `FtIndex::search` asks for `k` = the page's end, at least 1. It keeps
+  the results within the radius, and doubles `k` while every result is
+  within it, until fewer come back than were asked for or `k` reaches
+  10,000 (`RANGE_CAP`). The sort, `RETURN`, page and reply are a KNN's.
+- **Held by:**
+  - unit tests:
+    - `a_vector_range_term_parses_as_a_knn_cut_at_its_radius`;
+    - `a_vector_range_on_flat_is_every_document_within_its_radius`;
+    - `a_vector_range_on_hnsw_recalls_as_its_knn_does`;
+    - `a_vector_range_counts_to_its_ceiling`;
+  - `coproc_ft_drill`'s `range` section, before and after a co-processor
+    restart.
+- **Measured** (`a_vector_range_on_hnsw_recalls_as_its_knn_does`):
+  - 2,000 16-d vectors, 20 queries, ranges of 10, 50 and 200 documents;
+  - default `EF_RUNTIME`, RediSearch's default page of 10.
+
+  | metric | range (its total) | its first page | KNN of as many |
+  |---|---|---|---|
+  | L2 | 1.000 | 1.000 | 0.999 |
+  | COSINE | 1.000 | 1.000 | 1.000 |
+  | IP | 1.000 | 1.000 | 1.000 |
+
+  At these sizes every range matched its brute-force answer; the KNN of as
+  many missed 0.1% on L2. A range is cut from a KNN of at least as many,
+  whose `ef` is raised to its `k`. The test holds floors of 0.90 (0.80 on
+  IP), and says nothing of sets larger than these.
 
 ## Verification
 
