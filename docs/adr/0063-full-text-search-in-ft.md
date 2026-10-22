@@ -426,7 +426,97 @@ Against a local fleet, beside the run after ADR-0062 (its *As built*):
 - `FT.AGGREGATE`, next by count, and redisvl's `HybridQuery`, which uses it.
 - `INDEXEMPTY` and `INDEXMISSING`.
 - `SORTBY` on a TEXT field, which needs RediSearch's sort normalization
-  (`UNF`). Seven redisvl tests now wait on it (As built).
+  (`UNF`). Seven redisvl tests now wait on it (As built). Proposed as
+  amendment 1, below.
 - `FT.SEARCH` without a KNN still reads every document for a search with no
   text word, as it does today. Postings for tags and numbers would end
   that, and are a separate question.
+
+## Amendment 1 (PROPOSED 2026-10-22): `SORTBY` on TEXT and TAG fields, by their values
+
+**Why now.** `SORTBY` on a TEXT field is refused by name, and with full text
+built it is what stops 7 of redisvl's tests:
+- 4 are its word-weight tests, which sort by `description`, a TEXT field
+  that is not `SORTABLE`;
+- 3 sort by a `SORTABLE` TEXT field, two of them `NOINDEX`, one `UNF`.
+
+Reading how RediSearch sorts also showed that Flint sorts a TAG field
+differently from RediSearch (BUG-0274, filed with this).
+
+**What RediSearch does, from its source** (`document.c`, `sorting_vector`,
+`value/src/comparison.rs`, `pipeline_construction.c`):
+- **A `SORTABLE` TEXT or TAG field** puts its whole value in the
+  document's sorting vector, case-folded by ICU's `fold_string` unless the
+  field is `UNF`. For a TAG that is the value before it is split: `"b,a"`.
+- **A field that is not `SORTABLE`** is loaded from the key when a
+  `SORTBY` names it, and sorted as it is written.
+- **Strings compare as bytes,** ascending or descending as asked. A
+  document without the field comes last either way, and a tie goes to the
+  earlier write.
+
+### Options
+
+**A. Keep each TEXT and TAG field's sort value in the index (recommended).**
+Each document keeps, for each TEXT and TAG field, its value as written,
+folded when the field is `SORTABLE` without `UNF`. Any field sorts, with no
+reads at search time.
+- **Exact,** for every field, `SORTABLE` or not, as RediSearch sorts it.
+- **Memory:** the field's text once more. That is small beside what full
+  text already holds for the same text. A 500-byte message has about 60
+  distinct words, at least 6 KB of postings and positions. So a TEXT-heavy
+  index grows by about a tenth. It is charged to the D4 meter, and
+  `tests/ft_meter.rs` holds it.
+- **Fixes BUG-0274** with the same values.
+
+**B. Keep only `SORTABLE` fields' values; read the rest at search time.** A
+`SORTBY` on a field that is not `SORTABLE` reads that field from every
+match's key over the channel, as RediSearch loads it.
+- Exact, and no memory for fields that are not `SORTABLE`.
+- A search sorted that way costs a read per match, up to the 10,000
+  ceiling. The search path also has to read in the middle of a search,
+  which it does nowhere today.
+
+**C. Keep only `SORTABLE` fields' values; refuse the rest by name.**
+- The least code.
+- The 4 word-weight tests still fail. A TAG `SORTBY` that is served today
+  on a field that is not `SORTABLE` would become a refusal.
+
+### Sub-decision: how to fold
+
+`SORTABLE` without `UNF` sorts by ICU's full Unicode case folding:
+`Straße` folds to `strasse`, and a final `ς` folds to `σ`.
+- **(i) A table generated from Unicode's `CaseFolding.txt` (recommended).**
+  It holds the full foldings, statuses C and F, and is vendored like
+  Snowball. Exact, with no new crate. It needs one download, the file
+  from unicode.org, which I would ask for when the build reaches it.
+- **(ii) Rust's lower case, character by character.** Exact for ASCII and
+  most text, but it differs for about 200 code points: `ß`, the final
+  sigma, Cherokee, and others.
+- **(iii) The `icu_casemap` crate, which RediSearch uses** (Unicode-3.0, on
+  `deny.toml`'s list). Exact, but a large new dependency with its data.
+
+### Scope
+
+- **`SORTBY` on a TEXT field,** `SORTABLE` or not, `NOINDEX` or not,
+  ascending or descending, with or without a text query.
+- **`SORTBY` on a TAG field,** by the same rule (BUG-0274).
+- **A JSON value:** a string sorts as written, or folded. An array sorts by
+  its first element, as RediSearch's array comparison does (to be settled
+  from its source when built).
+- **Unchanged:** NUMERIC and the KNN distance sort as they do now. `SORTBY`
+  on a GEO field stays refused.
+- **Releases:** no new definition row, and nothing durable, since the
+  index is rebuilt from the keys. One release.
+
+### Verification
+
+- Unit tests:
+  - redisvl's three orders (`Banana`, `ZEBRA`, `apple` with `UNF`;
+    `apple`, `Banana`, `ZEBRA` without it);
+  - BUG-0274's acceptance test;
+  - missing values last in both directions.
+- The fold, if (i): every mapping in the table checked against
+  `CaseFolding.txt`'s own lines.
+- `coproc_ft_drill`: a `SORTBY` on a TEXT field before and after a
+  restart.
+- The suites: the 7 redisvl tests pass, and nothing that passed now fails.
