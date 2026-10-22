@@ -180,28 +180,30 @@ pub fn tokenize(text: &[u8]) -> Vec<Box<[u8]>> {
 }
 
 /// A quoted phrase's words, as RediSearch's query parser splits and
-/// normalizes them (`toksep2`, `rm_normalize`): a backslash is dropped
-/// before punctuation or whitespace, and kept before anything else.
-fn phrase_words(raw: &[u8]) -> Vec<Box<[u8]>> {
+/// normalizes them (`toksep2`, `rm_normalize`).
+pub(crate) fn phrase_words(raw: &[u8]) -> Vec<Box<[u8]>> {
     split_escaped(raw, PHRASE_SEPARATORS)
         .into_iter()
         .filter(|w| !w.is_empty())
-        .map(|w| {
-            let mut out = Vec::with_capacity(w.len());
-            for (i, &b) in w.iter().enumerate() {
-                let next = w.get(i + 1).copied();
-                if b == b'\\'
-                    && next.is_some_and(|n| {
-                        n.is_ascii_punctuation() || matches!(n, b' ' | b'\t'..=b'\r')
-                    })
-                {
-                    continue;
-                }
-                out.push(b);
-            }
-            fold_text(&out)
-        })
+        .map(normalize_query_word)
         .collect()
+}
+
+/// A query's word as RediSearch's parser normalizes it (`rm_normalize`): a
+/// backslash dropped before punctuation or whitespace and kept before
+/// anything else, then lowercased.
+pub(crate) fn normalize_query_word(w: &[u8]) -> Box<[u8]> {
+    let mut out = Vec::with_capacity(w.len());
+    for (i, &b) in w.iter().enumerate() {
+        let next = w.get(i + 1).copied();
+        if b == b'\\'
+            && next.is_some_and(|n| n.is_ascii_punctuation() || matches!(n, b' ' | b'\t'..=b'\r'))
+        {
+            continue;
+        }
+        out.push(b);
+    }
+    fold_text(&out)
 }
 
 /// `text` cut at each byte of `seps` that a backslash does not escape, as
@@ -428,7 +430,7 @@ pub fn vals_bytes(vals: Option<&[Val]>) -> usize {
 }
 
 /// A parsed `FILTER`, its fields resolved to their positions in the set.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     /// `*`: every vector.
     All,
@@ -534,6 +536,20 @@ pub fn parse(src: &[u8], fields: &[Field]) -> Result<Expr, String> {
         Some(b')') => Err("has a ')' with no '(' before it".into()),
         Some(c) => Err(format!("has an unexpected '{}'", c as char)),
     }
+}
+
+/// One `@field:` term on a TAG, NUMERIC or GEO field, read from `src[at..]`,
+/// which starts at the field's name: the term, and where it ends. For
+/// ADR-0063's query parser, which reads everything else.
+pub fn parse_field_term(src: &[u8], at: usize, fields: &[Field]) -> Result<(Expr, usize), String> {
+    let mut p = Parser {
+        s: src,
+        i: at,
+        fields,
+        depth: 0,
+    };
+    let e = p.field_term()?;
+    Ok((e, p.i))
 }
 
 struct Parser<'a> {

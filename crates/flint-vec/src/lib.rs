@@ -25,6 +25,7 @@
 pub mod filter;
 pub mod ft;
 pub mod ftindex;
+pub mod ftquery;
 pub mod ftstore;
 pub mod fulltext;
 pub mod geo;
