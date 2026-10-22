@@ -104,9 +104,9 @@ pub struct DocText {
 
 /// A document's TEXT values, each with its field, read as RediSearch's
 /// indexer reads them: words split and normalized (BUG-0272), stop words
-/// skipped before they take a position, and each word of
-/// [`MIN_STEM_LEN`] bytes or more also counted under its `+stem` at a fifth
-/// of its weight (`forward_index.c`).
+/// skipped before they take a position, and each word of 4 bytes or more
+/// (`DEFAULT_MIN_STEM_LENGTH`) also counted under its `+stem` at a fifth of
+/// its weight (`forward_index.c`).
 pub fn analyze(texts: &[(&TextField, &[u8])], stop: &StopWords) -> DocText {
     let mut acc: HashMap<Box<[u8]>, (u32, u32, Vec<u32>)> = HashMap::new();
     let (mut pos, mut len, mut max_freq) = (0u32, 0u32, 0u32);

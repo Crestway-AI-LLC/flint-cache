@@ -11,13 +11,13 @@
 // Snowball's code as it wrote it: not reformatted, and not held to this
 // workspace's lints, which it was not written for.
 #[rustfmt::skip]
-#[allow(clippy::all, clippy::unwrap_used, dead_code, unused)]
+#[allow(clippy::all, clippy::unwrap_used, dead_code, unused, rustdoc::all)]
 mod among;
 #[rustfmt::skip]
-#[allow(clippy::all, clippy::unwrap_used, dead_code, unused)]
+#[allow(clippy::all, clippy::unwrap_used, dead_code, unused, rustdoc::all)]
 mod english_stemmer;
 #[rustfmt::skip]
-#[allow(clippy::all, clippy::unwrap_used, dead_code, unused)]
+#[allow(clippy::all, clippy::unwrap_used, dead_code, unused, rustdoc::all)]
 mod snowball_env;
 
 pub use among::Among;
