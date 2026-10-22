@@ -23,6 +23,10 @@
 # cap quietly sized up to whatever the slowest drill has become.
 : "${FLINT_DRILL_TIMEOUT_S:=900}"
 
+# What the fleet was doing when the cap fired, taken before the kill
+# (BUG-0270). Beside this file, so a caller in any directory finds it.
+. "$(dirname "${BASH_SOURCE[0]}")/stall-evidence.sh" || return 125
+
 # NO `timeout`, ON PURPOSE. GNU coreutils has it, this Mac has neither it nor
 # gtimeout, and the gate runs on both. A cap that exists on only one of the
 # two platforms is the rc.15 bug shape — wait_port_free bound an address macOS
@@ -54,6 +58,9 @@ capped_drill() {   # capped_drill <drill-name>   (stdout/stderr are the caller's
     printf '      Everything it managed to print is above. Raise the cap with\n'
     printf '      FLINT_DRILL_TIMEOUT_S if this drill is legitimately slower;\n'
     printf '      seats it left behind are named by the leak check below.\n'
+    # Before the kill: the drill's EXIT trap deletes its fleet's logs, and
+    # the fleet stops being the fleet that stalled (BUG-0270).
+    stall_evidence "$d" "$dpid"
     kill -TERM "$dpid" 2>/dev/null
     # Its EXIT trap gets a chance to tear the fleet down before SIGKILL.
     i=0

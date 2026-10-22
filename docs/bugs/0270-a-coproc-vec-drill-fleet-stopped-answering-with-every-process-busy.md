@@ -52,15 +52,27 @@ searches, rebuilt and went idle.
 
 ## What would settle it
 
-- **Stacks the next time.** On a stall, the drills' watcher should copy the
-  fleet's logs before anything stops it. It should also take each process's
-  stacks: `sample` on macOS, if it can attach, or a stack tool on the gate
-  box's Linux. Without stacks, a second sighting tells no more than this
-  one.
+- **Stacks the next time: in place 2026-10-21.** When the per-drill cap
+  fires, `capped_drill` now calls `stall_evidence`
+  (`tools/lib/stall-evidence.sh`) before its kill. The drill's log then
+  holds:
+  - its process tree, with each process's state and CPU;
+  - each daemon's threads, with CPU, state and, on Linux, the kernel wait
+    channel;
+  - a stack from `eu-stack`, `gdb` or `sample`, or a line saying none could
+    attach;
+  - each daemon's sockets, from `lsof` or `ss`;
+  - the last 40 lines of every log under the drill's `fleet_init` scope.
+
+  On the laptop `sample` attaches and gives a call graph. On the gate box,
+  ptrace may be refused, and then the thread states are what it keeps.
+  Held by `stall_evidence_drill`. Its probe's EXIT trap deletes the log the
+  evidence must show, so the drill fails if the evidence is taken after the
+  kill (checked by moving the call after it).
 - **The `CLOSE_WAIT` owner.** `lsof -i` on the ports names the process that
   holds each half-closed connection. If it is the proxy, a worker that loops
   on a connection whose peer has gone would explain both the busy proxy and
   its silence.
 - **Acceptance:** the cause is found and held by a test, or `coproc_vec_drill`
-  runs 50 times on the box with no stall and the watcher's stack capture is
-  in place. Then this closes as not reproduced.
+  runs 50 times on the box with no stall now that the stack capture is in
+  place. Then this closes as not reproduced.
