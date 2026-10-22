@@ -432,7 +432,13 @@ Against a local fleet, beside the run after ADR-0062 (its *As built*):
   text word, as it does today. Postings for tags and numbers would end
   that, and are a separate question.
 
-## Amendment 1 (PROPOSED 2026-10-22): `SORTBY` on TEXT and TAG fields, by their values
+## Amendment 1 (ACCEPTED 2026-10-22, option A): `SORTBY` on TEXT and TAG fields, by their values
+
+**ACCEPTED 2026-10-22, option A** (Jeff: "go with A then", after the
+recommendation of A with fold (i)). The table comes from Unicode 17.0.0's
+`CaseFolding.txt`: RediSearch's `icu_casemap` 2.2.0 carries ICU4X 2.2's
+data, exported from ICU `release-78.1rc`, which is Unicode 17.0.
+**Proposed 2026-10-22.**
 
 **Why now.** `SORTBY` on a TEXT field is refused by name, and with full text
 built it is what stops 7 of redisvl's tests:
