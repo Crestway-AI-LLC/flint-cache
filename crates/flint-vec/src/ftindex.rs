@@ -7,10 +7,12 @@
 
 use crate::filter::{self, Field, FieldKind, Val, Vals};
 use crate::ft::{IndexDef, On, Search, VectorField, distance, vector_from_bytes};
+use crate::ftquery::{self, Docs};
+use crate::fulltext::{self, DocId, StopWords, TextField, TextIndex};
 use crate::{Quant, VectorSet, hnsw};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// A document as read from its key.
 pub enum Source<'a> {
@@ -29,13 +31,30 @@ struct Doc {
     expires_at: Option<u64>,
     /// The order of its last write among the index's documents. Results
     /// that tie come in this order, as RediSearch's document ids, which it
-    /// assigns at each write, order them (amendment 3, part 6).
+    /// assigns at each write, order them (amendment 3, part 6). Its id in
+    /// the text index too (ADR-0063).
     seq: u64,
+    /// Its score: `SCORE_FIELD`'s, else the index's `SCORE`, kept as
+    /// RediSearch keeps it, a float.
+    score: f32,
 }
 
-/// What a document map entry costs the D4 meter beyond its key and values:
-/// the `Doc`, its key's box and its slot in the map.
-const DOC_BYTES: usize = 104;
+/// What a document costs the D4 meter beyond its key, twice, and values:
+/// the `Doc`, its key's box and its slot in the map, and its id's entry in
+/// `by_seq`.
+const DOC_BYTES: usize = 200;
+
+/// What a TAG value's document count costs the D4 meter beyond its bytes.
+const TAG_COUNT_BYTES: usize = 64;
+
+/// A document as read for the index: its values, its vector, its TEXT
+/// values by attribute, and its score.
+struct Read {
+    vals: Option<Vals>,
+    vector: Result<Option<Vec<f32>>, String>,
+    texts: Vec<(usize, Vec<u8>)>,
+    score: f32,
+}
 
 /// How many more neighbours a KNN asks its set for than it answers, so that
 /// documents tied at its k-th distance are chosen by write order rather than
@@ -63,6 +82,19 @@ pub struct FtIndex {
     ready: bool,
     /// The next document write's `seq`.
     next_seq: u64,
+    /// The TEXT fields' words (ADR-0063), by document id.
+    text: TextIndex,
+    /// Each TEXT attribute that is indexed, by its place in the definition.
+    text_fields: HashMap<usize, TextField>,
+    stop: StopWords,
+    /// The TEXT attributes declared `NOSTEM`, as a field mask.
+    nostem: u32,
+    /// Each document's key, by id: write order.
+    by_seq: BTreeMap<DocId, Vec<u8>>,
+    /// How many documents hold each TAG value, by attribute: a TAG term's
+    /// IDF, as RediSearch scores one.
+    tags: Vec<HashMap<Box<[u8]>, u32>>,
+    tag_bytes: usize,
 }
 
 /// Keys with their distance from a KNN's vector, nearest first.
@@ -74,6 +106,9 @@ type Ranked = Vec<(Vec<u8>, Option<f32>)>;
 pub struct Hits {
     pub total: usize,
     pub keys: Vec<(Vec<u8>, Option<f32>)>,
+    /// Each key's score under the search's scorer (ADR-0063), for
+    /// `WITHSCORES`; 0 for a KNN's, which is refused it.
+    pub scores: Vec<f64>,
 }
 
 impl FtIndex {
@@ -82,6 +117,32 @@ impl FtIndex {
         let set = def.vector.as_ref().map(|v| {
             VectorSet::new(v.dim, v.metric, v.index, Quant::None).with_fields(fields.to_vec())
         });
+        let mut text_fields = HashMap::new();
+        let mut nostem = 0u32;
+        for (at, a) in def.attrs.iter().enumerate() {
+            if a.field.kind != FieldKind::Text || a.noindex {
+                continue;
+            }
+            let stem = !a.flags.iter().any(|f| &**f == "NOSTEM");
+            if !stem {
+                nostem |= 1 << at;
+            }
+            let weight = a
+                .weight
+                .as_deref()
+                .and_then(|w| w.parse::<f64>().ok())
+                .unwrap_or(1.0) as f32;
+            text_fields.insert(
+                at,
+                TextField {
+                    bit: at as u32,
+                    weight,
+                    stem,
+                },
+            );
+        }
+        let stop = StopWords::of(def.stopwords.as_deref());
+        let tags = vec![HashMap::new(); def.attrs.len()];
         FtIndex {
             def,
             fields,
@@ -90,6 +151,13 @@ impl FtIndex {
             failures: 0,
             ready: false,
             next_seq: 0,
+            text: TextIndex::default(),
+            text_fields,
+            stop,
+            nostem,
+            by_seq: BTreeMap::new(),
+            tags,
+            tag_bytes: 0,
         }
     }
 
@@ -134,7 +202,7 @@ impl FtIndex {
         src: Source<'_>,
         expires_at: Option<u64>,
     ) -> Result<(), String> {
-        let (vals, vector) = match (self.def.on, src) {
+        let read = match (self.def.on, src) {
             (On::Hash, Source::Hash(fields)) => self.read_hash(fields),
             (On::Json, Source::Json(doc)) => self.read_json(doc),
             _ => {
@@ -142,6 +210,12 @@ impl FtIndex {
                 return Ok(());
             }
         };
+        let Read {
+            vals,
+            vector,
+            texts,
+            score,
+        } = read;
         let vector = match vector {
             Ok(v) => v,
             Err(e) => {
@@ -150,6 +224,9 @@ impl FtIndex {
                 return Err(e);
             }
         };
+        // Its earlier write's words and tags go; the vector set replaces its
+        // own entry below.
+        self.unindex(key);
         if let Some(set) = &mut self.set {
             match vector {
                 Some(v) => set.set(
@@ -165,15 +242,61 @@ impl FtIndex {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
+        let words: Vec<(&TextField, &[u8])> = texts
+            .iter()
+            .filter_map(|(at, t)| Some((self.text_fields.get(at)?, t.as_slice())))
+            .collect();
+        self.text.put(seq, fulltext::analyze(&words, &self.stop));
+        if let Some(v) = &vals {
+            for (f, val) in v.iter().enumerate() {
+                if let Val::Tags(ts) = val {
+                    for t in ts.iter() {
+                        let n = self.tags[f].entry(t.clone()).or_insert_with(|| {
+                            self.tag_bytes += TAG_COUNT_BYTES + t.len();
+                            0
+                        });
+                        *n += 1;
+                    }
+                }
+            }
+        }
+        self.by_seq.insert(seq, key.to_vec());
         self.docs.insert(
             key.to_vec(),
             Doc {
                 vals,
                 expires_at,
                 seq,
+                score,
             },
         );
         Ok(())
+    }
+
+    /// Take `key`'s document out of everything but the vector set: the
+    /// document map, its id, its words and its tags' counts.
+    fn unindex(&mut self, key: &[u8]) -> bool {
+        let Some(d) = self.docs.remove(key) else {
+            return false;
+        };
+        self.by_seq.remove(&d.seq);
+        self.text.remove(d.seq);
+        if let Some(v) = &d.vals {
+            for (f, val) in v.iter().enumerate() {
+                if let Val::Tags(ts) = val {
+                    for t in ts.iter() {
+                        if let Some(n) = self.tags[f].get_mut(t) {
+                            *n -= 1;
+                            if *n == 0 {
+                                self.tags[f].remove(t);
+                                self.tag_bytes -= TAG_COUNT_BYTES + t.len();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Whether `key` is one of the index's documents.
@@ -186,7 +309,7 @@ impl FtIndex {
         if let Some(set) = &mut self.set {
             set.del(key);
         }
-        self.docs.remove(key).is_some()
+        self.unindex(key)
     }
 
     /// Set or clear `key`'s expiry without re-reading it (`EXPIRE`,
@@ -232,7 +355,7 @@ impl FtIndex {
             return 0;
         };
         DOC_BYTES
-            + key.len()
+            + 2 * key.len()
             + filter::vals_bytes(d.vals.as_deref())
             + self
                 .set
@@ -241,10 +364,12 @@ impl FtIndex {
                 .unwrap_or(0)
     }
 
-    /// What the vector set holds beyond its live entries: deleted HNSW
-    /// slots, which wait for its next insert (BUG-0257).
+    /// What the index holds beyond each document's own charge: the vector
+    /// set's deleted HNSW slots, which wait for its next insert (BUG-0257);
+    /// the TEXT fields' words and postings, whose terms documents share
+    /// (ADR-0063); and the TAG values' document counts.
     pub fn held(&self) -> usize {
-        self.set.as_ref().map_or(0, |s| s.held())
+        self.set.as_ref().map_or(0, |s| s.held()) + self.text.bytes() + self.tag_bytes
     }
 
     /// What the whole index costs the D4 meter: every document's
@@ -276,19 +401,36 @@ impl FtIndex {
         self.docs.get(key).map_or(u64::MAX, |d| d.seq)
     }
 
-    /// The documents `s` asks for, as of `now`: the `k` nearest the filter
-    /// matches for a KNN, else every match; then sorted, then paged.
+    /// The documents `s` asks for, as of `now`: the `k` nearest the query's
+    /// matches for a KNN; else every match, scored by `s.scorer` and ordered
+    /// as RediSearch orders them, highest score first (ADR-0063); then
+    /// sorted by `SORTBY` if asked, then paged.
     pub fn search(&self, s: &Search, now: u64) -> Result<Hits, String> {
-        let mut hits: Vec<(Vec<u8>, Option<f32>)> = match (&s.knn, &self.set, &self.def.vector) {
+        let view = View { ix: self, now };
+        let matches =
+            || ftquery::matches(s.query.as_ref(), &self.text, &view, self.nostem, s.scorer);
+        let mut hits: Vec<(Vec<u8>, Option<f32>, f64)> = match (&s.knn, &self.set, &self.def.vector)
+        {
             (Some(knn), Some(set), Some(v)) => {
+                // A query with a text term is matched first, from the
+                // postings; the KNN then searches among its matches.
+                let allowed: Option<HashSet<&[u8]>> = s.has_text().then(|| {
+                    matches()
+                        .iter()
+                        .filter_map(|(id, _)| self.by_seq.get(id).map(Vec::as_slice))
+                        .collect()
+                });
                 let expired = set.expired_count(now);
                 let ef = knn.ef.or(v.ef_runtime).unwrap_or(hnsw::EF_SEARCH_DEFAULT);
                 // The `k` nearest live matches, nearest first, a tie to the
                 // earlier write.
                 let nearest = |k: usize| -> Result<Ranked, String> {
                     let ask = k.saturating_add(expired).saturating_add(TIE_SLACK);
-                    let mut near: Ranked = set
-                        .search(&knn.vector, ask, ef, ask, s.filter.as_ref(), None)?
+                    let found = match &allowed {
+                        Some(a) => set.search_among(&knn.vector, ask, ef, ask, a)?,
+                        None => set.search(&knn.vector, ask, ef, ask, s.filter.as_ref(), None)?,
+                    };
+                    let mut near: Ranked = found
                         .into_iter()
                         .filter(|(id, _)| !set.is_expired(id, now))
                         .map(|(id, score)| (id, Some(distance(v.metric, score))))
@@ -301,7 +443,7 @@ impl FtIndex {
                     near.truncate(k);
                     Ok(near)
                 };
-                match knn.range {
+                let near = match knn.range {
                     None => nearest(knn.k)?,
                     // ADR-0061 C: a range is a KNN cut at its radius. It is
                     // asked for the page's end, then for twice as many
@@ -320,25 +462,21 @@ impl FtIndex {
                             k = k.saturating_mul(2).min(RANGE_CAP);
                         }
                     }
-                }
+                };
+                near.into_iter().map(|(k, d)| (k, d, 0.0)).collect()
             }
             (Some(_), _, _) => return Err("this index has no VECTOR field".into()),
             (None, _, _) => {
-                let mut keys: Vec<(Vec<u8>, Option<f32>)> = self
-                    .docs
-                    .iter()
-                    .filter(|(_, d)| self.live(d, now))
-                    .filter(|(_, d)| {
-                        s.filter
-                            .as_ref()
-                            .is_none_or(|f| f.matches(d.vals.as_deref()))
-                    })
-                    .map(|(k, _)| (k.clone(), None))
-                    .collect();
-                // In write order, as RediSearch's document ids order them,
-                // so a page is the same page each time it is asked for.
-                keys.sort_by_key(|(k, _)| self.seq(k));
-                keys
+                let mut m = matches();
+                // Highest score first, a tie to the earlier write, as
+                // RediSearch's sorter orders a search with no SORTBY;
+                // matches come in write order for a SORTBY to sort.
+                if s.sortby.is_none() {
+                    m.sort_by(ftquery::by_score);
+                }
+                m.into_iter()
+                    .filter_map(|(id, sc)| Some((self.by_seq.get(&id)?.clone(), None, sc)))
+                    .collect()
             }
         };
         let total = hits.len();
@@ -357,14 +495,21 @@ impl FtIndex {
                 });
             }
         }
-        let keys = hits.into_iter().skip(s.offset).take(s.num).collect();
-        Ok(Hits { total, keys })
+        let page: Vec<(Vec<u8>, Option<f32>, f64)> =
+            hits.into_iter().skip(s.offset).take(s.num).collect();
+        Ok(Hits {
+            total,
+            scores: page.iter().map(|(_, _, sc)| *sc).collect(),
+            keys: page.into_iter().map(|(k, d, _)| (k, d)).collect(),
+        })
     }
 
-    fn read_hash(
-        &self,
-        fields: &[(Vec<u8>, Vec<u8>)],
-    ) -> (Option<Vals>, Result<Option<Vec<f32>>, String>) {
+    /// The index's score for a document that gives none.
+    fn default_score(&self) -> f32 {
+        self.def.score as f32
+    }
+
+    fn read_hash(&self, fields: &[(Vec<u8>, Vec<u8>)]) -> Read {
         let get = |name: &str| {
             fields
                 .iter()
@@ -375,20 +520,43 @@ impl FtIndex {
         // A GEO value that is not a point leaves the document out, as a bad
         // vector does and as RediSearch's indexer does (ADR-0062).
         let mut bad: Option<String> = None;
+        let mut texts = Vec::new();
         let vals: Vals = self
             .def
             .attrs
             .iter()
-            .map(|a| match get(&a.path) {
+            .enumerate()
+            .map(|(at, a)| match get(&a.path) {
                 Some(raw) if a.field.kind == FieldKind::Geo => {
                     geo_or_note(&a.field.name, std::iter::once(raw), &mut bad)
+                }
+                // Its words go to the text index (ADR-0063).
+                Some(raw) if a.field.kind == FieldKind::Text => {
+                    texts.push((at, raw.to_vec()));
+                    Val::Missing
                 }
                 Some(raw) => filter::hash_val(a.field.kind, raw, a.separator),
                 None => Val::Missing,
             })
             .collect();
+        // A score that is not a number is the default, as RediSearch's
+        // `SchemaRule_HashScore` takes it.
+        let score = self
+            .def
+            .score_field
+            .as_deref()
+            .and_then(get)
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| !v.is_nan())
+            .map_or(self.default_score(), |v| v as f32);
         if let Some(e) = bad {
-            return (any(vals), Err(e));
+            return Read {
+                vals: any(vals),
+                vector: Err(e),
+                texts,
+                score,
+            };
         }
         let vector = match &self.def.vector {
             None => Ok(None),
@@ -399,16 +567,23 @@ impl FtIndex {
                     .map_err(|e| format!("{} is not indexed: {e}", v.name)),
             },
         };
-        (any(vals), vector)
+        Read {
+            vals: any(vals),
+            vector,
+            texts,
+            score,
+        }
     }
 
-    fn read_json(&self, doc: &Value) -> (Option<Vals>, Result<Option<Vec<f32>>, String>) {
+    fn read_json(&self, doc: &Value) -> Read {
         let mut bad: Option<String> = None;
+        let mut texts = Vec::new();
         let vals: Vals = self
             .def
             .attrs
             .iter()
-            .map(|a| match (a.field.kind, json_at(doc, &a.path)) {
+            .enumerate()
+            .map(|(at, a)| match (a.field.kind, json_at(doc, &a.path)) {
                 // A string, or an array of them, any of which may match.
                 (FieldKind::Geo, Some(Value::String(s))) => {
                     geo_or_note(&a.field.name, std::iter::once(s.as_bytes()), &mut bad)
@@ -418,17 +593,86 @@ impl FtIndex {
                     xs.iter().filter_map(|x| x.as_str()).map(str::as_bytes),
                     &mut bad,
                 ),
+                (FieldKind::Text, Some(Value::String(s))) => {
+                    texts.push((at, s.as_bytes().to_vec()));
+                    Val::Missing
+                }
                 (kind, v) => json_val(kind, a.separator, v),
             })
             .collect();
+        let score = self
+            .def
+            .score_field
+            .as_deref()
+            .and_then(|p| json_at(doc, p))
+            .and_then(Value::as_f64)
+            .map_or(self.default_score(), |v| v as f32);
         if let Some(e) = bad {
-            return (any(vals), Err(e));
+            return Read {
+                vals: any(vals),
+                vector: Err(e),
+                texts,
+                score,
+            };
         }
         let vector = match &self.def.vector {
             None => Ok(None),
             Some(v) => json_vector(v, json_at(doc, &v.path)),
         };
-        (any(vals), vector)
+        Read {
+            vals: any(vals),
+            vector,
+            texts,
+            score,
+        }
+    }
+}
+
+/// The index's documents, as a search as of `now` reads them.
+struct View<'a> {
+    ix: &'a FtIndex,
+    now: u64,
+}
+
+impl View<'_> {
+    fn doc(&self, id: DocId) -> Option<&Doc> {
+        self.ix.docs.get(self.ix.by_seq.get(&id)?)
+    }
+}
+
+impl Docs for View<'_> {
+    fn count(&self) -> usize {
+        self.ix.docs.len()
+    }
+    fn ids(&self) -> Box<dyn Iterator<Item = DocId> + '_> {
+        Box::new(
+            self.ix
+                .by_seq
+                .iter()
+                .filter(|(_, k)| {
+                    self.ix
+                        .docs
+                        .get(*k)
+                        .is_some_and(|d| self.ix.live(d, self.now))
+                })
+                .map(|(id, _)| *id),
+        )
+    }
+    fn live(&self, id: DocId) -> bool {
+        self.doc(id).is_some_and(|d| self.ix.live(d, self.now))
+    }
+    fn vals(&self, id: DocId) -> Option<&[Val]> {
+        self.doc(id)?.vals.as_deref()
+    }
+    fn score(&self, id: DocId) -> f32 {
+        self.doc(id).map_or(1.0, |d| d.score)
+    }
+    fn tag_docs(&self, field: usize, tag: &[u8]) -> usize {
+        self.ix
+            .tags
+            .get(field)
+            .and_then(|m| m.get(tag))
+            .map_or(0, |n| *n as usize)
     }
 }
 
@@ -1411,5 +1655,281 @@ mod tests {
         assert_eq!(tags(0, r#"["x|y", " z "]"#), t(&[" z ", "x|y"]));
         assert_eq!(tags(b'|', r#""a,b""#), t(&["a,b"]));
         assert_eq!(tags(b',', r#"["a, b", "c"]"#), t(&["a", "b", "c"]));
+    }
+
+    fn index_of(schema: &[&str]) -> FtIndex {
+        let mut parts = vec!["FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:"];
+        parts.extend_from_slice(schema);
+        let (_, def) = parse_create(&a(&parts)).expect("parses");
+        let mut ix = FtIndex::new(def);
+        ix.set_ready();
+        ix
+    }
+
+    fn put(ix: &mut FtIndex, key: &str, fields: &[(&str, &[u8])]) {
+        let fields: Vec<(Vec<u8>, Vec<u8>)> = fields
+            .iter()
+            .map(|(f, v)| (f.as_bytes().to_vec(), v.to_vec()))
+            .collect();
+        ix.put(key.as_bytes(), Source::Hash(&fields), None)
+            .expect("indexed");
+    }
+
+    /// ADR-0063: RediSearch's `testScoreIndex` through `FT.CREATE` and
+    /// `FT.SEARCH` as a client sends them: `SCORE_FIELD`, a title of `WEIGHT
+    /// 10`, each scorer's top five with `WITHSCORES`, to two decimals.
+    #[test]
+    fn full_text_answers_redisearch_s_own_test_index() {
+        let mut ix = index_of(&[
+            "SCORE_FIELD",
+            "__score",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "WEIGHT",
+            "10",
+            "body",
+            "TEXT",
+        ]);
+        for n in 1..25usize {
+            let sc = ((35.0 - n as f64) / 35.0).sqrt();
+            put(
+                &mut ix,
+                &format!("doc{n}"),
+                &[
+                    ("__score", format!("{sc:?}").as_bytes()),
+                    ("title", "hello world ".repeat(n).as_bytes()),
+                    ("body", "lorem ipsum ".repeat(n).as_bytes()),
+                ],
+            );
+        }
+        let top = |scorer: &str| -> Vec<(String, f64)> {
+            let h = search(
+                &ix,
+                &[
+                    "FT.SEARCH",
+                    "idx",
+                    "hello world",
+                    "SCORER",
+                    scorer,
+                    "NOCONTENT",
+                    "WITHSCORES",
+                    "LIMIT",
+                    "0",
+                    "5",
+                ],
+                None,
+            );
+            assert_eq!(h.total, 24, "{scorer}");
+            keys(&h)
+                .into_iter()
+                .zip(h.scores.iter().map(|s| (s * 100.0).round() / 100.0))
+                .collect()
+        };
+        let want = |xs: &[(usize, f64)]| -> Vec<(String, f64)> {
+            xs.iter().map(|(n, s)| (format!("doc{n}"), *s)).collect()
+        };
+        assert_eq!(
+            top("TFIDF"),
+            want(&[(1, 1.97), (2, 1.94), (3, 1.91), (4, 1.88), (5, 1.85)])
+        );
+        assert_eq!(
+            top("BM25"),
+            want(&[(17, 0.73), (18, 0.73), (16, 0.72), (19, 0.72), (15, 0.72)])
+        );
+        assert_eq!(
+            top("BM25STD"),
+            want(&[(1, 0.08), (2, 0.08), (3, 0.08), (4, 0.08), (5, 0.08)])
+        );
+        assert_eq!(
+            top("DISMAX"),
+            want(&[
+                (24, 480.0),
+                (23, 460.0),
+                (22, 440.0),
+                (21, 420.0),
+                (20, 400.0)
+            ])
+        );
+        // The default scorer is BM25STD.
+        let h = search(
+            &ix,
+            &["FT.SEARCH", "idx", "hello world", "WITHSCORES"],
+            None,
+        );
+        assert_eq!(keys(&h)[0], "doc1");
+        assert!((h.scores[0] - 0.0845).abs() < 1e-3, "{}", h.scores[0]);
+    }
+
+    /// ADR-0063: a TAG match is a word's result, so on an index with TEXT
+    /// fields a tag or `*` search is ordered by BM25STD, the shortest
+    /// documents first; with no TEXT field every score ties and write order
+    /// holds.
+    #[test]
+    fn a_search_with_no_text_word_is_ordered_by_score() {
+        let mut ix = index_of(&["SCHEMA", "t", "TEXT", "c", "TAG"]);
+        put(
+            &mut ix,
+            "doc:long",
+            &[("t", b"one two three four"), ("c", b"x")],
+        );
+        put(&mut ix, "doc:short", &[("t", b"one"), ("c", b"x")]);
+        put(&mut ix, "doc:mid", &[("t", b"one two"), ("c", b"x")]);
+        let q = |query: &str| keys(&search(&ix, &["FT.SEARCH", "idx", query], None));
+        assert_eq!(q("@c:{x}"), ["doc:short", "doc:mid", "doc:long"]);
+        assert_eq!(q("*"), ["doc:short", "doc:mid", "doc:long"]);
+        let mut plain = index_of(&["SCHEMA", "c", "TAG", "n", "NUMERIC"]);
+        for k in ["doc:3", "doc:1", "doc:2"] {
+            put(&mut plain, k, &[("c", b"x"), ("n", b"1")]);
+        }
+        let q = |query: &str| keys(&search(&plain, &["FT.SEARCH", "idx", query], None));
+        assert_eq!(q("@c:{x}"), ["doc:3", "doc:1", "doc:2"]);
+        assert_eq!(q("@n:[0 5]"), ["doc:3", "doc:1", "doc:2"]);
+    }
+
+    /// ADR-0063: text terms beside a KNN filter its candidates, as
+    /// langchain-redis's `Text("val") % "ba*"` writes them.
+    #[test]
+    fn a_knn_searches_among_a_text_term_s_matches() {
+        let mut ix = hash_index();
+        for (k, c, v) in [
+            ("doc:foo", "foo", [0.0, 0.0]),
+            ("doc:bar", "bar", [3.0, 0.0]),
+            ("doc:baz", "baz", [2.0, 0.0]),
+            ("doc:qux", "qux", [0.1, 0.0]),
+        ] {
+            put(
+                &mut ix,
+                k,
+                &[("content", c.as_bytes()), ("embedding", &blob(&v))],
+            );
+        }
+        let knn = |q: &str| {
+            let h = search(
+                &ix,
+                &["FT.SEARCH", "idx", q, "SORTBY", "d"],
+                Some(&[0.0, 0.0]),
+            );
+            keys(&h)
+        };
+        assert_eq!(
+            knn("(@content:(ba*))=>[KNN 3 @embedding $v AS d]"),
+            ["doc:baz", "doc:bar"]
+        );
+        assert_eq!(
+            knn("(-@content:foo)=>[KNN 1 @embedding $v AS d]"),
+            ["doc:qux"]
+        );
+        assert_eq!(
+            knn("(@content:(the))=>[KNN 3 @embedding $v AS d]"),
+            Vec::<String>::new(),
+            "a query of stop words matches nothing"
+        );
+    }
+
+    /// ADR-0063: rewrites, deletes and expiries keep the postings exactly
+    /// what an index built afresh from the documents left holds: every
+    /// query's matches and scores agree.
+    #[test]
+    fn postings_follow_every_rewrite_and_delete() {
+        let schema = ["SCHEMA", "t", "TEXT", "u", "TEXT", "NOSTEM", "c", "TAG"];
+        let words = [
+            "running",
+            "runs",
+            "engine",
+            "engineer",
+            "engineering",
+            "the",
+            "doctor",
+            "doctors",
+            "a",
+            "medical",
+            "professional",
+            "cancer",
+            "cancers",
+            "lung",
+        ];
+        let mut x = 0x5eed_u64;
+        let mut next = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        let mut live = index_of(&schema);
+        let mut docs: std::collections::BTreeMap<String, Vec<(&str, String)>> = Default::default();
+        for _ in 0..400 {
+            let key = format!("doc:{}", next(40));
+            if next(5) == 0 {
+                live.remove(key.as_bytes());
+                docs.remove(&key);
+                continue;
+            }
+            let mut text = |n: usize| -> String {
+                (0..1 + next(n))
+                    .map(|_| words[next(words.len())])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let d = vec![
+                ("t", text(8)),
+                ("u", text(4)),
+                ("c", ["x", "y", "x,y"][next(3)].to_string()),
+            ];
+            let f: Vec<(&str, &[u8])> = d.iter().map(|(k, v)| (*k, v.as_bytes())).collect();
+            put(&mut live, &key, &f);
+            docs.insert(key, d);
+        }
+        let mut fresh = index_of(&schema);
+        for (k, d) in &docs {
+            let f: Vec<(&str, &[u8])> = d.iter().map(|(k, v)| (*k, v.as_bytes())).collect();
+            put(&mut fresh, k, &f);
+        }
+        let scored = |ix: &FtIndex, q: &str, scorer: &str| -> Vec<(String, u64)> {
+            let h = search(
+                ix,
+                &[
+                    "FT.SEARCH",
+                    "idx",
+                    q,
+                    "SCORER",
+                    scorer,
+                    "WITHSCORES",
+                    "LIMIT",
+                    "0",
+                    "1000",
+                ],
+                None,
+            );
+            let mut v: Vec<(String, u64)> = keys(&h)
+                .into_iter()
+                .zip(h.scores.iter().map(|s| s.to_bits()))
+                .collect();
+            v.sort();
+            v
+        };
+        for q in [
+            "running",
+            "@u:running",
+            "engine*",
+            "%doctr%",
+            "*neer*",
+            "cancer lung",
+            "cancer | doctor",
+            "\"medical professional\"",
+            "-engineer",
+            "~lung doctor",
+            "@c:{x} medical",
+            "*",
+        ] {
+            for scorer in ["BM25STD", "TFIDF", "TFIDF.DOCNORM", "BM25", "DISMAX"] {
+                assert_eq!(
+                    scored(&live, q, scorer),
+                    scored(&fresh, q, scorer),
+                    "{q} under {scorer}"
+                );
+            }
+        }
+        assert_eq!(live.held(), fresh.held(), "the same words and postings");
     }
 }

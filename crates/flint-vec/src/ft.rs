@@ -6,6 +6,8 @@
 //! over, so a search is never answered as if it had asked for less.
 
 use crate::filter::{self, Expr, Field, FieldKind};
+use crate::ftquery::{self, QNode, Scorer};
+use crate::fulltext::StopWords;
 use crate::{IndexKind, Metric};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -67,9 +69,13 @@ pub struct IndexDef {
     pub attrs: Vec<Attr>,
     /// At most one; an index with none answers filter-only searches.
     pub vector: Option<VectorField>,
-    /// `STOPWORDS` as declared, for `FT.INFO`'s `stopwords_list`. An exact
-    /// phrase keeps every word either way.
+    /// `STOPWORDS` as declared, RediSearch's default list when not: left
+    /// out of TEXT fields and of queries (ADR-0063).
     pub stopwords: Option<Vec<Box<str>>>,
+    /// `SCORE`: a document's score when it gives none, 1 unless declared.
+    pub score: f64,
+    /// `SCORE_FIELD`: where a document gives its own score.
+    pub score_field: Option<Box<str>>,
 }
 
 impl IndexDef {
@@ -113,6 +119,8 @@ impl IndexDef {
             "attrs": attrs,
             "vector": vector,
             "stopwords": self.stopwords,
+            "score": self.score,
+            "score_field": self.score_field.as_deref(),
         })
         .to_string()
     }
@@ -183,12 +191,24 @@ impl IndexDef {
             None | Some(Value::Null) => None,
             Some(sw) => Some(strings(Some(sw))?),
         };
+        // A row an older binary wrote has neither: its index dropped both
+        // when it was made, and scores with the defaults (ADR-0063).
+        let score = match v.get("score") {
+            None | Some(Value::Null) => 1.0,
+            Some(x) => x.as_f64()?,
+        };
+        let score_field = match v.get("score_field") {
+            None | Some(Value::Null) => None,
+            Some(f) => Some(f.as_str()?.into()),
+        };
         Some(IndexDef {
             on,
             prefixes,
             attrs,
             vector,
             stopwords,
+            score,
+            score_field,
         })
     }
 }
@@ -246,7 +266,11 @@ pub struct Knn {
 /// What `FT.SEARCH` asked for.
 #[derive(Debug, PartialEq)]
 pub struct Search {
-    /// `None` is `*`: every document.
+    /// The query (ADR-0063); `None` when every word in it is a stop word,
+    /// which matches no document.
+    pub query: Option<QNode>,
+    /// The query as ADR-0059's filter, when it has no text term and is not
+    /// `*`: what a filtered KNN hands its vector set.
     pub filter: Option<Expr>,
     pub knn: Option<Knn>,
     pub nocontent: bool,
@@ -258,6 +282,18 @@ pub struct Search {
     pub sortby: Option<(Box<str>, bool)>,
     pub offset: usize,
     pub num: usize,
+    /// `SCORER`: `BM25STD` unless named.
+    pub scorer: Scorer,
+    /// `WITHSCORES`: each result's score after its key.
+    pub withscores: bool,
+}
+
+impl Search {
+    /// Whether the query has a text term, which only the `FT.*` index's
+    /// postings can answer: a filtered KNN then searches among its matches.
+    pub fn has_text(&self) -> bool {
+        self.query.as_ref().is_none_or(|q| q.as_filter().is_none())
+    }
 }
 
 /// A distance as RediSearch reports one, from this crate's score, where
@@ -310,6 +346,8 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
     let mut on = On::Hash;
     let mut prefixes: Vec<Vec<u8>> = Vec::new();
     let mut stopwords: Option<Vec<Box<str>>> = None;
+    let mut score = 1.0;
+    let mut score_field: Option<Box<str>> = None;
     let mut i = 2;
     loop {
         let Some(opt) = arg(args, i) else {
@@ -341,9 +379,7 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                 }
                 i += 2 + n;
             }
-            // Stop words shape full-text scoring, which is not served. An
-            // exact phrase is matched with every word it has, stop word or
-            // not (ADR-0060).
+            // Left out of TEXT fields and of queries (ADR-0063).
             b"STOPWORDS" => {
                 let n = number(arg(args, i + 1), "FT.CREATE STOPWORDS")?;
                 if args.len() < i + 2 + n {
@@ -357,19 +393,42 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                 );
                 i += 2 + n;
             }
-            // The documents' default score, and the fields that set each
-            // one's score, language and payload: full-text ranking and
-            // stemming, which an exact phrase does not use. redis-py's
-            // IndexDefinition sends `SCORE 1.0` on every index.
+            // The documents' default score, which every scorer multiplies
+            // by. redis-py's IndexDefinition sends `SCORE 1.0` on every
+            // index.
             b"SCORE" => {
-                arg(args, i + 1)
+                score = arg(args, i + 1)
                     .and_then(|v| std::str::from_utf8(v).ok())
                     .and_then(|v| v.parse::<f64>().ok())
                     .filter(|v| (0.0..=1.0).contains(v))
                     .ok_or("FT.CREATE SCORE needs a number from 0 to 1")?;
                 i += 2;
             }
-            b"LANGUAGE" | b"LANGUAGE_FIELD" | b"SCORE_FIELD" | b"PAYLOAD_FIELD" => {
+            b"SCORE_FIELD" => {
+                let f = arg(args, i + 1).ok_or("an FT.CREATE option needs a value")?;
+                score_field = Some(text(f)?.into());
+                i += 2;
+            }
+            // Stemming is English's (ADR-0063, sub-decision 2): an index in
+            // another language would be stemmed wrongly, so it is refused.
+            b"LANGUAGE" => {
+                let l = arg(args, i + 1).ok_or("an FT.CREATE option needs a value")?;
+                if !l.eq_ignore_ascii_case(b"english") {
+                    return Err(format!(
+                        "FT.CREATE LANGUAGE {} is not supported: English only (ADR-0063)",
+                        String::from_utf8_lossy(l)
+                    ));
+                }
+                i += 2;
+            }
+            b"LANGUAGE_FIELD" => {
+                return Err(
+                    "FT.CREATE LANGUAGE_FIELD is not supported: English only (ADR-0063)".into(),
+                );
+            }
+            // A document's payload, which only `HAMMING` and `WITHPAYLOADS`
+            // read, both refused.
+            b"PAYLOAD_FIELD" => {
                 if arg(args, i + 1).is_none() {
                     return Err("an FT.CREATE option needs a value".into());
                 }
@@ -474,12 +533,13 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                     kind = FieldKind::Tag;
                     i += 1;
                 }
-                // Full-text ranking and stemming, which an exact phrase
-                // does not use, and the suffix trie that infix and suffix
-                // terms use, which are refused.
+                // A word's weight in this field's scores (ADR-0063).
                 b"WEIGHT" if kind == FieldKind::Text => {
-                    weight =
-                        Some(text(arg(args, i + 1).ok_or("TEXT WEIGHT needs a value")?)?.into());
+                    let w = text(arg(args, i + 1).ok_or("TEXT WEIGHT needs a value")?)?;
+                    if !w.parse::<f64>().is_ok_and(|x| x.is_finite() && x >= 0.0) {
+                        return Err("TEXT WEIGHT needs a number of 0 or more".into());
+                    }
+                    weight = Some(w.into());
                     i += 2;
                 }
                 b"NOSTEM" if kind == FieldKind::Text => {
@@ -528,6 +588,8 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             attrs,
             vector,
             stopwords,
+            score,
+            score_field,
         },
     ))
 }
@@ -633,6 +695,7 @@ pub fn vector_from_bytes(b: &[u8], dim: usize) -> Result<Vec<f32>, String> {
 pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> {
     let query = arg(args, 2).ok_or("FT.SEARCH <index> <query> [options]")?;
     let mut s = Search {
+        query: None,
         filter: None,
         knn: None,
         nocontent: false,
@@ -640,6 +703,8 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
         sortby: None,
         offset: 0,
         num: 10,
+        scorer: Scorer::DEFAULT,
+        withscores: false,
     };
     let mut params: HashMap<String, Vec<u8>> = HashMap::new();
     let mut i = 3;
@@ -649,13 +714,14 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
                 s.nocontent = true;
                 i += 1;
             }
-            // The full-text scoring function: no search here is ranked by a
-            // text score, so it changes no answer. redisvl sends it.
             b"SCORER" => {
-                if arg(args, i + 1).is_none() {
-                    return Err("FT.SEARCH SCORER needs a scorer".into());
-                }
+                s.scorer =
+                    Scorer::parse(arg(args, i + 1).ok_or("FT.SEARCH SCORER needs a scorer")?)?;
                 i += 2;
+            }
+            b"WITHSCORES" => {
+                s.withscores = true;
+                i += 1;
             }
             b"RETURN" => {
                 let n = number(arg(args, i + 1), "FT.SEARCH RETURN")?;
@@ -733,7 +799,8 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
     // is read as a filter.
     let (rest, range) = take_range(query, def, &params)?;
     let query = rest.as_str();
-    let (filter_part, knn_part) = match query.rfind("=>") {
+    // The KNN clause is the last `=>[`: a `=>{...}` is a term's attributes.
+    let (filter_part, knn_part) = match query.rfind("=>[") {
         Some(at) => (&query[..at], Some(&query[at + 2..])),
         None => (query, None),
     };
@@ -748,24 +815,26 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
             v.name, v.name
         ));
     }
-    if f != "*" {
-        let mut e = filter::parse(f.as_bytes(), &fields).map_err(|e| format!("the query {e}"))?;
-        // A term on a NOINDEX field matches no document, as RediSearch
-        // answers it: the field is returned and sorted on, never searched.
-        let noindex: Vec<usize> = def
-            .attrs
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.noindex)
-            .map(|(at, _)| at)
-            .collect();
-        if !noindex.is_empty() {
-            e = unindexed(e, &noindex);
-        }
-        if e != Expr::All {
-            s.filter = Some(e);
-        }
+    let stop = StopWords::of(def.stopwords.as_deref());
+    let mut q =
+        ftquery::parse(f.as_bytes(), &fields, &stop).map_err(|e| format!("the query {e}"))?;
+    // A term on a NOINDEX field matches no document, as RediSearch answers
+    // it: the field is returned and sorted on, never searched.
+    let noindex: Vec<usize> = def
+        .attrs
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.noindex)
+        .map(|(at, _)| at)
+        .collect();
+    if !noindex.is_empty() {
+        q = q.map(|q| q.unindexed(&noindex));
     }
+    s.filter = q
+        .as_ref()
+        .and_then(QNode::as_filter)
+        .filter(|e| *e != Expr::All);
+    s.query = q;
     if let Some(k) = knn_part {
         if range.is_some() {
             return Err("a vector range query cannot also be a KNN (ADR-0061)".into());
@@ -774,6 +843,11 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
     }
     if range.is_some() {
         s.knn = range;
+    }
+    if s.withscores && s.knn.is_some() {
+        return Err(
+            "FT.SEARCH WITHSCORES with a KNN or a vector range is not supported (ADR-0063)".into(),
+        );
     }
     if let Some((by, _)) = &s.sortby {
         let by_distance = s.knn.as_ref().is_some_and(|k| k.alias == *by);
@@ -938,26 +1012,6 @@ fn breaks_a_conjunction(s: &str) -> bool {
         }
     }
     depth != 0 || until.is_some()
-}
-
-/// `e` with each term on a field in `noindex` replaced by one that matches
-/// nothing.
-fn unindexed(e: Expr, noindex: &[usize]) -> Expr {
-    let none = || Expr::Not(Box::new(Expr::All));
-    match e {
-        Expr::Tag { field, .. }
-        | Expr::Range { field, .. }
-        | Expr::Phrase { field, .. }
-        | Expr::Geo { field, .. }
-            if noindex.contains(&field) =>
-        {
-            none()
-        }
-        Expr::Not(x) => Expr::Not(Box::new(unindexed(*x, noindex))),
-        Expr::And(xs) => Expr::And(xs.into_iter().map(|x| unindexed(x, noindex)).collect()),
-        Expr::Or(xs) => Expr::Or(xs.into_iter().map(|x| unindexed(x, noindex)).collect()),
-        other => other,
-    }
 }
 
 /// A KNN clause's value: a literal, or a `$parameter` from `PARAMS`.
@@ -1402,7 +1456,13 @@ mod tests {
             &def,
         )
         .expect("parses");
-        assert!(matches!(s.filter, Some(Expr::Phrase { .. })));
+        // A phrase is full text (ADR-0063): the query has it, and no filter
+        // could.
+        assert!(matches!(
+            s.query.as_ref().map(|q| &q.node),
+            Some(ftquery::Node::Phrase { .. })
+        ));
+        assert!(s.filter.is_none() && s.has_text());
         assert_eq!(s.returns, Some(vec![("price".into(), "p".into())]));
         assert_eq!(s.sortby, Some(("price".into(), false)));
     }
@@ -1500,7 +1560,19 @@ mod tests {
             Ok(s) => panic!("{args:?} parsed as {s:?}"),
             Err(e) => e,
         };
-        assert!(refused(a(&["FT.SEARCH", "idx", "*", "WITHSCORES"])).contains("WITHSCORES"));
+        assert!(
+            refused(with_vector(
+                &["FT.SEARCH", "idx", "*=>[KNN 2 @embedding $v]", "WITHSCORES"],
+                "v",
+                &q
+            ))
+            .contains("WITHSCORES")
+        );
+        assert!(refused(a(&["FT.SEARCH", "idx", "*", "SCORER", "HAMMING"])).contains("HAMMING"));
+        assert!(refused(a(&["FT.SEARCH", "idx", "*", "SCORER", "NOPE"])).contains("not a scorer"));
+        assert!(
+            refused(a(&["FT.SEARCH", "idx", "hello=>{$phonetic: true}"])).contains("$phonetic")
+        );
         assert!(refused(a(&["FT.SEARCH", "idx", "*", "VERBATIM"])).contains("VERBATIM"));
         assert!(refused(a(&["FT.SEARCH", "idx", "*", "DIALECT", "1"])).contains("DIALECT 1"));
         assert!(
@@ -1531,10 +1603,22 @@ mod tests {
             ))
             .contains("bytes")
         );
-        assert!(
-            refused(a(&["FT.SEARCH", "idx", "@content:(hello world)"])).contains("exact phrase")
-        );
-        assert!(refused(a(&["FT.SEARCH", "idx", "hello"])).contains("full-text"));
+        // Full text is served (ADR-0063), scored by BM25STD unless named.
+        let s = parse_search(
+            &a(&[
+                "FT.SEARCH",
+                "idx",
+                "@content:(hello world)",
+                "SCORER",
+                "TFIDF",
+                "WITHSCORES",
+            ]),
+            &def,
+        )
+        .expect("parses");
+        assert_eq!((s.scorer, s.withscores), (Scorer::Tfidf, true));
+        let s = parse_search(&a(&["FT.SEARCH", "idx", "hello"]), &def).expect("parses");
+        assert_eq!(s.scorer, Scorer::Bm25Std);
         assert!(
             refused(a(&["FT.SEARCH", "idx", "*", "SORTBY", "content"])).contains("NUMERIC or TAG")
         );
@@ -1559,6 +1643,55 @@ mod tests {
             Ok((b"i".to_vec(), true))
         );
         assert!(parse_drop(&a(&["FT.DROPINDEX", "i", "KEEPDOCS"])).is_err());
+    }
+
+    /// ADR-0063: a document's score and the index's language.
+    #[test]
+    fn scores_are_kept_and_languages_other_than_english_refused() {
+        let base = ["FT.CREATE", "s", "ON", "HASH", "PREFIX", "1", "doc:"];
+        let create = |extra: &[&str]| {
+            let mut v: Vec<&str> = base.to_vec();
+            v.extend_from_slice(extra);
+            v.extend_from_slice(&["SCHEMA", "t", "TEXT", "WEIGHT", "2.5"]);
+            parse_create(&a(&v))
+        };
+        let (_, def) = create(&[
+            "SCORE",
+            "0.5",
+            "SCORE_FIELD",
+            "__score",
+            "LANGUAGE",
+            "English",
+        ])
+        .expect("parses");
+        assert_eq!(
+            (def.score, def.score_field.as_deref()),
+            (0.5, Some("__score"))
+        );
+        // Kept through the index row, which an older binary wrote without.
+        let back = IndexDef::decode(&def.encode()).expect("decodes");
+        assert_eq!(back, def);
+        let mut old: Value = serde_json::from_str(&def.encode()).expect("json");
+        let o = old.as_object_mut().expect("an object");
+        o.remove("score");
+        o.remove("score_field");
+        let old = IndexDef::decode(&old.to_string()).expect("an older row decodes");
+        assert_eq!((old.score, old.score_field), (1.0, None));
+        for (extra, says) in [
+            (&["LANGUAGE", "german"][..], "English only"),
+            (&["LANGUAGE_FIELD", "lang"][..], "LANGUAGE_FIELD"),
+            (&["SCORE", "2"][..], "from 0 to 1"),
+        ] {
+            let e = create(extra).expect_err("refused");
+            assert!(e.contains(says), "{extra:?}: {e}");
+        }
+        let mut v: Vec<&str> = base.to_vec();
+        v.extend_from_slice(&["SCHEMA", "t", "TEXT", "WEIGHT", "heavy"]);
+        assert!(
+            parse_create(&a(&v))
+                .expect_err("refused")
+                .contains("WEIGHT")
+        );
     }
 
     #[test]

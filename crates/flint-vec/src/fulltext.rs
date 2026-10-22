@@ -165,9 +165,11 @@ struct DocStats {
 }
 
 /// What a term's entry costs the D4 meter beyond its bytes: the `Arc`'s
-/// counts, its slot in the term map at a node's worst fill, and its empty
-/// posting map. An over-estimate, which `tests/ft_meter.rs` holds it to.
-const TERM_BYTES: usize = 160;
+/// counts, its slot in the term map at a node's worst fill, and its posting
+/// map's first leaf, which a `BTreeMap` allocates whole for one entry (11
+/// slots of a document id and a [`Hit`]: 368 bytes). An over-estimate,
+/// which `tests/ft_meter.rs` holds it to.
+const TERM_BYTES: usize = 480;
 /// What a posting costs beyond its offsets: its slot in the posting map at
 /// a node's worst fill, and its offsets' allocation rounded up.
 const POSTING_BYTES: usize = 96;

@@ -3961,14 +3961,25 @@ fn ft_search_resp3(args: &[Vec<u8>], v: &Value) -> Option<Value> {
     let Value::Integer(total) = items.first()? else {
         return None;
     };
-    let nocontent = args
-        .iter()
-        .skip(3)
-        .any(|a| a.eq_ignore_ascii_case(b"NOCONTENT"));
+    let flag = |name: &[u8]| args.iter().skip(3).any(|a| a.eq_ignore_ascii_case(name));
+    let (nocontent, withscores) = (flag(b"NOCONTENT"), flag(b"WITHSCORES"));
     let mut results = Vec::new();
     let mut it = items[1..].iter().peekable();
     while let Some(id) = it.next() {
         let mut entry = vec![(map_key("id"), id.clone())];
+        // `WITHSCORES` (ADR-0063): the score after the key, a double here as
+        // RediSearch sends one under RESP3.
+        if withscores {
+            let score = match it.next() {
+                Some(Value::Bulk(Some(b))) => std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|t| t.parse::<f64>().ok())
+                    .map_or_else(|| Value::Bulk(Some(b.clone())), Value::Double),
+                Some(other) => other.clone(),
+                None => return None,
+            };
+            entry.push((map_key("score"), score));
+        }
         if !nocontent && let Some(Value::Array(Some(fields))) = it.peek() {
             let pairs = fields
                 .as_chunks::<2>()
@@ -8421,5 +8432,71 @@ mod repair_tests {
             exec_item(false, None, Some(Value::Integer(1))),
             Value::Integer(1)
         );
+    }
+}
+
+#[cfg(test)]
+mod ft_resp3_tests {
+    use super::{Value, ft_search_resp3, map_key};
+
+    fn args(parts: &[&str]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+    }
+
+    fn bulk(s: &str) -> Value {
+        Value::Bulk(Some(s.as_bytes().to_vec()))
+    }
+
+    /// ADR-0063: `WITHSCORES` puts each score after its key in RESP2, and a
+    /// `score` double in each result's map in RESP3, as RediSearch does.
+    #[test]
+    fn a_scored_search_carries_its_scores_in_either_shape() {
+        let resp2 = Value::Array(Some(vec![
+            Value::Integer(2),
+            bulk("doc:1"),
+            bulk("0.5"),
+            Value::Array(Some(vec![bulk("t"), bulk("hello")])),
+            bulk("doc:2"),
+            bulk("0.25"),
+            Value::Array(Some(vec![bulk("t"), bulk("hi")])),
+        ]));
+        let r3 = ft_search_resp3(&args(&["FT.SEARCH", "i", "hello", "WITHSCORES"]), &resp2)
+            .expect("reshaped");
+        let Value::Map(top) = r3 else {
+            panic!("not a map");
+        };
+        let results = top
+            .iter()
+            .find(|(k, _)| *k == map_key("results"))
+            .map(|(_, v)| v.clone());
+        let Some(Value::Array(Some(rs))) = results else {
+            panic!("no results");
+        };
+        assert_eq!(rs.len(), 2);
+        let Value::Map(first) = &rs[0] else {
+            panic!("not a map");
+        };
+        assert_eq!(first[0], (map_key("id"), bulk("doc:1")));
+        assert_eq!(first[1], (map_key("score"), Value::Double(0.5)));
+        assert_eq!(first[2].0, map_key("extra_attributes"));
+        // With NOCONTENT: a key and its score, nothing else.
+        let resp2 = Value::Array(Some(vec![Value::Integer(1), bulk("doc:1"), bulk("1")]));
+        let r3 = ft_search_resp3(
+            &args(&["FT.SEARCH", "i", "hello", "NOCONTENT", "WITHSCORES"]),
+            &resp2,
+        )
+        .expect("reshaped");
+        let Value::Map(top) = r3 else {
+            panic!("not a map");
+        };
+        let Some((_, Value::Array(Some(rs)))) = top.iter().find(|(k, _)| *k == map_key("results"))
+        else {
+            panic!("no results");
+        };
+        let Value::Map(only) = &rs[0] else {
+            panic!("not a map");
+        };
+        assert_eq!(only[1], (map_key("score"), Value::Double(1.0)));
+        assert_eq!(only.len(), 3, "id, score and values");
     }
 }

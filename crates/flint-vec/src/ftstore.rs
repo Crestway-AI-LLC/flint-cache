@@ -156,6 +156,8 @@ pub struct SearchPlan {
     pub hits: Hits,
     pub on: On,
     pub nocontent: bool,
+    /// `WITHSCORES`: each key's score after it (ADR-0063).
+    pub withscores: bool,
     pub returns: Option<Vec<(Box<str>, Box<str>)>>,
     /// The KNN distance's name, for a KNN search.
     pub alias: Option<Box<str>>,
@@ -470,6 +472,7 @@ impl Store {
             hits,
             on: ix.def().on,
             nocontent: s.nocontent,
+            withscores: s.withscores,
             returns: s.returns,
             alias: s.knn.map(|k| k.alias),
             paths: ix
@@ -812,14 +815,19 @@ fn json_path<'a>(doc: &'a Json, path: &str) -> Option<&'a Json> {
         .try_fold(doc, |v, m| v.get(m))
 }
 
-/// `FT.SEARCH`'s reply, RESP2's shape: the total, then each key and, unless
+/// `FT.SEARCH`'s reply, RESP2's shape: the total, then each key, its score
+/// with `WITHSCORES` as RediSearch puts it right after the key, and, unless
 /// `NOCONTENT`, its fields. `docs[i]` is the read of `plan.hits.keys[i]`; a
 /// document gone since the search chose it is left out.
 pub fn search_reply(plan: &SearchPlan, docs: &[Option<DocRead>]) -> Value {
     let mut out = vec![int(plan.hits.total)];
     for (i, (key, dist)) in plan.hits.keys.iter().enumerate() {
+        let score = plan
+            .withscores
+            .then(|| Value::Double(plan.hits.scores.get(i).copied().unwrap_or(0.0)));
         if plan.nocontent {
             out.push(bulk(key));
+            out.extend(score);
             continue;
         }
         let Some(doc) = docs.get(i).and_then(|d| d.as_ref()) else {
@@ -889,6 +897,7 @@ pub fn search_reply(plan: &SearchPlan, docs: &[Option<DocRead>]) -> Value {
             }
         }
         out.push(bulk(key));
+        out.extend(score);
         out.push(Value::Array(Some(fields)));
     }
     Value::Array(Some(out))
@@ -1133,6 +1142,59 @@ mod tests {
             s.plan_ft(b"ns", &a(&["FT.DROPINDEX", "i"]), 0),
             FtPlan::Drop { .. }
         ));
+    }
+
+    /// ADR-0063: `WITHSCORES` puts each score right after its key, as
+    /// RediSearch's RESP2 reply does, with or without `NOCONTENT`.
+    #[test]
+    fn a_scored_search_puts_each_score_after_its_key() {
+        let mut s = store();
+        create(
+            &mut s,
+            &[
+                "FT.CREATE",
+                "idx",
+                "PREFIX",
+                "1",
+                "doc:",
+                "SCHEMA",
+                "t",
+                "TEXT",
+            ],
+        );
+        s.ft_set_ready(b"ns", b"idx");
+        for (k, t) in [("doc:1", "hello world"), ("doc:2", "hello")] {
+            s.ft_reindex(b"ns", k.as_bytes(), &hash(&[("t", t.as_bytes().to_vec())]));
+        }
+        let plan = |extra: &[&str]| {
+            let mut q = vec!["FT.SEARCH", "idx", "hello"];
+            q.extend_from_slice(extra);
+            let FtPlan::Search(p) = s.plan_ft(b"ns", &a(&q), 0) else {
+                panic!("not a search");
+            };
+            p
+        };
+        let p = plan(&["NOCONTENT", "WITHSCORES"]);
+        let Value::Array(Some(r)) = search_reply(&p, &[]) else {
+            panic!("not an array");
+        };
+        // The shorter document scores higher under BM25STD.
+        assert_eq!(r.len(), 5);
+        assert_eq!((&r[0], &r[1]), (&Value::Integer(2), &bulk(b"doc:2")));
+        let (Value::Double(a), Value::Double(b)) = (&r[2], &r[4]) else {
+            panic!("scores are doubles: {r:?}");
+        };
+        assert!(a > b && *b > 0.0, "{a} {b}");
+        let p = plan(&["WITHSCORES"]);
+        let docs = [
+            Some(hash(&[("t", b"hello".to_vec())])),
+            Some(hash(&[("t", b"hello world".to_vec())])),
+        ];
+        let Value::Array(Some(r)) = search_reply(&p, &docs) else {
+            panic!("not an array");
+        };
+        assert_eq!(r.len(), 7, "a key, its score and its fields, twice");
+        assert!(matches!(r[2], Value::Double(_)) && matches!(r[3], Value::Array(_)));
     }
 
     #[test]

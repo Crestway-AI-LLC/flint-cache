@@ -39,7 +39,7 @@ use filter::{Expr, Field, FieldKind, Vals};
 use flint_resp::Value;
 use hnsw::Hnsw;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use vecfile::VecFile;
@@ -460,12 +460,31 @@ impl VectorSet {
         scan_cap: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, f32)>, String> {
         match (&self.index, filter) {
-            (Index::Flat(m), None) => Ok(flat_search(m, self.metric, query, k, |_| true)),
-            (Index::Flat(m), Some(f)) => Ok(flat_search(m, self.metric, query, k, |e| {
+            (Index::Flat(m), None) => Ok(flat_search(m, self.metric, query, k, |_, _| true)),
+            (Index::Flat(m), Some(f)) => Ok(flat_search(m, self.metric, query, k, |_, e| {
                 f.matches(e.vals.as_deref())
             })),
             (Index::Hnsw(h), None) => h.knn(query, k, ef, rerank),
             (Index::Hnsw(h), Some(f)) => h.knn_where(query, k, ef, rerank, f, scan_cap),
+        }
+    }
+
+    /// [`VectorSet::search`] over only the ids in `allowed` (ADR-0063): an
+    /// `FT.*` query's matches, found first when it has a text term, which
+    /// the field index cannot answer.
+    pub(crate) fn search_among(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        rerank: usize,
+        allowed: &HashSet<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, f32)>, String> {
+        match &self.index {
+            Index::Flat(m) => Ok(flat_search(m, self.metric, query, k, |id, _| {
+                allowed.contains(id)
+            })),
+            Index::Hnsw(h) => h.knn_among(query, k, ef, rerank, allowed),
         }
     }
 }
@@ -520,7 +539,7 @@ fn flat_search(
     metric: Metric,
     query: &[f32],
     k: usize,
-    admit: impl Fn(&Entry) -> bool,
+    admit: impl Fn(&[u8], &Entry) -> bool,
 ) -> Vec<(Vec<u8>, f32)> {
     if k == 0 {
         return Vec::new();
@@ -531,7 +550,7 @@ fn flat_search(
         0.0
     };
     let mut heap: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
-    for (id, e) in entries.iter().filter(|(_, e)| admit(e)) {
+    for (id, e) in entries.iter().filter(|(id, e)| admit(id, e)) {
         let score = flat_score(metric, query, q_norm, e);
         heap.push(std::cmp::Reverse(Scored {
             score,

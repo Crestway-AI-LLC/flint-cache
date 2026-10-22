@@ -1062,6 +1062,52 @@ impl Hnsw {
                 Ok(Vec::new())
             };
         };
+        if k == 0 || self.entry.is_none() {
+            return Ok(Vec::new());
+        }
+        let (matches, all) = fi.matching(filter, cap, &self.deleted);
+        self.knn_of(q, k, ef, rerank, matches, all, |n| fi.matches(filter, n))
+    }
+
+    /// [`Hnsw::knn_where`] over the vectors of `allowed` (ADR-0063): a
+    /// query's text terms, matched by the `FT.*` index first, which the field
+    /// index cannot answer. Scored one by one when there are no more than
+    /// [`scan_threshold`] of them, else found by the filtered walk.
+    pub fn knn_among(
+        &self,
+        q: &[f32],
+        k: usize,
+        ef: usize,
+        rerank: usize,
+        allowed: &HashSet<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, f32)>, String> {
+        let mut matches: Vec<u32> = allowed
+            .iter()
+            .filter_map(|id| self.id_to_idx.get(*id).copied())
+            .filter(|&n| !self.deleted[n as usize])
+            .collect();
+        // Slot order, so a walk seeded from them is the same walk each time.
+        matches.sort_unstable();
+        let cap = scan_threshold(self.live, ef.max(self.depth(k, rerank)));
+        let all = matches.len() <= cap;
+        let slots: SlotSet = matches.iter().copied().collect();
+        self.knn_of(q, k, ef, rerank, matches, all, |n| slots.contains(&n))
+    }
+
+    /// The `k` nearest of `matches`, every one scored when `all` says they are
+    /// all of them, else a walk that returns only nodes `admit` takes, seeded
+    /// from them.
+    #[allow(clippy::too_many_arguments)]
+    fn knn_of(
+        &self,
+        q: &[f32],
+        k: usize,
+        ef: usize,
+        rerank: usize,
+        matches: Vec<u32>,
+        all: bool,
+        admit: impl Fn(u32) -> bool,
+    ) -> Result<Vec<(Vec<u8>, f32)>, String> {
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -1072,7 +1118,6 @@ impl Hnsw {
         let query = self.codes.query(q, qn);
         let depth = self.depth(k, rerank);
         let ef = ef.max(depth);
-        let (matches, all) = fi.matching(filter, cap, &self.deleted);
         let w = if all {
             let mut w: Vec<DI> = matches
                 .into_iter()
@@ -1093,7 +1138,7 @@ impl Hnsw {
             // a walk from there alone found fewer than `k` (measured on two
             // clusters of 1,500, one of them matching, with `sq8`).
             let seeds = &matches[..matches.len().min(ef)];
-            self.walk(&query, ep, ef, |n| fi.matches(filter, n), seeds)
+            self.walk(&query, ep, ef, admit, seeds)
         };
         self.ranked(w, q, qn, k, depth)
     }
