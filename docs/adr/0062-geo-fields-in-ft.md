@@ -1,7 +1,9 @@
 # ADR-0062: GEO fields in `FT.*`, which redisvl's schemas declare
 
-Status: **PROPOSED 2026-10-21.** It builds on ADR-0060's `FT.*` surface and
-ADR-0059's filter, both on public main after v0.1.0-rc.85.
+Status: **ACCEPTED 2026-10-21, option B** (Jeff: "Accept B, build it"), to
+land in the same release as ADR-0060's release N. **Proposed 2026-10-21.**
+It builds on ADR-0060's `FT.*` surface and ADR-0059's filter, both on public
+main after v0.1.0-rc.85.
 
 ## Context
 
