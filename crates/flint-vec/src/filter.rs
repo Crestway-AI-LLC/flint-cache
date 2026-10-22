@@ -139,16 +139,102 @@ pub enum Val {
     Geo(Box<[u64]>),
 }
 
-/// The bytes RediSearch splits text on by default, besides whitespace.
-const SEPARATORS: &[u8] = b",.<>{}[]\"':;!@#$%^&*()-+=~";
+/// The bytes that end a word in a TEXT value, as RediSearch's indexer splits
+/// one (`ToksepMap_g`, `toksep.h`), unless a backslash comes before one.
+/// Space and tab are the only whitespace among them (BUG-0272).
+const SEPARATORS: &[u8] = b" \t,./(){}[]:;~!@#$%^&*-=+|'`\"<>?";
 
-/// A TEXT value's words, as RediSearch splits them by default and folded to
-/// lower case: what an exact phrase is matched against.
+/// The same in a quoted phrase, as RediSearch's query parser splits one
+/// (`ToksepParserMap_g`, `parser.y`): `$`, which marks a parameter there,
+/// does not end a word.
+const PHRASE_SEPARATORS: &[u8] = b" \t,./(){}[]:;~!@#%^&*-=+|'`\"<>?";
+
+/// A TEXT value's words, as RediSearch's indexer splits and normalizes them
+/// (`toksep`, `DefaultNormalize`): what an exact phrase is matched against.
+/// - A backslash keeps the separator after it in the word, and is dropped.
+/// - Control bytes, a newline among them, are dropped, so they join the
+///   bytes on either side rather than split them.
+/// - The value ends at its first NUL, as RediSearch reads it as a C string.
 pub fn tokenize(text: &[u8]) -> Vec<Box<[u8]>> {
-    text.split(|b| b.is_ascii_whitespace() || SEPARATORS.contains(b))
+    let text = text.split(|&b| b == 0).next().unwrap_or_default();
+    split_escaped(text, SEPARATORS)
+        .into_iter()
+        .map(|w| {
+            let mut out = Vec::with_capacity(w.len());
+            let mut escaped = false;
+            for &b in w {
+                if b.is_ascii_control() || (matches!(b, b' ' | b'\t') && !escaped) {
+                } else if b == b'\\' && !escaped {
+                    escaped = true;
+                    continue;
+                } else {
+                    out.push(b);
+                }
+                escaped = false;
+            }
+            out
+        })
         .filter(|w| !w.is_empty())
-        .map(fold)
+        .map(|w| fold_text(&w))
         .collect()
+}
+
+/// A quoted phrase's words, as RediSearch's query parser splits and
+/// normalizes them (`toksep2`, `rm_normalize`): a backslash is dropped
+/// before punctuation or whitespace, and kept before anything else.
+fn phrase_words(raw: &[u8]) -> Vec<Box<[u8]>> {
+    split_escaped(raw, PHRASE_SEPARATORS)
+        .into_iter()
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut out = Vec::with_capacity(w.len());
+            for (i, &b) in w.iter().enumerate() {
+                let next = w.get(i + 1).copied();
+                if b == b'\\'
+                    && next.is_some_and(|n| {
+                        n.is_ascii_punctuation() || matches!(n, b' ' | b'\t'..=b'\r')
+                    })
+                {
+                    continue;
+                }
+                out.push(b);
+            }
+            fold_text(&out)
+        })
+        .collect()
+}
+
+/// `text` cut at each byte of `seps` that a backslash does not escape, as
+/// RediSearch's `toksep` cuts it. Pieces may be empty.
+fn split_escaped<'a>(text: &'a [u8], seps: &[u8]) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    let (mut start, mut escaped) = (0, false);
+    for (i, &b) in text.iter().enumerate() {
+        if !escaped && seps.contains(&b) {
+            out.push(&text[start..i]);
+            start = i + 1;
+        } else {
+            escaped = !escaped && b == b'\\';
+        }
+    }
+    out.push(&text[start..]);
+    out
+}
+
+/// A TEXT word in lower case, one character at a time, as RediSearch's
+/// `unicode_tolower` maps each code point on its own: a final capital sigma
+/// becomes `σ`, where Rust's `str::to_lowercase` writes `ς`. ASCII's
+/// lower case when it is not UTF-8.
+fn fold_text(raw: &[u8]) -> Box<[u8]> {
+    match std::str::from_utf8(raw) {
+        Ok(s) => s
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .into_bytes()
+            .into_boxed_slice(),
+        Err(_) => raw.to_ascii_lowercase().into_boxed_slice(),
+    }
 }
 
 /// `raw` folded to lower case: Unicode's folding when it is UTF-8, ASCII's
@@ -627,7 +713,9 @@ impl<'a> Parser<'a> {
                         return Err("ends with a '\\'".into());
                     };
                     self.i += 1;
-                    text.push(n);
+                    // Kept, as RediSearch's lexer keeps it: the phrase's
+                    // words are cut and unescaped as it cuts them.
+                    text.extend_from_slice(&[b'\\', n]);
                 }
                 b'"' => break,
                 c => text.push(c),
@@ -640,7 +728,7 @@ impl<'a> Parser<'a> {
             }
             self.i += 1;
         }
-        let words = tokenize(&text);
+        let words = phrase_words(&text);
         if words.is_empty() {
             return Err("has an empty phrase".into());
         }
@@ -1520,5 +1608,79 @@ mod tests {
             (0, 0, 0, 0, 0)
         );
         assert!(fi.tags.iter().all(HashMap::is_empty) && fi.nums.iter().all(BTreeSet::is_empty));
+    }
+
+    /// BUG-0272: a TEXT value is cut where RediSearch's indexer cuts it, and
+    /// a quoted phrase where its query parser cuts one.
+    #[test]
+    fn text_is_split_and_folded_as_redisearch_splits_and_folds_it() {
+        let words = |t: &[u8]| -> Vec<String> {
+            tokenize(t)
+                .iter()
+                .map(|w| String::from_utf8_lossy(w).into_owned())
+                .collect()
+        };
+        assert_eq!(
+            words(b"What's the weather like today?"),
+            ["what", "s", "the", "weather", "like", "today"]
+        );
+        assert_eq!(
+            words(b"TCP/IP a|b x`y $100 50%"),
+            ["tcp", "ip", "a", "b", "x", "y", "100", "50"]
+        );
+        assert_eq!(
+            words(b"snake_case"),
+            ["snake_case"],
+            "'_' is part of a word"
+        );
+        assert_eq!(
+            words(b"line1\nline2\r"),
+            ["line1line2"],
+            "control bytes are dropped"
+        );
+        assert_eq!(
+            words(b"a\\,b c\\\\,d"),
+            ["a,b", "c\\", "d"],
+            "'\\' escapes a separator"
+        );
+        assert_eq!(words(b"keep\0gone"), ["keep"], "the value ends at a NUL");
+        assert_eq!(
+            words("ΟΔΟΣ".as_bytes()),
+            ["οδοσ"],
+            "one code point at a time"
+        );
+
+        let phrase = |t: &[u8]| -> Vec<String> {
+            phrase_words(t)
+                .iter()
+                .map(|w| String::from_utf8_lossy(w).into_owned())
+                .collect()
+        };
+        assert_eq!(phrase(b"like today?"), ["like", "today"]);
+        assert_eq!(phrase(b"a$b"), ["a$b"], "'$' does not split a phrase");
+        assert_eq!(phrase(b"a\\,b"), ["a,b"]);
+        assert_eq!(phrase(b"a\\b"), ["a\\b"], "'\\' is kept before a letter");
+
+        let fields = vec![Field {
+            name: "t".into(),
+            kind: FieldKind::Text,
+        }];
+        let hit = |doc: &[u8], q: &str| {
+            let v = hash_val(FieldKind::Text, doc, b',');
+            parse(q.as_bytes(), &fields)
+                .expect(q)
+                .matches(Some(std::slice::from_ref(&v)))
+        };
+        assert!(hit(b"What's the weather like today?", "@t:(\"today\")"));
+        assert!(hit(
+            b"What's the weather like today?",
+            "@t:(\"like today\")"
+        ));
+        assert!(hit(b"TCP/IP", "@t:(\"tcp ip\")"));
+        assert!(hit(b"a\\,b", "@t:(\"a\\,b\")"));
+        assert!(
+            !hit(b"a,b", "@t:(\"a\\,b\")"),
+            "an escaped separator is part of the word"
+        );
     }
 }
