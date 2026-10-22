@@ -225,7 +225,7 @@ fn split_escaped<'a>(text: &'a [u8], seps: &[u8]) -> Vec<&'a [u8]> {
 /// `unicode_tolower` maps each code point on its own: a final capital sigma
 /// becomes `σ`, where Rust's `str::to_lowercase` writes `ς`. ASCII's
 /// lower case when it is not UTF-8.
-fn fold_text(raw: &[u8]) -> Box<[u8]> {
+pub(crate) fn fold_text(raw: &[u8]) -> Box<[u8]> {
     match std::str::from_utf8(raw) {
         Ok(s) => s
             .chars()

@@ -229,16 +229,20 @@ follows the words searched rather than the size of the index.
   stemmed, and a phrase with a stop word in it matches nothing. That
   changes what today's phrase answers. FT.* has not shipped in a release,
   so nobody depends on the old answer.
-- **A search with no text word** under the default scorer: RediSearch's
-  `BM25STD` scores tags and numbers 0, so their results stay in write
-  order, as today. Two cases are settled from the source before the build
-  claims either:
-  - `*`: `BM25STD` scores a wildcard match by the document's length (the
-    `Virtual` case in `default.c`). On an index with TEXT fields, that
-    may order a `*` search by length rather than by write order.
-  - the other scorers: `TFIDF` counts a tag as a word of frequency 1.
-  If either shows ADR-0060's write order is wrong, it is filed as a bug and
-  fixed with this.
+- **A search with no text word is scored too,** as RediSearch scores it.
+  ADR-0060 answers such a search in write order. Read from RediSearch's
+  source after this ADR was first written (`rqe_iterators`'
+  `inverted_index/tag.rs`, `wildcard.rs`, `numeric.rs`):
+  - A TAG match is a word's result: frequency 1, and the tag value's own
+    IDF.
+  - A `*` match is a virtual result of frequency 1, which `BM25STD` scores
+    by the document's length.
+  - A number or a point scores 0 under `BM25STD`.
+  So on an index with TEXT fields, RediSearch orders a tag or `*` search
+  by score, the shortest documents first, and not by write order. On an
+  index with no TEXT field every length is 0 and the scores tie, so write
+  order holds. This is filed as a bug against ADR-0060 and fixed with this
+  build.
 - **Releases:**
   - The definition row gains `score`, `score_field` and the language keys.
     An older co-processor reads the definition by the keys it knows and

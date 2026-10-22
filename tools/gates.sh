@@ -2721,7 +2721,12 @@ assert_license_headers_are_this_repos() {
   # index answers nothing, which is the right answer there.
   local bad needle
   needle="All rights re""served"
-  bad=$(git grep -l -F "$needle" -- tools crates 2>/dev/null || true)
+  # Excluded, with the reason: Snowball's BSD-3-Clause notices, vendored with
+  # its stemmer (ADR-0063). The licence requires its copyright lines kept
+  # with the source, and they carry the phrase.
+  bad=$(git grep -l -F "$needle" -- tools crates \
+    ':!crates/flint-vec/src/snowball/COPYING' \
+    ':!crates/flint-vec/src/snowball/COPYING-data' 2>/dev/null || true)
   [ -z "$bad" ] && return 0
   echo "FAIL  these tracked files carry the OPS repo's license header:"
   printf '        %s\n' $bad

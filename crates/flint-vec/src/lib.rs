@@ -26,10 +26,12 @@ pub mod filter;
 pub mod ft;
 pub mod ftindex;
 pub mod ftstore;
+pub mod fulltext;
 pub mod geo;
 mod hnsw;
 mod kernel;
 mod quant;
+mod snowball;
 pub mod vecfile;
 
 use filter::{Expr, Field, FieldKind, Vals};
