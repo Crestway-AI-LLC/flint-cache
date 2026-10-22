@@ -548,11 +548,13 @@ fn meta_of(fields: &[Field], vals: Option<&[Val]>) -> Option<Vec<u8>> {
                 Some(n) => Value::Number(n),
                 None => continue,
             },
-            Val::Text(ws) => Value::String(
+            // The words themselves, as the extraction reads an array back:
+            // joined into one string, a word holding an escaped separator
+            // would be split again (BUG-0272).
+            Val::Text(ws) => Value::Array(
                 ws.iter()
-                    .map(|w| String::from_utf8_lossy(w))
-                    .collect::<Vec<_>>()
-                    .join(" "),
+                    .map(|w| Value::String(String::from_utf8_lossy(w).into_owned()))
+                    .collect(),
             ),
             // The hashes themselves: the set's extraction reads them back.
             Val::Geo(hs) => Value::Array(hs.iter().map(|h| Value::from(*h)).collect()),
@@ -1024,6 +1026,36 @@ mod tests {
             (h.total, keys(&h)),
             (4, vec!["doc:2".to_string(), "doc:3".to_string()])
         );
+    }
+
+    /// BUG-0272: a filtered KNN reads a TEXT field's words as a filter-only
+    /// search does, a word holding an escaped separator included.
+    #[test]
+    fn a_filtered_knn_reads_text_words_as_the_index_holds_them() {
+        let mut ix = hash_index();
+        for (key, content, v) in [
+            ("doc:1", "tcp\\/ip stack", [0.0, 0.0]),
+            ("doc:2", "tcp ip stack", [1.0, 0.0]),
+        ] {
+            let fields = vec![
+                (b"content".to_vec(), content.as_bytes().to_vec()),
+                (b"embedding".to_vec(), blob(&v)),
+            ];
+            ix.put(key.as_bytes(), Source::Hash(&fields), None)
+                .expect("indexed");
+        }
+        let q = "@content:(\"tcp\\/ip\")";
+        assert_eq!(
+            keys(&search(&ix, &["FT.SEARCH", "idx", q], None)),
+            ["doc:1"]
+        );
+        let knn = format!("({q})=>[KNN 2 @embedding $v AS d]");
+        let h = search(
+            &ix,
+            &["FT.SEARCH", "idx", &knn, "SORTBY", "d"],
+            Some(&[0.0, 0.0]),
+        );
+        assert_eq!(keys(&h), ["doc:1"]);
     }
 
     #[test]

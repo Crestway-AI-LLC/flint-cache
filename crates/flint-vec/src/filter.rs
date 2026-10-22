@@ -370,6 +370,20 @@ pub fn extract(fields: &[Field], meta: Option<&[u8]>) -> Option<Vals> {
                 (FieldKind::Text, Some(serde_json::Value::String(s))) => {
                     hash_val(FieldKind::Text, s.as_bytes(), 0)
                 }
+                // Words an `FT.*` index has already split (`meta_of`), kept
+                // as they are: one may hold an escaped separator (BUG-0272).
+                (FieldKind::Text, Some(serde_json::Value::Array(a))) => {
+                    let ws: Vec<Box<[u8]>> = a
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| s.as_bytes().into())
+                        .collect();
+                    if ws.is_empty() {
+                        Val::Missing
+                    } else {
+                        Val::Text(ws.into_boxed_slice())
+                    }
+                }
                 (FieldKind::Numeric, Some(serde_json::Value::Number(n))) => match n.as_f64() {
                     // `-0` is stored as `0`, so the two sort as one value.
                     Some(x) => Val::Num(if x == 0.0 { 0.0 } else { x }),

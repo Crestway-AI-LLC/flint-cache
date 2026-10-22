@@ -6,13 +6,15 @@ RediSearch's source** for ADR-0063 (`toksep.h`, `tokenize.c`, the query
 parser's `parser.y` and `util/strconv.h`), not seen in a run. None of the
 three clients' suites writes a phrase that reaches it.
 Held by `text_is_split_and_folded_as_redisearch_splits_and_folds_it` in
-`crates/flint-vec/src/filter.rs`.
+`crates/flint-vec/src/filter.rs`, and by
+`a_filtered_knn_reads_text_words_as_the_index_holds_them` in
+`crates/flint-vec/src/ftindex.rs`. Each fails with the old code put back.
 **Severity:** low. A wrong answer, but only for an exact phrase,
 `@f:("...")`, the one TEXT query `FT.SEARCH` serves, over text with the
 bytes below. LangChain's chat history stores each message as TEXT, and a
 question ends in `?`.
-**Area:** `crates/flint-vec/src/filter.rs`, `tokenize` and
-`Parser::phrase`.
+**Area:** `crates/flint-vec/src/filter.rs`, `tokenize`, `Parser::phrase`
+and `extract`; `crates/flint-vec/src/ftindex.rs`, `meta_of`.
 
 ## What happened
 
@@ -45,6 +47,12 @@ which drops a `\` only before punctuation or whitespace. Flint dropped every
   is cut and unescaped as its parser does (`toksep2` over
   `ToksepParserMap_g`, then `rm_normalize`).
 - **Each word is lowercased** one character at a time.
+- **A filtered KNN reads the same words.** An index with a VECTOR field
+  hands its vector set each document's values as JSON, which the set reads
+  back. A TEXT value went as its words joined by spaces, and was split
+  again, so a word holding an escaped separator (`tcp\/ip`) came back as
+  two, and a phrase beside a KNN missed it. The words now go as an array,
+  read back as they are.
 
 TAG values are not changed: they keep `fold`, and this did not check
 RediSearch's TAG folding.
