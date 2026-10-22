@@ -176,8 +176,12 @@ if which == "write":
     want(r, [2, b"doc:3", b"doc:2"], "a range, sorted, NOCONTENT")
     r = cmd(px, "FT.SEARCH", "idx", '@body:("quick brown")', "NOCONTENT")
     want(r, [1, b"doc:1"], "an exact phrase")
+    # `*` is scored too, as RediSearch scores it (BUG-0273): BM25STD puts
+    # the shortest bodies first, so doc:1, with three words that are not
+    # stop words, comes last, and the other three, two words each, tie in
+    # write order.
     r = cmd(px, "FT.SEARCH", "idx", "*", "LIMIT", "1", "2", "NOCONTENT")
-    want(r, [4, b"doc:2", b"doc:3"], "LIMIT")
+    want(r, [4, b"doc:3", b"doc:4"], "LIMIT")
     info = cmd(px, "FT.INFO", "idx")
     want(info[info.index(b"num_docs") + 1], 4, "FT.INFO num_docs")
     # The index moves with its documents.
@@ -394,6 +398,54 @@ if which in ("geo", "geosame"):
         want(cmd(px, "FT.DROPINDEX", "gjx", "DD"), "OK", "FT.DROPINDEX gjx DD")
     print("  GEO: within a radius over HASH and JSON, with a tag and negated; bad units and radii refused as RediSearch's")
 
+if which in ("text", "textsame"):
+    # ADR-0063: full text through the proxy, scored by BM25STD as RediSearch
+    # scores it, worked out here from its formula with its f32 constants:
+    # the same scores before a restart and after its rebuild.
+    import math
+    f32 = lambda x: struct.unpack("<f", struct.pack("<f", x))[0]
+    docs = {"t:1": "hello world", "t:2": "hello world hello",
+            "t:3": "hello there world again more", "t:4": "world", "t:5": "lorem ipsum"}
+    if which == "text":
+        want(cmd(px, "FT.CREATE", "tx", "ON", "HASH", "PREFIX", "1", "t:", "SCHEMA",
+                 "title", "TEXT", "c", "TAG"), "OK", "FT.CREATE with a TEXT field")
+        for k, t in docs.items():
+            want(cmd(px, "HSET", k, "title", t, "c", "a" if k != "t:2" else "b"), 2, "HSET " + k)
+    stop = {"there"}
+    words = {k: [w for w in t.split() if w not in stop] for k, t in docs.items()}
+    n_docs = len(docs)
+    avg = sum(len(w) for w in words.values()) / n_docs
+    b, k1 = f32(0.75), f32(1.2)
+    def bm25std(term, k):
+        f = float(words[k].count(term))
+        n = sum(1 for ws in words.values() if term in ws)
+        idf = math.log(1.0 + (n_docs - n + 0.5) / (n + 0.5))
+        blen = f32(b * len(words[k])) / avg
+        return idf * f * f32(k1 + 1.0) / (f + k1 * (f32(1.0 - b) + blen))
+    hits = [k for k, ws in words.items() if "hello" in ws and "world" in ws]
+    exp = sorted(((bm25std("hello", k) + bm25std("world", k), k) for k in hits),
+                 key=lambda x: -x[0])
+    r = cmd(px, "FT.SEARCH", "tx", "hello world", "NOCONTENT", "WITHSCORES")
+    want(r[0], 3, which + ": three documents hold both words")
+    got = [(float(r[i + 1]), r[i].decode()) for i in range(1, len(r), 2)]
+    want([k for _, k in got], [k for _, k in exp], which + ": highest BM25STD first")
+    for (g, k), (e, _) in zip(got, exp):
+        if abs(g - e) > 1e-12 * max(1.0, abs(e)):
+            raise SystemExit("FAIL: %s: %s scored %r, BM25STD gives %r" % (which, k, g, e))
+    # redisvl's TextQuery shape: a union on the field ANDed with a tag.
+    r = cmd(px, "FT.SEARCH", "tx", "(@title:(hello | lorem)) (@c:{a})", "SCORER", "TFIDF",
+            "WITHSCORES", "NOCONTENT")
+    want(sorted(k.decode() for k in r[1::2]), ["t:1", "t:3", "t:5"], which + ": a TextQuery with a tag")
+    want(sorted(k.decode() for k in cmd(px, "FT.SEARCH", "tx", "@title:wor*", "NOCONTENT")[1:]),
+         ["t:1", "t:2", "t:3", "t:4"], which + ": a prefix")
+    want(cmd(px, "FT.SEARCH", "tx", '@title:"hello there"', "NOCONTENT"), [0],
+         which + ": a phrase with a stop word matches nothing, as in RediSearch")
+    refused(cmd(px, "FT.SEARCH", "tx", "hello", "SCORER", "HAMMING"),
+            "ERR FT.SEARCH SCORER HAMMING is not supported", which + ": HAMMING")
+    if which == "textsame":
+        want(cmd(px, "FT.DROPINDEX", "tx", "DD"), "OK", "FT.DROPINDEX tx DD")
+    print("  full text: BM25STD scores as its formula gives them, a TextQuery, a prefix, a stop-word phrase")
+
 if which == "off":
     refused(cmd(px, "FT.CREATE", "z", "PREFIX", "1", "z:", "SCHEMA", "a", "TAG"),
             "ERR FT.* is not enabled", "FT.CREATE without --ft")
@@ -416,6 +468,8 @@ echo "== ADR-0062: GEO fields"
 step geo || exit 1
 echo "== BUG-0271: a backfill over a covered prefix keeps write order"
 step fillorder || exit 1
+echo "== ADR-0063: full text, scored"
+step text || exit 1
 
 echo "== a co-processor restart rebuilds every index and registers its prefixes again"
 kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
@@ -426,6 +480,8 @@ echo "== ADR-0061: the same range, on the indexes the restart rebuilt"
 step range || exit 1
 echo "== ADR-0062: the same GEO answers, rebuilt; then the GEO indexes are dropped"
 step geosame || exit 1
+echo "== ADR-0063: the same scores, rebuilt; then the text index is dropped"
+step textsame || exit 1
 grep -q "FT\.\* on" "$D/vec.log" || { echo "FAIL: flint-vec did not say FT.* is on"; exit 1; }
 
 echo "== FT.DROPINDEX takes the prefixes off every pair"
@@ -439,4 +495,4 @@ kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec
 step off || exit 1
 
-echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), and --ft gates it (ADR-0060, amendment 3)"
+echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), and --ft gates it (ADR-0060, amendment 3)"

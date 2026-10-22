@@ -2,8 +2,8 @@
 
 Status: **ACCEPTED 2026-10-22, option B** (Jeff: "Accept B, build it"), with
 sub-decision 1 (i), Snowball v2.1.0's own code, and sub-decision 2,
-English only for now. BUG-0272 is gated with its build. **Proposed
-2026-10-22.**
+English only for now; **built 2026-10-22** (As built, below), with
+BUG-0272 and BUG-0273, to be gated together. **Proposed 2026-10-22.**
 It builds on ADR-0060's `FT.*` surface, ADR-0059's filter, and BUG-0272,
 which makes a TEXT value's words RediSearch's (public main after
 v0.1.0-rc.85, branch stack-1022).
@@ -291,6 +291,106 @@ follows the words searched rather than the size of the index.
   for it. Flint keeps one index for each namespace, so it answers as a
   single-shard RediSearch does.
 
+## As built (2026-10-22, for v0.1.0-rc.86)
+
+- **Settled from RediSearch's source while building,** beyond the first
+  text:
+  - **A TAG match is a word's result** (BUG-0273, under Its scope).
+  - **Stems are in the word list** that suffix, contains and fuzzy terms
+    read, since RediSearch adds every forward-index term, stems included,
+    to its terms trie. So `%%engine%%` also matches `engineering`, through
+    its stem `+engin`. A prefix never matches a stem, which starts with `+`.
+  - **A word's expansion** is the union of itself, `+stem` always, and the
+    bare stem when it differs (`StemmerExpander`). The query side has no
+    minimum length.
+  - **The other results:**
+    - a NUMERIC or GEO match is a numeric result of frequency 1 and
+      weight 1;
+    - a NOT match is a virtual result of frequency 0;
+    - an unmatched optional term is a virtual result of frequency 1 and
+      weight 0;
+    - a matched optional term takes the optional's weight.
+  - **An AND's children** are ordered by their expected match count, unless
+    `$inorder`. This decides the slop divisor when three or more of them
+    hold positions.
+  - **The scorers' constants** are `f32`: `k1` 1.2, `b` 0.75 or 0.5, and
+    `b × length` is multiplied in `f32`. A document's score is kept as a
+    float.
+  - **A HASH document's `SCORE_FIELD`** is a strict number with no range
+    check. Anything else gives the index's `SCORE`.
+- **Assumed, not settled:** a TAG term with several values, `@t:{a | b}`,
+  is scored by the first value a document holds, as a prefix's words are.
+  It changes a score only for a document holding two of the values.
+- **The code:**
+  - `crates/flint-vec/src/snowball/`: the generated stemmer, its runtime,
+    and the vocabulary, vendored under Snowball's licence (sub-decision 1).
+    `tools/gates.sh`'s licence-header check excludes its two `COPYING`
+    files, with the reason.
+  - `fulltext.rs`: a document's words, counted as RediSearch's forward
+    index counts them, and the posting lists.
+  - `ftquery.rs`: the parser, the plan, each document's match, and the
+    scorers. It is written from RediSearch's rules, not its code, which is
+    under RSAL, SSPL or AGPL.
+  - `ftindex.rs`: documents carry their write id, score and TAG counts;
+    every search is scored. A KNN with a text term searches among that
+    term's matches (`VectorSet::search_among`, `Hnsw::knn_among`).
+  - `ft.rs`, `ftstore.rs`, and the proxy's RESP3 shape, for the options and
+    the reply.
+- **Held by:**
+  - `every_english_word_stems_as_snowball_v2_1_0_stems_it`, all 29,417
+    words;
+  - `every_scorer_answers_redisearch_s_own_test_index` and
+    `full_text_answers_redisearch_s_own_test_index`: `testScoreIndex`, in
+    the query module and through `FT.CREATE` and `FT.SEARCH`. Every scorer
+    gave RediSearch's five keys and scores on the first run;
+  - `postings_follow_every_rewrite_and_delete`: 400 random rewrites and
+    deletes against an index built afresh from what is left. Twelve queries
+    under five scorers give the same matches and the same scores, bit for
+    bit;
+  - the parser, stem, phrase, slop, affix, fuzzy, KNN and reply-shape
+    tests beside them;
+  - `tests/ft_meter.rs`;
+  - `coproc_ft_drill`'s `text` and `textsame` sections, through the proxy,
+    before and after a co-processor restart. They check BM25STD's scores
+    against its formula, worked out in the drill's Python with RediSearch's
+    `f32` constants.
+  - Mutation-checked: the rewrite test fails with a delete that leaves its
+    postings, and BUG-0273's test fails with write order.
+- **Found while building it:**
+  - **BUG-0272** (the words) and **BUG-0273** (the order).
+  - **The meter undercharged a new word,** found by `tests/ft_meter.rs`. A
+    word's first posting allocates a whole `BTreeMap` leaf, 368 bytes, so a
+    document of words new to the index held 12.3 KB and was charged 7.3 KB.
+    The charge for a new word is now 480 bytes beyond its bytes; that
+    document is charged 14.9 KB.
+
+### The clients' suites, as built (2026-10-22)
+
+Against a local fleet, beside the run after ADR-0062 (its *As built*):
+
+| suite | passed before | passed now | failed now | errors now |
+|---|---|---|---|---|
+| redisvl | 238 | 263 | 29 | 17 |
+| langchain-redis, RESP3 | 150 | 157 | 24 | 23 |
+| langchain-redis, RESP2 | 188 | 200 | 3 | 1 |
+| LlamaIndex | 19 | 19 | 0 | 0 |
+
+- **No failure left names `WITHSCORES` or a text term,** in any suite.
+- **redisvl's 29:**
+  - `sentence-transformers` 19, not installed;
+  - `FT.AGGREGATE` 8;
+  - `INDEXEMPTY` 6;
+  - `SORTBY` on a TEXT field 7, up from 2. Its word-weight tests now get
+    past their text query and sort by `description`;
+  - its upsert script 4;
+  - `EXPIRE` inside `MULTI` 2.
+- **langchain-redis:** what is left is its own RESP3 parsing, `CROSSSLOT`
+  and transactions, as before (ADR-0060). Its chat history's
+  `search_messages` passes in both protocols.
+- **Not served, and not counted above:** a JSON TEXT field holding an
+  array of strings, which RediSearch indexes, is still read as missing.
+  None of the three clients writes one.
+
 ## Verification
 
 - **Units:**
@@ -309,8 +409,8 @@ follows the words searched rather than the size of the index.
   documents and queries is answered twice, from the postings and by
   checking each document's words. Both must give the same matches and the
   same scores, through rewrites, deletes and expiries.
-- **The meter:** `tests/meter.rs` holds the postings' bytes, as it holds
-  the rest.
+- **The meter:** a test holds the postings' bytes, as `tests/meter.rs`
+  holds a vector set's (as built: `tests/ft_meter.rs`).
 - **`coproc_ft_drill`:** a `text` section that runs `TextQuery`-shaped
   searches with `WITHSCORES` through the proxy, before and after a
   co-processor restart. Scores must be equal across the restart, and ties
@@ -326,7 +426,7 @@ follows the words searched rather than the size of the index.
 - `FT.AGGREGATE`, next by count, and redisvl's `HybridQuery`, which uses it.
 - `INDEXEMPTY` and `INDEXMISSING`.
 - `SORTBY` on a TEXT field, which needs RediSearch's sort normalization
-  (`UNF`).
+  (`UNF`). Seven redisvl tests now wait on it (As built).
 - `FT.SEARCH` without a KNN still reads every document for a search with no
   text word, as it does today. Postings for tags and numbers would end
   that, and are a separate question.

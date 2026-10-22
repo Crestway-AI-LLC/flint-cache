@@ -525,8 +525,16 @@ only on a fleet whose operator sets `coproc-ft on`.
     HASH field, at `,` unless it says otherwise, and a JSON string or each
     string of a JSON array only when it is declared, as in RediSearch.
   - `NUMERIC`.
-  - `TEXT`, matched only as an exact phrase, `@f:("a phrase")`: its words in
-    that order, lowercased, with no stemming, stop words or scoring.
+  - `TEXT`, searched as RediSearch searches it (ADR-0063), with `WEIGHT`,
+    `NOSTEM` and `WITHSUFFIXTRIE`:
+    - its words split where RediSearch's indexer splits them, and lowercased;
+    - stop words left out: RediSearch's 33, or the index's `STOPWORDS`
+      (`STOPWORDS 0` keeps every word);
+    - each word also indexed under its English stem, Snowball v2.1.0's, as
+      RediSearch's pinned Snowball stems it.
+  - `SCORE`, and a document's own score in `SCORE_FIELD`, which every
+    scorer multiplies by. `LANGUAGE` is English only; another language,
+    and `LANGUAGE_FIELD`, are refused.
   - `GEO` (ADR-0062): a point as `lon,lat` or `lon lat`, in a HASH field,
     a JSON string, or a JSON array of them. A document whose value is not a
     point, or is nearer a pole than ±85.05112878, is left out of the index,
@@ -534,6 +542,18 @@ only on a fleet whose operator sets `coproc-ft on`.
   - `VECTOR FLAT` or `HNSW` with `TYPE FLOAT32` and `L2`, `IP` or `COSINE`.
 - **Searches:**
   - ADR-0059's filter, or `*`.
+  - Full text (ADR-0063), in RediSearch's `DIALECT 2` grammar:
+    - words, on every TEXT field or on `@f:` or `@f1|f2:`; a word also
+      matches its stem's other forms, unless every field it searches is
+      `NOSTEM`;
+    - `(a b)` for both, `a | b` for either, `-a` for not, `~a` for
+      optional; AND binds tighter than OR;
+    - `pre*`, `*suf`, `*infix*` and `%fuzzy%` (1 to 3 edits), each reading
+      at most 200 of the index's words;
+    - `"an exact phrase"`, its words in order with nothing between, not
+      stemmed. A phrase with a stop word in it matches nothing, as in
+      RediSearch, since the index never holds a stop word;
+    - attributes `=>{$weight: w; $slop: n; $inorder: true}`.
   - A radius on a GEO field, `@field:[lon lat radius m|km|mi|ft]`, alone,
     negated or ANDed with the rest (ADR-0062). It answers as RediSearch
     does: a point stored as its 52-bit geohash, matched when its cell's
@@ -550,11 +570,23 @@ only on a fleet whose operator sets `coproc-ft on`.
   - `PARAMS`, `RETURN ... AS`, and `SORTBY` on the distance or a `NUMERIC`
     or `TAG` field.
   - `LIMIT`, up to 10,000 results a page, `NOCONTENT`, and `DIALECT 2`.
-  - Results that tie, and results with no order asked for, come in the
-    order their documents were last written, as RediSearch's document ids
-    order them. After a co-processor restart, the documents it rebuilt come
-    in the order the rebuild read them, as RediSearch's reload numbers them
-    again.
+  - `SCORER` (ADR-0063): `BM25STD` unless named, `BM25`, `TFIDF`,
+    `TFIDF.DOCNORM`, `DISMAX`, `DOCSCORE`, `BM25STD.TANH` and
+    `BM25STD.NORM`, each scoring as RediSearch's does. `WITHSCORES` puts each
+    result's score after its key, as Redis spells a double.
+  - **Order.** A search with no `SORTBY` comes highest score first, as
+    RediSearch orders one: it scores every search, so a TAG or `*` search
+    over an index with TEXT fields comes shortest document first
+    (BUG-0273). A KNN comes nearest first.
+  - **Ties** come in the order their documents were last written, as
+    RediSearch's document ids order them. After a co-processor restart, the
+    documents it rebuilt come in the order the rebuild read them, as
+    RediSearch's reload numbers them again.
+  - **Scores differ from RediSearch's** in two cases: after a delete,
+    RediSearch counts the deleted document in a word's IDF until its
+    garbage collector runs, and Flint does not; and a clustered RediSearch
+    scores each shard by its own counts, where Flint answers as one shard
+    does.
   - Replies are RESP2's or RESP3's shape, as the client negotiated.
 - **Aliases** are accepted wherever an index name is, and go with their index
   when it is dropped.
@@ -577,9 +609,12 @@ only on a fleet whose operator sets `coproc-ft on`.
 - **An index over keys that already exist is built from them** before it
   answers. Until it is, a search answers `-LOADING`.
 - **Refused by name:** `FT.AGGREGATE`, `FT.CURSOR`, `FT.ALTER`, suggestions
-  and spelling, `GEOSHAPE` fields and `SORTBY` on a GEO field, a vector
-  range under `|`, `-` or `~` or beside a KNN, any other full-text term,
-  `DIALECT 1` and every other `FT.SEARCH` option, `GEOFILTER` among them.
+  and spelling, `GEOSHAPE` fields and `SORTBY` on a GEO or TEXT field, a
+  vector range under `|`, `-` or `~` or beside a KNN, `WITHSCORES` beside a
+  KNN or a vector range, the `HAMMING` scorer, phonetic matching
+  (`$phonetic`, `PHONETIC`), `VERBATIM`, `NOSTOPWORDS`, `SLOP`, `INORDER`
+  and `EXPLAINSCORE`, `DIALECT 1` and every other `FT.SEARCH` option,
+  `GEOFILTER` among them.
 
 ## Protocols: RESP2 and RESP3
 
