@@ -1,6 +1,9 @@
 # ADR-0063: Full-text search in `FT.*`, which redisvl's `TextQuery` and LangChain's chat history send
 
-Status: **PROPOSED 2026-10-22**, for Jeff's acceptance.
+Status: **ACCEPTED 2026-10-22, option B** (Jeff: "Accept B, build it"), with
+sub-decision 1 (i), Snowball v2.1.0's own code, and sub-decision 2,
+English only for now. BUG-0272 is gated with its build. **Proposed
+2026-10-22.**
 It builds on ADR-0060's `FT.*` surface, ADR-0059's filter, and BUG-0272,
 which makes a TEXT value's words RediSearch's (public main after
 v0.1.0-rc.85, branch stack-1022).
@@ -73,8 +76,10 @@ reported and I did not check again are marked *(agent)*.
     matches nothing. `parser.y`'s phrase rule has no stop word check, and
     RediSearch's `testNoStopwords` shows a kept stop word matching nothing.
 - **Stemming** is on unless a field is `NOSTEM`:
-  - The stemmer is Snowball's, from its `libstemmer`, pinned at the commit
-    of its v2.1.0 *(agent)*. English unless `LANGUAGE`, a document's
+  - The stemmer is Snowball's, from its `libstemmer`. RediSearch's
+    `deps/snowball` submodule is at 4764395431c8, the commit Snowball tagged
+    v2.1.0 (2021-01-21). Snowball's English changed in 2025, so a newer
+    Snowball stems some words differently. English unless `LANGUAGE`, a document's
     `LANGUAGE_FIELD`, or the query's `LANGUAGE` says otherwise.
   - At indexing, a word of 4 bytes or more whose stem differs from it is
     also indexed as `+stem`. The stem's frequency is a fifth of the word's
@@ -253,7 +258,8 @@ follows the words searched rather than the size of the index.
      v2.1.0's `english.sbl` with Snowball's compiler, and vendor the
      generated file and its small runtime (BSD-3-Clause).
      - Checked word for word against Snowball's `snowball-data`: each
-       English word's expected stem.
+       English word's expected stem. Its `english/voc.txt` and
+       `output.txt` last changed in 2006 (2837d237), so they are v2.1.0's.
      - Needs two downloads, each asked for when the build reaches it:
        Snowball's source at tag v2.1.0, built and run locally to generate
        the file, and the `snowball-data` vocabulary.
