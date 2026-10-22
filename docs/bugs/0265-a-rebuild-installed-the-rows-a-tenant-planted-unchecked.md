@@ -1,11 +1,15 @@
-# BUG-0265: a co-processor rebuild installed durable rows a tenant could plant, unchecked, past both index caps, and one of the wrong length crashed it for every tenant (FIXED 2026-10-19, the cap half open)
+# BUG-0265: a co-processor rebuild installed durable rows a tenant could plant, unchecked, past both index caps, and one of the wrong length crashed it for every tenant (FIXED 2026-10-19; the cap half closed for new rows 2026-10-21)
 
 **Status:** **The crash is FIXED 2026-10-19** in `flint-vec`. A rebuild
 holds each durable vector row to the shape `VEC.SET` would have: a set this
 binary loaded, a valid id and the set's `DIM`. A row that fails is left out
 and the rebuild says so, by reason, as it does an unreadable row. **The cap
-half is open:** planted rows still take a namespace past both caps at a
-rebuild, and closing that is a design choice, below.
+half is closed for new rows 2026-10-21,** on public main from 3f7d3581, so it
+ships in the release after v0.1.0-rc.85. Every data seat now refuses a
+tenant's own write to a `\x00vec\x00` key by default, so a tenant can no
+longer plant rows. Two kinds of row still load past both caps at a rebuild:
+those a tenant wrote before its fleet ran the guard, and those on a fleet
+that sets `reserve-coproc-rows off`. How the guard was chosen is below.
 Found reading the proxy for ADR-0060, 2026-10-19. In every release with the
 vector co-processor up to v0.1.0-rc.84; the fix ships in the release after.
 **Severity:** high. One tenant, the playground's anonymous ones included,
@@ -102,7 +106,7 @@ it needs none of ADR-0060's index machinery, so it is built first:
 - Off by default in this release, because the release before's proxies do
   not mark their channel connections, and a node refusing the
   co-processor's own writes mid-roll would fail every `VEC.SET`. The next
-  release turns it on, and this half is closed then.
+  release turns it on, which closes this half for new rows.
 
 **The second release, built 2026-10-19 and held until the first was
 tagged:** flintctl starts every data seat with `--reserve-coproc-rows`
