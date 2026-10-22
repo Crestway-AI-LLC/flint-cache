@@ -329,6 +329,71 @@ if which == "range":
     refused(rng("@user:{x} | " + base), "ERR a vector range term stands alone", "a range under |")
     print("  VECTOR_RANGE: within the radius, nearest first, with a filter, counted past its page")
 
+if which == "fillorder":
+    # BUG-0271: a second index's backfill over a prefix another index covers
+    # leaves that index's documents in write order. The old backfill re-put
+    # every document it read into every covering index, in SCAN order.
+    want(cmd(px, "FT.CREATE", "oa", "ON", "HASH", "PREFIX", "1", "o:", "SCHEMA", "t", "TAG"),
+         "OK", "FT.CREATE oa")
+    order = [7, 2, 19, 11, 4, 15, 0, 9, 13, 5, 17, 1, 8, 12, 3, 18, 6, 14, 10, 16]
+    for i in order:
+        want(cmd(px, "HSET", "o:%d" % i, "t", "x"), 1, "HSET o:%d" % i)
+    written = [20] + [b"o:%d" % i for i in order]
+    q = ("@t:{x}", "NOCONTENT", "LIMIT", "0", "100")
+    want(cmd(px, "FT.SEARCH", "oa", *q), written, "oa, in write order")
+    want(cmd(px, "FT.CREATE", "ob", "ON", "HASH", "PREFIX", "1", "o:", "SCHEMA", "t", "TAG"),
+         "OK", "FT.CREATE ob over the same prefix")
+    # Retried through -LOADING until ob's backfill has read every key.
+    want(cmd(px, "FT.SEARCH", "ob", *q)[0], 20, "ob's backfill found all 20")
+    want(cmd(px, "FT.SEARCH", "oa", *q), written, "oa, still in write order after ob's backfill")
+    want(cmd(px, "FT.DROPINDEX", "ob"), "OK", "FT.DROPINDEX ob")
+    want(cmd(px, "FT.DROPINDEX", "oa", "DD"), "OK", "FT.DROPINDEX oa DD")
+    print("  a second index's backfill over a covered prefix leaves the first in write order (BUG-0271)")
+
+if which in ("geo", "geosame"):
+    # ADR-0062: GEO fields, as redisvl declares and filters them. Palermo and
+    # Catania are Redis's own example points: from (15, 37), Catania is at
+    # 56.4 km and Palermo at 190.4 km.
+    if which == "geo":
+        want(cmd(px, "FT.CREATE", "gx", "ON", "HASH", "PREFIX", "1", "g:", "SCHEMA",
+                 "loc", "GEO", "t", "TAG"), "OK", "FT.CREATE with a GEO field")
+        want(cmd(px, "FT.CREATE", "gjx", "ON", "JSON", "PREFIX", "1", "gj:", "SCHEMA",
+                 "$.loc", "AS", "loc", "GEO"), "OK", "FT.CREATE ON JSON with a GEO field")
+        for k, loc, t in [("g:palermo", "13.361389,38.115556", "a"),
+                          ("g:catania", "15.087269 37.502669", "b"),
+                          ("g:sf", "-122.4194,37.7749", "a")]:
+            want(cmd(px, "HSET", k, "loc", loc, "t", t), 2, "HSET " + k)
+        # Not a point: written, as RediSearch writes it, and not indexed.
+        want(cmd(px, "HSET", "g:nowhere", "loc", "nowhere", "t", "a"), 2, "HSET g:nowhere")
+        want(cmd(px, "JSON.SET", "gj:1", "$", '{"loc":["0,0","15.087269,37.502669"]}'), "OK",
+             "JSON.SET gj:1")
+        want(cmd(px, "JSON.SET", "gj:2", "$", '{"loc":"0,0"}'), "OK", "JSON.SET gj:2")
+    # Write order before the restart; after it, the order the rebuild read
+    # them, as RediSearch's reload numbers documents again (ADR-0060
+    # amendment 3, part 6). Membership either way.
+    def answer(r):
+        return r if which == "geo" else [r[0]] + sorted(r[1:])
+    want(answer(cmd(px, "FT.SEARCH", "gx", "@loc:[15 37 200 km]", "NOCONTENT")),
+         answer([2, b"g:palermo", b"g:catania"]), which + ": within 200 km")
+    want(cmd(px, "FT.SEARCH", "gx", "@loc:[15 37 100 km]", "NOCONTENT"),
+         [1, b"g:catania"], which + ": within 100 km")
+    want(cmd(px, "FT.SEARCH", "gx", "(@loc:[15 37 200 km] @t:{a})", "NOCONTENT"),
+         [1, b"g:palermo"], which + ": a radius ANDed with a tag")
+    want(cmd(px, "FT.SEARCH", "gx", "(-@loc:[15 37 200 km])", "NOCONTENT"),
+         [1, b"g:sf"], which + ": outside the radius")
+    want(cmd(px, "FT.SEARCH", "gjx", "@loc:[15 37 100 km]", "NOCONTENT"),
+         [1, b"gj:1"], which + ": a JSON array of points, any of which may match")
+    refused(cmd(px, "FT.SEARCH", "gx", "@loc:[15 37 1 yd]"),
+            "ERR the query has a geo filter RediSearch refuses: Invalid GeoFilter unit",
+            which + ": an unknown unit")
+    refused(cmd(px, "FT.SEARCH", "gx", "@loc:[15 37 0 km]"),
+            "ERR the query has a geo filter RediSearch refuses: Invalid GeoFilter radius",
+            which + ": a radius of 0")
+    if which == "geosame":
+        want(cmd(px, "FT.DROPINDEX", "gx", "DD"), "OK", "FT.DROPINDEX gx DD")
+        want(cmd(px, "FT.DROPINDEX", "gjx", "DD"), "OK", "FT.DROPINDEX gjx DD")
+    print("  GEO: within a radius over HASH and JSON, with a tag and negated; bad units and radii refused as RediSearch's")
+
 if which == "off":
     refused(cmd(px, "FT.CREATE", "z", "PREFIX", "1", "z:", "SCHEMA", "a", "TAG"),
             "ERR FT.* is not enabled", "FT.CREATE without --ft")
@@ -347,6 +412,10 @@ echo "== ADR-0060 amendment 3: MODULE LIST, aliases, a page past the default bud
 step amend3 || exit 1
 echo "== ADR-0061: a vector range query"
 step range || exit 1
+echo "== ADR-0062: GEO fields"
+step geo || exit 1
+echo "== BUG-0271: a backfill over a covered prefix keeps write order"
+step fillorder || exit 1
 
 echo "== a co-processor restart rebuilds every index and registers its prefixes again"
 kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
@@ -355,6 +424,8 @@ step same || exit 1
 step aliassame || exit 1
 echo "== ADR-0061: the same range, on the indexes the restart rebuilt"
 step range || exit 1
+echo "== ADR-0062: the same GEO answers, rebuilt; then the GEO indexes are dropped"
+step geosame || exit 1
 grep -q "FT\.\* on" "$D/vec.log" || { echo "FAIL: flint-vec did not say FT.* is on"; exit 1; }
 
 echo "== FT.DROPINDEX takes the prefixes off every pair"
@@ -368,4 +439,4 @@ kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec
 step off || exit 1
 
-echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), and --ft gates it (ADR-0060, amendment 3)"
+echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), and --ft gates it (ADR-0060, amendment 3)"

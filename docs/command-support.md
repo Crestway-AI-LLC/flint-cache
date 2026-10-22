@@ -527,9 +527,19 @@ only on a fleet whose operator sets `coproc-ft on`.
   - `NUMERIC`.
   - `TEXT`, matched only as an exact phrase, `@f:("a phrase")`: its words in
     that order, lowercased, with no stemming, stop words or scoring.
+  - `GEO` (ADR-0062): a point as `lon,lat` or `lon lat`, in a HASH field,
+    a JSON string, or a JSON array of them. A document whose value is not a
+    point, or is nearer a pole than ±85.05112878, is left out of the index,
+    as RediSearch leaves it out. `GEOSHAPE` is refused.
   - `VECTOR FLAT` or `HNSW` with `TYPE FLOAT32` and `L2`, `IP` or `COSINE`.
 - **Searches:**
   - ADR-0059's filter, or `*`.
+  - A radius on a GEO field, `@field:[lon lat radius m|km|mi|ft]`, alone,
+    negated or ANDed with the rest (ADR-0062). It answers as RediSearch
+    does: a point stored as its 52-bit geohash, matched when its cell's
+    centre is within the radius among the nine geohash cells RediSearch
+    reads for it. A bad unit, a radius not above 0, or a centre past
+    ±90/±180 is refused in RediSearch's words.
   - `=>[KNN k @field $param [EF_RUNTIME n] [AS name]]`, answering its distance
     as RediSearch does: squared L2, `1 - dot`, or `1 - cos`.
   - A vector range, `@field:[VECTOR_RANGE <radius> $param]`, with
@@ -542,7 +552,9 @@ only on a fleet whose operator sets `coproc-ft on`.
   - `LIMIT`, up to 10,000 results a page, `NOCONTENT`, and `DIALECT 2`.
   - Results that tie, and results with no order asked for, come in the
     order their documents were last written, as RediSearch's document ids
-    order them.
+    order them. After a co-processor restart, the documents it rebuilt come
+    in the order the rebuild read them, as RediSearch's reload numbers them
+    again.
   - Replies are RESP2's or RESP3's shape, as the client negotiated.
 - **Aliases** are accepted wherever an index name is, and go with their index
   when it is dropped.
@@ -565,9 +577,9 @@ only on a fleet whose operator sets `coproc-ft on`.
 - **An index over keys that already exist is built from them** before it
   answers. Until it is, a search answers `-LOADING`.
 - **Refused by name:** `FT.AGGREGATE`, `FT.CURSOR`, `FT.ALTER`, suggestions
-  and spelling, `GEO` fields, a vector range under `|`, `-` or `~` or beside
-  a KNN, any other full-text term, `DIALECT 1` and every other `FT.SEARCH`
-  option.
+  and spelling, `GEOSHAPE` fields and `SORTBY` on a GEO field, a vector
+  range under `|`, `-` or `~` or beside a KNN, any other full-text term,
+  `DIALECT 1` and every other `FT.SEARCH` option, `GEOFILTER` among them.
 
 ## Protocols: RESP2 and RESP3
 

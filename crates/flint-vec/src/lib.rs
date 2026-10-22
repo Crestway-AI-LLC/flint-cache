@@ -26,6 +26,7 @@ pub mod filter;
 pub mod ft;
 pub mod ftindex;
 pub mod ftstore;
+pub mod geo;
 mod hnsw;
 mod kernel;
 mod quant;

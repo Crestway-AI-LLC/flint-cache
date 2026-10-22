@@ -603,6 +603,39 @@ impl Store {
         left_out
     }
 
+    /// A backfill's read of `key`, into `index` alone, and only when the
+    /// index does not hold it yet (BUG-0271). A write since the index was
+    /// made already put it there, read under the key's lock as the backfill
+    /// reads it, so that copy is the key as it is. Putting it again would
+    /// move it to the end of the write order that ties and unsorted results
+    /// come in (ADR-0060 amendment 3, part 6), and putting it into every
+    /// index covering the key, as [`Store::ft_reindex`] does for a write,
+    /// would move it in indexes that are not backfilling at all. Why it was
+    /// left out, if it was.
+    pub fn ft_fill_doc(
+        &mut self,
+        ns: &[u8],
+        index: &[u8],
+        key: &[u8],
+        read: &DocRead,
+    ) -> Option<String> {
+        let ix = self.ft.get_mut(&(ns.to_vec(), index.to_vec()))?;
+        if !ix.covers(key) || ix.contains(key) {
+            return None;
+        }
+        let src = match (ix.def().on, &read.hash, &read.json) {
+            (On::Hash, Some(h), _) if !h.is_empty() => Source::Hash(h),
+            (On::Json, _, Some(j)) => Source::Json(j),
+            _ => return None,
+        };
+        let held = ix.held();
+        let left_out = ix.put(key, src, read.expires_at).err();
+        let added = (ix.charge(key) + ix.held()).saturating_sub(held);
+        let e = self.ns_bytes.entry(ns.to_vec()).or_default();
+        *e = e.saturating_add(added);
+        left_out
+    }
+
     /// Drop every expired document from every index, crediting what that
     /// frees; how many entries went. Called from [`Store::sweep_expired`].
     pub(crate) fn ft_sweep(&mut self, now: u64) -> usize {
@@ -657,6 +690,7 @@ impl Store {
                         }
                         crate::filter::FieldKind::Numeric => "NUMERIC",
                         crate::filter::FieldKind::Text => "TEXT",
+                        crate::filter::FieldKind::Geo => "GEO",
                     }),
                 ];
                 // RediSearch's layout, which redisvl reads back: the
@@ -945,6 +979,65 @@ mod tests {
     /// ADR-0060 amendment 3, part 4: an alias names its index wherever an
     /// index name is read, is refused as RediSearch refuses it, moves, and
     /// goes with its index.
+    /// BUG-0271: a backfill puts a key only into the index it is filling,
+    /// and not over a copy a write already put there, so write order holds
+    /// in the index being filled and in every other index on the prefix.
+    #[test]
+    fn a_backfill_keeps_a_written_document_in_its_place() {
+        let mut s = store();
+        create(
+            &mut s,
+            &["FT.CREATE", "a", "PREFIX", "1", "d:", "SCHEMA", "t", "TAG"],
+        );
+        // `b` is made and still backfilling.
+        let FtPlan::Create { index, def, .. } = s.plan_ft(
+            b"ns",
+            &a(&["FT.CREATE", "b", "PREFIX", "1", "d:", "SCHEMA", "t", "TAG"]),
+            0,
+        ) else {
+            panic!("not a create");
+        };
+        s.ft_create(b"ns", index, def);
+        let doc = |t: &str| hash(&[("t", t.as_bytes().to_vec())]);
+        // Written while `b` backfills: d:2, then d:1, into both.
+        s.ft_reindex(b"ns", b"d:2", &doc("x"));
+        s.ft_reindex(b"ns", b"d:1", &doc("x"));
+        // The backfill's scan reads keys in its own order, d:0 being a key
+        // from before either index.
+        for k in ["d:0", "d:1", "d:2"] {
+            assert_eq!(s.ft_fill_doc(b"ns", b"b", k.as_bytes(), &doc("x")), None);
+        }
+        s.ft_set_ready(b"ns", b"b");
+        let order = |s: &mut Store, ix: &str| -> Vec<String> {
+            let FtPlan::Search(p) =
+                s.plan_ft(b"ns", &a(&["FT.SEARCH", ix, "@t:{x}", "NOCONTENT"]), 0)
+            else {
+                panic!("not a search");
+            };
+            p.hits
+                .keys
+                .iter()
+                .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+                .collect()
+        };
+        assert_eq!(
+            order(&mut s, "b"),
+            ["d:2", "d:1", "d:0"],
+            "b: the writes, then what the backfill found"
+        );
+        assert_eq!(
+            order(&mut s, "a"),
+            ["d:2", "d:1"],
+            "a: untouched by b's backfill"
+        );
+        // A key the backfill finds gone, or not a document, adds nothing.
+        assert_eq!(
+            s.ft_fill_doc(b"ns", b"b", b"d:9", &DocRead::default()),
+            None
+        );
+        assert_eq!(order(&mut s, "b").len(), 3);
+    }
+
     #[test]
     fn an_alias_names_its_index_and_goes_with_it() {
         let mut s = store();

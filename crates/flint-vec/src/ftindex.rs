@@ -54,7 +54,8 @@ pub struct FtIndex {
     /// Over the documents that hold a vector, keyed as `docs` is.
     set: Option<VectorSet>,
     /// Documents left out since the index was made, as RediSearch counts
-    /// `hash_indexing_failures`: a vector that is not `DIM` float32s.
+    /// `hash_indexing_failures`: a vector that is not `DIM` float32s, or a
+    /// GEO value that is not a point a geohash holds (ADR-0062).
     failures: u64,
     /// Whether it holds every document under its prefixes: false while
     /// `FT.CREATE`'s backfill or a rebuild is still reading them, when a
@@ -173,6 +174,11 @@ impl FtIndex {
             },
         );
         Ok(())
+    }
+
+    /// Whether `key` is one of the index's documents.
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.docs.contains_key(key)
     }
 
     /// Drop `key` from the index; whether it was there.
@@ -366,15 +372,24 @@ impl FtIndex {
                 .find(|(f, _)| f == name.as_bytes())
                 .map(|(_, v)| v.as_slice())
         };
+        // A GEO value that is not a point leaves the document out, as a bad
+        // vector does and as RediSearch's indexer does (ADR-0062).
+        let mut bad: Option<String> = None;
         let vals: Vals = self
             .def
             .attrs
             .iter()
             .map(|a| match get(&a.path) {
+                Some(raw) if a.field.kind == FieldKind::Geo => {
+                    geo_or_note(&a.field.name, std::iter::once(raw), &mut bad)
+                }
                 Some(raw) => filter::hash_val(a.field.kind, raw, a.separator),
                 None => Val::Missing,
             })
             .collect();
+        if let Some(e) = bad {
+            return (any(vals), Err(e));
+        }
         let vector = match &self.def.vector {
             None => Ok(None),
             Some(v) => match get(&v.path) {
@@ -388,17 +403,48 @@ impl FtIndex {
     }
 
     fn read_json(&self, doc: &Value) -> (Option<Vals>, Result<Option<Vec<f32>>, String>) {
+        let mut bad: Option<String> = None;
         let vals: Vals = self
             .def
             .attrs
             .iter()
-            .map(|a| json_val(a.field.kind, a.separator, json_at(doc, &a.path)))
+            .map(|a| match (a.field.kind, json_at(doc, &a.path)) {
+                // A string, or an array of them, any of which may match.
+                (FieldKind::Geo, Some(Value::String(s))) => {
+                    geo_or_note(&a.field.name, std::iter::once(s.as_bytes()), &mut bad)
+                }
+                (FieldKind::Geo, Some(Value::Array(xs))) => geo_or_note(
+                    &a.field.name,
+                    xs.iter().filter_map(|x| x.as_str()).map(str::as_bytes),
+                    &mut bad,
+                ),
+                (kind, v) => json_val(kind, a.separator, v),
+            })
             .collect();
+        if let Some(e) = bad {
+            return (any(vals), Err(e));
+        }
         let vector = match &self.def.vector {
             None => Ok(None),
             Some(v) => json_vector(v, json_at(doc, &v.path)),
         };
         (any(vals), vector)
+    }
+}
+
+/// A GEO field's points, or [`Val::Missing`] with the first error noted in
+/// `bad`, which leaves the document out.
+fn geo_or_note<'a>(
+    name: &str,
+    raws: impl Iterator<Item = &'a [u8]>,
+    bad: &mut Option<String>,
+) -> Val {
+    match filter::geo_val(raws) {
+        Ok(v) => v,
+        Err(e) => {
+            bad.get_or_insert_with(|| format!("{name} is not indexed: {e}"));
+            Val::Missing
+        }
     }
 }
 
@@ -508,6 +554,8 @@ fn meta_of(fields: &[Field], vals: Option<&[Val]>) -> Option<Vec<u8>> {
                     .collect::<Vec<_>>()
                     .join(" "),
             ),
+            // The hashes themselves: the set's extraction reads them back.
+            Val::Geo(hs) => Value::Array(hs.iter().map(|h| Value::from(*h)).collect()),
         };
         obj.insert(f.name.to_string(), j);
     }
@@ -520,7 +568,7 @@ fn sort_order(a: Option<&Val>, b: Option<&Val>, asc: bool) -> Ordering {
         match v? {
             Val::Num(x) => Some(SortKey::Num(*x)),
             Val::Tags(ts) => ts.first().map(|t| SortKey::Bytes(t.to_vec())),
-            Val::Text(_) | Val::Missing => None,
+            Val::Text(_) | Val::Geo(_) | Val::Missing => None,
         }
     };
     match (key(a), key(b)) {
@@ -1036,6 +1084,166 @@ mod tests {
         );
         assert_eq!(ix.sweep_expired(1000), 1);
         assert_eq!(ix.len(), 1);
+    }
+
+    /// ADR-0062: a GEO field answers a radius as RediSearch measures it.
+    /// Over 10,000 random points around a city, for each unit, alone and
+    /// ANDed with a tag, the total equals a brute force of RediSearch's
+    /// rule: a point whose hash lies in one of the circle's geohash ranges
+    /// and whose cell centre is within the radius. Under a KNN on FLAT, the
+    /// nearest are taken from those matches. A document whose value is not
+    /// a point is left out and counted.
+    #[test]
+    fn a_geo_field_answers_a_radius_as_redisearch_measures_it() {
+        let (_, def) = parse_create(&a(&[
+            "FT.CREATE",
+            "g",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "p:",
+            "SCHEMA",
+            "loc",
+            "GEO",
+            "t",
+            "TAG",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+        ]))
+        .expect("parses");
+        let mut ix = FtIndex::new(def);
+        let mut rnd = floats(5);
+        let mut pts = Vec::new();
+        for i in 0..10_000 {
+            // About 28 km either way of San Francisco.
+            let (lon, lat) = (
+                -122.4194 + rnd() as f64 * 0.25,
+                37.7749 + rnd() as f64 * 0.25,
+            );
+            let t = if i % 2 == 0 { "a" } else { "b" };
+            let fields = vec![
+                (b"loc".to_vec(), format!("{lon},{lat}").into_bytes()),
+                (b"t".to_vec(), t.as_bytes().to_vec()),
+                (b"v".to_vec(), blob(&[lon as f32, lat as f32])),
+            ];
+            ix.put(format!("p:{i:05}").as_bytes(), Source::Hash(&fields), None)
+                .expect("indexed");
+            pts.push((lon, lat, crate::geo::hash(lon, lat).expect("a point")));
+        }
+        // RediSearch's rule, by brute force.
+        let rule = |h: u64, lon: f64, lat: f64, r: f64| {
+            crate::geo::ranges(lon, lat, r)
+                .iter()
+                .any(|&(lo, hi)| (lo..hi).contains(&h))
+                && crate::geo::within(h, lon, lat, r)
+        };
+        let (lon, lat) = (-122.4194, 37.7749);
+        for (r, unit, metres) in [
+            ("750", "m", 750.0),
+            ("0.5", "km", 500.0),
+            ("2", "KM", 2000.0),
+            ("1.5", "mi", 1.5 * 1609.34),
+            ("3000", "ft", 3000.0 * 0.3048),
+            ("40", "km", 40000.0),
+        ] {
+            let want: Vec<usize> = (0..pts.len())
+                .filter(|&i| rule(pts[i].2, lon, lat, metres))
+                .collect();
+            let q = format!("@loc:[{lon} {lat} {r} {unit}]");
+            let got = search(&ix, &["FT.SEARCH", "g", &q, "LIMIT", "0", "10000"], None);
+            assert_eq!(got.total, want.len(), "{q}");
+            let tagged = want.iter().filter(|&&i| i % 2 == 0).count();
+            let q2 = format!("(@loc:[{lon} {lat} {r} {unit}] @t:{{a}})");
+            let got2 = search(&ix, &["FT.SEARCH", "g", &q2, "LIMIT", "0", "10000"], None);
+            assert_eq!(got2.total, tagged, "{q2}");
+            // The nearest five matches by the vector, from the matches only.
+            let v = [lon as f32 + 0.01, lat as f32 - 0.01];
+            let mut near: Vec<(f32, String)> = want
+                .iter()
+                .map(|&i| {
+                    let (dx, dy) = (pts[i].0 as f32 - v[0], pts[i].1 as f32 - v[1]);
+                    (dx * dx + dy * dy, format!("p:{i:05}"))
+                })
+                .collect();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let kq = format!("(@loc:[{lon} {lat} {r} {unit}])=>[KNN 5 @v $v AS d]");
+            let got3 = search(&ix, &["FT.SEARCH", "g", &kq, "SORTBY", "d"], Some(&v));
+            let wanted: Vec<String> = near.into_iter().take(5).map(|(_, k)| k).collect();
+            assert_eq!(keys(&got3), wanted, "{kq}");
+        }
+        let all = search(
+            &ix,
+            &[
+                "FT.SEARCH",
+                "g",
+                "@loc:[-122.4194 37.7749 40 km]",
+                "LIMIT",
+                "0",
+                "0",
+            ],
+            None,
+        );
+        assert_eq!(all.total, 10_000, "40 km holds them all");
+        // Not a point, and past the latitude a geohash holds: left out, counted.
+        let before = ix.failures();
+        for bad in [&b"nowhere"[..], b"0,86", b"-200,10"] {
+            let fields = vec![(b"loc".to_vec(), bad.to_vec())];
+            assert!(
+                ix.put(b"p:bad", Source::Hash(&fields), None).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(ix.failures(), before + 3);
+
+        // JSON: a string, or an array of them any of which may match.
+        let (_, jdef) = parse_create(&a(&[
+            "FT.CREATE",
+            "j",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "j:",
+            "SCHEMA",
+            "$.loc",
+            "AS",
+            "loc",
+            "GEO",
+        ]))
+        .expect("parses");
+        let mut jx = FtIndex::new(jdef);
+        let doc = |v: serde_json::Value| serde_json::json!({ "loc": v });
+        jx.put(
+            b"j:1",
+            Source::Json(&doc("13.361389,38.115556".into())),
+            None,
+        )
+        .expect("indexed");
+        jx.put(
+            b"j:2",
+            Source::Json(&doc(serde_json::json!(["0,0", "15.087269 37.502669"]))),
+            None,
+        )
+        .expect("indexed");
+        jx.put(b"j:3", Source::Json(&doc("0,0".into())), None)
+            .expect("indexed");
+        assert!(
+            jx.put(b"j:4", Source::Json(&doc("x".into())), None)
+                .is_err()
+        );
+        let got = search(&jx, &["FT.SEARCH", "j", "@loc:[15 37 200 km]"], None);
+        assert_eq!(keys(&got), ["j:1", "j:2"]);
+        let got = search(&jx, &["FT.SEARCH", "j", "@loc:[15 37 100 km]"], None);
+        assert_eq!(keys(&got), ["j:2"], "only Catania is within 100 km");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 # ADR-0062: GEO fields in `FT.*`, which redisvl's schemas declare
 
-Status: **ACCEPTED 2026-10-21, option B** (Jeff: "Accept B, build it"), to
-land in the same release as ADR-0060's release N. **Proposed 2026-10-21.**
+Status: **ACCEPTED 2026-10-21, option B** (Jeff: "Accept B, build it");
+**built 2026-10-21** (As built, below), to land in the same release as
+ADR-0060's release N. **Proposed 2026-10-21.**
 It builds on ADR-0060's `FT.*` surface and ADR-0059's filter, both on public
 main after v0.1.0-rc.85.
 
@@ -37,8 +38,8 @@ start. Most of them never query the field. A few do, with `GeoRadius`.
 
 **What RediSearch answers.** From its source:
 - **A value** is `lon` and `lat`, separated by a comma or a space, each
-  trimmed and finite. What its indexer does with a document whose value does
-  not parse is to be confirmed when this is built.
+  trimmed and finite. A document whose value does not parse fails to index
+  (settled when built, below).
 - **It is stored as a 52-bit geohash**, 26 steps for each coordinate. The
   latitude is limited to ±85.05112878 and the longitude to ±180, so a point
   nearer a pole is never matched.
@@ -100,10 +101,11 @@ numbers.
   and `NOINDEX` as other fields take them. `GEOSHAPE` stays refused by name.
 - **Values:**
   - `"lon,lat"` or `"lon lat"`;
-  - for JSON, a string of that form, and an array of them if RediSearch's
-    JSON indexer takes one (to be confirmed when built);
-  - a value that does not parse, or a point past the latitude limit, is
-    handled as RediSearch's indexer handles it (to be confirmed when built).
+  - for JSON, a string of that form, or an array of them, any of which may
+    match (settled when built, below);
+  - a value that does not parse, or a point past the latitude limit, leaves
+    the document out of the index and is counted, as RediSearch's indexer
+    does (settled when built, below).
 - **`FT.SEARCH`:**
   - `@f:[lon lat radius unit]`, alone, negated, or with ADR-0059's other
     terms and a KNN or range query;
@@ -124,6 +126,77 @@ numbers.
   - If it misses that cut, a GEO field would need the two-release rule
     instead: refused by an older binary, and allowed only once a release
     knows it.
+
+## As built (2026-10-21, for the release after v0.1.0-rc.85)
+
+- **Settled from RediSearch's source when built:**
+  - A document whose GEO value does not parse, or whose point a geohash
+    cannot hold (a latitude past ±85.05112878, a longitude past ±180),
+    fails to index: "Invalid geo coordinates". RediSearch counts it in
+    `hash_indexing_failures`. Here it is left out and counted, as a bad
+    vector is.
+  - A JSON array of points is taken, and any of them may match.
+  - A value is split at its first comma or space before each part is
+    trimmed. So `"10.0, 20.0"` is a point, and `" 10.0,20.0"` and
+    `"10.0 , 20.0"` are not.
+  - A point is within a radius when its distance is at most the radius.
+- **The code:**
+  - `crates/flint-vec/src/geo.rs`, written from RediSearch's rules:
+    - parsing a value;
+    - the 52-bit hash, and a cell's centre;
+    - haversine on Redis's Earth radius, 6,372,797.560856 m;
+    - a radius query's step estimate and its nine cells.
+  - In `filter.rs`, three additions:
+    - `FieldKind::Geo`;
+    - `Val::Geo`, a document's hashes;
+    - `Expr::Geo`, whose cells are computed once when the query is parsed.
+  - A document scan and the field index both ask the same two things: does
+    a cell hold the point's hash, and is its centre within the radius. Both
+    therefore answer as RediSearch does, including the cells' own misses
+    near the poles with a large radius, which RediSearch's source records.
+  - The field index keeps a GEO field's points in the ordered set a NUMERIC
+    field uses, keyed by hash. It reads a geo term from its cells, and
+    removes a document that appears twice because it has several points.
+- **Not shared, a follow-up:** flint-server's GEO commands keep their own
+  copy of the same geohash rules (`crates/flint-server/src/commands/geo.rs`).
+  Both are held to Redis's own Sicily example. One shared crate would keep
+  the two from drifting.
+- **Held by:**
+  - unit tests:
+    - `hashes_centres_and_distances_agree_with_redis_s_own_example`;
+    - `a_value_is_lon_and_lat_by_a_comma_or_a_space`;
+    - `the_ranges_hold_every_point_within_the_radius`;
+    - `a_centre_past_the_square_reads_nothing`;
+    - `a_geo_filter_parses_as_redisvl_renders_it_and_refuses_as_redisearch_does`;
+    - `a_geo_field_answers_a_radius_as_redisearch_measures_it`, which
+      checks 10,000 points at each unit, alone, with a tag and under a KNN;
+  - `coproc_ft_drill`'s `geo` and `geosame` sections, before and after a
+    co-processor restart.
+- **Found while building it: BUG-0271.** `coproc_ft_drill`'s GEO section
+  writes documents straight after `FT.CREATE`. That showed an index's
+  backfill moving documents written during it out of write order, in its
+  own index and in every other index on the prefix. Fixed in the same
+  stack, before any release served `FT.*`.
+
+### The clients' suites, as built (2026-10-21)
+
+Against a local fleet, beside the run after ADR-0061 (its *As built*):
+
+| suite | passed before | passed now | failed now | errors now |
+|---|---|---|---|---|
+| redisvl | 207 | 238 | 54 | 17 |
+| langchain-redis, RESP3 | 149 | 150 | 31 | 23 |
+| langchain-redis, RESP2 | 187 | 188 | 15 | 1 |
+| LlamaIndex | 19 | 19 | 0 | 0 |
+
+- **redisvl:** the 48 tests that errored in the fixture now run, and 31 of
+  them pass. No failure left names GEO. Those that still fail name another
+  cause from the table in Context: `WITHSCORES` in 22 tests now,
+  full-text terms, `FT.AGGREGATE` and `INDEXEMPTY`.
+- **langchain-redis:** in each protocol, its three tests that GEO stopped
+  now run. `test_similarity_search_with_sort_by` passes.
+  `test_similarity_search_with_metadata_filtering`, over HASH and over
+  JSON, then fails on a full-text term.
 
 ## Verification
 

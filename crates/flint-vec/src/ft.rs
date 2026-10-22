@@ -213,6 +213,7 @@ fn kind_name(k: FieldKind) -> &'static str {
         FieldKind::FoldedTag => "foldedtag",
         FieldKind::Numeric => "numeric",
         FieldKind::Text => "text",
+        FieldKind::Geo => "geo",
     }
 }
 
@@ -222,6 +223,7 @@ fn kind_from_name(s: &str) -> Option<FieldKind> {
         "foldedtag" => FieldKind::FoldedTag,
         "numeric" => FieldKind::Numeric,
         "text" => FieldKind::Text,
+        "geo" => FieldKind::Geo,
         _ => return None,
     })
 }
@@ -430,10 +432,11 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             b"TAG" => FieldKind::FoldedTag,
             b"NUMERIC" => FieldKind::Numeric,
             b"TEXT" => FieldKind::Text,
-            b"GEO" | b"GEOSHAPE" => return Err("GEO fields are not supported (ADR-0060)".into()),
+            b"GEO" => FieldKind::Geo,
+            b"GEOSHAPE" => return Err("GEOSHAPE fields are not supported (ADR-0062)".into()),
             other => {
                 return Err(format!(
-                    "SCHEMA type {} is not one of TAG, NUMERIC, TEXT, VECTOR",
+                    "SCHEMA type {} is not one of TAG, NUMERIC, TEXT, GEO, VECTOR",
                     String::from_utf8_lossy(other)
                 ));
             }
@@ -942,7 +945,10 @@ fn breaks_a_conjunction(s: &str) -> bool {
 fn unindexed(e: Expr, noindex: &[usize]) -> Expr {
     let none = || Expr::Not(Box::new(Expr::All));
     match e {
-        Expr::Tag { field, .. } | Expr::Range { field, .. } | Expr::Phrase { field, .. }
+        Expr::Tag { field, .. }
+        | Expr::Range { field, .. }
+        | Expr::Phrase { field, .. }
+        | Expr::Geo { field, .. }
             if noindex.contains(&field) =>
         {
             none()
@@ -1208,7 +1214,7 @@ mod tests {
         // A row this binary cannot read is left out, not half served.
         let later = h
             .encode()
-            .replace("\"kind\":\"foldedtag\"", "\"kind\":\"geo\"");
+            .replace("\"kind\":\"foldedtag\"", "\"kind\":\"geoshape\"");
         assert_ne!(later, h.encode());
         assert_eq!(IndexDef::decode(&later), None);
     }
@@ -1232,7 +1238,7 @@ mod tests {
                 .contains("non-empty")
         );
         assert!(refused(&with(&["FILTER", "x", "SCHEMA", "a", "TAG"])).contains("FILTER"));
-        assert!(refused(&with(&["SCHEMA", "g", "GEO"])).contains("GEO"));
+        assert!(refused(&with(&["SCHEMA", "g", "GEOSHAPE"])).contains("GEOSHAPE"));
         assert!(refused(&with(&["SCHEMA", "t", "TEXT", "PHONETIC", "dm:en"])).contains("PHONETIC"));
         assert!(refused(&with(&["SCHEMA", "a", "TAG", "a", "NUMERIC"])).contains("twice"));
         assert!(

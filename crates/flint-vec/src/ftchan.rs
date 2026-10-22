@@ -542,7 +542,12 @@ fn fill_chunk(
                     Got::Reply(_) => {}
                 }
             }
-            store.lock().expect("store lock").ft_reindex(ns, key, &d);
+            // Into the index being filled, and not over a write's copy
+            // (BUG-0271).
+            store
+                .lock()
+                .expect("store lock")
+                .ft_fill_doc(ns, &fill.index, key, &d);
         }
         if next == b"0" {
             fill.at += 1;

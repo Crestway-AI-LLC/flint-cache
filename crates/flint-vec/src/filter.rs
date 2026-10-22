@@ -50,6 +50,9 @@ pub enum FieldKind {
     /// `@f:("a b")` matches a value holding those words in that order, split
     /// as RediSearch splits them and lowercased. `FT.CREATE` only.
     Text,
+    /// RediSearch's GEO (ADR-0062): points stored as their 52-bit geohash,
+    /// matched by `@f:[lon lat radius unit]`. `FT.CREATE` only.
+    Geo,
 }
 
 impl FieldKind {
@@ -65,6 +68,7 @@ impl FieldKind {
             FieldKind::Tag | FieldKind::FoldedTag => "tag",
             FieldKind::Numeric => "numeric",
             FieldKind::Text => "text",
+            FieldKind::Geo => "geo",
         }
     }
 }
@@ -130,6 +134,9 @@ pub enum Val {
     Num(f64),
     /// A TEXT field's words, in order, as [`tokenize`] splits them.
     Text(Box<[Box<[u8]>]>),
+    /// A GEO field's points, each its 52-bit geohash, sorted and without
+    /// repeats.
+    Geo(Box<[u64]>),
 }
 
 /// The bytes RediSearch splits text on by default, besides whitespace.
@@ -195,7 +202,30 @@ pub fn hash_val(kind: FieldKind, raw: &[u8], separator: u8) -> Val {
                 Val::Text(ws.into_boxed_slice())
             }
         }
+        FieldKind::Geo => geo_val(std::iter::once(raw)).unwrap_or(Val::Missing),
     }
+}
+
+/// A GEO field's points from its values (ADR-0062): each `lon,lat` or `lon
+/// lat`, inside the Web Mercator square. An error names the first that is
+/// not, and the document is then left out of the index, as RediSearch's
+/// indexer leaves it out ("Invalid geo coordinates").
+pub fn geo_val<'a>(raws: impl Iterator<Item = &'a [u8]>) -> Result<Val, String> {
+    let mut hs = Vec::new();
+    for raw in raws {
+        let (lon, lat) = crate::geo::parse_point(raw)?;
+        hs.push(
+            crate::geo::hash(lon, lat)
+                .ok_or_else(|| format!("{lon},{lat} is past the coordinates a geohash holds"))?,
+        );
+    }
+    hs.sort_unstable();
+    hs.dedup();
+    Ok(if hs.is_empty() {
+        Val::Missing
+    } else {
+        Val::Geo(hs.into_boxed_slice())
+    })
 }
 
 /// One vector's values, in the order its set declares its fields.
@@ -259,6 +289,18 @@ pub fn extract(fields: &[Field], meta: Option<&[u8]>) -> Option<Vals> {
                     Some(x) => Val::Num(if x == 0.0 { 0.0 } else { x }),
                     None => Val::Missing,
                 },
+                // An FT index's own META for its vector set: the hashes it
+                // already computed (ADR-0062). `VEC.CREATE` declares no GEO.
+                (FieldKind::Geo, Some(serde_json::Value::Array(a))) => {
+                    let mut hs: Vec<u64> = a.iter().filter_map(|x| x.as_u64()).collect();
+                    hs.sort_unstable();
+                    hs.dedup();
+                    if hs.is_empty() {
+                        Val::Missing
+                    } else {
+                        Val::Geo(hs.into_boxed_slice())
+                    }
+                }
                 _ => Val::Missing,
             };
             any |= v != Val::Missing;
@@ -277,6 +319,9 @@ pub fn vals_bytes(vals: Option<&[Val]>) -> usize {
     for x in v {
         if let Val::Tags(ts) | Val::Text(ts) = x {
             b += std::mem::size_of_val(&**ts) + ts.iter().map(|t| t.len()).sum::<usize>();
+        }
+        if let Val::Geo(hs) = x {
+            b += std::mem::size_of_val(&**hs);
         }
     }
     b
@@ -304,6 +349,18 @@ pub enum Expr {
     Phrase {
         field: usize,
         words: Vec<Box<[u8]>>,
+    },
+    /// `@f:[lon lat radius unit]`: GEO field `field` holds a point within
+    /// `radius_m` metres of `(lon, lat)`, measured from its geohash cell's
+    /// centre, among the geohash ranges `cells` RediSearch reads for that
+    /// circle (ADR-0062). Every path asks both, so a scan and the field
+    /// index give RediSearch's answer, the ranges' own misses included.
+    Geo {
+        field: usize,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        cells: Box<[(u64, u64)]>,
     },
     Not(Box<Expr>),
     And(Vec<Expr>),
@@ -335,6 +392,19 @@ impl Expr {
             },
             Expr::Phrase { field, words } => match at(*field) {
                 Some(Val::Text(ts)) => ts.windows(words.len()).any(|w| w == words.as_slice()),
+                _ => false,
+            },
+            Expr::Geo {
+                field,
+                lon,
+                lat,
+                radius_m,
+                cells,
+            } => match at(*field) {
+                Some(Val::Geo(hs)) => hs.iter().any(|h| {
+                    cells.iter().any(|&(lo, hi)| (lo..hi).contains(h))
+                        && crate::geo::within(*h, *lon, *lat, *radius_m)
+                }),
                 _ => false,
             },
             Expr::Not(e) => !e.matches(vals),
@@ -373,7 +443,7 @@ struct Parser<'a> {
     depth: usize,
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn peek(&self) -> Option<u8> {
         self.s.get(self.i).copied()
     }
@@ -505,6 +575,13 @@ impl Parser<'_> {
                 self.i += 1;
                 self.range(field)
             }
+            (Some(b'['), FieldKind::Geo) => {
+                self.i += 1;
+                self.geo(field)
+            }
+            (_, FieldKind::Geo) => Err(format!(
+                "uses @{name_s} as another kind, but {name_s} is GEO: use @{name_s}:[lon lat radius unit]"
+            )),
             (Some(b'(') | Some(b'"'), FieldKind::Text) => self.phrase(field),
             (Some(b'{'), FieldKind::Numeric) => Err(format!(
                 "uses @{name_s}:{{...}}, but {name_s} is NUMERIC: use @{name_s}:[lo hi]"
@@ -620,7 +697,73 @@ impl Parser<'_> {
 
     /// After `[`: two bounds and the closing `]`.
     fn range(&mut self, field: usize) -> Result<Expr, String> {
-        let mut toks: Vec<&[u8]> = Vec::new();
+        let toks = self.bracket()?;
+        match toks[..] {
+            [lo, hi] => {
+                let ((lo, lo_incl), (hi, hi_incl)) = (bound(lo)?, bound(hi)?);
+                Ok(Expr::Range {
+                    field,
+                    lo,
+                    lo_incl,
+                    hi,
+                    hi_incl,
+                })
+            }
+            [_, _, _, ..] => Err(
+                "has more than two bounds in [...]: a geo filter [lon lat radius unit] is for a GEO field"
+                    .into(),
+            ),
+            _ => Err("needs two bounds in [lo hi]".into()),
+        }
+    }
+
+    /// After `[` on a GEO field: `lon lat radius unit` and the closing `]`,
+    /// checked as RediSearch checks a geo filter, in its words.
+    fn geo(&mut self, field: usize) -> Result<Expr, String> {
+        let refuses = |why: &str| format!("has a geo filter RediSearch refuses: {why}");
+        let toks = self.bracket()?;
+        let [lon, lat, radius, unit] = toks[..] else {
+            return Err("needs four values in a geo filter: [lon lat radius unit]".into());
+        };
+        let num = |t: &[u8]| -> Result<f64, String> {
+            if t.starts_with(b"$") {
+                return Err("parameters ($name) are not supported".into());
+            }
+            std::str::from_utf8(t)
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|x| !x.is_nan())
+                .ok_or_else(|| {
+                    format!(
+                        "has a geo filter value that is not a number: {:?}",
+                        String::from_utf8_lossy(t)
+                    )
+                })
+        };
+        let (lon, lat, radius) = (num(lon)?, num(lat)?, num(radius)?);
+        let Some(unit) = crate::geo::unit_metres(unit) else {
+            return Err(refuses("Invalid GeoFilter unit"));
+        };
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            return Err(refuses("Invalid GeoFilter lat/lon"));
+        }
+        let radius_m = radius * unit;
+        // `num` refused NaN, so this is every radius not above 0.
+        if radius <= 0.0 || !radius_m.is_finite() {
+            return Err(refuses("Invalid GeoFilter radius"));
+        }
+        Ok(Expr::Geo {
+            field,
+            lon,
+            lat,
+            radius_m,
+            cells: crate::geo::ranges(lon, lat, radius_m).into_boxed_slice(),
+        })
+    }
+
+    /// After `[`: the blank-separated words up to the closing `]`.
+    fn bracket(&mut self) -> Result<Vec<&'a [u8]>, String> {
+        let mut toks: Vec<&'a [u8]> = Vec::new();
         loop {
             self.ws();
             match self.peek() {
@@ -641,22 +784,7 @@ impl Parser<'_> {
                 }
             }
         }
-        match toks[..] {
-            [lo, hi] => {
-                let ((lo, lo_incl), (hi, hi_incl)) = (bound(lo)?, bound(hi)?);
-                Ok(Expr::Range {
-                    field,
-                    lo,
-                    lo_incl,
-                    hi,
-                    hi_incl,
-                })
-            }
-            [_, _, _, ..] => {
-                Err("has more than two bounds in [...]: geo filters are not supported".into())
-            }
-            _ => Err("needs two bounds in [lo hi]".into()),
-        }
+        Ok(toks)
     }
 }
 
@@ -731,6 +859,9 @@ pub struct FieldIndex {
 enum Source<'a> {
     Tag(&'a SlotSet),
     Range(std::collections::btree_set::Range<'a, (u64, u32)>),
+    /// A GEO field's points in one geohash range: a slot with several
+    /// points can appear more than once.
+    Points(std::collections::btree_set::Range<'a, (u64, u32)>),
 }
 
 impl FieldIndex {
@@ -793,6 +924,14 @@ impl FieldIndex {
                     self.nums[f].insert((order_key(*x), slot));
                     self.num_postings += 1;
                 }
+                // A GEO field's points are ordered by geohash, as RediSearch
+                // orders them, so a radius reads them by cell (ADR-0062).
+                Val::Geo(hs) => {
+                    for h in hs.iter() {
+                        self.nums[f].insert((*h, slot));
+                        self.num_postings += 1;
+                    }
+                }
                 // A TEXT value has no index entry: a phrase is checked
                 // against each candidate's words.
                 Val::Missing | Val::Text(_) => {}
@@ -825,6 +964,13 @@ impl FieldIndex {
                 Val::Num(x) => {
                     if self.nums[f].remove(&(order_key(*x), slot)) {
                         self.num_postings -= 1;
+                    }
+                }
+                Val::Geo(hs) => {
+                    for h in hs.iter() {
+                        if self.nums[f].remove(&(*h, slot)) {
+                            self.num_postings -= 1;
+                        }
                     }
                 }
                 // A TEXT value has no index entry: a phrase is checked
@@ -866,6 +1012,7 @@ impl FieldIndex {
                         .sum::<usize>()
                 }
                 Val::Num(_) => b += NUM_POSTING,
+                Val::Geo(hs) => b += hs.len() * NUM_POSTING,
                 // A TEXT value has no index entry: a phrase is checked
                 // against each candidate's words.
                 Val::Missing | Val::Text(_) => {}
@@ -908,12 +1055,13 @@ impl FieldIndex {
                 }
             }
             Some((sources, exact)) => {
-                let several = sources.len() > 1;
+                let several =
+                    sources.len() > 1 || sources.iter().any(|s| matches!(s, Source::Points(_)));
                 let mut seen = SlotSet::default();
                 for src in sources {
                     let slots: Box<dyn Iterator<Item = u32>> = match src {
                         Source::Tag(set) => Box::new(set.iter().copied()),
-                        Source::Range(r) => Box::new(r.map(|&(_, s)| s)),
+                        Source::Range(r) | Source::Points(r) => Box::new(r.map(|&(_, s)| s)),
                     };
                     for slot in slots {
                         if several && !seen.insert(slot) {
@@ -947,6 +1095,20 @@ impl FieldIndex {
     fn sources(&self, e: &Expr) -> Option<(Vec<Source<'_>>, bool)> {
         match e {
             Expr::All | Expr::Not(_) | Expr::Phrase { .. } => None,
+            // RediSearch's cells for the radius: a superset, each point then
+            // measured from its cell's centre (ADR-0062).
+            Expr::Geo { field, cells, .. } => Some((
+                cells
+                    .iter()
+                    .map(|&(lo, hi)| {
+                        Source::Points(
+                            self.nums[*field]
+                                .range((Bound::Included((lo, 0)), Bound::Excluded((hi, 0)))),
+                        )
+                    })
+                    .collect(),
+                false,
+            )),
             Expr::Tag { field, any_of } => Some((
                 any_of
                     .iter()
@@ -997,7 +1159,7 @@ impl FieldIndex {
                             srcs.iter()
                                 .map(|s| match s {
                                     Source::Tag(set) => set.len(),
-                                    Source::Range(_) => usize::MAX / 2,
+                                    Source::Range(_) | Source::Points(_) => usize::MAX / 2,
                                 })
                                 .fold(0usize, usize::saturating_add)
                         })?;
@@ -1081,6 +1243,63 @@ mod tests {
             vals(r#"{"price":-0.0}"#).as_deref(),
             Some(&[Val::Missing, Val::Num(0.0)][..])
         );
+    }
+
+    /// ADR-0062: a geo filter as redisvl renders it, matched as RediSearch
+    /// measures it, and refused in RediSearch's words.
+    #[test]
+    fn a_geo_filter_parses_as_redisvl_renders_it_and_refuses_as_redisearch_does() {
+        let fields = vec![
+            Field {
+                name: "loc".into(),
+                kind: FieldKind::Geo,
+            },
+            Field {
+                name: "n".into(),
+                kind: FieldKind::Numeric,
+            },
+        ];
+        // Palermo, from Redis's own example.
+        let palermo: Vals = Box::new([
+            geo_val(std::iter::once(&b"13.361389,38.115556"[..])).expect("a point"),
+            Val::Missing,
+        ]);
+        let hit = |f: &str| {
+            parse(f.as_bytes(), &fields)
+                .expect(f)
+                .matches(Some(&palermo))
+        };
+        assert!(hit("@loc:[15 37 200 km]"));
+        assert!(!hit("@loc:[15 37 190 km]"));
+        assert!(hit("@loc:[15 37 190.5 KM]"));
+        assert!(hit("@loc:[15 37 118.4 mi]"));
+        assert!(!hit("(-@loc:[15 37 200 km])"));
+        assert!(hit("(-@loc:[15 37 1 m])"));
+        assert!(hit("(@loc:[15 37 200 km] @n:[-inf +inf]) | *"));
+        let Expr::Geo { radius_m, .. } =
+            parse(b"@loc:[-122.4194 37.7749 1 km]", &fields).expect("redisvl's")
+        else {
+            panic!("not a geo term");
+        };
+        assert_eq!(radius_m, 1000.0);
+        let refused = |f: &str| parse(f.as_bytes(), &fields).expect_err(f);
+        assert!(refused("@loc:[15 37 1 yd]").contains("Invalid GeoFilter unit"));
+        assert!(refused("@loc:[15 91 1 km]").contains("Invalid GeoFilter lat/lon"));
+        assert!(refused("@loc:[181 37 1 km]").contains("Invalid GeoFilter lat/lon"));
+        assert!(refused("@loc:[15 37 0 km]").contains("Invalid GeoFilter radius"));
+        assert!(refused("@loc:[15 37 -5 km]").contains("Invalid GeoFilter radius"));
+        assert!(refused("@loc:[15 37 1]").contains("four values"));
+        assert!(refused("@loc:[15 37 x km]").contains("not a number"));
+        assert!(refused("@loc:{a}").contains("is GEO"));
+        assert!(refused("@n:[1 2 3 km]").contains("is for a GEO field"));
+        // A centre nearer a pole than a geohash holds matches nothing.
+        assert!(!hit("@loc:[0 86 20000 km]"));
+        // Values: a point by a comma or a space; anything else leaves the
+        // document out, which the caller does with the error.
+        assert!(geo_val(std::iter::once(&b"13.36 38.11"[..])).is_ok());
+        assert!(geo_val(std::iter::once(&b"13.36;38.11"[..])).is_err());
+        assert!(geo_val(std::iter::once(&b"0,86"[..])).is_err());
+        assert_eq!(geo_val(std::iter::empty()), Ok(Val::Missing));
     }
 
     #[test]
