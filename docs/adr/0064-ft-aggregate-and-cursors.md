@@ -1,6 +1,10 @@
 # ADR-0064: `FT.AGGREGATE` and `FT.CURSOR`, which redisvl's bulk updates, semantic router and hybrid queries send
 
-Status: **PROPOSED 2026-10-23.** It builds on ADR-0060's `FT.*` surface,
+Status: **ACCEPTED 2026-10-23, option B** (Jeff: "go with your
+recommendations"), with sub-decision 1 (i), `QUANTILE` and
+`COUNT_DISTINCTISH` refused by name, and sub-decision 2 (i), `timefmt` and
+`parsetime` in the C locale's conversion specifiers. **Proposed
+2026-10-23.** It builds on ADR-0060's `FT.*` surface,
 ADR-0061's vector ranges, ADR-0063's full text and scorers, and ADR-0063
 amendment 1 (accepted 2026-10-22, being built), whose sort values it reads.
 
