@@ -567,8 +567,12 @@ only on a fleet whose operator sets `coproc-ft on`.
     ANDed with a filter: every document within the radius, measured as the
     KNN measures, nearest first. A range of more than 10,000 documents
     reports a total of 10,000.
-  - `PARAMS`, `RETURN ... AS`, and `SORTBY` on the distance or a `NUMERIC`
-    or `TAG` field.
+  - `PARAMS` and `RETURN ... AS`.
+  - `SORTBY` on the distance or a `NUMERIC`, `TAG` or `TEXT` field. A TEXT
+    or TAG field sorts by its whole value, as RediSearch sorts it (ADR-0063
+    amendment 1): as written, or case-folded by Unicode's full case folding
+    for a `SORTABLE` field without `UNF`. Values compare as bytes, and a
+    document without the field comes last either way.
   - `LIMIT`, up to 10,000 results a page, `NOCONTENT`, and `DIALECT 2`.
   - `SCORER` (ADR-0063): `BM25STD` unless named, `BM25`, `TFIDF`,
     `TFIDF.DOCNORM`, `DISMAX`, `DOCSCORE`, `BM25STD.TANH` and
@@ -609,8 +613,8 @@ only on a fleet whose operator sets `coproc-ft on`.
 - **An index over keys that already exist is built from them** before it
   answers. Until it is, a search answers `-LOADING`.
 - **Refused by name:** `FT.AGGREGATE`, `FT.CURSOR`, `FT.ALTER`, suggestions
-  and spelling, `GEOSHAPE` fields and `SORTBY` on a GEO or TEXT field, a
-  vector range under `|`, `-` or `~` or beside a KNN, `WITHSCORES` beside a
+  and spelling, `GEOSHAPE` fields and `SORTBY` on a GEO field, a vector
+  range under `|`, `-` or `~` or beside a KNN, `WITHSCORES` beside a
   KNN or a vector range, the `HAMMING` scorer, phonetic matching
   (`$phonetic`, `PHONETIC`), `VERBATIM`, `NOSTOPWORDS`, `SLOP`, `INORDER`
   and `EXPLAINSCORE`, `DIALECT 1` and every other `FT.SEARCH` option,

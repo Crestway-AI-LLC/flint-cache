@@ -440,11 +440,15 @@ if which in ("text", "textsame"):
          ["t:1", "t:2", "t:3", "t:4"], which + ": a prefix")
     want(cmd(px, "FT.SEARCH", "tx", '@title:"hello there"', "NOCONTENT"), [0],
          which + ": a phrase with a stop word matches nothing, as in RediSearch")
+    # ADR-0063 amendment 1: a TEXT field that is not SORTABLE sorts by its
+    # value as written, compared as bytes.
+    want(cmd(px, "FT.SEARCH", "tx", "*", "SORTBY", "title", "NOCONTENT"),
+         [5, b"t:3", b"t:1", b"t:2", b"t:5", b"t:4"], which + ": SORTBY a TEXT field")
     refused(cmd(px, "FT.SEARCH", "tx", "hello", "SCORER", "HAMMING"),
             "ERR FT.SEARCH SCORER HAMMING is not supported", which + ": HAMMING")
     if which == "textsame":
         want(cmd(px, "FT.DROPINDEX", "tx", "DD"), "OK", "FT.DROPINDEX tx DD")
-    print("  full text: BM25STD scores as its formula gives them, a TextQuery, a prefix, a stop-word phrase")
+    print("  full text: BM25STD scores as its formula gives them, a TextQuery, a prefix, a stop-word phrase, SORTBY a TEXT field")
 
 if which == "off":
     refused(cmd(px, "FT.CREATE", "z", "PREFIX", "1", "z:", "SCHEMA", "a", "TAG"),

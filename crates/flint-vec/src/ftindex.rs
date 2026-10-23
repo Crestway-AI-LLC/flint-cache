@@ -37,6 +37,44 @@ struct Doc {
     /// Its score: `SCORE_FIELD`'s, else the index's `SCORE`, kept as
     /// RediSearch keeps it, a float.
     score: f32,
+    /// Each TEXT and TAG attribute's value as `SORTBY` compares it
+    /// (ADR-0063 amendment 1), in the definition's order; `None` when the
+    /// document has none of them.
+    sorts: Option<Sorts>,
+}
+
+/// Each attribute's sort value, where it has one.
+type Sorts = Box<[Option<Box<[u8]>>]>;
+
+/// How a TEXT or TAG attribute's value becomes the bytes `SORTBY` compares,
+/// as RediSearch sorts it (`document.c`, `sorting_vector`): a field that is
+/// not `SORTABLE` is loaded from the key as written; a `SORTABLE` one goes
+/// into the document's sorting vector, a C string, case-folded unless `UNF`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SortRule {
+    /// Not TEXT or TAG: no sort value here.
+    None,
+    /// Not `SORTABLE`: the value as written.
+    Raw,
+    /// `SORTABLE UNF`: up to its first NUL.
+    Unfolded,
+    /// `SORTABLE`: up to its first NUL, case-folded, which a value that is
+    /// not UTF-8 cannot be, so RediSearch leaves its document out.
+    Folded,
+}
+
+/// `raw` as `rule` sorts it, or why its document is left out.
+fn sort_value(rule: SortRule, raw: &[u8]) -> Result<Option<Box<[u8]>>, &'static str> {
+    let c_str = |b: &[u8]| -> Vec<u8> { b.split(|&c| c == 0).next().unwrap_or_default().to_vec() };
+    Ok(match rule {
+        SortRule::None => None,
+        SortRule::Raw => Some(raw.into()),
+        SortRule::Unfolded => Some(c_str(raw).into_boxed_slice()),
+        SortRule::Folded => {
+            let s = String::from_utf8(c_str(raw)).map_err(|_| "it is SORTABLE and not UTF-8")?;
+            Some(crate::casefold::fold(&s).into_bytes().into_boxed_slice())
+        }
+    })
 }
 
 /// What a document costs the D4 meter beyond its key, twice, and values:
@@ -54,6 +92,7 @@ struct Read {
     vector: Result<Option<Vec<f32>>, String>,
     texts: Vec<(usize, Vec<u8>)>,
     score: f32,
+    sorts: Option<Sorts>,
 }
 
 /// How many more neighbours a KNN asks its set for than it answers, so that
@@ -95,6 +134,8 @@ pub struct FtIndex {
     /// IDF, as RediSearch scores one.
     tags: Vec<HashMap<Box<[u8]>, u32>>,
     tag_bytes: usize,
+    /// How each attribute's sort value is made.
+    sort_rules: Box<[SortRule]>,
 }
 
 /// Keys with their distance from a KNN's vector, nearest first.
@@ -143,6 +184,23 @@ impl FtIndex {
         }
         let stop = StopWords::of(def.stopwords.as_deref());
         let tags = vec![HashMap::new(); def.attrs.len()];
+        let sort_rules = def
+            .attrs
+            .iter()
+            .map(|a| {
+                let flag = |f: &str| a.flags.iter().any(|x| &**x == f);
+                match a.field.kind {
+                    FieldKind::Text | FieldKind::Tag | FieldKind::FoldedTag => {
+                        match (flag("SORTABLE"), flag("UNF")) {
+                            (false, _) => SortRule::Raw,
+                            (true, true) => SortRule::Unfolded,
+                            (true, false) => SortRule::Folded,
+                        }
+                    }
+                    FieldKind::Numeric | FieldKind::Geo => SortRule::None,
+                }
+            })
+            .collect();
         FtIndex {
             def,
             fields,
@@ -158,6 +216,7 @@ impl FtIndex {
             by_seq: BTreeMap::new(),
             tags,
             tag_bytes: 0,
+            sort_rules,
         }
     }
 
@@ -215,6 +274,7 @@ impl FtIndex {
             vector,
             texts,
             score,
+            sorts,
         } = read;
         let vector = match vector {
             Ok(v) => v,
@@ -268,6 +328,7 @@ impl FtIndex {
                 expires_at,
                 seq,
                 score,
+                sorts,
             },
         );
         Ok(())
@@ -357,6 +418,9 @@ impl FtIndex {
         DOC_BYTES
             + 2 * key.len()
             + filter::vals_bytes(d.vals.as_deref())
+            + d.sorts.as_ref().map_or(0, |s| {
+                std::mem::size_of_val(&**s) + s.iter().flatten().map(|v| v.len()).sum::<usize>()
+            })
             + self
                 .set
                 .as_ref()
@@ -399,6 +463,22 @@ impl FtIndex {
     /// `key`'s write order, or last for a key the index does not hold.
     fn seq(&self, key: &[u8]) -> u64 {
         self.docs.get(key).map_or(u64::MAX, |d| d.seq)
+    }
+
+    /// What `SORTBY` on attribute `at` sorts `key`'s document by: a NUMERIC
+    /// value, or a TEXT or TAG value's sort bytes; `None` when it has none.
+    fn sort_key(&self, key: &[u8], at: usize) -> Option<SortKey> {
+        let d = self.docs.get(key)?;
+        match self.fields.get(at)?.kind {
+            FieldKind::Numeric => match d.vals.as_ref()?.get(at)? {
+                Val::Num(x) => Some(SortKey::Num(*x)),
+                _ => None,
+            },
+            FieldKind::Text | FieldKind::Tag | FieldKind::FoldedTag => {
+                d.sorts.as_ref()?.get(at)?.clone().map(SortKey::Bytes)
+            }
+            FieldKind::Geo => None,
+        }
     }
 
     /// The documents `s` asks for, as of `now`: the `k` nearest the query's
@@ -488,11 +568,14 @@ impl FtIndex {
                     hits.reverse();
                 }
             } else if let Some(at) = self.fields.iter().position(|f| f.name == *by) {
-                let val = |k: &[u8]| self.docs.get(k).and_then(|d| d.vals.as_ref()?.get(at));
-                hits.sort_by(|a, b| {
-                    let o = sort_order(val(&a.0), val(&b.0), *asc);
-                    o.then_with(|| self.seq(&a.0).cmp(&self.seq(&b.0)))
-                });
+                // Each key once, then sorted: a missing value last either
+                // way, a tie to the earlier write.
+                let mut keyed: Vec<(Option<SortKey>, u64, _)> = hits
+                    .into_iter()
+                    .map(|h| (self.sort_key(&h.0, at), self.seq(&h.0), h))
+                    .collect();
+                keyed.sort_by(|a, b| sort_order(&a.0, &b.0, *asc).then(a.1.cmp(&b.1)));
+                hits = keyed.into_iter().map(|(_, _, h)| h).collect();
             }
         }
         let page: Vec<(Vec<u8>, Option<f32>, f64)> =
@@ -539,6 +622,10 @@ impl FtIndex {
                 None => Val::Missing,
             })
             .collect();
+        let sorts = self.sorts(
+            &mut bad,
+            self.def.attrs.iter().map(|a| get(&a.path).map(<[u8]>::to_vec)),
+        );
         // A score that is not a number is the default, as RediSearch's
         // `SchemaRule_HashScore` takes it.
         let score = self
@@ -556,6 +643,7 @@ impl FtIndex {
                 vector: Err(e),
                 texts,
                 score,
+                sorts,
             };
         }
         let vector = match &self.def.vector {
@@ -572,7 +660,34 @@ impl FtIndex {
             vector,
             texts,
             score,
+            sorts,
         }
+    }
+
+    /// Each attribute's sort value from its raw value (ADR-0063 amendment
+    /// 1), `None` when the document has none; a value a `SORTABLE` field
+    /// cannot fold notes why its document is left out in `bad`.
+    fn sorts(
+        &self,
+        bad: &mut Option<String>,
+        raws: impl Iterator<Item = Option<Vec<u8>>>,
+    ) -> Option<Sorts> {
+        let mut any = false;
+        let sorts: Sorts = raws
+            .zip(self.sort_rules.iter().zip(&self.def.attrs))
+            .map(|(raw, (rule, a))| {
+                let v = match sort_value(*rule, raw.as_deref()?) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        bad.get_or_insert_with(|| format!("{} is not indexed: {e}", a.field.name));
+                        None
+                    }
+                };
+                any |= v.is_some();
+                v
+            })
+            .collect();
+        any.then_some(sorts)
     }
 
     fn read_json(&self, doc: &Value) -> Read {
@@ -600,6 +715,17 @@ impl FtIndex {
                 (kind, v) => json_val(kind, a.separator, v),
             })
             .collect();
+        // A string sorts as itself; an array by its first element, as
+        // RediSearch compares arrays, and has no value if that is not a
+        // string.
+        let sorts = self.sorts(
+            &mut bad,
+            self.def.attrs.iter().map(|a| match json_at(doc, &a.path)? {
+                Value::String(s) => Some(s.as_bytes().to_vec()),
+                Value::Array(xs) => Some(xs.first()?.as_str()?.as_bytes().to_vec()),
+                _ => None,
+            }),
+        );
         let score = self
             .def
             .score_field
@@ -613,6 +739,7 @@ impl FtIndex {
                 vector: Err(e),
                 texts,
                 score,
+                sorts,
             };
         }
         let vector = match &self.def.vector {
@@ -624,6 +751,7 @@ impl FtIndex {
             vector,
             texts,
             score,
+            sorts,
         }
     }
 }
@@ -808,29 +936,25 @@ fn meta_of(fields: &[Field], vals: Option<&[Val]>) -> Option<Vec<u8>> {
     Some(Value::Object(obj).to_string().into_bytes())
 }
 
-/// SORTBY's order of two values, a missing one last either way.
-fn sort_order(a: Option<&Val>, b: Option<&Val>, asc: bool) -> Ordering {
-    let key = |v: Option<&Val>| -> Option<SortKey> {
-        match v? {
-            Val::Num(x) => Some(SortKey::Num(*x)),
-            Val::Tags(ts) => ts.first().map(|t| SortKey::Bytes(t.to_vec())),
-            Val::Text(_) | Val::Geo(_) | Val::Missing => None,
-        }
-    };
-    match (key(a), key(b)) {
+/// SORTBY's order of two documents' keys, as RediSearch's `cmp_fields`
+/// orders them: a missing one last either way.
+fn sort_order(a: &Option<SortKey>, b: &Option<SortKey>, asc: bool) -> Ordering {
+    match (a, b) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
         (Some(x), Some(y)) => {
-            let o = x.cmp(&y);
+            let o = x.cmp(y);
             if asc { o } else { o.reverse() }
         }
     }
 }
 
+/// A NUMERIC value, or the bytes a TEXT or TAG value sorts by (ADR-0063
+/// amendment 1), which compare as bytes.
 enum SortKey {
     Num(f64),
-    Bytes(Vec<u8>),
+    Bytes(Box<[u8]>),
 }
 
 impl PartialEq for SortKey {
@@ -1931,5 +2055,100 @@ mod tests {
             }
         }
         assert_eq!(live.held(), fresh.held(), "the same words and postings");
+    }
+
+    fn sorted(ix: &FtIndex, query: &str, by: &str, dir: &str) -> Vec<String> {
+        let h = search(
+            ix,
+            &["FT.SEARCH", "idx", query, "SORTBY", by, dir, "NOCONTENT"],
+            None,
+        );
+        keys(&h)
+    }
+
+    /// ADR-0063 amendment 1: a TEXT field sorts as RediSearch sorts it,
+    /// redisvl's own cases: a SORTABLE field case-folded, a SORTABLE UNF one
+    /// as written, one that is not SORTABLE as written too.
+    #[test]
+    fn a_text_field_sorts_by_its_value() {
+        for (flags, want) in [
+            (&["SORTABLE"][..], ["doc:apple", "doc:banana", "doc:zebra"]),
+            (&["SORTABLE", "UNF"][..], ["doc:banana", "doc:zebra", "doc:apple"]),
+            (&[][..], ["doc:banana", "doc:zebra", "doc:apple"]),
+            (&["NOINDEX", "SORTABLE"][..], ["doc:apple", "doc:banana", "doc:zebra"]),
+        ] {
+            let mut schema = vec!["SCHEMA", "title", "TEXT"];
+            schema.extend_from_slice(flags);
+            schema.extend_from_slice(&["body", "TEXT"]);
+            let mut ix = index_of(&schema);
+            for (k, t) in [("doc:zebra", "ZEBRA"), ("doc:apple", "apple"), ("doc:banana", "Banana")] {
+                put(&mut ix, k, &[("title", t.as_bytes()), ("body", b"fruit")]);
+            }
+            put(&mut ix, "doc:none", &[("body", b"fruit")]);
+            let mut asc = sorted(&ix, "*", "title", "ASC");
+            assert_eq!(asc.pop().as_deref(), Some("doc:none"), "{flags:?}: missing last");
+            assert_eq!(asc, want, "{flags:?}");
+            let mut desc = sorted(&ix, "fruit", "title", "DESC");
+            assert_eq!(desc.pop().as_deref(), Some("doc:none"), "{flags:?}: missing last");
+            assert_eq!(desc, want.iter().rev().copied().collect::<Vec<_>>(), "{flags:?}");
+        }
+    }
+
+    /// BUG-0274: a TAG field sorts by its whole value, as RediSearch's does,
+    /// not by its first tag.
+    #[test]
+    fn a_tag_field_sorts_by_its_whole_value() {
+        let mut ix = index_of(&["SCHEMA", "t", "TAG", "SORTABLE", "u", "TAG", "v", "TAG", "SORTABLE", "UNF"]);
+        put(&mut ix, "doc:1", &[("t", b"b,a"), ("u", b"Bob"), ("v", b"Bob")]);
+        put(&mut ix, "doc:2", &[("t", b"a,c"), ("u", b"alice"), ("v", b"alice")]);
+        put(&mut ix, "doc:3", &[("t", b"B,z")]);
+        // "a,c" < "b,a" < "b,z": the whole value, folded for a SORTABLE tag.
+        assert_eq!(sorted(&ix, "*", "t", "ASC"), ["doc:2", "doc:1", "doc:3"]);
+        assert_eq!(sorted(&ix, "*", "t", "DESC"), ["doc:3", "doc:1", "doc:2"]);
+        // Not SORTABLE, or UNF: as written, so "Bob" (B is 66) before "alice".
+        for f in ["u", "v"] {
+            assert_eq!(sorted(&ix, "*", f, "ASC"), ["doc:1", "doc:2", "doc:3"], "{f}");
+            assert_eq!(sorted(&ix, "*", f, "DESC"), ["doc:2", "doc:1", "doc:3"], "{f}");
+        }
+    }
+
+    /// A JSON string sorts as itself, folded here for a SORTABLE TAG; an
+    /// array by its first element, as RediSearch compares arrays. An empty
+    /// array has no value, so it comes last either way.
+    #[test]
+    fn a_json_array_sorts_by_its_first_element() {
+        let (_, def) = parse_create(&a(&[
+            "FT.CREATE", "idx", "ON", "JSON", "PREFIX", "1", "doc:", "SCHEMA", "$.t", "AS", "t",
+            "TAG", "SORTABLE",
+        ]))
+        .expect("parses");
+        let mut ix = FtIndex::new(def);
+        ix.set_ready();
+        for (k, t) in [
+            ("doc:1", r#"["b", "a"]"#),
+            ("doc:2", r#""Bz""#),
+            ("doc:3", "[]"),
+            ("doc:4", r#"["c"]"#),
+        ] {
+            let d: Value = serde_json::from_str(&format!(r#"{{"t":{t}}}"#)).expect("json");
+            ix.put(k.as_bytes(), Source::Json(&d), None).expect("indexed");
+        }
+        // "b" < "bz" (folded from "Bz") < "c", and the empty array last.
+        assert_eq!(sorted(&ix, "*", "t", "ASC"), ["doc:1", "doc:2", "doc:4", "doc:3"]);
+        assert_eq!(sorted(&ix, "*", "t", "DESC"), ["doc:4", "doc:2", "doc:1", "doc:3"]);
+    }
+
+    /// A SORTABLE field folds its value, which one that is not UTF-8 cannot
+    /// be: RediSearch leaves that document out. Not SORTABLE, or UNF, it is
+    /// kept.
+    #[test]
+    fn a_sortable_value_that_is_not_utf8_leaves_its_document_out() {
+        let mut ix = index_of(&["SCHEMA", "t", "TEXT", "SORTABLE", "u", "TEXT"]);
+        let fields = vec![(b"t".to_vec(), vec![0xff, 0xfe])];
+        assert!(ix.put(b"doc:1", Source::Hash(&fields), None).is_err());
+        assert_eq!((ix.len(), ix.failures()), (0, 1));
+        let fields = vec![(b"u".to_vec(), vec![0xff, 0xfe])];
+        assert!(ix.put(b"doc:2", Source::Hash(&fields), None).is_ok());
+        assert_eq!(ix.len(), 1);
     }
 }

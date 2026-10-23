@@ -22,6 +22,7 @@
 //! unchanged. ADR-0059 adds fields read from a vector's `META`, which
 //! `VEC.SEARCH ... FILTER` matches before it ranks, in a fifth config field.
 
+mod casefold;
 pub mod filter;
 pub mod ft;
 pub mod ftindex;

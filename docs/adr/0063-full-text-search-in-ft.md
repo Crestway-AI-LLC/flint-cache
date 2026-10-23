@@ -426,13 +426,12 @@ Against a local fleet, beside the run after ADR-0062 (its *As built*):
 - `FT.AGGREGATE`, next by count, and redisvl's `HybridQuery`, which uses it.
 - `INDEXEMPTY` and `INDEXMISSING`.
 - `SORTBY` on a TEXT field, which needs RediSearch's sort normalization
-  (`UNF`). Seven redisvl tests now wait on it (As built). Proposed as
-  amendment 1, below.
+  (`UNF`): amendment 1, below, accepted and built 2026-10-22.
 - `FT.SEARCH` without a KNN still reads every document for a search with no
   text word, as it does today. Postings for tags and numbers would end
   that, and are a separate question.
 
-## Amendment 1 (ACCEPTED 2026-10-22, option A): `SORTBY` on TEXT and TAG fields, by their values
+## Amendment 1 (ACCEPTED 2026-10-22, option A; BUILT 2026-10-22): `SORTBY` on TEXT and TAG fields, by their values
 
 **ACCEPTED 2026-10-22, option A** (Jeff: "go with A then", after the
 recommendation of A with fold (i)). The table comes from Unicode 17.0.0's
@@ -526,3 +525,40 @@ match's key over the channel, as RediSearch loads it.
 - `coproc_ft_drill`: a `SORTBY` on a TEXT field before and after a
   restart.
 - The suites: the 7 redisvl tests pass, and nothing that passed now fails.
+
+### As built (2026-10-22, for v0.1.0-rc.86)
+
+- **Each document keeps a sort value for each TEXT and TAG field**
+  (`ftindex.rs`, `Doc.sorts`), made by the field's rule:
+  - not `SORTABLE`: the value as written;
+  - `SORTABLE UNF`: the value up to its first NUL, as RediSearch's sorting
+    vector holds a C string;
+  - `SORTABLE`: the same, case-folded. A value that is not UTF-8 cannot be
+    folded, and RediSearch leaves its document out of the index; so does
+    Flint, counting it in `FT.INFO`'s failures.
+  - A JSON array sorts by its first element. An empty array, or one whose
+    first element is not a string, has no value.
+- **The fold** is `casefold::fold`: the C and F mappings of Unicode
+  17.0.0's `CaseFolding.txt`, 1,585 of them, in a table that
+  `tools/casefold_table.py` generates from the file. The file and its
+  licence (Unicode V3) are vendored beside the table, under
+  `crates/flint-vec/src/casefold/`.
+- **`SORTBY`** compares values as bytes, ascending or descending. A
+  document without a value comes last either way, and a tie goes to the
+  earlier write. NUMERIC and the KNN distance sort as before.
+- **The meter** charges each document's sort values with it, and
+  `tests/ft_meter.rs` holds the charge.
+- **BUG-0274 is fixed** by the same values.
+- **Verification:**
+  - units: redisvl's three orders with `SORTABLE`, `SORTABLE UNF`, neither,
+    and `NOINDEX SORTABLE`; BUG-0274's acceptance test; a JSON array; a
+    `SORTABLE` value that is not UTF-8; missing values last in both
+    directions;
+  - the fold: every Unicode scalar value folds as the vendored file says,
+    read by the test apart from the script, and the cases where full
+    folding differs from Rust's lower case;
+  - `coproc_ft_drill`'s `text` section: a `SORTBY` on a TEXT field, before
+    and after a co-processor restart;
+  - the suites, 2026-10-23, with ADR-0064 on the same stack: redisvl's 7
+    `SORTBY` tests on a TEXT field pass, among its 271 (ADR-0064's As
+    built).

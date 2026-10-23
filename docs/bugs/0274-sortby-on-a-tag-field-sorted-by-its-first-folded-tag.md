@@ -1,10 +1,9 @@
-# BUG-0274: `SORTBY` on a TAG field sorted by its first tag, folded, where RediSearch sorts by the field's whole value (OPEN)
+# BUG-0274: `SORTBY` on a TAG field sorted by its first tag, folded, where RediSearch sorts by the field's whole value (FIXED)
 
-**Status:** **OPEN 2026-10-22.** Its fix is ADR-0063 amendment 1's
-mechanism, proposed the same day, and waits on that amendment's acceptance.
-ADR-0060's release N, on public main after v0.1.0-rc.85, has it, and no
-release has served `FT.*` yet. **Found by reading RediSearch's source** for
-that amendment, not seen in a run: `document.c`'s tag preprocessor and
+**Status:** **FIXED 2026-10-22,** by ADR-0063 amendment 1's build, before
+any release served `FT.*`. ADR-0060's release N, on public main after
+v0.1.0-rc.85, had it. **Found by reading RediSearch's source** for that
+amendment, not seen in a run: `document.c`'s tag preprocessor and
 `sorting_vector`, and `value/src/comparison.rs`. No client suite's test
 reaches it.
 **Severity:** low. Which documents a search answers is right; their order
@@ -31,15 +30,24 @@ it:
 | `b,a` and `a,c` | `a,c`, then `b,a` | a tie on `a`, so write order |
 | `Bob` and `alice`, not `SORTABLE` | `Bob` (`B` is 66), then `alice` (`a` is 97) | `alice`, then `bob` |
 
-## The fix (pending)
+## The fix
 
-Keep each TAG field's sort value with its document: the value as written,
-case-folded when the field is `SORTABLE` without `UNF`. ADR-0063
-amendment 1 proposes the same for TEXT fields, and how to fold.
+Each document keeps each TEXT and TAG field's sort value
+(`ftindex.rs`, `Doc.sorts`), made as RediSearch makes it:
+- **not `SORTABLE`:** the value as written;
+- **`SORTABLE UNF`:** the value up to its first NUL, as RediSearch's
+  sorting vector holds a C string;
+- **`SORTABLE`:** the same, case-folded by Unicode's full case folding
+  (`casefold/`), as ICU's `fold_string` folds it.
+
+`SORTBY` compares those values as bytes, with a missing value last either
+way and a tie to the earlier write. A JSON array sorts by its first
+element.
 
 ## Acceptance
 
-A unit test in `ftindex.rs`: the two cases in the table, a `SORTABLE` TAG
-folded and a `SORTABLE UNF` TAG kept as written, each ascending and
-descending, with a document missing the field last both ways. It must fail
-with today's `sort_order`.
+`ftindex.rs`, `a_tag_field_sorts_by_its_whole_value`: the table's two
+cases, with a `SORTABLE` TAG folded, a `SORTABLE UNF` TAG and one that is
+not `SORTABLE` kept as written, each ascending and descending, with a
+document missing the field last both ways. It fails with the old
+`sort_order`, which ordered `b,a` against `a,c` by write.

@@ -277,7 +277,7 @@ pub struct Search {
     /// `RETURN`: `(field, the name to answer it as)`. `None` returns every
     /// field.
     pub returns: Option<Vec<(Box<str>, Box<str>)>>,
-    /// `SORTBY`: the KNN distance's name or a NUMERIC or TAG attribute's,
+    /// `SORTBY`: the KNN distance's name or a NUMERIC, TAG or TEXT attribute's,
     /// and whether ascending.
     pub sortby: Option<(Box<str>, bool)>,
     pub offset: usize,
@@ -855,13 +855,13 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
             *a.field.name == **by
                 && matches!(
                     a.field.kind,
-                    FieldKind::Numeric | FieldKind::Tag | FieldKind::FoldedTag
+                    FieldKind::Numeric | FieldKind::Tag | FieldKind::FoldedTag | FieldKind::Text
                 )
         });
         if !by_distance && !by_attr {
             return Err(format!(
-                "FT.SEARCH SORTBY {by}: sorts by the KNN distance or a NUMERIC or TAG field only \
-                 (ADR-0060)"
+                "FT.SEARCH SORTBY {by}: sorts by the KNN distance or a NUMERIC, TAG or TEXT field \
+                 only (ADR-0063)"
             ));
         }
     }
@@ -1620,7 +1620,7 @@ mod tests {
         let s = parse_search(&a(&["FT.SEARCH", "idx", "hello"]), &def).expect("parses");
         assert_eq!(s.scorer, Scorer::Bm25Std);
         assert!(
-            refused(a(&["FT.SEARCH", "idx", "*", "SORTBY", "content"])).contains("NUMERIC or TAG")
+            refused(a(&["FT.SEARCH", "idx", "*", "SORTBY", "nosuch"])).contains("TAG or TEXT")
         );
         let (_, noidx) = parse_create(&a(&[
             "FT.CREATE",
