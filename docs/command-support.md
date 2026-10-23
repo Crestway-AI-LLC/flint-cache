@@ -592,6 +592,51 @@ only on a fleet whose operator sets `coproc-ft on`.
     scores each shard by its own counts, where Flint answers as one shard
     does.
   - Replies are RESP2's or RESP3's shape, as the client negotiated.
+- **`FT.AGGREGATE` and `FT.CURSOR` (ADR-0064),** as one RediSearch shard
+  answers them:
+  - **The query** is `FT.SEARCH`'s: a filter, full text, a KNN or a vector
+    range, with `SCORER`, `ADDSCORES` and `PARAMS`. A KNN comes nearest
+    first; any other query in write order, as RediSearch's iterators walk
+    document ids.
+  - **The steps, in the order written:** `LOAD` (`@__key`, `*`, `AS`),
+    `GROUPBY ... REDUCE`, `APPLY`, `FILTER`, `SORTBY` with `MAX`, and
+    `LIMIT`. A `SORTBY` with neither `MAX` nor `LIMIT` keeps 10 rows, as in
+    RediSearch.
+  - **What a step reads.** `GROUPBY`, `SORTBY` and a reducer read any
+    schema field without `LOAD`; `APPLY` and `FILTER` read only what was
+    loaded, `SORTABLE` fields and earlier names. A `SORTABLE` TEXT or TAG
+    field reads folded unless `UNF`. A NUMERIC field reads as a number.
+  - **Reducers:** `COUNT`, `COUNT_DISTINCT`, `SUM`, `AVG`, `MIN`, `MAX`,
+    `STDDEV`, `TOLIST`, `FIRST_VALUE ... BY`, `RANDOM_SAMPLE`, named
+    `__generated_alias...` without `AS`.
+  - **Expressions:** RediSearch's operators and precedence, its 32
+    functions (math, string, date, `geodistance`), a missing value failing
+    the query. `timefmt` and `parsetime` take the C locale's POSIX
+    conversion specifiers only.
+  - **Numbers** are written as RediSearch writes them: a whole number as an
+    integer, anything else as `%.12g`.
+  - **Reads.** What the index holds answers without a read: a NUMERIC
+    value, a TEXT or TAG value not `SORTABLE` or `UNF`, the key. A field
+    outside the schema, a GEO or VECTOR field, a folded `SORTABLE` field
+    asked for by `LOAD`, a JSON document's values and `LOAD *` are read back
+    from the document, only for the reply's rows unless a step reads them.
+  - **Cursors:** `WITHCURSOR [COUNT n] [MAXIDLE ms]` (1000 and 300,000 by
+    default, 300,000 at most), then `FT.CURSOR READ <index> <id> [COUNT n]`
+    and `FT.CURSOR DEL <index> <id>`. A pipeline that only loads, applies
+    and filters is walked a page at a time on the live index, so a document
+    written meanwhile can come on a later page; one that sorts, groups or
+    pages with `LIMIT` is computed at the first read. At most 128 cursors
+    are open on an index. A cursor is the co-processor's: a restart or a
+    failover loses it, and the next read answers `Cursor not found`.
+  - **Bounds:** a reply holds at most 10,000 rows, as RediSearch answers
+    with `MAXAGGREGATERESULTS 10000`: a longer result is cut, and a `LIMIT`
+    past it is refused. A pipeline that must read more than 10,000
+    documents back before it runs is refused; a cursor reads a page at a
+    time.
+  - **The total,** without `SORTBY` or `GROUPBY`, is the matches left after
+    `FILTER`, as `WITHCOUNT` counts them. RediSearch's RESP2 total there
+    counts only the rows it had read when it wrote the number.
+  - Replies are RESP2's or RESP3's shape, as the client negotiated.
 - **Aliases** are accepted wherever an index name is, and go with their index
   when it is dropped.
 - **`MODULE LIST`** answers one module, `search` at version 20600, while
@@ -612,13 +657,15 @@ only on a fleet whose operator sets `coproc-ft on`.
   (above).
 - **An index over keys that already exist is built from them** before it
   answers. Until it is, a search answers `-LOADING`.
-- **Refused by name:** `FT.AGGREGATE`, `FT.CURSOR`, `FT.ALTER`, suggestions
+- **Refused by name:** `FT.ALTER`, suggestions
   and spelling, `GEOSHAPE` fields and `SORTBY` on a GEO field, a vector
   range under `|`, `-` or `~` or beside a KNN, `WITHSCORES` beside a
   KNN or a vector range, the `HAMMING` scorer, phonetic matching
   (`$phonetic`, `PHONETIC`), `VERBATIM`, `NOSTOPWORDS`, `SLOP`, `INORDER`
   and `EXPLAINSCORE`, `DIALECT 1` and every other `FT.SEARCH` option,
-  `GEOFILTER` among them.
+  `GEOFILTER` among them; `FT.AGGREGATE`'s `QUANTILE` and
+  `COUNT_DISTINCTISH` reducers, its query options other than `SCORER`,
+  `ADDSCORES` and `WITHCOUNT`, and `FORMAT EXPAND`.
 
 ## Protocols: RESP2 and RESP3
 

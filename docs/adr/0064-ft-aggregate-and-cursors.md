@@ -1,6 +1,6 @@
 # ADR-0064: `FT.AGGREGATE` and `FT.CURSOR`, which redisvl's bulk updates, semantic router and hybrid queries send
 
-Status: **ACCEPTED 2026-10-23, option B** (Jeff: "go with your
+Status: **ACCEPTED 2026-10-23, option B; BUILT 2026-10-23** (As built, below) (Jeff: "go with your
 recommendations"), with sub-decision 1 (i), `QUANTILE` and
 `COUNT_DISTINCTISH` refused by name, and sub-decision 2 (i), `timefmt` and
 `parsetime` in the C locale's conversion specifiers. **Proposed
@@ -363,3 +363,90 @@ amendment.
 - **`FT.PROFILE` and `FT.EXPLAIN`.**
 - **redisvl's `SQLQuery`.** It needs `sql-redis`, which is not installed
   here, so its translations are measured when it is.
+
+## As built (2026-10-23, for v0.1.0-rc.86)
+
+- **Where it lives:**
+  - `ftexpr.rs`: the expression language, its 32 functions, and
+    `num_to_str`;
+  - `ftagg.rs`: the request, its compilation against an index's schema,
+    the pipeline, the reducers, and the reply;
+  - `ftindex.rs`: the matches in RediSearch's order, and each document's
+    first row from what the index holds;
+  - `ftstore.rs`: planning, the cursors, and the page;
+  - `ftchan.rs`: the channel's reads;
+  - `flint-proxy`: the RESP3 map, and each command's channel budget.
+- **The query** is `FT.SEARCH`'s, split out as `ft::parse_query`.
+  - A KNN comes nearest first.
+  - A vector range, and any other query, come in write order.
+  - `ADDSCORES` gives the text or TAG terms' score, and 0 for a vector
+    alone.
+- **Values from the index.** A document's first row takes from the index
+  what it holds:
+  - NUMERIC values;
+  - TEXT and TAG values as ADR-0063 amendment 1 keeps them;
+  - the key, the distance and the score.
+
+  A field the index does not hold in the form `LOAD` gives is read back
+  over the channel:
+  - a field outside the schema;
+  - a GEO or VECTOR field;
+  - a folded `SORTABLE` field asked for by `LOAD`;
+  - a JSON document's values, and `LOAD *`.
+
+  It is read for every row before the pipeline runs when a step reads it,
+  and only for the reply's rows when none does. The channel is opened only
+  when something must be read.
+- **Names** resolve as RediSearch resolves them:
+  - `GROUPBY`, `SORTBY` and a reducer load any schema field just before
+    their step;
+  - `APPLY` and `FILTER` read only what was loaded, a `SORTABLE` field, or
+    an earlier name;
+  - an explicit `LOAD` takes the place of the sorting vector's value.
+- **Cursors** are kept by the co-processor in a table of their own, inside
+  the store's lock, by a random 31-bit id.
+  - A read takes its cursor out until its page is answered, so a second
+    read meanwhile finds none, as in RediSearch.
+  - A cursor whose pipeline only loads, applies and filters walks the index
+    on from its last document in write order, at each read.
+  - Any other is computed at its first read, and its rows are charged to
+    the D4 meter (`Store::ft_cursor_bytes`).
+  - A full page leaves the cursor open; the read after the last answers id
+    0.
+  - An index dropped and made again answers `The index was dropped while
+    the cursor was idle`.
+- **Errors** are `ERR` and RediSearch's own words, as the rest of `FT.*`
+  answers, without RediSearch's newer `SEARCH_` prefixes.
+- **Found while building, and settled the way RediSearch's source has it:**
+  - redisvl's router writes `SORTBY 1 @distance MAX 1` before its
+    `FILTER`. So the nearest route alone is tested against its threshold,
+    and a farther route under its own threshold is not returned.
+  - A JSON array, empty, or whose first element is not a string, has no
+    sort value.
+- **Verification:**
+  - units: `ftexpr` (the grammar; RediSearch's test values; `%.12g`
+    against C's `snprintf`; dates against Python's C-library `strftime`),
+    `ftagg` (redisvl's four requests, RediSearch's error texts, resolution,
+    reducers, sorting, counts, the row's names), and `ftstore` (held
+    values answer without a read, reads only where needed, both kinds of
+    cursor, namespace and index isolation, idle expiry, the limit of 128);
+  - the proxy: the RESP3 map and the channel's budget;
+  - `coproc_ft_drill`'s `agg` and `aggsame` sections: redisvl's paging,
+    router and hybrid query through the proxy, RESP3, a field read back,
+    and a cursor not found after a co-processor restart;
+  - mutation checks: a cursor that closes on a full page, a `SORTBY` that
+    puts a missing value first, and a NUMERIC `LOAD` read back instead of
+    held each fail their test;
+  - **the suites, 2026-10-23,** on this stack with ADR-0063 amendment 1:
+    - redisvl's catalogue: **271 passed** (263 on public e6f0ef34), 21
+      failed, 17 errors. The 8 `FT.AGGREGATE` failures pass, and so do
+      amendment 1's 7 `SORTBY` tests on a TEXT field;
+    - its bulk updates now get past their cursor to their upsert script,
+      an `EVAL` that writes an indexed key. ADR-0060 refuses that script
+      (`-INDEXED`), so it now stops 11 tests, up from 4;
+    - also left: `sentence-transformers` 19, not installed; `INDEXEMPTY`
+      and `INDEXMISSING` 6; `EXPIRE` inside a transaction 2;
+    - langchain-redis 157 (RESP2 200) and LlamaIndex 19, unchanged;
+    - redisvl's `SemanticRouter` with a stand-in vectorizer of fixed
+      vectors, against a local fleet: 45 routings by `MIN`, `SUM` and
+      `AVG`, each the one the pipeline gives worked out by hand.

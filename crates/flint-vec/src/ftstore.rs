@@ -10,10 +10,13 @@
 //! is never ahead of the durable document and never silently behind it.
 
 use crate::ft::{self, IndexDef, On, Search};
+use crate::ftagg::{self, Cursor, CursorState, Row};
+use crate::ftexpr::Datum;
 use crate::ftindex::{FtIndex, Hits, Source};
 use crate::{Cap, Persist, Store, bucket_of, durable_key, err};
 use flint_resp::Value;
 use serde_json::Value as Json;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering::Relaxed;
 
 /// `FT.CREATE`'s refusal while the co-processor runs without `--ft`: the
@@ -148,8 +151,79 @@ pub enum FtPlan {
     },
     /// `FT.SEARCH`: the hits, then each document read for the reply.
     Search(SearchPlan),
+    /// `FT.AGGREGATE` and `FT.CURSOR READ` (ADR-0064): a page of rows, read
+    /// back where the index does not hold a field, run and answered by
+    /// [`aggregate_page`].
+    Aggregate(Box<AggPlan>),
     /// A data write to keys an index may cover.
     Write(WritePlan),
+}
+
+/// One `FT.AGGREGATE` reply, or one page of its cursor.
+pub struct AggPlan {
+    pub plan: ftagg::Plan,
+    pub on: On,
+    pub page: Page,
+    /// The cursor this page is of, new or taken out of the table for the
+    /// read; the caller puts it back unless the page is its last.
+    pub cursor: Option<Cursor>,
+    /// A cursor's walk reached the index's end with this page.
+    pub walked_out: bool,
+}
+
+pub enum Page {
+    /// Rows for the pipeline to run over.
+    Run(Vec<Row>),
+    /// Rows a sort, group or `LIMIT` already made, with their names and
+    /// this page's count.
+    Ran {
+        names: Vec<Box<str>>,
+        rows: Vec<Row>,
+        total: usize,
+    },
+}
+
+/// The open `FT.AGGREGATE` cursors (ADR-0064), by id, over every namespace
+/// as RediSearch's ids are; a read finds only its own namespace's.
+#[derive(Default)]
+pub struct Cursors {
+    by_id: HashMap<u64, Cursor>,
+    rng: u64,
+}
+
+/// RediSearch's `INDEX_CURSOR_LIMIT`.
+pub const CURSORS_PER_INDEX: usize = 128;
+
+impl Cursors {
+    /// Drops every cursor idle past its time, as RediSearch's timer reaps
+    /// them.
+    fn sweep(&mut self, now: u64) {
+        self.by_id.retain(|_, c| c.expires_at > now);
+    }
+
+    /// An id no open cursor has: random, non-zero, under 2^31.
+    fn fresh_id(&mut self, now: u64) -> u64 {
+        if self.rng == 0 {
+            self.rng = now ^ 0x9E37_79B9_7F4A_7C15 ^ ((std::process::id() as u64) << 32);
+        }
+        loop {
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 7;
+            self.rng ^= self.rng << 17;
+            let id = self.rng & 0x7fff_ffff;
+            if id != 0 && !self.by_id.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn bytes(&self, ns: Option<&[u8]>) -> usize {
+        self.by_id
+            .values()
+            .filter(|c| ns.is_none_or(|n| c.ns == n))
+            .map(Cursor::bytes)
+            .sum()
+    }
 }
 
 pub struct SearchPlan {
@@ -284,6 +358,8 @@ impl Store {
             b"FT.CREATE" if !self.ft_on => FtPlan::Reply(err(FT_OFF)),
             b"FT.CREATE" => self.plan_ft_create(ns, args),
             b"FT.SEARCH" => self.plan_ft_search(ns, args, now),
+            b"FT.AGGREGATE" => self.plan_ft_aggregate(ns, args, now),
+            b"FT.CURSOR" => self.plan_ft_cursor(ns, args, now),
             b"FT.DROPINDEX" => self.plan_ft_drop(ns, args),
             b"FT.ALIASADD" | b"FT.ALIASUPDATE" | b"FT.ALIASDEL" => self.plan_ft_alias(ns, args),
             b"FT.INFO" => FtPlan::Reply(self.ft_info(ns, args, now)),
@@ -293,7 +369,8 @@ impl Store {
             n if routed_write(n) => self.plan_ft_write(ns, args),
             other => FtPlan::Reply(err(&format!(
                 "ERR {} is not supported (ADR-0060 serves FT.CREATE, FT.SEARCH, FT.INFO, \
-                 FT._LIST, FT.DROPINDEX and the FT.ALIAS commands)",
+                 FT._LIST, FT.DROPINDEX and the FT.ALIAS commands; ADR-0064 FT.AGGREGATE and \
+                 FT.CURSOR)",
                 String::from_utf8_lossy(other)
             ))),
         }
@@ -442,6 +519,259 @@ impl Store {
             index,
             persist,
         }
+    }
+
+    /// The index `name` names in `ns`, ready to answer, or the reply that
+    /// says why not, as `FT.SEARCH` answers.
+    fn ft_ready(&self, ns: &[u8], name: &[u8]) -> Result<(Vec<u8>, &FtIndex), Value> {
+        let found = self
+            .ft_resolve(ns, name)
+            .and_then(|i| Some((i.clone(), self.ft_index(ns, &i)?)));
+        let Some((index, ix)) = found else {
+            return Err(err(&format!(
+                "ERR {}: no such index",
+                String::from_utf8_lossy(name)
+            )));
+        };
+        if !ix.ready() {
+            return Err(err("LOADING the index is still being built, retry"));
+        }
+        Ok((index, ix))
+    }
+
+    /// `FT.AGGREGATE` (ADR-0064): the request compiled against the index,
+    /// its matches as the pipeline's first rows; with `WITHCURSOR`, a new
+    /// cursor, its first page the matches it walks first.
+    fn plan_ft_aggregate(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> FtPlan {
+        let Some(name) = args.get(1) else {
+            return FtPlan::Reply(err("ERR FT.AGGREGATE <index> <query> [options]"));
+        };
+        let (index, ix) = match self.ft_ready(ns, name) {
+            Ok(x) => x,
+            Err(v) => return FtPlan::Reply(v),
+        };
+        let compiled = ftagg::parse(args).and_then(|req| {
+            let q = ft::parse_query(&req.query, ix.def(), &req.params)?;
+            let metric = q.knn.as_ref().map(|k| &*k.alias);
+            let plan = ftagg::compile(&req, ix.def(), metric)?;
+            Ok((req, q, plan))
+        });
+        let (req, q, plan) = match compiled {
+            Ok(x) => x,
+            Err(e) => return FtPlan::Reply(err(&format!("ERR {e}"))),
+        };
+        let hits = match ix.agg_matches(&q, req.scorer, req.addscores, now) {
+            Ok(h) => h,
+            Err(e) => return FtPlan::Reply(err(&format!("ERR {e}"))),
+        };
+        let Some(opts) = req.cursor else {
+            let rows = hits.iter().map(|h| ix.agg_row(&plan, h)).collect();
+            return FtPlan::Aggregate(Box::new(AggPlan {
+                plan,
+                on: ix.def().on,
+                page: Page::Run(rows),
+                cursor: None,
+                walked_out: true,
+            }));
+        };
+        let mut cursors = self.ft_cursors.lock().expect("cursors lock");
+        cursors.sweep(now);
+        let open = cursors
+            .by_id
+            .values()
+            .filter(|c| c.ns == ns && c.index == index)
+            .count();
+        if open >= CURSORS_PER_INDEX {
+            return FtPlan::Reply(err(&format!(
+                "ERR INDEX_CURSOR_LIMIT of {CURSORS_PER_INDEX} has been reached for an index"
+            )));
+        }
+        let id = cursors.fresh_id(now);
+        drop(cursors);
+        // A pipeline that only loads, applies and filters is walked as
+        // RediSearch walks it, a page of matches at a time; any other is
+        // computed at the first read, as RediSearch's sorter and grouper
+        // read every match before their first row.
+        let stream = !plan.buffered && q.knn.is_none() && !req.withcount;
+        let (rows, walked_out, state) = if stream {
+            let page: Vec<_> = hits.iter().take(opts.count).collect();
+            let after = page.last().map_or(0, |h| h.seq);
+            let rows = page.iter().map(|h| ix.agg_row(&plan, h)).collect();
+            (
+                rows,
+                hits.len() < opts.count,
+                CursorState::Stream {
+                    req: req.clone(),
+                    after,
+                },
+            )
+        } else {
+            let rows = hits.iter().map(|h| ix.agg_row(&plan, h)).collect();
+            (
+                rows,
+                true,
+                CursorState::Rows {
+                    names: Vec::new(),
+                    rows: VecDeque::new(),
+                    total: req.withcount.then_some(0),
+                },
+            )
+        };
+        FtPlan::Aggregate(Box::new(AggPlan {
+            on: ix.def().on,
+            page: Page::Run(rows),
+            cursor: Some(Cursor {
+                id,
+                ns: ns.to_vec(),
+                index,
+                generation: ix.generation(),
+                count: opts.count,
+                max_idle_ms: opts.max_idle_ms,
+                expires_at: now + opts.max_idle_ms,
+                plan: plan.clone(),
+                state,
+            }),
+            plan,
+            walked_out,
+        }))
+    }
+
+    /// `FT.CURSOR READ <index> <id> [COUNT <n>]` and `FT.CURSOR DEL <index>
+    /// <id>` (ADR-0064), in RediSearch's words. A read takes its cursor out
+    /// of the table until its page is answered, so a second read of it
+    /// meanwhile finds none, as in RediSearch.
+    fn plan_ft_cursor(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> FtPlan {
+        let sub = args.get(1).map(|a| a.to_ascii_uppercase());
+        let sub = match sub.as_deref() {
+            Some(b"READ") => "READ",
+            Some(b"DEL") => "DEL",
+            Some(_) => return FtPlan::Reply(err("ERR unknown subcommand")),
+            None => {
+                return FtPlan::Reply(err("ERR wrong number of arguments for 'FT.CURSOR' command"));
+            }
+        };
+        if args.len() < 4 {
+            return FtPlan::Reply(err(&format!(
+                "ERR wrong number of arguments for 'FT.CURSOR|{sub}' command"
+            )));
+        }
+        let Some(id) = std::str::from_utf8(&args[3])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            return FtPlan::Reply(err("ERR Bad cursor ID"));
+        };
+        let mut count = None;
+        if sub == "READ" && args.len() > 5 {
+            if !args[4].eq_ignore_ascii_case(b"COUNT") {
+                return FtPlan::Reply(err(&format!(
+                    "ERR Unknown argument `{}`",
+                    String::from_utf8_lossy(&args[4])
+                )));
+            }
+            match std::str::from_utf8(&args[5])
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                Some(n) if n > 0 => count = Some(n),
+                Some(_) => {}
+                None => {
+                    return FtPlan::Reply(err(&format!(
+                        "ERR Bad value for COUNT: `{}`",
+                        String::from_utf8_lossy(&args[5])
+                    )));
+                }
+            }
+        }
+        let resolved = self.ft_resolve(ns, &args[2]);
+        let mut cursors = self.ft_cursors.lock().expect("cursors lock");
+        cursors.sweep(now);
+        let mine = cursors.by_id.get(&id).is_some_and(|c| c.ns == ns);
+        if resolved.is_none() {
+            return FtPlan::Reply(err(&format!(
+                "ERR {}: no such index",
+                String::from_utf8_lossy(&args[2])
+            )));
+        }
+        if sub == "DEL" {
+            return FtPlan::Reply(if mine && cursors.by_id.remove(&id).is_some() {
+                Value::Simple("OK".into())
+            } else {
+                err("ERR Cursor does not exist")
+            });
+        }
+        let not_found = || FtPlan::Reply(err(&format!("ERR Cursor not found, id: {id}")));
+        if !mine {
+            return not_found();
+        }
+        let Some(mut c) = cursors.by_id.remove(&id) else {
+            return not_found();
+        };
+        drop(cursors);
+        let ix = match resolved.as_deref().and_then(|i| self.ft_index(ns, i)) {
+            Some(ix) if c.index == resolved.clone().unwrap_or_default() => ix,
+            _ => return not_found(),
+        };
+        if ix.generation() != c.generation {
+            return FtPlan::Reply(err("ERR The index was dropped while the cursor was idle"));
+        }
+        if let Some(n) = count {
+            c.count = n;
+        }
+        let n = c.count;
+        match &mut c.state {
+            CursorState::Stream { req, after } => {
+                let hits = ft::parse_query(&req.query, ix.def(), &req.params)
+                    .and_then(|q| ix.agg_matches(&q, req.scorer, req.addscores, now));
+                let hits = match hits {
+                    Ok(h) => h,
+                    Err(e) => return FtPlan::Reply(err(&format!("ERR {e}"))),
+                };
+                let next: Vec<_> = hits.iter().filter(|h| h.seq > *after).collect();
+                let page: Vec<_> = next.iter().take(n).collect();
+                if let Some(last) = page.last() {
+                    *after = last.seq;
+                }
+                let rows = page.iter().map(|h| ix.agg_row(&c.plan, h)).collect();
+                FtPlan::Aggregate(Box::new(AggPlan {
+                    plan: c.plan.clone(),
+                    on: ix.def().on,
+                    page: Page::Run(rows),
+                    walked_out: next.len() < n,
+                    cursor: Some(c),
+                }))
+            }
+            CursorState::Rows { names, rows, total } => {
+                let take = n.min(rows.len());
+                let page: Vec<Row> = rows.drain(..take).collect();
+                let page_total = total.unwrap_or(0);
+                let names = names.clone();
+                FtPlan::Aggregate(Box::new(AggPlan {
+                    plan: c.plan.clone(),
+                    on: ix.def().on,
+                    page: Page::Ran {
+                        names,
+                        rows: page,
+                        total: page_total,
+                    },
+                    walked_out: true,
+                    cursor: Some(c),
+                }))
+            }
+        }
+    }
+
+    /// Puts a cursor back after its page, idle from `now` (ADR-0064).
+    pub fn ft_cursor_put(&self, mut c: Cursor, now: u64) {
+        c.expires_at = now + c.max_idle_ms;
+        let mut cursors = self.ft_cursors.lock().expect("cursors lock");
+        cursors.by_id.insert(c.id, c);
+    }
+
+    /// What open cursors hold for `ns`, or for every namespace, in RAM:
+    /// charged to the D4 meter with the indexes.
+    pub(crate) fn ft_cursor_bytes(&self, ns: Option<&[u8]>) -> usize {
+        self.ft_cursors.lock().expect("cursors lock").bytes(ns)
     }
 
     fn plan_ft_search(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> FtPlan {
@@ -813,6 +1143,197 @@ fn json_path<'a>(doc: &'a Json, path: &str) -> Option<&'a Json> {
     path.strip_prefix("$.")?
         .split('.')
         .try_fold(doc, |v, m| v.get(m))
+}
+
+/// What `path` holds in document `d`, as `LOAD` gives it: a HASH field as
+/// written; a JSON string as itself, a number as a number, anything else
+/// as its JSON text. A bare name on a JSON index is the member `$.<name>`.
+fn doc_value(d: &DocRead, on: On, path: &str) -> Option<Datum> {
+    match on {
+        On::Hash => d
+            .hash
+            .as_ref()?
+            .iter()
+            .rev()
+            .find(|(f, _)| f == path.as_bytes())
+            .map(|(_, v)| Datum::str(v)),
+        On::Json => {
+            let p = if path.starts_with('$') {
+                path.to_string()
+            } else {
+                format!("$.{path}")
+            };
+            json_path(d.json.as_ref()?, &p).map(|v| match v {
+                Json::Number(n) => n
+                    .as_f64()
+                    .map_or_else(|| Datum::str(n.to_string()), Datum::Num),
+                Json::Null => Datum::Null,
+                other => Datum::Str(json_text(other).into()),
+            })
+        }
+    }
+}
+
+/// `LOAD *`: every field of a HASH, in its order; a JSON document as `$`.
+fn doc_fields(d: &DocRead, on: On) -> Vec<(Box<str>, Datum)> {
+    match on {
+        On::Hash => d
+            .hash
+            .iter()
+            .flatten()
+            .map(|(f, v)| (String::from_utf8_lossy(f).into(), Datum::str(v)))
+            .collect(),
+        On::Json => d
+            .json
+            .iter()
+            .map(|j| ("$".into(), Datum::Str(j.to_string().into_bytes().into())))
+            .collect(),
+    }
+}
+
+/// Reads one document back for [`aggregate_page`]: `Ok(None)` when the
+/// channel's budget is spent.
+pub type DocReader<'a> = dyn FnMut(&[u8]) -> Result<Option<DocRead>, String> + 'a;
+
+/// One `FT.AGGREGATE` reply, or one page of its cursor (ADR-0064): the
+/// rows read back where the plan needs a field the index does not hold,
+/// the pipeline run over them, and the reply, RESP2's shape. With the
+/// cursor to put back when it has pages left. `read` reads one document,
+/// `Ok(None)` when the channel's budget is spent.
+pub fn aggregate_page(p: AggPlan, read: &mut DocReader<'_>, seed: u64) -> (Value, Option<Cursor>) {
+    let AggPlan {
+        plan,
+        on,
+        page,
+        cursor,
+        walked_out,
+    } = p;
+    let reads: Vec<(usize, Box<str>)> = plan
+        .root
+        .iter()
+        .enumerate()
+        .filter_map(|(s, k)| match &k.load {
+            Some(ftagg::Load::Read(path)) => Some((s, path.clone())),
+            _ => None,
+        })
+        .collect();
+    // A document gone since it matched is left out, as RediSearch's loader
+    // drops it.
+    let gone = |d: &DocRead| match on {
+        On::Hash => d.hash.as_ref().is_none_or(|h| h.is_empty()),
+        On::Json => d.json.is_none(),
+    };
+    let mut read_rows = |rows: &mut Vec<Row>, late: bool| -> Result<(), Value> {
+        let mut kept = Vec::with_capacity(rows.len());
+        for mut r in rows.drain(..) {
+            let Some((key, _)) = r.doc.clone() else {
+                kept.push(r);
+                continue;
+            };
+            let d = match read(&key) {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    return Err(err(
+                        "ERR FT.AGGREGATE reads documents back and this page is past the channel's budget: ask for fewer (ADR-0064)",
+                    ));
+                }
+                Err(e) => return Err(err(&format!("COPROCUNAVAIL {e}"))),
+            };
+            if gone(&d) {
+                continue;
+            }
+            for (s, path) in &reads {
+                if late && !plan.late_reads.contains(s) {
+                    continue;
+                }
+                let v = doc_value(&d, on, path);
+                if late {
+                    r.vals[*s] = v;
+                } else {
+                    r.loads[*s] = v;
+                }
+            }
+            if plan.load_all && !late {
+                r.all = doc_fields(&d, on);
+            }
+            kept.push(r);
+        }
+        *rows = kept;
+        Ok(())
+    };
+    let first = matches!(page, Page::Run(_));
+    let (names, mut rows, total) = match page {
+        Page::Run(mut rows) => {
+            if plan.early_reads {
+                if rows.len() > ftagg::MAX_RESULTS {
+                    return (
+                        err(&format!(
+                            "ERR FT.AGGREGATE would read {} documents back, more than {}: narrow the query, or LOAD only what the index holds (ADR-0064)",
+                            rows.len(),
+                            ftagg::MAX_RESULTS
+                        )),
+                        None,
+                    );
+                }
+                if let Err(v) = read_rows(&mut rows, false) {
+                    return (v, None);
+                }
+            }
+            match ftagg::run(&plan, rows, seed) {
+                Ok(ran) => (ran.names, ran.rows, ran.total),
+                Err(e) => return (err(&format!("ERR {e}")), None),
+            }
+        }
+        Page::Ran { names, rows, total } => (names, rows, total),
+    };
+    let Some(mut c) = cursor else {
+        rows.truncate(ftagg::MAX_RESULTS);
+        if !plan.late_reads.is_empty()
+            && let Err(v) = read_rows(&mut rows, true)
+        {
+            return (v, None);
+        }
+        return (ftagg::reply(total, &names, &rows), None);
+    };
+    // A page that fills its COUNT leaves the cursor open, as RediSearch's
+    // does: the read after it is the one that answers id 0.
+    let count = c.count;
+    let (mut page_rows, page_total, done) = match &mut c.state {
+        CursorState::Stream { .. } => {
+            let n = rows.len();
+            (rows, n, walked_out)
+        }
+        CursorState::Rows {
+            names: keep,
+            rows: rest,
+            total: kept_total,
+        } if first => {
+            let take = count.min(rows.len());
+            let head: Vec<Row> = rows.drain(..take).collect();
+            *rest = rows.into();
+            *keep = names.clone();
+            if let Some(t) = kept_total {
+                *t = total;
+            }
+            let done = head.len() < count;
+            (head, total, done)
+        }
+        CursorState::Rows { .. } => {
+            let done = rows.len() < count;
+            (rows, total, done)
+        }
+    };
+    if !plan.late_reads.is_empty()
+        && let Err(v) = read_rows(&mut page_rows, true)
+    {
+        return (v, None);
+    }
+    let id = if done { 0 } else { c.id };
+    let v = Value::Array(Some(vec![
+        ftagg::reply(page_total, &names, &page_rows),
+        Value::Integer(id as i64),
+    ]));
+    (v, (!done).then_some(c))
 }
 
 /// `FT.SEARCH`'s reply, RESP2's shape: the total, then each key, its score
@@ -1368,5 +1889,454 @@ mod tests {
             .position(|v| *v == bulk(b"num_docs"))
             .expect("num_docs");
         assert_eq!(info[at + 1], Value::Integer(1));
+    }
+
+    /// ADR-0064's tests: `FT.AGGREGATE` and its cursors through the plan
+    /// and the page, with a reader that counts what it reads back.
+    mod aggregate {
+        use super::*;
+
+        fn idx() -> Store {
+            let mut s = store();
+            create(
+                &mut s,
+                &[
+                    "FT.CREATE",
+                    "i",
+                    "PREFIX",
+                    "1",
+                    "d:",
+                    "SCHEMA",
+                    "title",
+                    "TEXT",
+                    "SORTABLE",
+                    "n",
+                    "NUMERIC",
+                    "t",
+                    "TAG",
+                ],
+            );
+            for (k, title, n, t) in [
+                ("d:1", "Banana", "3", "x"),
+                ("d:2", "apple", "1", "y"),
+                ("d:3", "Cherry", "2", "x"),
+                ("d:4", "date", "5", "x"),
+            ] {
+                s.ft_reindex(
+                    b"ns",
+                    k.as_bytes(),
+                    &hash(&[
+                        ("title", title.as_bytes().to_vec()),
+                        ("n", n.as_bytes().to_vec()),
+                        ("t", t.as_bytes().to_vec()),
+                        ("extra", format!("e{k}").into_bytes()),
+                    ]),
+                );
+            }
+            s
+        }
+
+        /// One reply or page: planned, read back from `docs`, run; the
+        /// cursor put back as the binary puts it.
+        fn page(s: &Store, parts: &[&str], now: u64, reads: &mut usize) -> Value {
+            match s.plan_ft(b"ns", &a(parts), now) {
+                FtPlan::Aggregate(p) => {
+                    let p = *p;
+                    let mut read = |key: &[u8]| -> Result<Option<DocRead>, String> {
+                        *reads += 1;
+                        let k = String::from_utf8_lossy(key).into_owned();
+                        Ok(Some(hash(&[("extra", format!("e{k}").into_bytes())])))
+                    };
+                    let (v, c) = aggregate_page(p, &mut read, 1);
+                    if let Some(c) = c {
+                        s.ft_cursor_put(c, now);
+                    }
+                    v
+                }
+                FtPlan::Reply(v) => v,
+                _ => panic!("not an aggregate"),
+            }
+        }
+
+        fn b(x: &str) -> Value {
+            Value::Bulk(Some(x.as_bytes().to_vec()))
+        }
+
+        fn row(kv: &[&str]) -> Value {
+            Value::Array(Some(kv.iter().map(|x| b(x)).collect()))
+        }
+
+        fn rows(v: &Value) -> Vec<Value> {
+            let Value::Array(Some(items)) = v else {
+                panic!("an array: {v:?}");
+            };
+            items[1..].to_vec()
+        }
+
+        /// A cursor's page: its rows and its id.
+        fn cursor_page(v: &Value) -> (Vec<Value>, i64) {
+            let Value::Array(Some(pair)) = v else {
+                panic!("a cursor reply: {v:?}");
+            };
+            let Value::Integer(id) = pair[1] else {
+                panic!("an id");
+            };
+            (rows(&pair[0]), id)
+        }
+
+        /// What the index holds answers with no read: the key, a NUMERIC
+        /// value as a number, a SORTABLE TEXT folded where a step reads it.
+        #[test]
+        fn held_values_answer_without_a_read() {
+            let s = idx();
+            let mut reads = 0;
+            let v = page(
+                &s,
+                &["FT.AGGREGATE", "i", "*", "LOAD", "2", "@__key", "@n"],
+                0,
+                &mut reads,
+            );
+            assert_eq!(reads, 0);
+            assert_eq!(
+                v,
+                Value::Array(Some(vec![
+                    Value::Integer(4),
+                    row(&["__key", "d:1", "n", "3"]),
+                    row(&["__key", "d:2", "n", "1"]),
+                    row(&["__key", "d:3", "n", "2"]),
+                    row(&["__key", "d:4", "n", "5"]),
+                ]))
+            );
+            let v = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "@t:{x}",
+                    "SORTBY",
+                    "2",
+                    "@title",
+                    "DESC",
+                    "MAX",
+                    "2",
+                ],
+                0,
+                &mut reads,
+            );
+            assert_eq!(reads, 0);
+            assert_eq!(
+                rows(&v),
+                [row(&["title", "date"]), row(&["title", "cherry"])]
+            );
+            let v = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "*",
+                    "GROUPBY",
+                    "1",
+                    "@t",
+                    "REDUCE",
+                    "COUNT",
+                    "0",
+                    "AS",
+                    "c",
+                    "REDUCE",
+                    "SUM",
+                    "1",
+                    "@n",
+                    "AS",
+                    "s",
+                    "SORTBY",
+                    "2",
+                    "@c",
+                    "DESC",
+                ],
+                0,
+                &mut reads,
+            );
+            assert_eq!(reads, 0);
+            assert_eq!(
+                rows(&v),
+                [
+                    row(&["t", "x", "c", "3", "s", "10"]),
+                    row(&["t", "y", "c", "1", "s", "1"])
+                ]
+            );
+        }
+
+        /// A field outside the schema is read back, for the reply's rows
+        /// only when no step reads it, and for every row first when one
+        /// does.
+        #[test]
+        fn a_field_the_index_does_not_hold_is_read_back() {
+            let s = idx();
+            let mut reads = 0;
+            let v = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "*",
+                    "LOAD",
+                    "1",
+                    "@extra",
+                    "SORTBY",
+                    "2",
+                    "@n",
+                    "DESC",
+                    "MAX",
+                    "1",
+                ],
+                0,
+                &mut reads,
+            );
+            assert_eq!(reads, 1, "the one row in the reply");
+            assert_eq!(rows(&v), [row(&["extra", "ed:4", "n", "5"])]);
+            reads = 0;
+            let v = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "*",
+                    "LOAD",
+                    "1",
+                    "@extra",
+                    "FILTER",
+                    "@extra == 'ed:2'",
+                ],
+                0,
+                &mut reads,
+            );
+            assert_eq!(reads, 4, "every row, before the FILTER");
+            assert_eq!(rows(&v), [row(&["extra", "ed:2"])]);
+        }
+
+        /// redisvl's bulk paging: a cursor walks the index in write order,
+        /// a page at a time; a document written between reads comes on a
+        /// later page; a page that fills COUNT leaves the cursor open, and
+        /// the read after the last answers id 0.
+        #[test]
+        fn a_cursor_walks_the_index_as_it_changes() {
+            let mut s = idx();
+            let mut reads = 0;
+            let first = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "@t:{x}",
+                    "WITHCURSOR",
+                    "COUNT",
+                    "2",
+                    "LOAD",
+                    "1",
+                    "__key",
+                ],
+                0,
+                &mut reads,
+            );
+            let (r, id) = cursor_page(&first);
+            assert_eq!(r, [row(&["__key", "d:1"]), row(&["__key", "d:3"])]);
+            assert!(id > 0);
+            s.ft_reindex(b"ns", b"d:5", &hash(&[("t", b"x".to_vec())]));
+            let read = |s: &Store, reads: &mut usize| {
+                page(s, &["FT.CURSOR", "READ", "i", &id.to_string()], 0, reads)
+            };
+            let (r, id2) = cursor_page(&read(&s, &mut reads));
+            assert_eq!(r, [row(&["__key", "d:4"]), row(&["__key", "d:5"])]);
+            assert_eq!(id2, id, "a full page leaves it open");
+            let (r, id3) = cursor_page(&read(&s, &mut reads));
+            assert!(r.is_empty());
+            assert_eq!(id3, 0);
+            assert_eq!(
+                read(&s, &mut reads),
+                Value::Error(format!("ERR Cursor not found, id: {id}"))
+            );
+            assert_eq!(reads, 0);
+        }
+
+        /// A sorted or grouped cursor computes its rows at the first read
+        /// and pages them; DEL ends it.
+        #[test]
+        fn a_sorted_cursor_pages_what_it_computed() {
+            let s = idx();
+            let mut reads = 0;
+            let first = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "*",
+                    "LOAD",
+                    "1",
+                    "@__key",
+                    "SORTBY",
+                    "2",
+                    "@n",
+                    "ASC",
+                    "MAX",
+                    "3",
+                    "WITHCURSOR",
+                    "COUNT",
+                    "2",
+                ],
+                0,
+                &mut reads,
+            );
+            let (r, id) = cursor_page(&first);
+            assert_eq!(
+                r,
+                [
+                    row(&["__key", "d:2", "n", "1"]),
+                    row(&["__key", "d:3", "n", "2"])
+                ]
+            );
+            let next = page(
+                &s,
+                &["FT.CURSOR", "READ", "i", &id.to_string()],
+                0,
+                &mut reads,
+            );
+            let (r, id2) = cursor_page(&next);
+            assert_eq!(r, [row(&["__key", "d:1", "n", "3"])]);
+            assert_eq!(id2, 0, "fewer than COUNT: the last page");
+            let again = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "*",
+                    "GROUPBY",
+                    "1",
+                    "@t",
+                    "WITHCURSOR",
+                    "COUNT",
+                    "1",
+                ],
+                0,
+                &mut reads,
+            );
+            let (_, id) = cursor_page(&again);
+            assert_eq!(
+                page(
+                    &s,
+                    &["FT.CURSOR", "DEL", "i", &id.to_string()],
+                    0,
+                    &mut reads
+                ),
+                Value::Simple("OK".into())
+            );
+            assert_eq!(
+                page(
+                    &s,
+                    &["FT.CURSOR", "DEL", "i", &id.to_string()],
+                    0,
+                    &mut reads
+                ),
+                Value::Error("ERR Cursor does not exist".into())
+            );
+        }
+
+        /// A cursor is found only in its own namespace, only before it
+        /// idles out, and says so when its index was dropped and made again.
+        #[test]
+        fn a_cursor_is_its_namespace_s_and_its_index_s() {
+            let mut s = idx();
+            let mut reads = 0;
+            let first = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "*",
+                    "WITHCURSOR",
+                    "COUNT",
+                    "1",
+                    "MAXIDLE",
+                    "1000",
+                    "LOAD",
+                    "1",
+                    "@__key",
+                ],
+                0,
+                &mut reads,
+            );
+            let (_, id) = cursor_page(&first);
+            let other = s.plan_ft(
+                b"other",
+                &a(&["FT.CURSOR", "READ", "i", &id.to_string()]),
+                0,
+            );
+            assert!(reply_err(other).contains("no such index"));
+            assert_eq!(
+                page(
+                    &s,
+                    &["FT.CURSOR", "READ", "i", &id.to_string()],
+                    2000,
+                    &mut reads
+                ),
+                Value::Error(format!("ERR Cursor not found, id: {id}")),
+                "idle past MAXIDLE"
+            );
+            let first = page(
+                &s,
+                &[
+                    "FT.AGGREGATE",
+                    "i",
+                    "*",
+                    "WITHCURSOR",
+                    "COUNT",
+                    "1",
+                    "LOAD",
+                    "1",
+                    "@__key",
+                ],
+                0,
+                &mut reads,
+            );
+            let (_, id) = cursor_page(&first);
+            s.ft_drop(b"ns", b"i");
+            create(
+                &mut s,
+                &["FT.CREATE", "i", "PREFIX", "1", "d:", "SCHEMA", "t", "TAG"],
+            );
+            assert_eq!(
+                page(
+                    &s,
+                    &["FT.CURSOR", "READ", "i", &id.to_string()],
+                    0,
+                    &mut reads
+                ),
+                Value::Error("ERR The index was dropped while the cursor was idle".into())
+            );
+        }
+
+        #[test]
+        fn an_index_holds_at_most_128_cursors() {
+            let s = idx();
+            let mut reads = 0;
+            for _ in 0..CURSORS_PER_INDEX {
+                let v = page(
+                    &s,
+                    &["FT.AGGREGATE", "i", "*", "WITHCURSOR", "COUNT", "1"],
+                    0,
+                    &mut reads,
+                );
+                assert!(cursor_page(&v).1 > 0);
+            }
+            assert_eq!(
+                page(
+                    &s,
+                    &["FT.AGGREGATE", "i", "*", "WITHCURSOR", "COUNT", "1"],
+                    0,
+                    &mut reads
+                ),
+                Value::Error("ERR INDEX_CURSOR_LIMIT of 128 has been reached for an index".into())
+            );
+            assert!(s.ft_cursor_bytes(Some(b"ns")) > 0, "charged to the meter");
+        }
     }
 }

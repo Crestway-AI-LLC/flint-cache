@@ -25,6 +25,8 @@
 mod casefold;
 pub mod filter;
 pub mod ft;
+pub mod ftagg;
+pub mod ftexpr;
 pub mod ftindex;
 pub mod ftquery;
 pub mod ftstore;
@@ -1128,6 +1130,10 @@ pub struct Store {
     /// Serve `FT.*`. Off for a bare `Store`; the binary turns it on with
     /// `--ft`, in the release that brings it.
     ft_on: bool,
+    /// `FT.AGGREGATE`'s open cursors (ADR-0064). Behind a lock of their
+    /// own, taken only while the store's is held, so a read can take its
+    /// cursor out while planning under `&self`.
+    ft_cursors: std::sync::Mutex<ftstore::Cursors>,
 }
 
 impl Store {
@@ -1157,7 +1163,7 @@ impl Store {
     /// it is never answered to one.
     pub fn stats(&self) -> StoreStats {
         StoreStats {
-            index_bytes: self.ns_bytes.values().sum(),
+            index_bytes: self.ns_bytes.values().sum::<usize>() + self.ft_cursor_bytes(None),
             index_cap: self.index_cap,
             total_cap: self.total_cap,
             namespaces: self.ns_bytes.values().filter(|&&b| b > 0).count(),
@@ -1277,7 +1283,7 @@ impl Store {
 
     /// Estimated index bytes currently attributed to `ns` (for INFO/metrics).
     pub fn ns_mem_bytes(&self, ns: &[u8]) -> usize {
-        self.ns_bytes.get(ns).copied().unwrap_or(0)
+        self.ns_bytes.get(ns).copied().unwrap_or(0) + self.ft_cursor_bytes(Some(ns))
     }
 
     /// Number of sets held (across all tenants) — for INFO/metrics.
@@ -1669,13 +1675,13 @@ impl Store {
     /// running total: one add per namespace, and nothing to drift.
     fn over_cap(&self, ns: &[u8], new: usize, old: usize) -> Option<Cap> {
         if self.index_cap > 0 {
-            let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
+            let used = self.ns_bytes.get(ns).copied().unwrap_or(0) + self.ft_cursor_bytes(Some(ns));
             if used.saturating_add(new).saturating_sub(old) > self.index_cap {
                 return Some(Cap::Namespace(used));
             }
         }
         if self.total_cap > 0 {
-            let total: usize = self.ns_bytes.values().sum();
+            let total: usize = self.ns_bytes.values().sum::<usize>() + self.ft_cursor_bytes(None);
             if total.saturating_add(new).saturating_sub(old) > self.total_cap {
                 return Some(Cap::Server);
             }

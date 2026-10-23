@@ -794,10 +794,54 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
             }
         }
     }
-    let query = text(query)?;
+    let q = parse_query(text(query)?, def, &params)?;
+    s.query = q.query;
+    s.filter = q.filter;
+    s.knn = q.knn;
+    if s.withscores && s.knn.is_some() {
+        return Err(
+            "FT.SEARCH WITHSCORES with a KNN or a vector range is not supported (ADR-0063)".into(),
+        );
+    }
+    if let Some((by, _)) = &s.sortby {
+        let by_distance = s.knn.as_ref().is_some_and(|k| k.alias == *by);
+        let by_attr = def.attrs.iter().any(|a| {
+            *a.field.name == **by
+                && matches!(
+                    a.field.kind,
+                    FieldKind::Numeric | FieldKind::Tag | FieldKind::FoldedTag | FieldKind::Text
+                )
+        });
+        if !by_distance && !by_attr {
+            return Err(format!(
+                "FT.SEARCH SORTBY {by}: sorts by the KNN distance or a NUMERIC, TAG or TEXT field \
+                 only (ADR-0063)"
+            ));
+        }
+    }
+    Ok(s)
+}
+
+/// What a query string asks of an index (ADR-0059, ADR-0061, ADR-0063): its
+/// query, the same as ADR-0059's filter when it has no text term, and its
+/// KNN or vector range.
+#[derive(Debug, PartialEq)]
+pub struct QueryPart {
+    pub query: Option<QNode>,
+    pub filter: Option<Expr>,
+    pub knn: Option<Knn>,
+}
+
+/// The query string of an `FT.SEARCH` or `FT.AGGREGATE`, with its `PARAMS`,
+/// against the index `def`.
+pub fn parse_query(
+    query: &str,
+    def: &IndexDef,
+    params: &HashMap<String, Vec<u8>>,
+) -> Result<QueryPart, String> {
     // ADR-0061: a vector range term comes out of the query before the rest
     // is read as a filter.
-    let (rest, range) = take_range(query, def, &params)?;
+    let (rest, range) = take_range(query, def, params)?;
     let query = rest.as_str();
     // The KNN clause is the last `=>[`: a `=>{...}` is a term's attributes.
     let (filter_part, knn_part) = match query.rfind("=>[") {
@@ -830,42 +874,22 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
     if !noindex.is_empty() {
         q = q.map(|q| q.unindexed(&noindex));
     }
-    s.filter = q
+    let filter = q
         .as_ref()
         .and_then(QNode::as_filter)
         .filter(|e| *e != Expr::All);
-    s.query = q;
+    let mut knn = range;
     if let Some(k) = knn_part {
-        if range.is_some() {
+        if knn.is_some() {
             return Err("a vector range query cannot also be a KNN (ADR-0061)".into());
         }
-        s.knn = Some(parse_knn(k, def, &params)?);
+        knn = Some(parse_knn(k, def, params)?);
     }
-    if range.is_some() {
-        s.knn = range;
-    }
-    if s.withscores && s.knn.is_some() {
-        return Err(
-            "FT.SEARCH WITHSCORES with a KNN or a vector range is not supported (ADR-0063)".into(),
-        );
-    }
-    if let Some((by, _)) = &s.sortby {
-        let by_distance = s.knn.as_ref().is_some_and(|k| k.alias == *by);
-        let by_attr = def.attrs.iter().any(|a| {
-            *a.field.name == **by
-                && matches!(
-                    a.field.kind,
-                    FieldKind::Numeric | FieldKind::Tag | FieldKind::FoldedTag | FieldKind::Text
-                )
-        });
-        if !by_distance && !by_attr {
-            return Err(format!(
-                "FT.SEARCH SORTBY {by}: sorts by the KNN distance or a NUMERIC, TAG or TEXT field \
-                 only (ADR-0063)"
-            ));
-        }
-    }
-    Ok(s)
+    Ok(QueryPart {
+        query: q,
+        filter,
+        knn,
+    })
 }
 
 /// The query without its vector range term, `@<field>:[VECTOR_RANGE
@@ -1619,9 +1643,7 @@ mod tests {
         assert_eq!((s.scorer, s.withscores), (Scorer::Tfidf, true));
         let s = parse_search(&a(&["FT.SEARCH", "idx", "hello"]), &def).expect("parses");
         assert_eq!(s.scorer, Scorer::Bm25Std);
-        assert!(
-            refused(a(&["FT.SEARCH", "idx", "*", "SORTBY", "nosuch"])).contains("TAG or TEXT")
-        );
+        assert!(refused(a(&["FT.SEARCH", "idx", "*", "SORTBY", "nosuch"])).contains("TAG or TEXT"));
         let (_, noidx) = parse_create(&a(&[
             "FT.CREATE",
             "n",

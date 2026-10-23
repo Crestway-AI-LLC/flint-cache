@@ -58,7 +58,7 @@ for _ in $(seq 1 60); do case "$(valkey-cli -p 6542 PING 2>&1)" in *NOAUTH*|PONG
 # script below against the proxy (and the nodes, directly, as a channel-less
 # writer would reach them).
 step() {
-  python3 - "$1" <<'PY'
+  python3 - "$1" "$D" <<'PY'
 import socket, struct, sys, time
 
 def conn(port, auth=None, ns=None):
@@ -92,7 +92,21 @@ def read(f):
     if t == b"*":
         n = int(rest)
         return None if n < 0 else [read(f) for _ in range(n)]
+    # RESP3, for a connection that said HELLO 3: a map as its pairs in order.
+    if t == b"%":
+        return Map([(read(f), read(f)) for _ in range(int(rest))])
+    if t == b",":
+        return float(rest)
+    if t == b"_":
+        return None
     raise SystemExit("FAIL: bad reply %r" % line)
+
+class Map(list):
+    def get(self, k):
+        for a, b in self:
+            if a == k:
+                return b
+        return None
 
 class Err(str):
     pass
@@ -450,6 +464,93 @@ if which in ("text", "textsame"):
         want(cmd(px, "FT.DROPINDEX", "tx", "DD"), "OK", "FT.DROPINDEX tx DD")
     print("  full text: BM25STD scores as its formula gives them, a TextQuery, a prefix, a stop-word phrase, SORTBY a TEXT field")
 
+if which in ("agg", "aggsame"):
+    # ADR-0064: FT.AGGREGATE and FT.CURSOR through the proxy, in the shapes
+    # redisvl sends: bulk paging, its semantic router, its hybrid query.
+    # Its keys are under ag:, which no other section's index covers: under g:,
+    # the GEO section's index took them in, and its negated radius matched
+    # them.
+    import os
+    saved = os.path.join(sys.argv[2], "agg-cursor")
+    pts = {"ag:1": ("greeting", (0.0, 0.1)), "ag:2": ("greeting", (1.0, 1.0)),
+           "ag:3": ("farewell", (0.3, 0.0)), "ag:4": ("farewell", (2.0, 2.0)),
+           "ag:5": ("greeting", (0.05, 0.0)), "ag:6": ("other", (5.0, 5.0))}
+    if which == "agg":
+        want(cmd(px, "FT.CREATE", "ag", "ON", "HASH", "PREFIX", "1", "ag:", "SCHEMA", "route", "TAG",
+                 "n", "NUMERIC", "SORTABLE", "title", "TEXT", "v", "VECTOR", "FLAT", "6", "TYPE",
+                 "FLOAT32", "DIM", "2", "DISTANCE_METRIC", "L2"), "OK", "FT.CREATE ag")
+        for i, (k, (route, xy)) in enumerate(pts.items()):
+            want(cmd(px, "HSET", k, "route", route, "n", i, "title", "hello " + route, "v", vec(*xy),
+                     "extra", "x" + k), 5, "HSET " + k)
+    # redisvl's update_by_filter: a cursor through a filter's matches.
+    r = cmd(px, "FT.AGGREGATE", "ag", "@route:{greeting}", "SCORER", "TFIDF", "WITHCURSOR", "COUNT",
+            "2", "MAXIDLE", "300000", "LOAD", "1", "__key", "DIALECT", "2")
+    got, pages = [], 0
+    while True:
+        if isinstance(r, Err):
+            raise SystemExit("FAIL: %s: a cursor read: %s" % (which, r))
+        page, cid = r
+        got += [row[1].decode() for row in page[1:]]
+        pages += 1
+        if cid == 0:
+            break
+        r = cmd(px, "FT.CURSOR", "READ", "ag", cid)
+    want((sorted(got), pages), (["ag:1", "ag:2", "ag:5"], 2), which + ": a cursor pages a filter's matches")
+    # redisvl's semantic router: the nearest reference per route, sorted,
+    # MAX 1, then each route's threshold. Squared L2, as RediSearch's.
+    router = ["FT.AGGREGATE", "ag", "@v:[VECTOR_RANGE $r $vec]=>{$YIELD_DISTANCE_AS: vector_distance}",
+              "SCORER", "TFIDF", "DIALECT", "2", "GROUPBY", "1", "@route", "REDUCE", "MIN", "1",
+              "vector_distance", "AS", "distance", "SORTBY", "1", "@distance", "MAX", "1", "FILTER",
+              "(@route == 'greeting' && @distance < 0.3) || (@route == 'farewell' && @distance < 0.5)",
+              "PARAMS", "4", "r", "1", "vec", vec(0.0, 0.0)]
+    r = cmd(px, *router)
+    want(len(r), 2, which + ": the router matches one route")
+    row = r[1]
+    want(row[:3], [b"route", b"greeting", b"distance"], which + ": the router's row")
+    if abs(float(row[3]) - 0.0025) > 1e-6:
+        raise SystemExit("FAIL: %s: the nearest greeting is 0.0025 away, got %r" % (which, row[3]))
+    if which == "agg":
+        # redisvl's AggregateHybridQuery: text and vector scores combined;
+        # `extra` is outside the schema, so it is read back.
+        r = cmd(px, "FT.AGGREGATE", "ag", "(~@title:(hello))=>[KNN 3 @v $vec AS vector_distance]",
+                "SCORER", "BM25STD", "ADDSCORES", "LOAD", "2", "route", "extra", "DIALECT", "2",
+                "APPLY", "(2 - @vector_distance)/2", "AS", "vector_similarity", "APPLY", "@__score",
+                "AS", "text_score", "APPLY", "0.3*@text_score + 0.7*@vector_similarity", "AS",
+                "hybrid_score", "SORTBY", "2", "@hybrid_score", "DESC", "MAX", "3",
+                "PARAMS", "2", "vec", vec(0.0, 0.0))
+        want(r[0], 3, "agg: the hybrid query's KNN 3")
+        names = [b"vector_distance", b"__score", b"route", b"extra", b"vector_similarity",
+                 b"text_score", b"hybrid_score"]
+        scores = []
+        for row in r[1:]:
+            want(row[0::2], names, "agg: a hybrid row's names, in the order they were made")
+            d = dict(zip(row[0::2], row[1::2]))
+            want(d[b"extra"][:4], b"xag:", "agg: a field outside the schema, read back")
+            h = 0.3 * float(d[b"text_score"]) + 0.7 * float(d[b"vector_similarity"])
+            if abs(h - float(d[b"hybrid_score"])) > 1e-9:
+                raise SystemExit("FAIL: agg: hybrid_score %r, its APPLY gives %r" % (d[b"hybrid_score"], h))
+            scores.append(h)
+        want(scores, sorted(scores, reverse=True), "agg: highest hybrid_score first")
+        # RESP3: RediSearch's map, a row's fields under extra_attributes.
+        c3 = conn(6542, auth="tok")
+        raw(c3, "HELLO", "3")
+        m = cmd(c3, "FT.AGGREGATE", "ag", "@route:{farewell}", "LOAD", "1", "__key")
+        want([k for k, _ in m], ["attributes", "format", "results", "total_results", "warning"],
+             "agg: RESP3's map")
+        want(m.get("total_results"), 2, "agg: RESP3's total")
+        want(sorted(x.get("extra_attributes").get(b"__key") for x in m.get("results")),
+             [b"ag:3", b"ag:4"], "agg: RESP3's rows")
+        # A cursor left open over the restart.
+        page, cid = cmd(px, "FT.AGGREGATE", "ag", "*", "WITHCURSOR", "COUNT", "1", "LOAD", "1", "__key")
+        open(saved, "w").write(str(cid))
+        print("  FT.AGGREGATE: redisvl's bulk paging, router and hybrid query, RESP3's map, a field read back")
+    else:
+        cid = int(open(saved).read())
+        refused(cmd(px, "FT.CURSOR", "READ", "ag", cid), "ERR Cursor not found, id: %d" % cid,
+                "aggsame: a cursor does not outlive its co-processor")
+        want(cmd(px, "FT.DROPINDEX", "ag", "DD"), "OK", "FT.DROPINDEX ag DD")
+        print("  FT.AGGREGATE: the same router answer, rebuilt; a cursor from before the restart is not found")
+
 if which == "off":
     refused(cmd(px, "FT.CREATE", "z", "PREFIX", "1", "z:", "SCHEMA", "a", "TAG"),
             "ERR FT.* is not enabled", "FT.CREATE without --ft")
@@ -474,6 +575,8 @@ echo "== BUG-0271: a backfill over a covered prefix keeps write order"
 step fillorder || exit 1
 echo "== ADR-0063: full text, scored"
 step text || exit 1
+echo "== ADR-0064: FT.AGGREGATE and FT.CURSOR"
+step agg || exit 1
 
 echo "== a co-processor restart rebuilds every index and registers its prefixes again"
 kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
@@ -486,6 +589,8 @@ echo "== ADR-0062: the same GEO answers, rebuilt; then the GEO indexes are dropp
 step geosame || exit 1
 echo "== ADR-0063: the same scores, rebuilt; then the text index is dropped"
 step textsame || exit 1
+echo "== ADR-0064: the same aggregate, rebuilt; a cursor from before the restart is gone"
+step aggsame || exit 1
 grep -q "FT\.\* on" "$D/vec.log" || { echo "FAIL: flint-vec did not say FT.* is on"; exit 1; }
 
 echo "== FT.DROPINDEX takes the prefixes off every pair"
@@ -499,4 +604,4 @@ kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec
 step off || exit 1
 
-echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), and --ft gates it (ADR-0060, amendment 3)"
+echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), FT.AGGREGATE answers redisvl's paging, router and hybrid query and its cursors end with their co-processor (ADR-0064), and --ft gates it (ADR-0060, amendment 3)"

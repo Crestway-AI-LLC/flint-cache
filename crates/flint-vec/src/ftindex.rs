@@ -6,7 +6,9 @@
 //! to choose them, and is rebuilt from those keys.
 
 use crate::filter::{self, Field, FieldKind, Val, Vals};
-use crate::ft::{IndexDef, On, Search, VectorField, distance, vector_from_bytes};
+use crate::ft::{IndexDef, Knn, On, QueryPart, Search, VectorField, distance, vector_from_bytes};
+use crate::ftagg::{Load, Plan, Row};
+use crate::ftexpr::Datum;
 use crate::ftquery::{self, Docs};
 use crate::fulltext::{self, DocId, StopWords, TextField, TextIndex};
 use crate::{Quant, VectorSet, hnsw};
@@ -136,6 +138,22 @@ pub struct FtIndex {
     tag_bytes: usize,
     /// How each attribute's sort value is made.
     sort_rules: Box<[SortRule]>,
+    /// Which index of the co-processor's life this is: an index dropped and
+    /// made again under its name is another, as a cursor finds (ADR-0064).
+    generation: u64,
+}
+
+/// The next index's [`FtIndex::generation`].
+static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One document an `FT.AGGREGATE` query matched (ADR-0064): its key and
+/// write order, its distance under a KNN or range, its score.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggHit {
+    pub key: Vec<u8>,
+    pub seq: u64,
+    pub dist: Option<f32>,
+    pub score: f64,
 }
 
 /// Keys with their distance from a KNN's vector, nearest first.
@@ -217,6 +235,7 @@ impl FtIndex {
             tags,
             tag_bytes: 0,
             sort_rules,
+            generation: GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -489,9 +508,8 @@ impl FtIndex {
         let view = View { ix: self, now };
         let matches =
             || ftquery::matches(s.query.as_ref(), &self.text, &view, self.nostem, s.scorer);
-        let mut hits: Vec<(Vec<u8>, Option<f32>, f64)> = match (&s.knn, &self.set, &self.def.vector)
-        {
-            (Some(knn), Some(set), Some(v)) => {
+        let mut hits: Vec<(Vec<u8>, Option<f32>, f64)> = match &s.knn {
+            Some(knn) => {
                 // A query with a text term is matched first, from the
                 // postings; the KNN then searches among its matches.
                 let allowed: Option<HashSet<&[u8]>> = s.has_text().then(|| {
@@ -500,53 +518,19 @@ impl FtIndex {
                         .filter_map(|(id, _)| self.by_seq.get(id).map(Vec::as_slice))
                         .collect()
                 });
-                let expired = set.expired_count(now);
-                let ef = knn.ef.or(v.ef_runtime).unwrap_or(hnsw::EF_SEARCH_DEFAULT);
-                // The `k` nearest live matches, nearest first, a tie to the
-                // earlier write.
-                let nearest = |k: usize| -> Result<Ranked, String> {
-                    let ask = k.saturating_add(expired).saturating_add(TIE_SLACK);
-                    let found = match &allowed {
-                        Some(a) => set.search_among(&knn.vector, ask, ef, ask, a)?,
-                        None => set.search(&knn.vector, ask, ef, ask, s.filter.as_ref(), None)?,
-                    };
-                    let mut near: Ranked = found
-                        .into_iter()
-                        .filter(|(id, _)| !set.is_expired(id, now))
-                        .map(|(id, score)| (id, Some(distance(v.metric, score))))
-                        .collect();
-                    near.sort_by(|a, b| {
-                        a.1.partial_cmp(&b.1)
-                            .unwrap_or(Ordering::Equal)
-                            .then_with(|| self.seq(&a.0).cmp(&self.seq(&b.0)))
-                    });
-                    near.truncate(k);
-                    Ok(near)
-                };
+                let filter = s.filter.as_ref();
                 let near = match knn.range {
-                    None => nearest(knn.k)?,
-                    // ADR-0061 C: a range is a KNN cut at its radius. It is
-                    // asked for the page's end, then for twice as many
-                    // until its farthest is past the radius, every vector is
-                    // in, or the ceiling is reached; the total is what lies
-                    // within it.
+                    None => self.nearest(knn, filter, allowed.as_ref(), knn.k, now)?,
+                    // ADR-0061 C: a range is a KNN cut at its radius, asked
+                    // for the page's end first.
                     Some(radius) => {
-                        let mut k = s.offset.saturating_add(s.num).clamp(1, RANGE_CAP);
-                        loop {
-                            let mut near = nearest(k)?;
-                            let got = near.len();
-                            near.retain(|(_, d)| d.is_some_and(|d| d <= radius));
-                            if near.len() < got || got < k || k >= RANGE_CAP {
-                                break near;
-                            }
-                            k = k.saturating_mul(2).min(RANGE_CAP);
-                        }
+                        let want = s.offset.saturating_add(s.num);
+                        self.within(knn, filter, allowed.as_ref(), radius, want, now)?
                     }
                 };
                 near.into_iter().map(|(k, d)| (k, d, 0.0)).collect()
             }
-            (Some(_), _, _) => return Err("this index has no VECTOR field".into()),
-            (None, _, _) => {
+            None => {
                 let mut m = matches();
                 // Highest score first, a tie to the earlier write, as
                 // RediSearch's sorter orders a search with no SORTBY;
@@ -587,6 +571,178 @@ impl FtIndex {
         })
     }
 
+    /// The `k` nearest live documents to `knn`'s vector, nearest first, a
+    /// tie to the earlier write: among `allowed` when the query has a text
+    /// term, else among `filter`'s matches.
+    fn nearest(
+        &self,
+        knn: &Knn,
+        filter: Option<&filter::Expr>,
+        allowed: Option<&HashSet<&[u8]>>,
+        k: usize,
+        now: u64,
+    ) -> Result<Ranked, String> {
+        let (Some(set), Some(v)) = (&self.set, &self.def.vector) else {
+            return Err("this index has no VECTOR field".into());
+        };
+        let expired = set.expired_count(now);
+        let ef = knn.ef.or(v.ef_runtime).unwrap_or(hnsw::EF_SEARCH_DEFAULT);
+        let ask = k.saturating_add(expired).saturating_add(TIE_SLACK);
+        let found = match allowed {
+            Some(a) => set.search_among(&knn.vector, ask, ef, ask, a)?,
+            None => set.search(&knn.vector, ask, ef, ask, filter, None)?,
+        };
+        let mut near: Ranked = found
+            .into_iter()
+            .filter(|(id, _)| !set.is_expired(id, now))
+            .map(|(id, score)| (id, Some(distance(v.metric, score))))
+            .collect();
+        near.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| self.seq(&a.0).cmp(&self.seq(&b.0)))
+        });
+        near.truncate(k);
+        Ok(near)
+    }
+
+    /// Every live document within `radius` of `knn`'s vector, nearest
+    /// first, up to [`RANGE_CAP`] (ADR-0061 C): asked for `want` first, then
+    /// for twice as many until the farthest is past the radius, every vector
+    /// is in, or the ceiling is reached.
+    fn within(
+        &self,
+        knn: &Knn,
+        filter: Option<&filter::Expr>,
+        allowed: Option<&HashSet<&[u8]>>,
+        radius: f32,
+        want: usize,
+        now: u64,
+    ) -> Result<Ranked, String> {
+        let mut k = want.clamp(1, RANGE_CAP);
+        loop {
+            let mut near = self.nearest(knn, filter, allowed, k, now)?;
+            let got = near.len();
+            near.retain(|(_, d)| d.is_some_and(|d| d <= radius));
+            if near.len() < got || got < k || k >= RANGE_CAP {
+                return Ok(near);
+            }
+            k = k.saturating_mul(2).min(RANGE_CAP);
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// What `q` matches for `FT.AGGREGATE`, in RediSearch's order: a KNN's
+    /// nearest first; a vector range's, and every other query's, in write
+    /// order, as its iterators walk document ids. Each with its score under
+    /// `scorer` when `scores` (`ADDSCORES`): a text or TAG term's, 0 for a
+    /// vector alone.
+    pub fn agg_matches(
+        &self,
+        q: &QueryPart,
+        scorer: ftquery::Scorer,
+        scores: bool,
+        now: u64,
+    ) -> Result<Vec<AggHit>, String> {
+        let view = View { ix: self, now };
+        let all = q
+            .query
+            .as_ref()
+            .is_some_and(|n| n.as_filter() == Some(filter::Expr::All));
+        let has_text = q.query.as_ref().is_none_or(|n| n.as_filter().is_none());
+        let matched = || ftquery::matches(q.query.as_ref(), &self.text, &view, self.nostem, scorer);
+        let hit = |key: Vec<u8>, dist: Option<f32>, score: f64| AggHit {
+            seq: self.seq(&key),
+            key,
+            dist,
+            score,
+        };
+        let Some(knn) = &q.knn else {
+            let mut m = matched();
+            m.sort_by_key(|(id, _)| *id);
+            return Ok(m
+                .into_iter()
+                .filter_map(|(id, sc)| Some(hit(self.by_seq.get(&id)?.clone(), None, sc)))
+                .collect());
+        };
+        let m = if has_text || (scores && !all) {
+            matched()
+        } else {
+            Vec::new()
+        };
+        let score_of: HashMap<&[u8], f64> = m
+            .iter()
+            .filter_map(|(id, sc)| Some((self.by_seq.get(id)?.as_slice(), *sc)))
+            .collect();
+        let allowed: Option<HashSet<&[u8]>> = has_text.then(|| score_of.keys().copied().collect());
+        let filter = q.filter.as_ref();
+        let near = match knn.range {
+            None => self.nearest(knn, filter, allowed.as_ref(), knn.k, now)?,
+            Some(radius) => {
+                let mut r = self.within(knn, filter, allowed.as_ref(), radius, RANGE_CAP, now)?;
+                r.sort_by_key(|(k, _)| self.seq(k));
+                r
+            }
+        };
+        Ok(near
+            .into_iter()
+            .map(|(k, d)| {
+                let sc = if scores {
+                    score_of.get(k.as_slice()).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                hit(k, d, sc)
+            })
+            .collect())
+    }
+
+    /// What the index holds of attribute `at` for `d`: a NUMERIC value, or
+    /// a TEXT or TAG value as amendment 1 keeps it, as written or folded.
+    fn held_value(&self, d: &Doc, at: usize) -> Option<Datum> {
+        match self.fields.get(at)?.kind {
+            FieldKind::Numeric => match d.vals.as_ref()?.get(at)? {
+                Val::Num(x) => Some(Datum::Num(*x)),
+                _ => None,
+            },
+            FieldKind::Text | FieldKind::Tag | FieldKind::FoldedTag => d
+                .sorts
+                .as_ref()?
+                .get(at)?
+                .as_ref()
+                .map(|b| Datum::Str(b.clone())),
+            FieldKind::Geo => None,
+        }
+    }
+
+    /// `hit`'s first row for `plan`: its distance and score, and what the
+    /// index holds of each name the plan reads from it. A field the index
+    /// does not hold is left for the caller to read.
+    pub fn agg_row(&self, plan: &Plan, hit: &AggHit) -> Row {
+        let mut r = Row::root(plan, &hit.key, hit.seq);
+        if let (Some(s), Some(d)) = (plan.metric, hit.dist) {
+            r.vals[s] = Some(Datum::Num(f64::from(d)));
+        }
+        if let Some(s) = plan.score {
+            r.vals[s] = Some(Datum::Num(hit.score));
+        }
+        let doc = self.docs.get(&hit.key);
+        for (s, k) in plan.root.iter().enumerate() {
+            if let (Some(at), Some(d)) = (k.sv, doc) {
+                r.sv[s] = self.held_value(d, at);
+            }
+            match (&k.load, doc) {
+                (Some(Load::Key), _) => r.loads[s] = Some(Datum::str(&hit.key)),
+                (Some(Load::Held(at)), Some(d)) => r.loads[s] = self.held_value(d, *at),
+                _ => {}
+            }
+        }
+        r
+    }
+
     /// The index's score for a document that gives none.
     fn default_score(&self) -> f32 {
         self.def.score as f32
@@ -624,7 +780,10 @@ impl FtIndex {
             .collect();
         let sorts = self.sorts(
             &mut bad,
-            self.def.attrs.iter().map(|a| get(&a.path).map(<[u8]>::to_vec)),
+            self.def
+                .attrs
+                .iter()
+                .map(|a| get(&a.path).map(<[u8]>::to_vec)),
         );
         // A score that is not a number is the default, as RediSearch's
         // `SchemaRule_HashScore` takes it.
@@ -2073,24 +2232,46 @@ mod tests {
     fn a_text_field_sorts_by_its_value() {
         for (flags, want) in [
             (&["SORTABLE"][..], ["doc:apple", "doc:banana", "doc:zebra"]),
-            (&["SORTABLE", "UNF"][..], ["doc:banana", "doc:zebra", "doc:apple"]),
+            (
+                &["SORTABLE", "UNF"][..],
+                ["doc:banana", "doc:zebra", "doc:apple"],
+            ),
             (&[][..], ["doc:banana", "doc:zebra", "doc:apple"]),
-            (&["NOINDEX", "SORTABLE"][..], ["doc:apple", "doc:banana", "doc:zebra"]),
+            (
+                &["NOINDEX", "SORTABLE"][..],
+                ["doc:apple", "doc:banana", "doc:zebra"],
+            ),
         ] {
             let mut schema = vec!["SCHEMA", "title", "TEXT"];
             schema.extend_from_slice(flags);
             schema.extend_from_slice(&["body", "TEXT"]);
             let mut ix = index_of(&schema);
-            for (k, t) in [("doc:zebra", "ZEBRA"), ("doc:apple", "apple"), ("doc:banana", "Banana")] {
+            for (k, t) in [
+                ("doc:zebra", "ZEBRA"),
+                ("doc:apple", "apple"),
+                ("doc:banana", "Banana"),
+            ] {
                 put(&mut ix, k, &[("title", t.as_bytes()), ("body", b"fruit")]);
             }
             put(&mut ix, "doc:none", &[("body", b"fruit")]);
             let mut asc = sorted(&ix, "*", "title", "ASC");
-            assert_eq!(asc.pop().as_deref(), Some("doc:none"), "{flags:?}: missing last");
+            assert_eq!(
+                asc.pop().as_deref(),
+                Some("doc:none"),
+                "{flags:?}: missing last"
+            );
             assert_eq!(asc, want, "{flags:?}");
             let mut desc = sorted(&ix, "fruit", "title", "DESC");
-            assert_eq!(desc.pop().as_deref(), Some("doc:none"), "{flags:?}: missing last");
-            assert_eq!(desc, want.iter().rev().copied().collect::<Vec<_>>(), "{flags:?}");
+            assert_eq!(
+                desc.pop().as_deref(),
+                Some("doc:none"),
+                "{flags:?}: missing last"
+            );
+            assert_eq!(
+                desc,
+                want.iter().rev().copied().collect::<Vec<_>>(),
+                "{flags:?}"
+            );
         }
     }
 
@@ -2098,17 +2279,35 @@ mod tests {
     /// not by its first tag.
     #[test]
     fn a_tag_field_sorts_by_its_whole_value() {
-        let mut ix = index_of(&["SCHEMA", "t", "TAG", "SORTABLE", "u", "TAG", "v", "TAG", "SORTABLE", "UNF"]);
-        put(&mut ix, "doc:1", &[("t", b"b,a"), ("u", b"Bob"), ("v", b"Bob")]);
-        put(&mut ix, "doc:2", &[("t", b"a,c"), ("u", b"alice"), ("v", b"alice")]);
+        let mut ix = index_of(&[
+            "SCHEMA", "t", "TAG", "SORTABLE", "u", "TAG", "v", "TAG", "SORTABLE", "UNF",
+        ]);
+        put(
+            &mut ix,
+            "doc:1",
+            &[("t", b"b,a"), ("u", b"Bob"), ("v", b"Bob")],
+        );
+        put(
+            &mut ix,
+            "doc:2",
+            &[("t", b"a,c"), ("u", b"alice"), ("v", b"alice")],
+        );
         put(&mut ix, "doc:3", &[("t", b"B,z")]);
         // "a,c" < "b,a" < "b,z": the whole value, folded for a SORTABLE tag.
         assert_eq!(sorted(&ix, "*", "t", "ASC"), ["doc:2", "doc:1", "doc:3"]);
         assert_eq!(sorted(&ix, "*", "t", "DESC"), ["doc:3", "doc:1", "doc:2"]);
         // Not SORTABLE, or UNF: as written, so "Bob" (B is 66) before "alice".
         for f in ["u", "v"] {
-            assert_eq!(sorted(&ix, "*", f, "ASC"), ["doc:1", "doc:2", "doc:3"], "{f}");
-            assert_eq!(sorted(&ix, "*", f, "DESC"), ["doc:2", "doc:1", "doc:3"], "{f}");
+            assert_eq!(
+                sorted(&ix, "*", f, "ASC"),
+                ["doc:1", "doc:2", "doc:3"],
+                "{f}"
+            );
+            assert_eq!(
+                sorted(&ix, "*", f, "DESC"),
+                ["doc:2", "doc:1", "doc:3"],
+                "{f}"
+            );
         }
     }
 
@@ -2118,8 +2317,19 @@ mod tests {
     #[test]
     fn a_json_array_sorts_by_its_first_element() {
         let (_, def) = parse_create(&a(&[
-            "FT.CREATE", "idx", "ON", "JSON", "PREFIX", "1", "doc:", "SCHEMA", "$.t", "AS", "t",
-            "TAG", "SORTABLE",
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "$.t",
+            "AS",
+            "t",
+            "TAG",
+            "SORTABLE",
         ]))
         .expect("parses");
         let mut ix = FtIndex::new(def);
@@ -2131,11 +2341,18 @@ mod tests {
             ("doc:4", r#"["c"]"#),
         ] {
             let d: Value = serde_json::from_str(&format!(r#"{{"t":{t}}}"#)).expect("json");
-            ix.put(k.as_bytes(), Source::Json(&d), None).expect("indexed");
+            ix.put(k.as_bytes(), Source::Json(&d), None)
+                .expect("indexed");
         }
         // "b" < "bz" (folded from "Bz") < "c", and the empty array last.
-        assert_eq!(sorted(&ix, "*", "t", "ASC"), ["doc:1", "doc:2", "doc:4", "doc:3"]);
-        assert_eq!(sorted(&ix, "*", "t", "DESC"), ["doc:4", "doc:2", "doc:1", "doc:3"]);
+        assert_eq!(
+            sorted(&ix, "*", "t", "ASC"),
+            ["doc:1", "doc:2", "doc:4", "doc:3"]
+        );
+        assert_eq!(
+            sorted(&ix, "*", "t", "DESC"),
+            ["doc:4", "doc:2", "doc:1", "doc:3"]
+        );
     }
 
     /// A SORTABLE field folds its value, which one that is not UTF-8 cannot

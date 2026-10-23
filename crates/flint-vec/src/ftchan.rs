@@ -15,8 +15,8 @@ use flint_resp::Value;
 use flint_vec::Store;
 use flint_vec::ft::IndexDef;
 use flint_vec::ftstore::{
-    self, DocRead, FtPlan, Reads, SearchPlan, WritePlan, ft_alias_list_key, ft_backfill_key,
-    ft_def_key, ft_docs_key, ft_list_key,
+    self, AggPlan, DocRead, FtPlan, Reads, SearchPlan, WritePlan, ft_alias_list_key,
+    ft_backfill_key, ft_def_key, ft_docs_key, ft_list_key,
 };
 use flint_vec::{INDEX_BUCKETS, bucket_of};
 use std::collections::HashMap;
@@ -375,8 +375,38 @@ pub(crate) fn handle(
             Value::Simple("OK".into())
         }
         FtPlan::Search(plan) => search(&plan, g),
+        FtPlan::Aggregate(plan) => aggregate(*plan, store, g),
         FtPlan::Write(plan) => write(ns, &plan, store, g),
     }
+}
+
+/// `FT.AGGREGATE` and `FT.CURSOR READ` (ADR-0064): the channel opened only
+/// for a field the index does not hold, then the cursor back in the table
+/// if it has pages left.
+fn aggregate(plan: AggPlan, store: &Arc<Mutex<Store>>, g: &mut Grant<'_>) -> Value {
+    let reads = match plan.on {
+        flint_vec::ft::On::Hash => (true, false),
+        flint_vec::ft::On::Json => (false, true),
+    };
+    let mut ch: Option<flint_tls::Stream> = None;
+    let mut read = |key: &[u8]| -> Result<Option<DocRead>, String> {
+        let c = match ch.as_mut() {
+            Some(c) => c,
+            None => {
+                let opened = g.open().map_err(|v| match v {
+                    Value::Error(e) => e,
+                    _ => "the channel did not open".to_string(),
+                })?;
+                ch.insert(opened)
+            }
+        };
+        read_doc(c, key, reads, false)
+    };
+    let (reply, cursor) = ftstore::aggregate_page(plan, &mut read, now_ms());
+    if let Some(c) = cursor {
+        store.lock().expect("store lock").ft_cursor_put(c, now_ms());
+    }
+    reply
 }
 
 /// `FT.SEARCH`: read each hit back for the reply.

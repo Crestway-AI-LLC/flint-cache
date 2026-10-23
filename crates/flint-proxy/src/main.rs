@@ -3850,17 +3850,46 @@ const FT_PAGE_MAX: u64 = 10_000;
 /// (ADR-0060 amendment 3, part 1).
 fn family_grant(topo: &Topology, args: &[Vec<u8>]) -> (u64, Duration) {
     let base = (topo.family_budget, topo.family_deadline);
-    if !args
-        .first()
-        .is_some_and(|n| n.eq_ignore_ascii_case(b"FT.SEARCH"))
-    {
-        return base;
-    }
-    let budget = topo
-        .family_budget
-        .max(ft_search_page(args).min(FT_PAGE_MAX) + 16);
+    let name = args.first().map(|n| n.to_ascii_uppercase());
+    let page = match name.as_deref() {
+        Some(b"FT.SEARCH") => ft_search_page(args),
+        Some(b"FT.AGGREGATE" | b"FT.CURSOR") => ft_aggregate_page(args),
+        _ => return base,
+    };
+    let budget = topo.family_budget.max(page.min(FT_PAGE_MAX) + 16);
     let past = budget - topo.family_budget;
     (budget, topo.family_deadline + Duration::from_millis(past))
+}
+
+/// The most documents one `FT.AGGREGATE` or `FT.CURSOR READ` may read back
+/// (ADR-0064): a cursor's `COUNT`, else the reply's `LIMIT` or `MAX`, else
+/// the reply's ceiling. A read of a cursor that names no `COUNT` may be of
+/// one made with a larger one, so it is given the ceiling.
+fn ft_aggregate_page(args: &[Vec<u8>]) -> u64 {
+    let n = |i: usize| {
+        args.get(i)
+            .and_then(|a| std::str::from_utf8(a).ok()?.parse::<u64>().ok())
+    };
+    let (mut count, mut limit) = (None, None);
+    let mut i = 3;
+    while let Some(a) = args.get(i) {
+        if a.eq_ignore_ascii_case(b"COUNT") {
+            count = n(i + 1);
+            i += 2;
+        } else if a.eq_ignore_ascii_case(b"LIMIT") {
+            limit = n(i + 2).max(limit);
+            i += 3;
+        } else if a.eq_ignore_ascii_case(b"MAX") {
+            limit = n(i + 1).max(limit);
+            i += 2;
+        } else if a.eq_ignore_ascii_case(b"PARAMS") {
+            let k = usize::try_from(n(i + 1).unwrap_or(0)).unwrap_or(usize::MAX);
+            i = i.saturating_add(2).saturating_add(k);
+        } else {
+            i += 1;
+        }
+    }
+    count.or(limit).unwrap_or(FT_PAGE_MAX)
 }
 
 /// `FT.SEARCH`'s page size: the `num` of `LIMIT <offset> <num>`, or
@@ -3936,6 +3965,16 @@ fn ft_by_proto(args: &[Vec<u8>], v: Value) -> Value {
     let resp3 = match args.first().map(|n| n.to_ascii_uppercase()).as_deref() {
         Some(b"FT.SEARCH") => ft_search_resp3(args, &v),
         Some(b"FT.INFO") => ft_info_resp3(&v),
+        Some(b"FT.AGGREGATE") => {
+            let cursor = args
+                .iter()
+                .skip(3)
+                .any(|a| a.eq_ignore_ascii_case(b"WITHCURSOR"));
+            ft_aggregate_resp3(&v, cursor)
+        }
+        Some(b"FT.CURSOR") if args.get(1).is_some_and(|s| s.eq_ignore_ascii_case(b"READ")) => {
+            ft_aggregate_resp3(&v, true)
+        }
         _ => None,
     };
     match resp3 {
@@ -3954,6 +3993,57 @@ fn map_key(s: &str) -> Value {
 /// `[total, key, [field, value, ...], ...]`, or with `NOCONTENT` `[total,
 /// key, ...]`, as RESP3's `{total_results, results: [{id,
 /// extra_attributes, values}], ...}`.
+/// `FT.AGGREGATE`'s and `FT.CURSOR READ`'s reply under RESP3, as RediSearch
+/// sends it (ADR-0064): a map of `attributes`, `format`, `results`, each
+/// row's fields under `extra_attributes`, `total_results` and `warning`; a
+/// cursor's wrapped with its id, `[map, id]`.
+fn ft_aggregate_resp3(v: &Value, cursor: bool) -> Option<Value> {
+    let (page, id) = if cursor {
+        let Value::Array(Some(pair)) = v else {
+            return None;
+        };
+        match pair.as_slice() {
+            [page, id @ Value::Integer(_)] => (page, Some(id.clone())),
+            _ => return None,
+        }
+    } else {
+        (v, None)
+    };
+    let Value::Array(Some(items)) = page else {
+        return None;
+    };
+    let Value::Integer(total) = items.first()? else {
+        return None;
+    };
+    let mut results = Vec::with_capacity(items.len().saturating_sub(1));
+    for row in &items[1..] {
+        let Value::Array(Some(fields)) = row else {
+            return None;
+        };
+        let pairs = fields
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[k, v]| (k.clone(), v.clone()))
+            .collect();
+        results.push(Value::Map(vec![
+            (map_key("extra_attributes"), Value::Map(pairs)),
+            (map_key("values"), Value::Array(Some(Vec::new()))),
+        ]));
+    }
+    let map = Value::Map(vec![
+        (map_key("attributes"), Value::Array(Some(Vec::new()))),
+        (map_key("format"), map_key("STRING")),
+        (map_key("results"), Value::Array(Some(results))),
+        (map_key("total_results"), Value::Integer(*total)),
+        (map_key("warning"), Value::Array(Some(Vec::new()))),
+    ]);
+    Some(match id {
+        Some(id) => Value::Array(Some(vec![map, id])),
+        None => map,
+    })
+}
+
 fn ft_search_resp3(args: &[Vec<u8>], v: &Value) -> Option<Value> {
     let Value::Array(Some(items)) = v else {
         return None;
@@ -8437,7 +8527,9 @@ mod repair_tests {
 
 #[cfg(test)]
 mod ft_resp3_tests {
-    use super::{Value, ft_search_resp3, map_key};
+    use super::{
+        FT_PAGE_MAX, Value, ft_aggregate_page, ft_aggregate_resp3, ft_search_resp3, map_key,
+    };
 
     fn args(parts: &[&str]) -> Vec<Vec<u8>> {
         parts.iter().map(|p| p.as_bytes().to_vec()).collect()
@@ -8445,6 +8537,101 @@ mod ft_resp3_tests {
 
     fn bulk(s: &str) -> Value {
         Value::Bulk(Some(s.as_bytes().to_vec()))
+    }
+
+    /// ADR-0064: `FT.AGGREGATE`'s RESP3 reply is RediSearch's map, each
+    /// row's fields under `extra_attributes`; a cursor's is that map and its
+    /// id.
+    #[test]
+    fn an_aggregate_is_redisearch_s_map_in_resp3() {
+        let page = Value::Array(Some(vec![
+            Value::Integer(2),
+            Value::Array(Some(vec![bulk("__key"), bulk("d:1")])),
+            Value::Array(Some(vec![bulk("__key"), bulk("d:2"), bulk("n"), bulk("3")])),
+        ]));
+        let Some(Value::Map(top)) = ft_aggregate_resp3(&page, false) else {
+            panic!("not a map");
+        };
+        let keys: Vec<&Value> = top.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            [
+                &map_key("attributes"),
+                &map_key("format"),
+                &map_key("results"),
+                &map_key("total_results"),
+                &map_key("warning")
+            ]
+        );
+        assert_eq!(top[3].1, Value::Integer(2));
+        let Value::Array(Some(results)) = &top[2].1 else {
+            panic!("results");
+        };
+        assert_eq!(
+            results[1],
+            Value::Map(vec![
+                (
+                    map_key("extra_attributes"),
+                    Value::Map(vec![(bulk("__key"), bulk("d:2")), (bulk("n"), bulk("3"))])
+                ),
+                (map_key("values"), Value::Array(Some(Vec::new()))),
+            ])
+        );
+        let cursor = Value::Array(Some(vec![page, Value::Integer(42)]));
+        let Some(Value::Array(Some(pair))) = ft_aggregate_resp3(&cursor, true) else {
+            panic!("not a cursor's pair");
+        };
+        assert!(matches!(pair[0], Value::Map(_)));
+        assert_eq!(pair[1], Value::Integer(42));
+    }
+
+    /// An aggregate's channel is sized to what it may read back: a
+    /// cursor's `COUNT`, else its `LIMIT` or `MAX`, else the ceiling.
+    #[test]
+    fn an_aggregate_s_channel_is_sized_to_its_page() {
+        let n = |parts: &[&str]| ft_aggregate_page(&args(parts));
+        assert_eq!(
+            n(&[
+                "FT.AGGREGATE",
+                "i",
+                "*",
+                "WITHCURSOR",
+                "COUNT",
+                "500",
+                "LOAD",
+                "1",
+                "__key"
+            ]),
+            500
+        );
+        assert_eq!(
+            n(&["FT.AGGREGATE", "i", "*", "SORTBY", "1", "@a", "MAX", "7"]),
+            7
+        );
+        assert_eq!(n(&["FT.AGGREGATE", "i", "*", "LIMIT", "0", "50"]), 50);
+        assert_eq!(
+            n(&["FT.AGGREGATE", "i", "COUNT"]),
+            FT_PAGE_MAX,
+            "the query is not an option"
+        );
+        assert_eq!(n(&["FT.CURSOR", "READ", "i", "9", "COUNT", "20"]), 20);
+        assert_eq!(n(&["FT.CURSOR", "READ", "i", "9"]), FT_PAGE_MAX);
+        assert_eq!(
+            n(&[
+                "FT.AGGREGATE",
+                "i",
+                "*",
+                "PARAMS",
+                "2",
+                "COUNT",
+                "3",
+                "LIMIT",
+                "0",
+                "9"
+            ]),
+            9,
+            "a parameter's value is not an option"
+        );
     }
 
     /// ADR-0063: `WITHSCORES` puts each score after its key in RESP2, and a
