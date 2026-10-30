@@ -12,6 +12,8 @@ was ACCEPTED 2026-10-19, option A (Jeff: "A: node row"). Amendment 3,
 what the frameworks' suites need next, was ACCEPTED 2026-10-20 as
 recommended (Jeff: "As recommended"): parts 1, 3, 4, 5 and 6 are built,
 and part 2 is documented only.
+Amendment 4, a script and `JSON.MERGE` on an indexed key, is PROPOSED
+2026-10-30.
 
 Proposed 2026-10-19.
 
@@ -410,6 +412,97 @@ suites found a fifth item, the flush. Each part below is its own choice.
     - `an_alias_names_its_index_and_goes_with_it`;
     - `an_ft_search_is_granted_a_channel_for_its_page`;
   - `coproc_ft_drill`'s `amend3`, `aliassame` and `flush` sections.
+
+## Amendment 4, 2026-10-30 (PROPOSED): a script, and `JSON.MERGE`, on an indexed key
+
+**Why now.** With `FT.AGGREGATE` served (ADR-0064), redisvl's
+`update_by_filter` gets past its cursor to its writes, and stops there.
+Each write is one of two scripts on one declared key:
+
+```
+EVAL "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+      redis.call('HSET', KEYS[1], unpack(ARGV)) return 1" 1 <key> <field> <value> ...
+EVAL "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+      redis.call('JSON.MERGE', KEYS[1], '$', ARGV[1]) return 1" 1 <key> <json>
+```
+
+A node refuses both, as amendment 2 has it: a script that writes under an
+index's prefix, and `JSON.MERGE`, which the co-processor does not serve.
+11 of redisvl's catalogued tests stop there (ADR-0064's As built), up from
+4 before `FT.AGGREGATE`.
+
+**What Flint does today:**
+- **The proxy** sends a write a node refused with `-INDEXED` to the `FT.`
+  co-processor, and every write under that prefix for 10 minutes after.
+  A script is no exception (`data_command`, after amendment 2).
+- **The co-processor** serves only the writes `ftstore::routed_write`
+  lists: `HSET`, `HMSET`, `HDEL`, `DEL`, `UNLINK`, the `EXPIRE` family,
+  `PERSIST`, `JSON.SET`, `JSON.DEL` and `JSON.FORGET`. It refuses a script
+  and `JSON.MERGE`.
+- **A script runs on its node.** Its writes are buffered and committed as
+  one batch when it ends (ADR-0051). Its guard refuses a write under an
+  index prefix at the row, so a key it builds and never declares is caught
+  too.
+  - redisvl's scripts do not `pcall`, so the refusal ends each one with
+    nothing written.
+  - A script may write any key in its declared keys' slot (ADR-0052 D2).
+  - Over a co-processor's channel, no prefix is guarded at all.
+
+### Options
+
+**A. The co-processor runs the script, and the node lets it write only the
+keys it declares (recommended).**
+- `EVAL` and `EVALSHA` join the co-processor's writes. It runs the script
+  on the pair over its channel, under the declared keys' locks, as it runs
+  `HSET`. It then reads each declared key under an index's prefix back, and
+  indexes it.
+- A script that arrives over a channel runs with the namespace's prefixes
+  guarded, except for its declared keys. So a write to an undeclared key
+  under a prefix is refused there too, as it is from a tenant, and the
+  co-processor's read-back holds everything the script wrote under a
+  prefix.
+- `JSON.MERGE` joins the routed writes, and is read back as `JSON.SET` is.
+- **Exact** for every script that declares the indexed keys it writes, as
+  redisvl's do and as Redis Cluster asks of every script.
+- **Costs:**
+  - a node change: the channel's script guard, about the size of
+    amendment 2's;
+  - two more commands on the co-processor's write path, which already
+    locks, writes, reads back and indexes.
+
+**B. A, and a script may also write an undeclared indexed key.** The node
+reports every key under a prefix that a script wrote, and the co-processor
+reads those back.
+- Exact for every script.
+- A new reply shape for the one channel command that runs a script, and
+  no client of the three needs it.
+
+**C. Keep refusing them.** redisvl's `update_by_filter` stays refused on an
+index.
+
+### Recommendation: A
+
+- **Releases:** the node and the co-processor change together. If this
+  lands before v0.1.0-rc.86 is cut, it ships with `FT.*`'s first release,
+  under the rule that already holds: every seat runs the release before
+  `coproc-ft on`. So no new rollback rule.
+- **Unchanged:**
+  - a script inside a transaction, which is refused as any transaction
+    holding an indexed write is (2 of redisvl's tests, `EXPIRE` inside
+    `MULTI`);
+  - a script that `pcall`s the refusal of an undeclared key, which gets
+    the refusal and goes on, as today;
+  - `EVAL_RO`, `EVALSHA_RO`, `FUNCTION` and `FCALL`, which Flint does not
+    serve.
+- **Verification:**
+  - unit tests for the channel guard: a declared key under a prefix is
+    written, and an undeclared one is refused;
+  - unit tests for the co-processor's plan: a script's declared keys are
+    read back, and `JSON.MERGE`'s key is;
+  - `coproc_ft_drill`: redisvl's two scripts through the proxy, on HASH and
+    JSON, with each document's new values found by a search, and an
+    undeclared indexed key refused;
+  - the suites: the 11 tests pass, and nothing that passed now fails.
 
 ## As built, release N (2026-10-19)
 
