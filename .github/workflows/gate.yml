@@ -39,6 +39,17 @@ on:
     # ship. That is the cheapest gate-minute we buy.
     branches: [main, 'release/**']
   pull_request:
+  # NIGHTLY, on main, so durability is tested on a schedule and not only when
+  # something is pushed (Jeff asked 2026-10-30; before that day's push the
+  # last run was 10/22). The full drills and chaos legs run, which is every
+  # durability drill: restart, failover, repl, snapshot_restore, the rewind
+  # drills, and chaos with its acked-write oracle. A scheduled run gives chaos
+  # three fresh seeds (the step before "Run stages"), so it reaches kill
+  # sequences the fixed 7 19 42 never do; each seed is printed, so a red
+  # night reproduces with SEEDS=<seed> tools/chaos_drill.sh. 10:30 UTC is
+  # 03:30 PT, away from the 20:30 PT KV gate and the working day.
+  schedule:
+    - cron: '30 10 * * *'
   # Hand-runnable, because "did my CI change work" should not require
   # opening a pull request to find out.
   workflow_dispatch:
@@ -316,6 +327,16 @@ jobs:
       # `check` is deliberately omitted: ci.yml already runs fmt, clippy and
       # tests in both feature configs, and running them twice per PR buys
       # nothing. This job is the stages that were never automated.
+      # Fresh chaos seeds on the nightly run only; a push or PR keeps the
+      # fixed seeds, so a change is judged on the same sequences every time.
+      - name: Fresh chaos seeds (nightly)
+        if: github.event_name == 'schedule' && matrix.name == 'chaos'
+        run: |
+          set -euo pipefail
+          seeds="$(od -An -N6 -tu2 /dev/urandom | xargs)"
+          echo "nightly chaos seeds: $seeds (reproduce: SEEDS=\"$seeds\" tools/chaos_drill.sh)"
+          echo "SEEDS=$seeds" >> "$GITHUB_ENV"
+
       - name: Run stages — ${{ matrix.stages }}
         run: tools/gates.sh ${{ matrix.stages }}
 
