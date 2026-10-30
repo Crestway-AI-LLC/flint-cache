@@ -15,6 +15,8 @@ and part 2 is documented only.
 Amendment 4, a script and `JSON.MERGE` on an indexed key, was ACCEPTED
 2026-10-30, option A (Jeff: "go with your recommendations"), and is built
 (its As built, below).
+Amendment 5, several VECTOR fields in one index, `FLOAT64` vectors and
+several vector ranges in one query, is PROPOSED 2026-10-30, recommended A.
 
 Proposed 2026-10-19.
 
@@ -534,6 +536,127 @@ index.
     `JSON.MERGE` through the proxy on HASH and JSON indexes, each write
     found by a search, a script on a missing key making no document, and a
     script that builds an undeclared indexed key refused whole.
+
+## Amendment 5, 2026-10-30 (PROPOSED): several VECTOR fields in one index, `FLOAT64` vectors, and several vector ranges in one query
+
+**Why now.** ADR-0064 left one redisvl suite file waiting on this ADR:
+`test_aggregation.py`, 26 cases (16 tests, some run with several
+parameters). Its fixture is one index with three VECTOR fields, each FLAT
+and cosine: `user_embedding` (3 dims) and `image_embedding` (5 dims) are
+`FLOAT32`, and `audio_embedding` (6 dims) is `FLOAT64`. Flint refuses that
+index ("an index has at most one VECTOR field"), so every case stops at the
+fixture.
+
+**What redisvl sends** (redisvl 0.28.0, printed from its own builders):
+
+```
+FT.AGGREGATE <idx> "(~@description:(a | medical | ...))=>[KNN 10 @user_embedding $vector AS vector_distance]"
+  SCORER BM25STD ADDSCORES LOAD 6 user ... DIALECT 2
+  APPLY "(2 - @vector_distance)/2" AS vector_similarity APPLY "@__score" AS text_score
+  APPLY "0.3*@text_score + 0.7*@vector_similarity" AS hybrid_score SORTBY 2 @hybrid_score DESC MAX 10
+
+FT.AGGREGATE <idx> "@user_embedding:[VECTOR_RANGE 2.0 $vector_0]=>{$YIELD_DISTANCE_AS: distance_0}
+                    @image_embedding:[VECTOR_RANGE 2.0 $vector_1]=>{$YIELD_DISTANCE_AS: distance_1}"
+  SCORER TFIDF LOAD 6 user ... DIALECT 2
+  APPLY "(2 - @distance_0)/2" AS score_0 APPLY "(2 - @distance_1)/2" AS score_1
+  APPLY "@score_0 * 1.0 + @score_1 * 1.0" AS combined_score SORTBY 2 @combined_score DESC MAX 10
+```
+
+The first is `AggregateHybridQuery`, a KNN on one of the index's VECTOR
+fields. The second is `MultiVectorQuery`: one `VECTOR_RANGE` term for each
+of two or three fields, ANDed, each yielding its distance for the `APPLY`
+steps. A `FLOAT64` field's query vector is 8 bytes a dimension.
+
+**Measured against today's build** (2c2c6281), with the fixture cut to its
+one `FLOAT32` VECTOR field so that it loads, 13 cases pass: the 12 hybrid
+queries, with their filters, GEO, stop words and weights, and one argument
+check. The 13 multi-vector cases stop at "a query takes one vector range
+term (ADR-0061)". So the work is three
+things and nothing else this file reaches:
+
+1. several VECTOR fields in one index;
+2. `FLOAT64` vectors;
+3. several `VECTOR_RANGE` terms, ANDed, in one query.
+
+**What Flint does today:**
+- `IndexDef` holds at most one `VectorField`, and the index backs it with
+  one vector set (ADR-0017's engine) over the index's documents.
+- `parse_vector` refuses any `TYPE` but `FLOAT32`, and a document's vector
+  must be `DIM` × 4 bytes.
+- `take_range` takes one `VECTOR_RANGE` term per query: alone or ANDed
+  with a filter. A second, or one under `|` or `-`, or one beside a KNN, is
+  refused by name. A range counts at most 10,000 documents (ADR-0061).
+- The kernel is float32, with the 8-bit and 1-bit codes of ADR-0049 built
+  on it.
+
+### Options
+
+**A. Several VECTOR fields, each its own set; `FLOAT64` read as float32;
+several ranges ANDed (recommended).**
+- Each VECTOR field gets its own vector set over the index's documents,
+  with its own `DIM`, metric and algorithm. A KNN or a range names its
+  field, as RediSearch's do; naming a field the index does not have is
+  refused as today. An index holds at most 8 VECTOR fields, refused by
+  name past that, each a set of its own; the 16-attribute cap of the other
+  fields is unchanged, so every index that loads today still loads.
+- A `FLOAT64` field's vectors, in documents and in queries, are 8 bytes a
+  dimension and are rounded to float32 when read. Distances are computed in
+  float32, as for every other field, so a `FLOAT64` field's distances agree
+  with RediSearch's to about seven significant digits, not to sixteen. The
+  document keeps the bytes its client wrote; `FT.INFO` reports `FLOAT64`.
+  Documented in `docs/command-support.md`.
+- A query may AND several `VECTOR_RANGE` terms, on the same field or on
+  different ones. Each term is the set of documents within its radius,
+  each counted up to the 10,000 of ADR-0061, and the query's documents are
+  those in every term and in the filter. Each term's `$YIELD_DISTANCE_AS`
+  names a distance that `FT.SEARCH` returns and `FT.AGGREGATE`'s steps
+  read; two terms may not yield the same name. A range under `|` or `-`,
+  or beside a KNN, stays refused by name.
+- **Exact** for every float32 field. For a `FLOAT64` field, exact up to
+  float32's precision, which is past the precision of the embedding models
+  the three clients ship with.
+- **Costs:**
+  - a set for each VECTOR field: an index with three costs what three
+    one-field indexes over the same documents cost, each metered;
+  - a change to the definition row's encoding. It is written so that a
+    release before this amendment refuses to load an index it cannot serve
+    whole, rather than serving one of its fields;
+  - no kernel change.
+
+**B. As A, but `FLOAT64` kept as float64.** A second kernel, the flat
+search and the HNSW graph generic over the element type, and no 8-bit or
+1-bit code for a `FLOAT64` field.
+- Distances agree with RediSearch's to float64's precision.
+- About twice A's work, and twice the RAM for a `FLOAT64` field's vectors,
+  for a precision no client of the three uses.
+
+**C. Several VECTOR fields and several ranges, `FLOAT64` still refused.**
+A client whose fields are all `FLOAT32` gains, and `test_aggregation.py`'s
+fixture is still refused: none of its 26 cases pass.
+
+### Recommendation: A
+
+- **Releases:** the co-processor alone changes; the data node and the
+  proxy do not. If this is built before v0.1.0-rc.86 is cut, it ships with
+  `FT.*`'s first release. Otherwise it is a co-processor upgrade with one
+  rollback rule: **drop every index with more than one VECTOR field, or
+  with a `FLOAT64` field, before rolling back** to a release without it.
+  The older co-processor refuses to load such an index, so its prefixes
+  would stay guarded with no index serving them.
+- **Unchanged:** the 16-attribute cap; ADR-0061's 10,000-document range count;
+  a KNN and a range in one query, refused; `FLOAT16`, `BFLOAT16`, `INT8`
+  and `UINT8`, refused by name (no client of the three sends them).
+- **Verification:**
+  - unit tests: an index with several VECTOR fields of different `DIM`s
+    and metrics; a `FLOAT64` document and query vector and the distance
+    they give; two and three range terms, ANDed with a filter, each
+    yielding its own distance; the refusals that stay;
+  - the definition row: an index of this amendment round-trips, and the
+    decoder of today refuses it;
+  - `coproc_ft_drill`: redisvl's two queries through the proxy on HASH and
+    JSON, before and after a co-processor restart;
+  - the suites: `test_aggregation.py`'s 26 cases pass, and nothing that
+    passed now fails.
 
 ## As built, release N (2026-10-19)
 
