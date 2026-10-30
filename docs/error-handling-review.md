@@ -1,13 +1,13 @@
 # Error-handling review map
 
-Pinned to [`2c2c6281`](https://github.com/Crestway-AI-LLC/flint-cache/tree/2c2c6281e386a1ab7a9908f516d7ed618db494c9), public main on 2026-10-30. Every line number below refers to that commit, and every code link opens it, so the map stays exact as main moves on. About 84,000 lines of non-test code in 16 crates, split into fourteen areas that one reviewer can take each. Each area lists where its error paths are, the questions a reviewer should answer, and the decisions and past bugs that set the rules it should follow.
+Pinned to [`2c2c6281`](https://github.com/Crestway-AI-LLC/flint-cache/tree/2c2c6281e386a1ab7a9908f516d7ed618db494c9), public main on 2026-10-30. Every line number below refers to that commit, and every code link opens it, so the map stays exact as main moves on. About 66,000 lines of non-test code, comments left out, in 17 crates, split into fourteen areas that one reviewer can take each. Each area lists where its error paths are, the questions a reviewer should answer, and the decisions and past bugs that set the rules it should follow.
 
 Report each finding as a numbered bug in `bugs/`: what happens, how it was found, and an acceptance test that fails today.
 
 ## Rules every area is reviewed against
 
-- **No `unwrap()` outside tests.** Clippy's `unwrap_used` is set for the workspace and the gate runs clippy with warnings as errors. `expect()` is allowed: 146 calls in production crates. Each should hold an invariant, not an input.
-- **A panic ends one thread and poisons its locks.** No profile sets `panic = "abort"` and no production path catches a panic. A panic kills its thread, and any `std::sync::Mutex` it held is poisoned. flint-server never calls `expect` on a lock and recovers a poisoned one at 15 sites; flint-vec calls `lock().expect` at 32 of its 43 lock sites. BUG-0073 is the precedent: a panicking thread stopped a pair's snapshots silently.
+- **No `unwrap()` outside tests.** Clippy's `unwrap_used` is set for the workspace and the gate runs clippy with warnings as errors. `expect()` is allowed: 143 calls in production crates. Each should hold an invariant, not an input.
+- **A panic's reach depends on where it runs.** No profile sets `panic = "abort"`. A panic on a std thread ends that thread. One in a Tokio task is caught by Tokio and lands in the task's `JoinError` while the worker thread goes on: the proxy runs each client (`main.rs:6753`), its pool readers (`apool.rs:162`) and its pub/sub links (`pubsub.rs:330`) as tasks, and the HA control plane runs on openraft's. One on the main thread ends the process. In every case a `std::sync::Mutex` held at the panic is poisoned. flint-server never calls `expect` on a lock and recovers a poisoned one at 30 sites; flint-vec calls `lock().expect` at 32 of its 43 lock sites. A task whose `JoinHandle` is dropped fails silently; BUG-0073 is the precedent, a panicking thread that stopped a pair's snapshots.
 - **Leaving with the database open uses `hard_exit`.** Any exit while RocksDB is open goes through `hard_exit` (flint-server `main.rs:162`), which calls `_exit` so it does not race RocksDB's C++ teardown. Startup exits before the store opens use `process::exit`.
 - **Errors speak the client's dialect.** Where a command exists in Valkey, RedisJSON or RediSearch, its refusals use their text and kind. An error reply never contains a raw newline (BUG-0184). Flint's own codes are `LOADING`, `READONLY`, `MOVED`, `TRYAGAIN`, `CROSSSLOT`, `THROTTLED`, `WALGAP`, `INDEXED`, `COPROCUNAVAIL`, `VECFULL` and `QUOTA`; [retry-safety.md](retry-safety.md) says which a client may retry.
 - **Unknown is not a value.** A probe that fails is unknown, never full, empty or healthy (`disk::sample`, BUG-0079). A verdict names what it examined (ADR-0028). An unknown flag name is refused at start (`reject_unknown_flags`), and flintctl checks seat environment names (BUG-0099).
@@ -18,16 +18,16 @@ Report each finding as a numbered bug in `bugs/`: what happens, how it was found
 |---|---|---|---|---|
 | A | [Write path and storage engine](#a-write-path-and-storage-engine) | P1 | ≈ 4,300 | Rust and RocksDB or storage engines |
 | B | [Replication](#b-replication) | P1 | ≈ 3,000 | distributed systems, replication |
-| C | [Failover, roles and fencing](#c-failover-roles-and-fencing) | P1 | ≈ 5,200 | distributed systems, consensus |
+| C | [Failover, roles and fencing](#c-failover-roles-and-fencing) | P1 | ≈ 5,400 | distributed systems, consensus |
 | D | [Snapshots, backup and restore](#d-snapshots-backup-and-restore) | P1 | ≈ 2,900 | Rust, storage and operations |
 | E | [Client connections and the wire protocol](#e-client-connections-and-the-wire-protocol) | P2 | ≈ 3,300 | network servers, the Redis protocol |
 | F | [Proxy: routing, retries and backend failures](#f-proxy-routing-retries-and-backend-failures) | P2 | ≈ 1,900 | network and distributed systems |
-| G | [Proxy: client sessions](#g-proxy-client-sessions) | P2 | ≈ 3,400 | network servers, multi-tenant systems |
+| G | [Proxy: client sessions](#g-proxy-client-sessions) | P2 | ≈ 3,500 | network servers, multi-tenant systems |
 | H | [Scripts and transactions](#h-scripts-and-transactions) | P2 | ≈ 3,800 | Rust, Lua and Redis semantics |
 | I | [Slot migration and rebalancing](#i-slot-migration-and-rebalancing) | P2 | ≈ 2,300 | distributed systems |
 | J | [Commands and data types](#j-commands-and-data-types) | P3 | ≈ 17,000; split by family | Redis and Valkey semantics |
 | K | [Vector and FT co-processor](#k-vector-and-ft-co-processor) | P3 | ≈ 5,600 of service code, ≈ 9,000 of parsers | Rust concurrency, search |
-| L | [Startup, configuration and shutdown](#l-startup-configuration-and-shutdown) | P2 | ≈ 2,500 | Rust, systems |
+| L | [Startup, configuration and shutdown](#l-startup-configuration-and-shutdown) | P2 | ≈ 2,900 | Rust, systems |
 | M | [Operator tooling and the control-plane service](#m-operator-tooling-and-the-control-plane-service) | P3 | ≈ 15,000 | operations tooling, Rust |
 | N | [Cross-cutting sweep](#n-cross-cutting-sweep) | P1 | whole tree | anyone with grep and patience |
 
@@ -103,7 +103,7 @@ The master's stream to its replicas, the replica's apply loop, full sync, and th
 
 ## C. Failover, roles and fencing
 
-**P1** · ≈ 5,200 lines · reviewer: distributed systems, consensus
+**P1** · ≈ 5,400 lines · reviewer: distributed systems, consensus
 
 Who is master and how the others are kept from acting as one: role epochs on disk, promote, demote, fence, the controller's decision loop, and the control plane's leases and Raft store. A mistake here gives two masters or none.
 
@@ -121,7 +121,8 @@ Who is master and how the others are kept from acting as one: role epochs on dis
 - [`crates/flint-controller/src/main.rs:2123-2140`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controller/src/main.rs#L2123-L2140) fence
 - [`crates/flint-controlplane/src/ha.rs:84-576`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controlplane/src/ha.rs#L84-L576) RPC framing, call, serve_rpc, propose
 - [`crates/flint-controlplane/src/ha.rs:577-1586`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controlplane/src/ha.rs#L577-L1586) handle_admin
-- [`crates/flint-controlplane/src/raft.rs:55-143`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controlplane/src/raft.rs#L55-L143) io, atomic_write, Store::open
+- [`crates/flint-controlplane/src/raft.rs:55-143`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controlplane/src/raft.rs#L55-L143) io, atomic_write, Store::open, flush
+- [`crates/flint-controlplane/src/raft.rs:144-295`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controlplane/src/raft.rs#L144-L295) the RaftStorage callbacks: build_snapshot, save_vote, append_to_log, delete_conflict_logs_since, purge_logs_upto, apply_to_state_machine, install_snapshot
 - [`crates/flint-controlplane/src/main.rs:185-231`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controlplane/src/main.rs#L185-L231) publish_lease_mirror
 
 **Questions to answer**
@@ -131,6 +132,7 @@ Who is master and how the others are kept from acting as one: role epochs on dis
 - Are stale and equal epochs refused by every role command, including right after a restart?
 - If lease renewal fails, does a master stop taking writes in time? Is a control plane that is down treated differently from one that refuses?
 - If the Raft store cannot open or `atomic_write` fails, does the control plane refuse to serve rather than serve an empty registry?
+- Each Raft storage callback changes the in-memory vote, log or registry and then `flush`es. If the flush fails after the change, what does the running node serve next, what does openraft do with the error, and what does a restart recover?
 
 **Rules and history:** [ADR-0004](adr/0004-no-per-group-raft.md), [ADR-0018](adr/0018-cp-held-leases.md), [ADR-0019](adr/0019-rewind-rejoin-promotion-fences.md), [ADR-0032](adr/0032-one-implementation-of-every-control-plane-mutation.md), [BUG-0074](bugs/0074-min-replicas-that-cannot-survive-a-failover.md), [BUG-0076](bugs/0076-a-surviving-replica-is-never-repointed-after-a-promotion.md), [BUG-0119](bugs/0119-flintctl-panicked-on-a-master-that-was-merely-mid-promotion.md), [BUG-0151](bugs/0151-a-pair-whose-membership-changed-can-hold-two-lease-rows-and-two-masters.md), [BUG-0174](bugs/0174-reconcile-cold-start-gives-up-while-the-master-is-still-loading.md), [BUG-0201](bugs/0201-the-controller-fails-over-a-master-at-its-connection-cap-though-it-is-serving.md), [BUG-0207](bugs/0207-during-a-roll-the-controller-fails-the-pair-over-mid-handover.md), [failover.md](failover.md)
 
@@ -205,7 +207,7 @@ How the proxy finds the right pair, follows MOVED, rediscovers a master after a 
 - [`crates/flint-proxy/src/main.rs:1398-1513`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L1398-L1513) call_raw, discover_master
 - [`crates/flint-proxy/src/main.rs:1605-1885`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L1605-L1885) call, lease, call_private, call_slow, route_key, repair_reply
 - [`crates/flint-proxy/src/main.rs:1886-2228`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L1886-L2228) forward_collect, forward, refresh_pair_master, fan_out
-- [`crates/flint-proxy/src/apool.rs`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/apool.rs) the async backend pool
+- [`crates/flint-proxy/src/apool.rs`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/apool.rs) the async backend pool; its reader task at 162
 - [`crates/flint-proxy/src/errors.rs:44-121`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/errors.rs#L44-L121) classify, observe, report
 
 **Questions to answer**
@@ -220,7 +222,7 @@ How the proxy finds the right pair, follows MOVED, rediscovers a master after a 
 
 ## G. Proxy: client sessions
 
-**P2** · ≈ 3,400 lines · reviewer: network servers, multi-tenant systems
+**P2** · ≈ 3,500 lines · reviewer: network servers, multi-tenant systems
 
 One client's session through the proxy: auth, quotas, MULTI/EXEC pinned to a backend, pub/sub, the near cache, and the control-plane snapshot that names tenants.
 
@@ -231,6 +233,8 @@ One client's session through the proxy: auth, quotas, MULTI/EXEC pinned to a bac
 - [`crates/flint-proxy/src/main.rs:2754-3307`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L2754-L3307) serve_client
 - [`crates/flint-proxy/src/main.rs:3308-3690`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L3308-L3690) reset, abort_txn, refuse_in_txn, call_pinned, transaction_step
 - [`crates/flint-proxy/src/main.rs:3740-3988`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L3740-L3988) family_command, family_grant, FT paging
+- [`crates/flint-proxy/src/main.rs:6727-6772`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L6727-L6772) the accept loop: one spawn_local task per client
+- [`crates/flint-proxy/src/pubsub.rs:266-340`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/pubsub.rs#L266-L340) pub/sub link tasks
 - [`crates/flint-proxy/src/pubsub.rs`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/pubsub.rs) pub/sub fan-in
 - [`crates/flint-proxy/src/cache.rs`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/cache.rs) near cache
 
@@ -264,10 +268,10 @@ EVAL and EVALSHA in the embedded Lua VM, the key guard that limits what a script
 
 **Questions to answer**
 
-- When a script errors after some writes, are all of its buffered writes discarded? Check the interplay with `pcall` and `redis.error_reply`.
+- Intended, not a bug: an uncaught error, the time limit or the memory limit discards everything a script wrote, while a script that returns `redis.error_reply` has completed and its writes commit (`script::Outcome`, ADR-0051). Does every path end in one of those two, including a `pcall` that catches a refusal and goes on?
 - What limits a runaway script (time, memory), and what happens to its connection and locks when it is stopped?
 - Can any path in `script_libs.rs` panic on input a script controls?
-- Can one command failing at EXEC leave the rest of the transaction applied?
+- Intended, not a bug: a queue-time error (unknown command, arity, cross-slot) makes EXEC answer `EXECABORT` having applied nothing, while a runtime error (WRONGTYPE, a bad float) is one element of EXEC's reply and the other commands apply, as in Redis (`command-support.md`). Does a failure of admission or of the commit itself (the disk guard, a write stall, a storage error) behave like the first kind, applying nothing, and never like the second?
 - If the storage write in `commit_watched` fails, what does the client see, and is WATCH state cleared?
 
 **Rules and history:** [ADR-0012](adr/0012-same-slot-transactions.md), [ADR-0051](adr/0051-rate-limiters-measured-and-running-lua.md), [ADR-0052](adr/0052-job-queues-on-flint-measured.md), [ADR-0053](adr/0053-transactions-across-slots-measured.md), [ADR-0060](adr/0060-redisearch-ft-vector-surface.md), [BUG-0181](bugs/0181-a-cross-slot-mset-in-multi-failed-alone-and-the-rest-applied.md), [BUG-0189](bugs/0189-a-script-longer-than-4-kib-was-refused-as-an-oversized-key.md), [command-support.md](command-support.md)
@@ -355,7 +359,7 @@ flint-vec: the VEC and FT families, its channel to the pairs, rebuild after a re
 
 ## L. Startup, configuration and shutdown
 
-**P2** · ≈ 2,500 lines · reviewer: Rust, systems
+**P2** · ≈ 2,900 lines · reviewer: Rust, systems
 
 Flags, environment knobs, opening an existing data directory, marker files, and leaving the process. The main risk is starting with a setting the operator did not ask for, without saying so.
 
@@ -366,6 +370,7 @@ Flags, environment knobs, opening an existing data directory, marker files, and 
 - [`crates/flint-server/src/main.rs:2142-3771`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-server/src/main.rs#L2142-L3771) main: about 1,600 lines of startup
 - [`crates/flint-storage/src/rocks.rs:276-280`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-storage/src/rocks.rs#L276-L280) env_u64: an unparsable value is ignored
 - [`crates/flint-proxy/src/main.rs:3717-3722`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L3717-L3722) parse_u64_knob: panics on a bad value
+- [`crates/flint-proxy/src/main.rs:6400-6808`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-proxy/src/main.rs#L6400-L6808) main, after the first test module
 - [`crates/flint-vec/src/main.rs:167-302`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-vec/src/main.rs#L167-L302) main
 - [`crates/flint-controller/src/main.rs:129-164`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controller/src/main.rs#L129-L164) arg, arg_or
 - [`crates/flint-controller/src/main.rs:1499-1723`](https://github.com/Crestway-AI-LLC/flint-cache/blob/2c2c6281e386a1ab7a9908f516d7ed618db494c9/crates/flint-controller/src/main.rs#L1499-L1723) main
@@ -417,20 +422,19 @@ The patterns that turn an error into silence, counted per crate. Each one is fin
 
 | Crate | Lines | `expect` | `let _ =` | `.ok()` | `unwrap_or*` | `panic!` and kin | `eprintln!` |
 |---|---|---|---|---|---|---|---|
-| flint-server | 24,634 | 18 | 42 | 120 | 152 | 6 | 113 |
-| flint-vec | 15,407 | 43 | 11 | 62 | 66 | 6 | 16 |
-| flint-storage | 12,104 | 3 | 8 | 51 | 67 | 0 | 3 |
-| flint-ctl | 10,635 | 54 | 19 | 63 | 93 | 28 | 155 |
-| flint-proxy | 7,306 | 0 | 13 | 42 | 44 | 1 | 6 |
-| flint-controlplane | 5,421 | 9 | 9 | 47 | 40 | 4 | 6 |
-| flint-backup | 2,334 | 2 | 9 | 16 | 69 | 0 | 3 |
-| flint-controller | 2,135 | 4 | 14 | 12 | 16 | 1 | 37 |
-| flint-tls | 1,143 | 7 | 3 | 13 | 3 | 0 | 2 |
-| flint-resp | 1,078 | 2 | 0 | 2 | 1 | 2 | 0 |
-| others (7 crates) | 2,193 | 4 | 6 | 15 | 18 | 0 | 3 |
-| **Total** | **84,390** | **146** | **134** | **443** | **569** | **48** | **344** |
+| flint-server | 18,965 | 14 | 37 | 122 | 168 | 4 | 113 |
+| flint-vec | 13,320 | 43 | 13 | 62 | 67 | 6 | 16 |
+| flint-storage | 9,529 | 3 | 8 | 67 | 70 | 0 | 3 |
+| flint-ctl | 7,105 | 54 | 19 | 63 | 93 | 28 | 155 |
+| flint-proxy | 6,266 | 3 | 16 | 59 | 68 | 3 | 12 |
+| flint-controlplane | 4,121 | 9 | 9 | 47 | 40 | 4 | 6 |
+| flint-backup | 1,908 | 2 | 9 | 16 | 69 | 0 | 3 |
+| flint-controller | 1,419 | 4 | 14 | 12 | 16 | 1 | 37 |
+| flint-tls | 884 | 7 | 4 | 13 | 3 | 0 | 2 |
+| others (8 crates) | 2,143 | 4 | 6 | 17 | 22 | 2 | 3 |
+| **Total** | **65,660** | **143** | **135** | **478** | **616** | **48** | **350** |
 
-Regex counts over non-test code at the pinned commit; test modules, test files, benches and the chaos and conformance harnesses are left out. `panic!` and kin includes `unreachable!`, `todo!` and `unimplemented!`. A count is where to start, not a finding.
+Regex counts over non-test code at the pinned commit, comment lines left out; test modules (`cfg(test)` and `cfg(all(test, ...))`, wherever they sit in a file), test files, benches and the chaos and conformance harnesses are left out. `panic!` and kin includes `unreachable!`, `todo!` and `unimplemented!`. A count is where to start, not a finding.
 
 **Questions to answer**
 
@@ -439,6 +443,7 @@ Regex counts over non-test code at the pinned commit; test modules, test files, 
 - Each `expect`: is it an invariant the code itself guarantees, or can input, the disk or a peer reach it?
 - Each `panic!` and `unreachable!` on a serving path: can a client, a peer or a corrupt row reach it?
 - Locks: does each crate either recover poisoned locks or make sure no panic can happen while one is held?
+- Tasks: is every Tokio `JoinHandle` awaited or checked, so a task that panicked or failed is noticed rather than dropped?
 - Is each `eprintln!` on an error path matched by a counter an alert can watch? A log line no one reads is how BUG-0073 and BUG-0163 stayed unseen.
 
 **Commands to start**
