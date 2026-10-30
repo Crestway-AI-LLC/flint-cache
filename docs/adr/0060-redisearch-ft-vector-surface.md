@@ -16,7 +16,8 @@ Amendment 4, a script and `JSON.MERGE` on an indexed key, was ACCEPTED
 2026-10-30, option A (Jeff: "go with your recommendations"), and is built
 (its As built, below).
 Amendment 5, several VECTOR fields in one index, `FLOAT64` vectors and
-several vector ranges in one query, is PROPOSED 2026-10-30, recommended A.
+several vector ranges in one query, was ACCEPTED 2026-10-30, option A
+(Jeff: "go with A").
 
 Proposed 2026-10-19.
 
@@ -537,7 +538,7 @@ index.
     found by a search, a script on a missing key making no document, and a
     script that builds an undeclared indexed key refused whole.
 
-## Amendment 5, 2026-10-30 (PROPOSED): several VECTOR fields in one index, `FLOAT64` vectors, and several vector ranges in one query
+## Amendment 5, 2026-10-30 (ACCEPTED the same day, option A): several VECTOR fields in one index, `FLOAT64` vectors, and several vector ranges in one query
 
 **Why now.** ADR-0064 left one redisvl suite file waiting on this ADR:
 `test_aggregation.py`, 26 cases (16 tests, some run with several
