@@ -247,6 +247,9 @@ pub struct SearchPlan {
     pub returns: Option<Vec<(Box<str>, Box<str>)>>,
     /// The KNN distance's name, for a KNN search.
     pub alias: Option<Box<str>>,
+    /// Each further vector range's distance name, in the query's order
+    /// (ADR-0060 amendment 5).
+    pub more_aliases: Vec<Box<str>>,
     /// The attributes' names and paths, for a JSON `RETURN`.
     pub paths: Vec<(Box<str>, Box<str>)>,
 }
@@ -564,8 +567,8 @@ impl Store {
         };
         let compiled = ftagg::parse(args).and_then(|req| {
             let q = ft::parse_query(&req.query, ix.def(), &req.params)?;
-            let metric = q.knn.as_ref().map(|k| &*k.alias);
-            let plan = ftagg::compile(&req, ix.def(), metric)?;
+            let metrics: Vec<&str> = q.knn.iter().chain(&q.more).map(|k| &*k.alias).collect();
+            let plan = ftagg::compile(&req, ix.def(), &metrics)?;
             Ok((req, q, plan))
         });
         let (req, q, plan) = match compiled {
@@ -817,6 +820,7 @@ impl Store {
             withscores: s.withscores,
             returns: s.returns,
             alias: s.knn.map(|k| k.alias),
+            more_aliases: s.more.into_iter().map(|k| k.alias).collect(),
             paths: ix
                 .def()
                 .attrs
@@ -824,7 +828,7 @@ impl Store {
                 .map(|a| (a.field.name.clone(), a.path.clone()))
                 .chain(
                     ix.def()
-                        .vector
+                        .vectors
                         .iter()
                         .map(|v| (v.name.clone(), v.path.clone())),
                 )
@@ -1074,7 +1078,7 @@ impl Store {
                 Value::Array(Some(v))
             })
             .collect();
-        if let Some(v) = &def.vector {
+        for v in &def.vectors {
             attrs.push(Value::Array(Some(
                 vec![
                     s("identifier"),
@@ -1086,7 +1090,7 @@ impl Store {
                     s("algorithm"),
                     s(&v.index.as_str().to_ascii_uppercase()),
                     s("data_type"),
-                    s("FLOAT32"),
+                    s(v.ty.as_str()),
                     s("dim"),
                     int(v.dim),
                     s("distance_metric"),
@@ -1374,10 +1378,22 @@ pub fn search_reply(plan: &SearchPlan, docs: &[Option<DocRead>]) -> Value {
         let Some(doc) = docs.get(i).and_then(|d| d.as_ref()) else {
             continue;
         };
+        let more = plan.hits.more.get(i).map_or(&[][..], Vec::as_slice);
+        let more_fields = || {
+            plan.more_aliases
+                .iter()
+                .zip(more)
+                .flat_map(|(a, d)| [bulk(a.as_bytes()), bulk(d.to_string().as_bytes())])
+        };
         let distance = |name: &str| -> Option<Vec<u8>> {
             match (&plan.alias, dist) {
                 (Some(a), Some(d)) if **a == *name => Some(d.to_string().into_bytes()),
-                _ => None,
+                _ => plan
+                    .more_aliases
+                    .iter()
+                    .zip(more)
+                    .find(|(a, _)| ***a == *name)
+                    .map(|(_, d)| d.to_string().into_bytes()),
             }
         };
         let mut fields: Vec<Value> = Vec::new();
@@ -1390,6 +1406,7 @@ pub fn search_reply(plan: &SearchPlan, docs: &[Option<DocRead>]) -> Value {
                     fields.push(bulk(a.as_bytes()));
                     fields.push(bulk(d.to_string().as_bytes()));
                 }
+                fields.extend(more_fields());
                 for (f, v) in h {
                     fields.push(bulk(f));
                     fields.push(bulk(v));
@@ -1403,6 +1420,7 @@ pub fn search_reply(plan: &SearchPlan, docs: &[Option<DocRead>]) -> Value {
                     fields.push(bulk(a.as_bytes()));
                     fields.push(bulk(d.to_string().as_bytes()));
                 }
+                fields.extend(more_fields());
                 fields.push(bulk(b"$"));
                 fields.push(bulk(j.to_string().as_bytes()));
             }

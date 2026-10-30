@@ -659,6 +659,42 @@ fixture is still refused: none of its 26 cases pass.
   - the suites: `test_aggregation.py`'s 26 cases pass, and nothing that
     passed now fails.
 
+### Amendment 5, as built (2026-10-30, rides with v0.1.0-rc.86)
+
+- **The definition.** `IndexDef::vectors` holds up to `MAX_VECTORS` (8)
+  fields, each with its `VecType`, `FLOAT32` or `FLOAT64`. The row is
+  written as before when the index has one `FLOAT32` field. With several,
+  or with a `FLOAT64` one, its `"vector"` is an array, which every earlier
+  decoder refuses, so a rolled-back co-processor leaves the index out with
+  a message rather than serving one of its fields.
+- **`FLOAT64`.** `vector_from_bytes` takes the field's type: 8 bytes a
+  dimension, each rounded to float32, a value too large for float32 refused
+  as not finite. `FT.INFO` reports the declared type.
+- **The index.** `FtIndex` keeps one vector set for each field, in the
+  definition's order, each with the index's filter fields. A document goes
+  into the set of each field it holds and out of the others. A malformed
+  vector in any field leaves the whole document out and counts it, as
+  before. A document is charged for each set it is in.
+- **The query.** A KNN or a range names its field, and `Knn::field` carries
+  where it is. `take_ranges` takes each `VECTOR_RANGE` term in the order
+  written: the first is `knn`, the rest `more`. Two that yield one name are
+  refused, and so are a range under `|`, `-` or `~`, or one beside a KNN.
+- **The answer.** `and_ranges` keeps the first range's documents that are
+  within every further range, each with its distance under each. With
+  further ranges, the first is counted whole (to the 10,000) before the
+  page is cut. `FT.SEARCH` returns each range's distance under its name,
+  and `SORTBY` takes the first's. `FT.AGGREGATE`'s plan has a slot for
+  each distance (`Plan::metrics`), so its steps read them by name.
+- **Held by:**
+  - unit tests: `an_index_holds_several_vector_fields_and_float64`,
+    `an_index_holds_at_most_eight_vector_fields`,
+    `a_float64_vector_is_read_as_float32`,
+    `several_vector_ranges_and_in_one_query`, and
+    `ranges_on_two_vector_fields_and_with_a_distance_each`;
+  - `coproc_ft_drill`'s `multi` and `multisame` sections: two VECTOR
+    fields, one `FLOAT64`, on HASH and JSON, with redisvl's multi-vector
+    query and a KNN on the `FLOAT64` field, before and after a restart.
+
 ## As built, release N (2026-10-19)
 
 Branch `adr0060-ft`, held by `coproc_ft_drill`. Two pairs, a proxy and

@@ -539,7 +539,13 @@ only on a fleet whose operator sets `coproc-ft on`.
     a JSON string, or a JSON array of them. A document whose value is not a
     point, or is nearer a pole than ±85.05112878, is left out of the index,
     as RediSearch leaves it out. `GEOSHAPE` is refused.
-  - `VECTOR FLAT` or `HNSW` with `TYPE FLOAT32` and `L2`, `IP` or `COSINE`.
+  - `VECTOR FLAT` or `HNSW` with `TYPE FLOAT32` or `FLOAT64` and `L2`,
+    `IP` or `COSINE`, up to 8 VECTOR fields in one index, each with its own
+    `DIM` and metric (ADR-0060 amendment 5). A `FLOAT64` vector, in a
+    document or a query, is 8 bytes a dimension and is read as float32, so
+    its distances agree with RediSearch's to about seven significant
+    digits rather than sixteen. The document keeps the bytes its client
+    wrote, and `FT.INFO` reports `FLOAT64`.
 - **Searches:**
   - ADR-0059's filter, or `*`.
   - Full text (ADR-0063), in RediSearch's `DIALECT 2` grammar:
@@ -567,6 +573,12 @@ only on a fleet whose operator sets `coproc-ft on`.
     ANDed with a filter: every document within the radius, measured as the
     KNN measures, nearest first. A range of more than 10,000 documents
     reports a total of 10,000.
+  - Several vector ranges ANDed in one query, on one VECTOR field or on
+    several (ADR-0060 amendment 5), as redisvl's `MultiVectorQuery` sends
+    them: the documents within every one, each answering its own
+    `$YIELD_DISTANCE_AS` name, which two ranges may not share. Each range
+    counts at most 10,000 documents. `SORTBY` on a distance takes the
+    first range's. A range under `|` or `-`, or beside a KNN, is refused.
   - `PARAMS` and `RETURN ... AS`.
   - `SORTBY` on the distance or a `NUMERIC`, `TAG` or `TEXT` field. A TEXT
     or TAG field sorts by its whole value, as RediSearch sorts it (ADR-0063

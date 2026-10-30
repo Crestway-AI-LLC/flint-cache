@@ -20,6 +20,45 @@ pub enum On {
     Json,
 }
 
+/// A VECTOR field's declared element type. A `FLOAT64` vector, in a
+/// document or a query, is 8 bytes a dimension and is read as float32, so
+/// its distances agree with RediSearch's to float32's precision (ADR-0060
+/// amendment 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecType {
+    Float32,
+    Float64,
+}
+
+impl VecType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VecType::Float32 => "FLOAT32",
+            VecType::Float64 => "FLOAT64",
+        }
+    }
+
+    fn parse(s: &str) -> Option<VecType> {
+        match s {
+            "FLOAT32" => Some(VecType::Float32),
+            "FLOAT64" => Some(VecType::Float64),
+            _ => None,
+        }
+    }
+
+    /// Bytes a dimension.
+    fn width(self) -> usize {
+        match self {
+            VecType::Float32 => 4,
+            VecType::Float64 => 8,
+        }
+    }
+}
+
+/// The most VECTOR fields an index holds, each a vector set of its own
+/// (ADR-0060 amendment 5).
+pub const MAX_VECTORS: usize = 8;
+
 /// An index's vector field.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorField {
@@ -29,6 +68,7 @@ pub struct VectorField {
     pub path: Box<str>,
     pub index: IndexKind,
     pub dim: usize,
+    pub ty: VecType,
     pub metric: Metric,
     /// HNSW's `EF_RUNTIME`, a search's default `EF`, when declared.
     pub ef_runtime: Option<usize>,
@@ -67,8 +107,9 @@ pub struct IndexDef {
     pub prefixes: Vec<Vec<u8>>,
     /// At most [`filter::MAX_FIELDS`].
     pub attrs: Vec<Attr>,
-    /// At most one; an index with none answers filter-only searches.
-    pub vector: Option<VectorField>,
+    /// At most [`MAX_VECTORS`], each with its own vector set (ADR-0060
+    /// amendment 5); an index with none answers filter-only searches.
+    pub vectors: Vec<VectorField>,
     /// `STOPWORDS` as declared, RediSearch's default list when not: left
     /// out of TEXT fields and of queries (ADR-0063).
     pub stopwords: Option<Vec<Box<str>>>,
@@ -82,6 +123,14 @@ impl IndexDef {
     /// The attributes as the filter parser sees them, in order.
     pub fn fields(&self) -> Vec<Field> {
         self.attrs.iter().map(|a| a.field.clone()).collect()
+    }
+
+    /// The VECTOR field a query names, and where it is in [`vectors`](Self::vectors).
+    pub fn vector(&self, name: &str) -> Option<(usize, &VectorField)> {
+        self.vectors
+            .iter()
+            .enumerate()
+            .find(|(_, v)| &*v.name == name)
     }
 
     /// The definition as the co-processor's index row holds it. JSON, with
@@ -102,8 +151,8 @@ impl IndexDef {
                 })
             })
             .collect();
-        let vector = self.vector.as_ref().map(|v| {
-            json!({
+        let one = |v: &VectorField| {
+            let mut o = json!({
                 "name": &*v.name,
                 "path": &*v.path,
                 "index": v.index.as_str(),
@@ -111,8 +160,22 @@ impl IndexDef {
                 "metric": v.metric.as_str(),
                 "ef_runtime": v.ef_runtime,
                 "hints": v.hints.iter().map(|(k, x)| [&**k, &**x]).collect::<Vec<_>>(),
-            })
-        });
+            });
+            if v.ty != VecType::Float32 {
+                o["type"] = json!(v.ty.as_str());
+            }
+            o
+        };
+        // ONE FLOAT32 FIELD IS WRITTEN AS EVERY EARLIER BINARY WROTE IT, so a
+        // rollback still reads it. Several, or a FLOAT64 one, are an ARRAY,
+        // which an earlier binary's decode refuses, leaving the index out
+        // out loud rather than serving one field of it, or a FLOAT64 field's
+        // bytes as float32s (ADR-0060 amendment 5).
+        let vector = match self.vectors.as_slice() {
+            [] => Value::Null,
+            [v] if v.ty == VecType::Float32 => one(v),
+            vs => Value::Array(vs.iter().map(one).collect()),
+        };
         json!({
             "on": match self.on { On::Hash => "hash", On::Json => "json" },
             "prefixes": self.prefixes,
@@ -160,15 +223,18 @@ impl IndexDef {
                 },
             });
         }
-        let vector = match v.get("vector")? {
-            Value::Null => None,
-            x => Some(VectorField {
+        let field = |x: &Value| -> Option<VectorField> {
+            Some(VectorField {
                 name: x.get("name")?.as_str()?.into(),
                 path: x.get("path")?.as_str()?.into(),
                 index: IndexKind::parse(x.get("index")?.as_str()?.as_bytes())?,
                 dim: usize::try_from(x.get("dim")?.as_u64()?)
                     .ok()
                     .filter(|d| *d > 0)?,
+                ty: match x.get("type") {
+                    None | Some(Value::Null) => VecType::Float32,
+                    Some(t) => VecType::parse(t.as_str()?)?,
+                },
                 metric: Metric::parse(x.get("metric")?.as_str()?.as_bytes())?,
                 ef_runtime: match x.get("ef_runtime")? {
                     Value::Null => None,
@@ -185,8 +251,16 @@ impl IndexDef {
                         })
                         .collect::<Option<Vec<_>>>()?,
                 },
-            }),
+            })
         };
+        let vectors = match v.get("vector")? {
+            Value::Null => Vec::new(),
+            Value::Array(vs) => vs.iter().map(field).collect::<Option<Vec<_>>>()?,
+            x => vec![field(x)?],
+        };
+        if vectors.len() > MAX_VECTORS {
+            return None;
+        }
         let stopwords = match v.get("stopwords") {
             None | Some(Value::Null) => None,
             Some(sw) => Some(strings(Some(sw))?),
@@ -205,7 +279,7 @@ impl IndexDef {
             on,
             prefixes,
             attrs,
-            vector,
+            vectors,
             stopwords,
             score,
             score_field,
@@ -253,6 +327,8 @@ fn kind_from_name(s: &str) -> Option<FieldKind> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Knn {
     pub k: usize,
+    /// The VECTOR field it searches: its place in [`IndexDef::vectors`].
+    pub field: usize,
     pub vector: Vec<f32>,
     /// `EF_RUNTIME` in the clause; the field's own when it gives none.
     pub ef: Option<usize>,
@@ -273,6 +349,9 @@ pub struct Search {
     /// `*`: what a filtered KNN hands its vector set.
     pub filter: Option<Expr>,
     pub knn: Option<Knn>,
+    /// Further vector range terms ANDed with `knn`'s, each with its own
+    /// distance (ADR-0060 amendment 5).
+    pub more: Vec<Knn>,
     pub nocontent: bool,
     /// `RETURN`: `(field, the name to answer it as)`. `None` returns every
     /// field.
@@ -450,7 +529,7 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
         return Err("FT.CREATE needs PREFIX: an index over every key is not served".into());
     }
     let mut attrs: Vec<Attr> = Vec::new();
-    let mut vector: Option<VectorField> = None;
+    let mut vectors: Vec<VectorField> = Vec::new();
     while i < args.len() {
         let path = text(&args[i])?.to_string();
         i += 1;
@@ -471,19 +550,20 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                 filter::MAX_NAME
             ));
         }
-        if attrs.iter().any(|a| *a.field.name == *name)
-            || vector.as_ref().is_some_and(|v| *v.name == *name)
+        if attrs.iter().any(|a| *a.field.name == *name) || vectors.iter().any(|v| *v.name == *name)
         {
             return Err(format!("SCHEMA field {name} is given twice"));
         }
         let ty = upper(arg(args, i).ok_or_else(|| format!("SCHEMA field {name} needs a type"))?);
         i += 1;
         if ty == b"VECTOR" {
-            if vector.is_some() {
-                return Err("an index has at most one VECTOR field".into());
+            if vectors.len() == MAX_VECTORS {
+                return Err(format!(
+                    "an index has at most {MAX_VECTORS} VECTOR fields (ADR-0060 amendment 5)"
+                ));
             }
             let (v, next) = parse_vector(args, i, &name, &path)?;
-            vector = Some(v);
+            vectors.push(v);
             i = next;
             continue;
         }
@@ -577,7 +657,7 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             weight,
         });
     }
-    if attrs.is_empty() && vector.is_none() {
+    if attrs.is_empty() && vectors.is_empty() {
         return Err("FT.CREATE SCHEMA needs at least one field".into());
     }
     Ok((
@@ -586,7 +666,7 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             on,
             prefixes,
             attrs,
-            vector,
+            vectors,
             stopwords,
             score,
             score_field,
@@ -640,16 +720,17 @@ fn parse_vector(
             }
         }
     }
-    match ty.as_deref() {
-        Some(b"FLOAT32") => {}
+    let ty = match ty.as_deref() {
+        Some(b"FLOAT32") => VecType::Float32,
+        Some(b"FLOAT64") => VecType::Float64,
         Some(other) => {
             return Err(format!(
-                "VECTOR TYPE {} is not supported: FLOAT32 only (ADR-0060)",
+                "VECTOR TYPE {} is not supported: FLOAT32 or FLOAT64 (ADR-0060)",
                 String::from_utf8_lossy(other)
             ));
         }
-        None => return Err("VECTOR needs TYPE FLOAT32".into()),
-    }
+        None => return Err("VECTOR needs TYPE FLOAT32 or FLOAT64".into()),
+    };
     let dim = dim
         .filter(|d| *d > 0)
         .ok_or("VECTOR needs DIM, a positive integer")?;
@@ -660,6 +741,7 @@ fn parse_vector(
             path: path.into(),
             index,
             dim,
+            ty,
             metric,
             ef_runtime,
             hints,
@@ -668,18 +750,32 @@ fn parse_vector(
     ))
 }
 
-/// A vector as little-endian float32 bytes, `dim` of them: a HASH field's
-/// value, or a query's `PARAMS`.
-pub fn vector_from_bytes(b: &[u8], dim: usize) -> Result<Vec<f32>, String> {
-    if b.len() != dim * 4 {
+/// A vector as little-endian bytes of `ty`, `dim` of them: a HASH field's
+/// value, or a query's `PARAMS`. A `FLOAT64` vector is rounded to float32
+/// (ADR-0060 amendment 5); one too large for float32 is not finite.
+pub fn vector_from_bytes(b: &[u8], dim: usize, ty: VecType) -> Result<Vec<f32>, String> {
+    if b.len() != dim * ty.width() {
         return Err(format!(
-            "the vector is {} bytes; DIM {dim} FLOAT32 is {}",
+            "the vector is {} bytes; DIM {dim} {} is {}",
             b.len(),
-            dim * 4
+            ty.as_str(),
+            dim * ty.width()
         ));
     }
-    let (words, _) = b.as_chunks::<4>();
-    let v: Vec<f32> = words.iter().map(|w| f32::from_le_bytes(*w)).collect();
+    let v: Vec<f32> = match ty {
+        VecType::Float32 => b
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect(),
+        VecType::Float64 => b
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|w| f64::from_le_bytes(*w) as f32)
+            .collect(),
+    };
     if v.iter().any(|x| !x.is_finite()) {
         return Err("the vector holds a value that is not finite".into());
     }
@@ -698,6 +794,7 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
         query: None,
         filter: None,
         knn: None,
+        more: Vec::new(),
         nocontent: false,
         returns: None,
         sortby: None,
@@ -798,6 +895,7 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
     s.query = q.query;
     s.filter = q.filter;
     s.knn = q.knn;
+    s.more = q.more;
     if s.withscores && s.knn.is_some() {
         return Err(
             "FT.SEARCH WITHSCORES with a KNN or a vector range is not supported (ADR-0063)".into(),
@@ -829,7 +927,11 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
 pub struct QueryPart {
     pub query: Option<QNode>,
     pub filter: Option<Expr>,
+    /// The KNN, or the first vector range term.
     pub knn: Option<Knn>,
+    /// The vector range terms after the first, ANDed with it (ADR-0060
+    /// amendment 5).
+    pub more: Vec<Knn>,
 }
 
 /// The query string of an `FT.SEARCH` or `FT.AGGREGATE`, with its `PARAMS`,
@@ -839,9 +941,9 @@ pub fn parse_query(
     def: &IndexDef,
     params: &HashMap<String, Vec<u8>>,
 ) -> Result<QueryPart, String> {
-    // ADR-0061: a vector range term comes out of the query before the rest
-    // is read as a filter.
-    let (rest, range) = take_range(query, def, params)?;
+    // ADR-0061: the vector range terms come out of the query before the
+    // rest is read as a filter; several, ANDed (ADR-0060 amendment 5).
+    let (rest, mut ranges) = take_ranges(query, def, params)?;
     let query = rest.as_str();
     // The KNN clause is the last `=>[`: a `=>{...}` is a term's attributes.
     let (filter_part, knn_part) = match query.rfind("=>[") {
@@ -850,12 +952,14 @@ pub fn parse_query(
     };
     let fields = def.fields();
     let f = filter_part.trim();
-    if let Some(v) = &def.vector
-        && f.contains(&format!("@{}:", v.name))
+    if let Some(v) = def
+        .vectors
+        .iter()
+        .find(|v| f.contains(&format!("@{}:", v.name)))
     {
         return Err(format!(
-            "the query filters on the VECTOR field {}: only as one \
-             @{}:[VECTOR_RANGE <radius> $<param>] term (ADR-0061)",
+            "the query filters on the VECTOR field {}: only as \
+             @{}:[VECTOR_RANGE <radius> $<param>] terms (ADR-0061)",
             v.name, v.name
         ));
     }
@@ -878,7 +982,7 @@ pub fn parse_query(
         .as_ref()
         .and_then(QNode::as_filter)
         .filter(|e| *e != Expr::All);
-    let mut knn = range;
+    let mut knn = (!ranges.is_empty()).then(|| ranges.remove(0));
     if let Some(k) = knn_part {
         if knn.is_some() {
             return Err("a vector range query cannot also be a KNN (ADR-0061)".into());
@@ -889,14 +993,39 @@ pub fn parse_query(
         query: q,
         filter,
         knn,
+        more: ranges,
     })
 }
 
-/// The query without its vector range term, `@<field>:[VECTOR_RANGE
+/// The query without its vector range terms, and the terms in the order
+/// written (ADR-0060 amendment 5): each one taken as [`take_range`] takes
+/// it, so each stands alone or is ANDed with the rest. Two may not yield
+/// their distances under one name.
+fn take_ranges(
+    query: &str,
+    def: &IndexDef,
+    params: &HashMap<String, Vec<u8>>,
+) -> Result<(String, Vec<Knn>), String> {
+    let (mut rest, mut ranges) = (query.to_string(), Vec::new());
+    while let (r, Some(knn)) = take_range(&rest, def, params)? {
+        if ranges.iter().any(|k: &Knn| k.alias == knn.alias) {
+            return Err(format!(
+                "two vector range terms yield their distances as {}: name each its own \
+                 with $YIELD_DISTANCE_AS (ADR-0060 amendment 5)",
+                knn.alias
+            ));
+        }
+        ranges.push(knn);
+        rest = r;
+    }
+    Ok((rest, ranges))
+}
+
+/// The query without its first vector range term, `@<field>:[VECTOR_RANGE
 /// <radius> $<param>]=>{$YIELD_DISTANCE_AS: <name>; $EPSILON: <e>}`, and
 /// the term as a [`Knn`] cut at its radius (ADR-0061). The term may stand
 /// alone or be ANDed with a filter, in either order, as redisvl writes it;
-/// under `|` or `-`, twice, or beside a KNN it is refused by name.
+/// under `|` or `-`, or beside a KNN, it is refused by name.
 fn take_range(
     query: &str,
     def: &IndexDef,
@@ -906,24 +1035,21 @@ fn take_range(
     let Some(vr) = up.find("VECTOR_RANGE") else {
         return Ok((query.to_string(), None));
     };
-    if up[vr + 1..].contains("VECTOR_RANGE") {
-        return Err("a query takes one vector range term (ADR-0061)".into());
-    }
-    let Some(v) = &def.vector else {
+    if def.vectors.is_empty() {
         return Err("this index has no VECTOR field".into());
-    };
+    }
     let shape = "a vector range term is @<field>:[VECTOR_RANGE <radius> $<param>]";
     let at = query[..vr].rfind('@').ok_or(shape)?;
     let (field, open) = query[at + 1..vr].split_once(':').ok_or(shape)?;
     if open.trim() != "[" {
         return Err(shape.into());
     }
-    if field.trim() != &*v.name {
+    let Some((field, v)) = def.vector(field.trim()) else {
         return Err(format!(
-            "VECTOR_RANGE names @{}, which is not this index's VECTOR field",
+            "VECTOR_RANGE names @{}, which is not one of this index's VECTOR fields",
             field.trim()
         ));
-    }
+    };
     let close = vr + query[vr..].find(']').ok_or(shape)?;
     let toks: Vec<&str> = query[vr..close].split_ascii_whitespace().collect();
     let [_, radius, vector] = toks.as_slice() else {
@@ -941,9 +1067,10 @@ fn take_range(
         Some(_) => param(vector, params)?,
         None => return Err("VECTOR_RANGE needs a $parameter for the query vector".into()),
     };
-    let vector = vector_from_bytes(&blob, v.dim).map_err(|e| format!("the query {e}"))?;
+    let vector = vector_from_bytes(&blob, v.dim, v.ty).map_err(|e| format!("the query {e}"))?;
     let mut knn = Knn {
         k: 0,
+        field,
         vector,
         ef: None,
         alias: format!("__{}_score", v.name).into(),
@@ -1073,26 +1200,27 @@ fn parse_knn(
     if !toks.first().is_some_and(|t| t.eq_ignore_ascii_case("KNN")) {
         return Err("a vector clause is =>[KNN ...]: RANGE is not supported (ADR-0060)".into());
     }
-    let Some(v) = &def.vector else {
+    if def.vectors.is_empty() {
         return Err("this index has no VECTOR field".into());
-    };
+    }
     let k = param_number(toks.get(1), params, "KNN's k")?;
     let field = toks
         .get(2)
         .and_then(|t| t.strip_prefix('@'))
         .ok_or("KNN needs @<vector field>")?;
-    if field != &*v.name {
+    let Some((field, v)) = def.vector(field) else {
         return Err(format!(
-            "KNN names @{field}, which is not this index's VECTOR field"
+            "KNN names @{field}, which is not one of this index's VECTOR fields"
         ));
-    }
+    };
     let blob = match toks.get(3) {
         Some(t) if t.starts_with('$') => param(t, params)?,
         _ => return Err("KNN needs a $parameter for the query vector".into()),
     };
-    let vector = vector_from_bytes(&blob, v.dim).map_err(|e| format!("the query {e}"))?;
+    let vector = vector_from_bytes(&blob, v.dim, v.ty).map_err(|e| format!("the query {e}"))?;
     let mut knn = Knn {
         k,
+        field,
         vector,
         ef: None,
         alias: format!("__{}_score", v.name).into(),
@@ -1232,7 +1360,7 @@ mod tests {
                 ("price", FieldKind::Numeric)
             ]
         );
-        let v = def.vector.as_ref().expect("a vector field");
+        let v = def.vectors.first().expect("a vector field");
         assert_eq!(
             (v.index, v.dim, v.metric, v.ef_runtime),
             (IndexKind::Hnsw, 3, Metric::Cosine, Some(10))
@@ -1288,7 +1416,7 @@ mod tests {
             "TAG",
         ]))
         .expect("parses");
-        assert!(h.vector.is_none());
+        assert!(h.vectors.is_empty());
         // A row this binary cannot read is left out, not half served.
         let later = h
             .encode()
@@ -1330,13 +1458,13 @@ mod tests {
                 "HNSW",
                 "6",
                 "TYPE",
-                "FLOAT64",
+                "FLOAT16",
                 "DIM",
                 "2",
                 "DISTANCE_METRIC",
                 "L2",
             ]))
-            .contains("FLOAT32 only")
+            .contains("FLOAT32 or FLOAT64")
         );
         assert!(
             refused(&with(&["SCHEMA", "v", "VECTOR", "SVS-VAMANA", "0"])).contains("SVS-VAMANA")
@@ -1563,16 +1691,20 @@ mod tests {
         ] {
             assert!(refused(q).contains("ADR-0061"), "{q}: {}", refused(q));
         }
+        // Two ranges may AND (ADR-0060 amendment 5), each under its own name.
         assert!(
             refused("@embedding:[VECTOR_RANGE 0.5 $vector] @embedding:[VECTOR_RANGE 0.6 $vector]")
-                .contains("one vector range")
+                .contains("name each its own")
         );
         assert!(
             refused("@embedding:[VECTOR_RANGE 0.5 $vector]=>{$SEARCH_WINDOW_SIZE: 4}")
                 .contains("SEARCH_WINDOW_SIZE")
         );
         assert!(refused("@embedding:[VECTOR_RANGE -1 $vector]").contains("at least 0"));
-        assert!(refused("@other:[VECTOR_RANGE 0.5 $vector]").contains("not this index's VECTOR"));
+        assert!(
+            refused("@other:[VECTOR_RANGE 0.5 $vector]")
+                .contains("not one of this index's VECTOR fields")
+        );
         assert!(refused("@embedding:[VECTOR_RANGE 0.5 vector]").contains("$parameter"));
     }
 
@@ -1617,7 +1749,7 @@ mod tests {
                 "v",
                 &q
             ))
-            .contains("not this index's VECTOR")
+            .contains("not one of this index's VECTOR fields")
         );
         assert!(
             refused(with_vector(
@@ -1723,10 +1855,10 @@ mod tests {
         // This crate scores L2 as the negated squared distance.
         assert_eq!(distance(Metric::L2, -4.0), 4.0);
         assert_eq!(
-            vector_from_bytes(&blob(&[1.5, -2.0]), 2),
+            vector_from_bytes(&blob(&[1.5, -2.0]), 2, VecType::Float32),
             Ok(vec![1.5, -2.0])
         );
-        assert!(vector_from_bytes(&blob(&[f32::NAN, 0.0]), 2).is_err());
+        assert!(vector_from_bytes(&blob(&[f32::NAN, 0.0]), 2, VecType::Float32).is_err());
     }
 
     #[test]
@@ -1766,5 +1898,228 @@ mod tests {
         assert!(hit("@t:\"QUICK\""));
         assert!(!hit("@t:(\"brown quick\")"), "a phrase keeps its order");
         assert!(!hit("@t:(\"quick fox\")"), "and its words together");
+    }
+
+    /// ADR-0060 amendment 5: redisvl's `test_aggregation.py` index, three
+    /// VECTOR fields of different `DIM`s, one of them `FLOAT64`.
+    fn three_vectors() -> IndexDef {
+        let (_, def) = parse_create(&a(&[
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "v1:",
+            "SCHEMA",
+            "credit_score",
+            "TAG",
+            "description",
+            "TEXT",
+            "user_embedding",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "3",
+            "DISTANCE_METRIC",
+            "COSINE",
+            "image_embedding",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "5",
+            "DISTANCE_METRIC",
+            "COSINE",
+            "audio_embedding",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT64",
+            "DIM",
+            "6",
+            "DISTANCE_METRIC",
+            "COSINE",
+        ]))
+        .expect("parses");
+        def
+    }
+
+    #[test]
+    fn an_index_holds_several_vector_fields_and_float64() {
+        let def = three_vectors();
+        let got: Vec<(&str, usize, VecType)> = def
+            .vectors
+            .iter()
+            .map(|v| (&*v.name, v.dim, v.ty))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("user_embedding", 3, VecType::Float32),
+                ("image_embedding", 5, VecType::Float32),
+                ("audio_embedding", 6, VecType::Float64),
+            ]
+        );
+        // Several fields, or a FLOAT64 one, are written as an array, which
+        // an earlier binary's decode refuses; this one reads them back.
+        let row = def.encode();
+        let v: Value = serde_json::from_str(&row).expect("json");
+        assert!(v["vector"].is_array(), "{row}");
+        assert_eq!(IndexDef::decode(&row), Some(def.clone()));
+        // One FLOAT32 field is written as every earlier binary wrote it.
+        let mut one = def.clone();
+        one.vectors.truncate(1);
+        let row = one.encode();
+        let v: Value = serde_json::from_str(&row).expect("json");
+        assert!(
+            v["vector"].is_object() && v["vector"].get("type").is_none(),
+            "{row}"
+        );
+        assert_eq!(IndexDef::decode(&row), Some(one));
+        // A FLOAT64 field alone is an array too.
+        let mut f64_only = def.clone();
+        f64_only.vectors.drain(..2);
+        let row = f64_only.encode();
+        assert!(serde_json::from_str::<Value>(&row).expect("json")["vector"].is_array());
+        assert_eq!(IndexDef::decode(&row), Some(f64_only));
+    }
+
+    #[test]
+    fn an_index_holds_at_most_eight_vector_fields() {
+        let mut parts: Vec<String> = ["FT.CREATE", "idx", "PREFIX", "1", "d:", "SCHEMA"]
+            .map(String::from)
+            .to_vec();
+        for i in 0..=MAX_VECTORS {
+            parts.push(format!("v{i}"));
+            parts.extend(
+                [
+                    "VECTOR",
+                    "FLAT",
+                    "6",
+                    "TYPE",
+                    "FLOAT32",
+                    "DIM",
+                    "2",
+                    "DISTANCE_METRIC",
+                    "L2",
+                ]
+                .map(String::from),
+            );
+        }
+        let args: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        let e = parse_create(&args).expect_err("nine VECTOR fields");
+        assert!(e.contains("at most 8 VECTOR fields"), "{e}");
+        assert_eq!(
+            parse_create(&args[..args.len() - 10]).map(|(_, d)| d.vectors.len()),
+            Ok(MAX_VECTORS)
+        );
+    }
+
+    #[test]
+    fn a_float64_vector_is_read_as_float32() {
+        let b: Vec<u8> = [1.5f64, -2.25]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        assert_eq!(
+            vector_from_bytes(&b, 2, VecType::Float64),
+            Ok(vec![1.5, -2.25])
+        );
+        let e = vector_from_bytes(&b, 4, VecType::Float64).expect_err("16 bytes is not DIM 4");
+        assert!(e.contains("DIM 4 FLOAT64 is 32"), "{e}");
+        let huge: Vec<u8> = [1e300f64, 0.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        assert!(
+            vector_from_bytes(&huge, 2, VecType::Float64).is_err(),
+            "too large for a float32"
+        );
+        // A FLOAT32 field still takes 4 bytes a dimension.
+        assert!(vector_from_bytes(&b, 2, VecType::Float32).is_err());
+    }
+
+    #[test]
+    fn several_vector_ranges_and_in_one_query() {
+        let def = three_vectors();
+        let mut params = HashMap::new();
+        params.insert("vector_0".to_string(), blob(&[0.1, 0.1, 0.5]));
+        params.insert("vector_1".to_string(), blob(&[0.3, 0.4, 0.7, 0.2, -0.3]));
+        params.insert(
+            "vector_2".to_string(),
+            [0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect(),
+        );
+        // redisvl's MultiVectorQuery, over all three fields.
+        let q = parse_query(
+            "@user_embedding:[VECTOR_RANGE 2.0 $vector_0]=>{$YIELD_DISTANCE_AS: distance_0} \
+             @image_embedding:[VECTOR_RANGE 2.0 $vector_1]=>{$YIELD_DISTANCE_AS: distance_1} \
+             @audio_embedding:[VECTOR_RANGE 2.0 $vector_2]=>{$YIELD_DISTANCE_AS: distance_2}",
+            &def,
+            &params,
+        )
+        .expect("parses");
+        let knn = q.knn.expect("the first range");
+        assert_eq!(
+            (knn.field, &*knn.alias, knn.range),
+            (0, "distance_0", Some(2.0))
+        );
+        let more: Vec<(usize, &str, usize)> = q
+            .more
+            .iter()
+            .map(|k| (k.field, &*k.alias, k.vector.len()))
+            .collect();
+        assert_eq!(more, vec![(1, "distance_1", 5), (2, "distance_2", 6)]);
+        assert_eq!(q.more[1].vector[5], 0.6f64 as f32);
+        // With a filter beside them.
+        let q = parse_query(
+            "(@credit_score:{high}) \
+             @user_embedding:[VECTOR_RANGE 2.0 $vector_0]=>{$YIELD_DISTANCE_AS: distance_0} \
+             @image_embedding:[VECTOR_RANGE 2.0 $vector_1]=>{$YIELD_DISTANCE_AS: distance_1}",
+            &def,
+            &params,
+        )
+        .expect("parses");
+        assert!(q.filter.is_some());
+        assert_eq!(q.more.len(), 1);
+        // Two that yield one name, one under |, and one beside a KNN stay
+        // refused.
+        let refused = |query: &str| parse_query(query, &def, &params).expect_err(query);
+        assert!(
+            refused(
+                "@user_embedding:[VECTOR_RANGE 2.0 $vector_0]=>{$YIELD_DISTANCE_AS: d} \
+                 @image_embedding:[VECTOR_RANGE 2.0 $vector_1]=>{$YIELD_DISTANCE_AS: d}"
+            )
+            .contains("name each its own")
+        );
+        assert!(
+            refused(
+                "@user_embedding:[VECTOR_RANGE 2.0 $vector_0] | \
+                 @image_embedding:[VECTOR_RANGE 2.0 $vector_1]"
+            )
+            .contains("not under |")
+        );
+        assert!(
+            refused(
+                "@user_embedding:[VECTOR_RANGE 2.0 $vector_0]=>[KNN 3 @image_embedding $vector_1]"
+            )
+            .contains("KNN")
+        );
+        // A KNN names any of the fields, and no other.
+        let q = parse_query("*=>[KNN 3 @image_embedding $vector_1 AS d]", &def, &params)
+            .expect("parses");
+        assert_eq!(q.knn.expect("knn").field, 1);
+        assert!(
+            refused("*=>[KNN 3 @nope $vector_1]").contains("not one of this index's VECTOR fields")
+        );
     }
 }

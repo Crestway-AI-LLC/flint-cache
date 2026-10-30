@@ -46,7 +46,7 @@ fn def() -> IndexDef {
 }
 
 fn plan(parts: &[&str], metric: Option<&str>) -> Result<Plan, String> {
-    compile(&req(parts)?, &def(), metric)
+    compile(&req(parts)?, &def(), metric.as_slice())
 }
 
 fn slot(p: &Plan, name: &str) -> usize {
@@ -481,8 +481,8 @@ fn the_router_s_pipeline_runs_as_redisearch_s() {
         .attrs
         .remove(0),
     );
-    let p = compile(&req(&parts).expect("parses"), &d, Some("vector_distance")).expect("compiles");
-    assert_eq!(p.metric, Some(0));
+    let p = compile(&req(&parts).expect("parses"), &d, &["vector_distance"]).expect("compiles");
+    assert_eq!(p.metrics, vec![0]);
     let rows = |dists: &[(&str, f64)]| -> Vec<Row> {
         dists
             .iter()
@@ -778,7 +778,7 @@ fn a_row_shows_its_names_in_the_order_they_were_made() {
     )
     .expect("compiles");
     let mut r = row(&p, "doc:1", 1, &[("body", s("hello"))]);
-    r.vals[p.metric.expect("metric")] = Some(n(0.5));
+    r.vals[*p.metrics.first().expect("metric")] = Some(n(0.5));
     r.vals[p.score.expect("score")] = Some(n(0.287_682_072_451_780_9));
     let ran = run(&p, vec![r], 1).expect("runs");
     assert_eq!(

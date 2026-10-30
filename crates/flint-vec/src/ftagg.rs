@@ -630,8 +630,10 @@ pub struct Plan {
     /// Each stretch's names, the root's first; a `GROUPBY` starts the next.
     names: Vec<Vec<Box<str>>>,
     ops: Vec<(usize, Op)>,
-    /// The slots of the KNN's or range's distance and of `__score`.
-    pub metric: Option<usize>,
+    /// The slots of the query's distances, the KNN's or first range's
+    /// first, then each further range's (ADR-0060 amendment 5), and of
+    /// `__score`.
+    pub metrics: Vec<usize>,
     pub score: Option<usize>,
     /// A step reads a field that must be read back, so every row is read
     /// before the pipeline runs.
@@ -757,9 +759,9 @@ impl Compiler<'_> {
     }
 }
 
-/// `req` against the index `def`, whose query's distance, if any, is
-/// named `metric`.
-pub fn compile(req: &Request, def: &IndexDef, metric: Option<&str>) -> Result<Plan, String> {
+/// `req` against the index `def`, whose query's distances, if any, are
+/// named `metrics`, the KNN's or first range's first.
+pub fn compile(req: &Request, def: &IndexDef, metrics: &[&str]) -> Result<Plan, String> {
     let mut c = Compiler {
         def,
         root: Vec::new(),
@@ -767,13 +769,16 @@ pub fn compile(req: &Request, def: &IndexDef, metric: Option<&str>) -> Result<Pl
         load_all: false,
         implicit: Vec::new(),
     };
-    let metric = metric.map(|m| {
-        c.add(RootKey {
-            name: m.into(),
-            sv: None,
-            load: None,
+    let metrics: Vec<usize> = metrics
+        .iter()
+        .map(|m| {
+            c.add(RootKey {
+                name: (*m).into(),
+                sv: None,
+                load: None,
+            })
         })
-    });
+        .collect();
     let score = req.addscores.then(|| {
         c.add(RootKey {
             name: "__score".into(),
@@ -956,7 +961,7 @@ pub fn compile(req: &Request, def: &IndexDef, metric: Option<&str>) -> Result<Pl
         root: c.root,
         names: c.names,
         ops,
-        metric,
+        metrics,
         score,
         early_reads,
         late_reads,

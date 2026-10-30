@@ -59,7 +59,7 @@ for _ in $(seq 1 60); do case "$(valkey-cli -p 6542 PING 2>&1)" in *NOAUTH*|PONG
 # writer would reach them).
 step() {
   python3 - "$1" "$D" <<'PY'
-import socket, struct, sys, time
+import json, socket, struct, sys, time
 
 def conn(port, auth=None, ns=None):
     s = socket.create_connection(("127.0.0.1", port))
@@ -129,6 +129,9 @@ def cmd(c, *args):
 
 def vec(*xs):
     return struct.pack("<%df" % len(xs), *xs)
+
+def vec64(*xs):
+    return struct.pack("<%dd" % len(xs), *xs)
 
 def want(got, exp, what):
     if got != exp:
@@ -590,6 +593,62 @@ if which in ("agg", "aggsame"):
         want(cmd(px, "FT.DROPINDEX", "ag", "DD"), "OK", "FT.DROPINDEX ag DD")
         print("  FT.AGGREGATE: the same router answer, rebuilt; a cursor from before the restart is not found")
 
+if which in ("multi", "multisame"):
+    # ADR-0060 amendment 5: two VECTOR fields in one index, one FLOAT64,
+    # and redisvl's MultiVectorQuery, ranges on both ANDed, each yielding its
+    # distance for APPLY; on HASH and on JSON. mv:1 is near on both, mv:2 on
+    # a only, mv:3 on b only, mv:4 has no b.
+    docs = {"1": ((0.0, 0.0), (0.0, 0.0)), "2": ((0.1, 0.0), (9.0, 9.0)),
+            "3": ((9.0, 9.0), (0.1, 0.0)), "4": ((0.0, 0.1), None)}
+    if which == "multi":
+        two = ["a", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", "2", "DISTANCE_METRIC", "L2",
+               "b", "VECTOR", "FLAT", "6", "TYPE", "FLOAT64", "DIM", "2", "DISTANCE_METRIC", "L2"]
+        want(cmd(px, "FT.CREATE", "mv", "ON", "HASH", "PREFIX", "1", "mv:", "SCHEMA", "user", "TAG",
+                 *two), "OK", "FT.CREATE mv, two VECTOR fields, one FLOAT64")
+        want(cmd(px, "FT.CREATE", "mvj", "ON", "JSON", "PREFIX", "1", "mvj:", "SCHEMA",
+                 "$.user", "AS", "user", "TAG", "$.a", "AS", "a", *two[1:10], "$.b", "AS", "b", *two[11:]),
+             "OK", "FT.CREATE mvj")
+        for k, (a, b) in docs.items():
+            h = ["user", "u" + k, "a", vec(*a)] + (["b", vec64(*b)] if b else [])
+            want(cmd(px, "HSET", "mv:" + k, *h), len(h) // 2, "HSET mv:" + k)
+            j = {"user": "u" + k, "a": list(a)}
+            if b:
+                j["b"] = list(b)
+            want(cmd(px, "JSON.SET", "mvj:" + k, "$", json.dumps(j)), "OK", "JSON.SET mvj:" + k)
+        info = cmd(px, "FT.INFO", "mv")
+        attrs = info[info.index(b"attributes") + 1]
+        types = [a[a.index(b"data_type") + 1] for a in attrs if b"VECTOR" in a]
+        want(types, [b"FLOAT32", b"FLOAT64"], "FT.INFO mv: two VECTOR fields, their types")
+    for ix in ("mv", "mvj"):
+        r = cmd(px, "FT.AGGREGATE", ix,
+                "@a:[VECTOR_RANGE 1 $va]=>{$YIELD_DISTANCE_AS: distance_0} "
+                "@b:[VECTOR_RANGE 200 $vb]=>{$YIELD_DISTANCE_AS: distance_1}",
+                "SCORER", "TFIDF", "LOAD", "1", "user", "DIALECT", "2",
+                "APPLY", "(2 - @distance_0)/2", "AS", "score_0", "APPLY", "(2 - @distance_1)/2", "AS", "score_1",
+                "APPLY", "@score_0 * 1.0 + @score_1 * 0.4", "AS", "combined_score",
+                "SORTBY", "2", "@combined_score", "DESC", "MAX", "10",
+                "PARAMS", "4", "va", vec(0.0, 0.0), "vb", vec64(0.0, 0.0))
+        if isinstance(r, Err):
+            raise SystemExit("FAIL: %s: %s: the multi-vector query: %s" % (which, ix, r))
+        rows = [dict(zip(row[0::2], row[1::2])) for row in r[1:]]
+        want([x[b"user"] for x in rows], [b"u1", b"u2"], "%s: %s: within both ranges, best first" % (which, ix))
+        want(float(rows[1][b"distance_1"]), 162.0, "%s: %s: mv:2's distance on b, 9^2 + 9^2" % (which, ix))
+        for x in rows:
+            c = (2 - float(x[b"distance_0"])) / 2 + 0.4 * (2 - float(x[b"distance_1"])) / 2
+            if abs(c - float(x[b"combined_score"])) > 1e-6:
+                raise SystemExit("FAIL: %s: %s: combined_score %r, its APPLYs give %r"
+                                 % (which, ix, x[b"combined_score"], c))
+        # A KNN on the FLOAT64 field, as AggregateHybridQuery names one.
+        r = cmd(px, "FT.SEARCH", ix, "*=>[KNN 2 @b $vb AS d]", "NOCONTENT", "PARAMS", "2", "vb",
+                vec64(0.0, 0.0), "DIALECT", "2")
+        want(r, [2, ix.encode() + b":1", ix.encode() + b":3"], "%s: %s: KNN on the FLOAT64 field" % (which, ix))
+    if which == "multisame":
+        want(cmd(px, "FT.DROPINDEX", "mv", "DD"), "OK", "FT.DROPINDEX mv DD")
+        want(cmd(px, "FT.DROPINDEX", "mvj", "DD"), "OK", "FT.DROPINDEX mvj DD")
+        print("  two VECTOR fields, one FLOAT64: the same multi-vector answers, rebuilt")
+    else:
+        print("  two VECTOR fields, one FLOAT64, on HASH and JSON: redisvl's multi-vector query and a KNN on the FLOAT64 field")
+
 if which == "off":
     refused(cmd(px, "FT.CREATE", "z", "PREFIX", "1", "z:", "SCHEMA", "a", "TAG"),
             "ERR FT.* is not enabled", "FT.CREATE without --ft")
@@ -618,6 +677,8 @@ echo "== ADR-0063: full text, scored"
 step text || exit 1
 echo "== ADR-0064: FT.AGGREGATE and FT.CURSOR"
 step agg || exit 1
+echo "== ADR-0060 amendment 5: two VECTOR fields, one FLOAT64, and ranges on both"
+step multi || exit 1
 
 echo "== a co-processor restart rebuilds every index and registers its prefixes again"
 kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
@@ -632,6 +693,8 @@ echo "== ADR-0063: the same scores, rebuilt; then the text index is dropped"
 step textsame || exit 1
 echo "== ADR-0064: the same aggregate, rebuilt; a cursor from before the restart is gone"
 step aggsame || exit 1
+echo "== ADR-0060 amendment 5: the same multi-vector answers, rebuilt"
+step multisame || exit 1
 grep -q "FT\.\* on" "$D/vec.log" || { echo "FAIL: flint-vec did not say FT.* is on"; exit 1; }
 
 echo "== FT.DROPINDEX takes the prefixes off every pair"
@@ -645,4 +708,4 @@ kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec
 step off || exit 1
 
-echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), FT.AGGREGATE answers redisvl's paging, router and hybrid query and its cursors end with their co-processor (ADR-0064), redisvl's update scripts and JSON.MERGE write indexed documents (ADR-0060 amendment 4), and --ft gates it (ADR-0060, amendment 3)"
+echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), FT.AGGREGATE answers redisvl's paging, router and hybrid query and its cursors end with their co-processor (ADR-0064), redisvl's update scripts and JSON.MERGE write indexed documents (ADR-0060 amendment 4), an index with two VECTOR fields, one FLOAT64, answers redisvl's multi-vector query before and after a restart (ADR-0060 amendment 5), and --ft gates it (ADR-0060, amendment 3)"

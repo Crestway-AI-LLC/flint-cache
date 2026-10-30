@@ -91,7 +91,9 @@ const TAG_COUNT_BYTES: usize = 64;
 /// values by attribute, and its score.
 struct Read {
     vals: Option<Vals>,
-    vector: Result<Option<Vec<f32>>, String>,
+    /// One for each VECTOR field, in the definition's order; `None` where
+    /// the document has none.
+    vectors: Result<Vec<Option<Vec<f32>>>, String>,
     texts: Vec<(usize, Vec<u8>)>,
     score: f32,
     sorts: Option<Sorts>,
@@ -111,8 +113,10 @@ pub struct FtIndex {
     def: IndexDef,
     fields: Box<[Field]>,
     docs: HashMap<Vec<u8>, Doc>,
-    /// Over the documents that hold a vector, keyed as `docs` is.
-    set: Option<VectorSet>,
+    /// One for each VECTOR field, in [`IndexDef::vectors`]' order, over the
+    /// documents that hold that field's vector, keyed as `docs` is (ADR-0060
+    /// amendment 5).
+    sets: Vec<VectorSet>,
     /// Documents left out since the index was made, as RediSearch counts
     /// `hash_indexing_failures`: a vector that is not `DIM` float32s, or a
     /// GEO value that is not a point a geohash holds (ADR-0062).
@@ -153,6 +157,9 @@ pub struct AggHit {
     pub key: Vec<u8>,
     pub seq: u64,
     pub dist: Option<f32>,
+    /// Its distance under each further vector range, in the query's order
+    /// (ADR-0060 amendment 5).
+    pub more: Vec<f32>,
     pub score: f64,
 }
 
@@ -165,6 +172,9 @@ type Ranked = Vec<(Vec<u8>, Option<f32>)>;
 pub struct Hits {
     pub total: usize,
     pub keys: Vec<(Vec<u8>, Option<f32>)>,
+    /// Each key's distance under each further vector range, in the query's
+    /// order; empty when it has none (ADR-0060 amendment 5).
+    pub more: Vec<Vec<f32>>,
     /// Each key's score under the search's scorer (ADR-0063), for
     /// `WITHSCORES`; 0 for a KNN's, which is refused it.
     pub scores: Vec<f64>,
@@ -173,9 +183,13 @@ pub struct Hits {
 impl FtIndex {
     pub fn new(def: IndexDef) -> Self {
         let fields: Box<[Field]> = def.fields().into_boxed_slice();
-        let set = def.vector.as_ref().map(|v| {
-            VectorSet::new(v.dim, v.metric, v.index, Quant::None).with_fields(fields.to_vec())
-        });
+        let sets = def
+            .vectors
+            .iter()
+            .map(|v| {
+                VectorSet::new(v.dim, v.metric, v.index, Quant::None).with_fields(fields.to_vec())
+            })
+            .collect();
         let mut text_fields = HashMap::new();
         let mut nostem = 0u32;
         for (at, a) in def.attrs.iter().enumerate() {
@@ -223,7 +237,7 @@ impl FtIndex {
             def,
             fields,
             docs: HashMap::new(),
-            set,
+            sets,
             failures: 0,
             ready: false,
             next_seq: 0,
@@ -290,12 +304,12 @@ impl FtIndex {
         };
         let Read {
             vals,
-            vector,
+            vectors,
             texts,
             score,
             sorts,
         } = read;
-        let vector = match vector {
+        let vectors = match vectors {
             Ok(v) => v,
             Err(e) => {
                 self.remove(key);
@@ -303,10 +317,10 @@ impl FtIndex {
                 return Err(e);
             }
         };
-        // Its earlier write's words and tags go; the vector set replaces its
-        // own entry below.
+        // Its earlier write's words and tags go; each vector set replaces
+        // its own entry below.
         self.unindex(key);
-        if let Some(set) = &mut self.set {
+        for (set, vector) in self.sets.iter_mut().zip(vectors) {
             match vector {
                 Some(v) => set.set(
                     key.to_vec(),
@@ -386,7 +400,7 @@ impl FtIndex {
 
     /// Drop `key` from the index; whether it was there.
     pub fn remove(&mut self, key: &[u8]) -> bool {
-        if let Some(set) = &mut self.set {
+        for set in &mut self.sets {
             set.del(key);
         }
         self.unindex(key)
@@ -399,9 +413,7 @@ impl FtIndex {
             return false;
         };
         doc.expires_at = expires_at;
-        if let Some(set) = &mut self.set
-            && set.contains(key)
-        {
+        for set in self.sets.iter_mut().filter(|s| s.contains(key)) {
             match expires_at {
                 Some(e) => {
                     set.expiry.insert(key.to_vec(), e);
@@ -441,10 +453,10 @@ impl FtIndex {
                 std::mem::size_of_val(&**s) + s.iter().flatten().map(|v| v.len()).sum::<usize>()
             })
             + self
-                .set
-                .as_ref()
-                .and_then(|s| s.entry_cost(key))
-                .unwrap_or(0)
+                .sets
+                .iter()
+                .filter_map(|s| s.entry_cost(key))
+                .sum::<usize>()
     }
 
     /// What the index holds beyond each document's own charge: the vector
@@ -452,7 +464,7 @@ impl FtIndex {
     /// the TEXT fields' words and postings, whose terms documents share
     /// (ADR-0063); and the TAG values' document counts.
     pub fn held(&self) -> usize {
-        self.set.as_ref().map_or(0, |s| s.held()) + self.text.bytes() + self.tag_bytes
+        self.sets.iter().map(VectorSet::held).sum::<usize>() + self.text.bytes() + self.tag_bytes
     }
 
     /// What the whole index costs the D4 meter: every document's
@@ -508,6 +520,7 @@ impl FtIndex {
         let view = View { ix: self, now };
         let matches =
             || ftquery::matches(s.query.as_ref(), &self.text, &view, self.nostem, s.scorer);
+        let mut more_of: HashMap<Vec<u8>, Vec<f32>> = HashMap::new();
         let mut hits: Vec<(Vec<u8>, Option<f32>, f64)> = match &s.knn {
             Some(knn) => {
                 // A query with a text term is matched first, from the
@@ -523,12 +536,26 @@ impl FtIndex {
                     None => self.nearest(knn, filter, allowed.as_ref(), knn.k, now)?,
                     // ADR-0061 C: a range is a KNN cut at its radius, asked
                     // for the page's end first.
+                    // ANDed with further ranges, the first is counted whole.
                     Some(radius) => {
-                        let want = s.offset.saturating_add(s.num);
+                        let want = if s.more.is_empty() {
+                            s.offset.saturating_add(s.num)
+                        } else {
+                            RANGE_CAP
+                        };
                         self.within(knn, filter, allowed.as_ref(), radius, want, now)?
                     }
                 };
-                near.into_iter().map(|(k, d)| (k, d, 0.0)).collect()
+                let anded = self.and_ranges(near, &s.more, filter, allowed.as_ref(), now)?;
+                anded
+                    .into_iter()
+                    .map(|(k, d, more)| {
+                        if !more.is_empty() {
+                            more_of.insert(k.clone(), more);
+                        }
+                        (k, d, 0.0)
+                    })
+                    .collect()
             }
             None => {
                 let mut m = matches();
@@ -567,6 +594,10 @@ impl FtIndex {
         Ok(Hits {
             total,
             scores: page.iter().map(|(_, _, sc)| *sc).collect(),
+            more: page
+                .iter()
+                .map(|(k, _, _)| more_of.remove(k).unwrap_or_default())
+                .collect(),
             keys: page.into_iter().map(|(k, d, _)| (k, d)).collect(),
         })
     }
@@ -582,8 +613,9 @@ impl FtIndex {
         k: usize,
         now: u64,
     ) -> Result<Ranked, String> {
-        let (Some(set), Some(v)) = (&self.set, &self.def.vector) else {
-            return Err("this index has no VECTOR field".into());
+        let (Some(set), Some(v)) = (self.sets.get(knn.field), self.def.vectors.get(knn.field))
+        else {
+            return Err("this index has no such VECTOR field".into());
         };
         let expired = set.expired_count(now);
         let ef = knn.ef.or(v.ef_runtime).unwrap_or(hnsw::EF_SEARCH_DEFAULT);
@@ -631,6 +663,39 @@ impl FtIndex {
         }
     }
 
+    /// `near`, the first vector range's documents, cut to those within
+    /// every range of `more` too, in `near`'s order, each with its distance
+    /// under each (ADR-0060 amendment 5). Each range counts at most
+    /// [`RANGE_CAP`] documents, as one alone does.
+    #[allow(clippy::type_complexity)]
+    fn and_ranges(
+        &self,
+        near: Ranked,
+        more: &[Knn],
+        filter: Option<&filter::Expr>,
+        allowed: Option<&HashSet<&[u8]>>,
+        now: u64,
+    ) -> Result<Vec<(Vec<u8>, Option<f32>, Vec<f32>)>, String> {
+        let mut each: Vec<HashMap<Vec<u8>, f32>> = Vec::with_capacity(more.len());
+        for r in more {
+            let radius = r.range.unwrap_or(f32::INFINITY);
+            let within = self.within(r, filter, allowed, radius, RANGE_CAP, now)?;
+            each.push(
+                within
+                    .into_iter()
+                    .filter_map(|(k, d)| Some((k, d?)))
+                    .collect(),
+            );
+        }
+        Ok(near
+            .into_iter()
+            .filter_map(|(k, d)| {
+                let ds: Option<Vec<f32>> = each.iter().map(|m| m.get(&k).copied()).collect();
+                Some((k, d, ds?))
+            })
+            .collect())
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -654,10 +719,11 @@ impl FtIndex {
             .is_some_and(|n| n.as_filter() == Some(filter::Expr::All));
         let has_text = q.query.as_ref().is_none_or(|n| n.as_filter().is_none());
         let matched = || ftquery::matches(q.query.as_ref(), &self.text, &view, self.nostem, scorer);
-        let hit = |key: Vec<u8>, dist: Option<f32>, score: f64| AggHit {
+        let hit = |key: Vec<u8>, dist: Option<f32>, more: Vec<f32>, score: f64| AggHit {
             seq: self.seq(&key),
             key,
             dist,
+            more,
             score,
         };
         let Some(knn) = &q.knn else {
@@ -665,7 +731,9 @@ impl FtIndex {
             m.sort_by_key(|(id, _)| *id);
             return Ok(m
                 .into_iter()
-                .filter_map(|(id, sc)| Some(hit(self.by_seq.get(&id)?.clone(), None, sc)))
+                .filter_map(|(id, sc)| {
+                    Some(hit(self.by_seq.get(&id)?.clone(), None, Vec::new(), sc))
+                })
                 .collect());
         };
         let m = if has_text || (scores && !all) {
@@ -687,15 +755,16 @@ impl FtIndex {
                 r
             }
         };
-        Ok(near
+        let anded = self.and_ranges(near, &q.more, filter, allowed.as_ref(), now)?;
+        Ok(anded
             .into_iter()
-            .map(|(k, d)| {
+            .map(|(k, d, more)| {
                 let sc = if scores {
                     score_of.get(k.as_slice()).copied().unwrap_or(0.0)
                 } else {
                     0.0
                 };
-                hit(k, d, sc)
+                hit(k, d, more, sc)
             })
             .collect())
     }
@@ -723,8 +792,11 @@ impl FtIndex {
     /// does not hold is left for the caller to read.
     pub fn agg_row(&self, plan: &Plan, hit: &AggHit) -> Row {
         let mut r = Row::root(plan, &hit.key, hit.seq);
-        if let (Some(s), Some(d)) = (plan.metric, hit.dist) {
+        if let (Some(&s), Some(d)) = (plan.metrics.first(), hit.dist) {
             r.vals[s] = Some(Datum::Num(f64::from(d)));
+        }
+        for (&s, d) in plan.metrics.iter().skip(1).zip(&hit.more) {
+            r.vals[s] = Some(Datum::Num(f64::from(*d)));
         }
         if let Some(s) = plan.score {
             r.vals[s] = Some(Datum::Num(hit.score));
@@ -799,24 +871,26 @@ impl FtIndex {
         if let Some(e) = bad {
             return Read {
                 vals: any(vals),
-                vector: Err(e),
+                vectors: Err(e),
                 texts,
                 score,
                 sorts,
             };
         }
-        let vector = match &self.def.vector {
-            None => Ok(None),
-            Some(v) => match get(&v.path) {
+        let vectors = self
+            .def
+            .vectors
+            .iter()
+            .map(|v| match get(&v.path) {
                 None => Ok(None),
-                Some(raw) => vector_from_bytes(raw, v.dim)
+                Some(raw) => vector_from_bytes(raw, v.dim, v.ty)
                     .map(Some)
                     .map_err(|e| format!("{} is not indexed: {e}", v.name)),
-            },
-        };
+            })
+            .collect();
         Read {
             vals: any(vals),
-            vector,
+            vectors,
             texts,
             score,
             sorts,
@@ -895,19 +969,21 @@ impl FtIndex {
         if let Some(e) = bad {
             return Read {
                 vals: any(vals),
-                vector: Err(e),
+                vectors: Err(e),
                 texts,
                 score,
                 sorts,
             };
         }
-        let vector = match &self.def.vector {
-            None => Ok(None),
-            Some(v) => json_vector(v, json_at(doc, &v.path)),
-        };
+        let vectors = self
+            .def
+            .vectors
+            .iter()
+            .map(|v| json_vector(v, json_at(doc, &v.path)))
+            .collect();
         Read {
             vals: any(vals),
-            vector,
+            vectors,
             texts,
             score,
             sorts,
@@ -2367,5 +2443,112 @@ mod tests {
         let fields = vec![(b"u".to_vec(), vec![0xff, 0xfe])];
         assert!(ix.put(b"doc:2", Source::Hash(&fields), None).is_ok());
         assert_eq!(ix.len(), 1);
+    }
+
+    /// ADR-0060 amendment 5: two VECTOR fields, one FLOAT64, each its own
+    /// set; ranges on both, ANDed, each with its own distance, in
+    /// `FT.SEARCH` and in `FT.AGGREGATE`'s matches.
+    #[test]
+    fn ranges_on_two_vector_fields_and_with_a_distance_each() {
+        let (_, def) = parse_create(&a(&[
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "user",
+            "TAG",
+            "a",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+            "b",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT64",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+        ]))
+        .expect("parses");
+        let mut ix = FtIndex::new(def);
+        ix.set_ready();
+        let f64s = |v: &[f64]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        // doc:1 is near on both, doc:2 on a only, doc:3 on b only, doc:4 has
+        // no b at all.
+        for (key, va, vb) in [
+            ("doc:1", [0.0f32, 0.0], Some([0.0f64, 0.0])),
+            ("doc:2", [0.1, 0.0], Some([9.0, 9.0])),
+            ("doc:3", [9.0, 9.0], Some([0.1, 0.0])),
+            ("doc:4", [0.0, 0.1], None),
+        ] {
+            let mut fields = vec![
+                (b"user".to_vec(), b"u".to_vec()),
+                (b"a".to_vec(), blob(&va)),
+            ];
+            if let Some(vb) = vb {
+                fields.push((b"b".to_vec(), f64s(&vb)));
+            }
+            ix.put(key.as_bytes(), Source::Hash(&fields), None)
+                .expect("indexed");
+        }
+        let query = |rb: &str| {
+            format!(
+                "@a:[VECTOR_RANGE 1 $va]=>{{$YIELD_DISTANCE_AS: da}} \
+                 @b:[VECTOR_RANGE {rb} $vb]=>{{$YIELD_DISTANCE_AS: db}}"
+            )
+        };
+        let search = |rb: &str| {
+            let mut args = a(&["FT.SEARCH", "idx", &query(rb), "PARAMS", "4", "va"]);
+            args.push(blob(&[0.0, 0.0]));
+            args.push(b"vb".to_vec());
+            args.push(f64s(&[0.0, 0.0]));
+            args.extend(a(&["DIALECT", "2"]));
+            let s = parse_search(&args, ix.def()).expect("parses");
+            ix.search(&s, 1000).expect("searches")
+        };
+        let h = search("1");
+        assert_eq!(keys(&h), vec!["doc:1"]);
+        assert_eq!((h.keys[0].1, h.more.clone()), (Some(0.0), vec![vec![0.0]]));
+        // Wider on b: doc:2 comes in with its b distance, 9² + 9².
+        let h = search("200");
+        assert_eq!(keys(&h), vec!["doc:1", "doc:2"]);
+        assert_eq!(h.more, vec![vec![0.0], vec![162.0]]);
+        // FT.AGGREGATE's matches carry both, in write order.
+        let mut params = HashMap::new();
+        params.insert("va".to_string(), blob(&[0.0, 0.0]));
+        params.insert("vb".to_string(), f64s(&[0.0, 0.0]));
+        let q = crate::ft::parse_query(&query("200"), ix.def(), &params).expect("parses");
+        let hits = ix
+            .agg_matches(&q, ftquery::Scorer::DEFAULT, false, 1000)
+            .expect("matches");
+        let got: Vec<(String, Vec<f32>)> = hits
+            .iter()
+            .map(|h| (String::from_utf8_lossy(&h.key).into_owned(), h.more.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("doc:1".into(), vec![0.0]), ("doc:2".into(), vec![162.0])]
+        );
+        assert_eq!(hits[0].dist, Some(0.0));
+        assert!(
+            hits[1].dist.is_some_and(|d| d > 0.0 && d < 0.02),
+            "{:?}",
+            hits[1].dist
+        );
+        // A document is charged for each set it is in.
+        assert!(ix.charge(b"doc:1") > ix.charge(b"doc:4"));
     }
 }
