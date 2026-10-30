@@ -34,6 +34,8 @@ Reference:
   managed-service plane, referenced from code comments by number).
 - `bugs/` — notable root-caused bugs, kept as regression documentation.
 - `retry-safety.md` — which commands are safe to retry, and why.
+- `error-handling-review.md` — the code split into fourteen review areas for
+  error handling, each with its code, its questions and its rules.
 
 Some code comments also reference `docs/design.md` and the raw benchmark
 data under `docs/bench/` — both are Crestway-internal working documents;

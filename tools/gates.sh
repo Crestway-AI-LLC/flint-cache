@@ -3821,7 +3821,10 @@ GUIDES = {
 # Docs that describe MECHANISM. They name control-plane verbs -- CPLEASE,
 # FLINTDEMOTE, FLINTSLOTSTATS -- to explain how the system works, not to tell
 # anyone to send them, and a client command matrix is right not to list them.
-INTERNALS = {"architecture.md", "capacity-model.md", "failover.md"}
+# error-handling-review.md names commands as review subjects, for reviewers
+# reading code, not as anything to send.
+INTERNALS = {"architecture.md", "capacity-model.md", "error-handling-review.md",
+             "failover.md"}
 MATRIX = "command-support.md"
 
 present = {os.path.basename(f) for f in glob.glob("docs/*.md")}
