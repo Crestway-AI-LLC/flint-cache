@@ -464,6 +464,45 @@ if which in ("text", "textsame"):
         want(cmd(px, "FT.DROPINDEX", "tx", "DD"), "OK", "FT.DROPINDEX tx DD")
     print("  full text: BM25STD scores as its formula gives them, a TextQuery, a prefix, a stop-word phrase, SORTBY a TEXT field")
 
+if which == "scripts":
+    # ADR-0060 amendment 4: redisvl's update_by_filter scripts, and
+    # JSON.MERGE, on indexed keys through the proxy. Each runs on the pair
+    # through the co-processor, which reads the declared key back and
+    # indexes it. On two indexes of their own, dropped at the end.
+    hash_script = ("if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end "
+                   "redis.call('HSET', KEYS[1], unpack(ARGV)) return 1")
+    json_script = ("if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end "
+                   "redis.call('JSON.MERGE', KEYS[1], '$', ARGV[1]) return 1")
+    want(cmd(px, "FT.CREATE", "sx", "ON", "HASH", "PREFIX", "1", "sc:", "SCHEMA",
+             "user", "TAG", "n", "NUMERIC"), "OK", "FT.CREATE sx")
+    want(cmd(px, "FT.CREATE", "sj", "ON", "JSON", "PREFIX", "1", "scj:", "SCHEMA",
+             "$.user", "AS", "user", "TAG", "$.n", "AS", "n", "NUMERIC"), "OK", "FT.CREATE sj")
+    want(cmd(px, "HSET", "sc:1", "user", "ann", "n", 1), 2, "HSET sc:1")
+    want(cmd(px, "JSON.SET", "scj:1", "$", '{"user":"ann","n":1}'), "OK", "JSON.SET scj:1")
+    want(cmd(px, "EVAL", hash_script, 1, "sc:1", "n", 7), 1, "redisvl's HASH update script")
+    want(cmd(px, "FT.SEARCH", "sx", "@n:[7 7]", "NOCONTENT"), [1, b"sc:1"],
+         "the script's write, indexed")
+    want(cmd(px, "EVAL", hash_script, 1, "sc:gone", "n", 7), 0, "the script on a missing key")
+    want(cmd(px, "FT.SEARCH", "sx", "@n:[7 7]", "NOCONTENT"), [1, b"sc:1"],
+         "no document made of a missing key")
+    want(cmd(px, "EVAL", json_script, 1, "scj:1", '{"n":8}'), 1, "redisvl's JSON update script")
+    want(cmd(px, "FT.SEARCH", "sj", "@n:[8 8]", "NOCONTENT"), [1, b"scj:1"],
+         "the JSON script's write, indexed")
+    want(cmd(px, "JSON.MERGE", "scj:1", "$", '{"user":"bob"}'), "OK", "JSON.MERGE")
+    want(cmd(px, "FT.SEARCH", "sj", "@user:{bob}", "NOCONTENT"), [1, b"scj:1"],
+         "JSON.MERGE's write, indexed")
+    # A key the script builds under the prefix is refused, and so is the
+    # whole script: nothing of it is written, so nothing goes unindexed.
+    r = cmd(px, "EVAL", "redis.call('HSET', KEYS[1], 'n', 9) "
+            "return redis.call('HSET', 'sc:{t}b', 'n', 9)", 1, "sc:{t}a")
+    if not (isinstance(r, Err) and "INDEXED" in r):
+        raise SystemExit("FAIL: scripts: a script writing an undeclared indexed key: got %r" % r)
+    want(cmd(px, "EXISTS", "sc:{t}a", "sc:{t}b"), 0, "scripts: nothing of the refused script written")
+    want(cmd(px, "FT.SEARCH", "sx", "@n:[9 9]", "NOCONTENT"), [0], "scripts: nothing of it indexed")
+    want(cmd(px, "FT.DROPINDEX", "sx", "DD"), "OK", "FT.DROPINDEX sx DD")
+    want(cmd(px, "FT.DROPINDEX", "sj", "DD"), "OK", "FT.DROPINDEX sj DD")
+    print("  redisvl's update scripts and JSON.MERGE write indexed documents; an undeclared indexed key is refused")
+
 if which in ("agg", "aggsame"):
     # ADR-0064: FT.AGGREGATE and FT.CURSOR through the proxy, in the shapes
     # redisvl sends: bulk paging, its semantic router, its hybrid query.
@@ -564,6 +603,8 @@ echo "== documents written through the proxy are indexed as they are written"
 step write || exit 1
 echo "== an index over JSON documents that already exist on both pairs"
 step json || exit 1
+echo "== ADR-0060 amendment 4: a script, and JSON.MERGE, on an indexed key"
+step scripts || exit 1
 
 echo "== ADR-0060 amendment 3: MODULE LIST, aliases, a page past the default budget, ties"
 step amend3 || exit 1
@@ -604,4 +645,4 @@ kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec
 step off || exit 1
 
-echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), FT.AGGREGATE answers redisvl's paging, router and hybrid query and its cursors end with their co-processor (ADR-0064), and --ft gates it (ADR-0060, amendment 3)"
+echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), FT.AGGREGATE answers redisvl's paging, router and hybrid query and its cursors end with their co-processor (ADR-0064), redisvl's update scripts and JSON.MERGE write indexed documents (ADR-0060 amendment 4), and --ft gates it (ADR-0060, amendment 3)"

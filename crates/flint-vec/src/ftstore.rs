@@ -76,8 +76,10 @@ pub fn ft_docs_key(bucket: u16) -> Vec<u8> {
 }
 
 /// The data writes the co-processor makes for a key an index covers. The
-/// three clients write documents with nothing else (ADR-0059's survey);
-/// every other write to such a key is refused, by the node, and here.
+/// three clients write documents with nothing else (ADR-0059's survey),
+/// and redisvl's `update_by_filter` with a script that runs `HSET` or
+/// `JSON.MERGE` on its one declared key (ADR-0060 amendment 4); every
+/// other write to such a key is refused, by the node, and here.
 pub fn routed_write(name: &[u8]) -> bool {
     matches!(
         name.to_ascii_uppercase().as_slice(),
@@ -92,8 +94,11 @@ pub fn routed_write(name: &[u8]) -> bool {
             | b"PEXPIREAT"
             | b"PERSIST"
             | b"JSON.SET"
+            | b"JSON.MERGE"
             | b"JSON.DEL"
             | b"JSON.FORGET"
+            | b"EVAL"
+            | b"EVALSHA"
     )
 }
 
@@ -103,10 +108,17 @@ pub fn is_ft_command(name: &[u8]) -> bool {
     (name.len() > 3 && name[..3].eq_ignore_ascii_case(b"FT.")) || routed_write(name)
 }
 
-/// The keys a routed write writes.
+/// The keys a routed write writes. A script's are the keys it declares: the
+/// node lets a script from the channel write no other key under an index's
+/// prefix (ADR-0060 amendment 4), so they are all it can have written there.
 fn write_keys(args: &[Vec<u8>]) -> &[Vec<u8>] {
     match args.first().map(|n| n.to_ascii_uppercase()).as_deref() {
         Some(b"DEL" | b"UNLINK") => &args[1..],
+        Some(b"EVAL" | b"EVALSHA") => args
+            .get(2)
+            .and_then(|n| std::str::from_utf8(n).ok()?.parse::<usize>().ok())
+            .and_then(|n| args.get(3..3usize.checked_add(n)?))
+            .unwrap_or(&[]),
         _ => &args[1..args.len().min(2)],
     }
 }
@@ -822,6 +834,14 @@ impl Store {
 
     fn plan_ft_write(&self, ns: &[u8], args: &[Vec<u8>]) -> FtPlan {
         let keys = write_keys(args);
+        let script =
+            args[0].eq_ignore_ascii_case(b"EVAL") || args[0].eq_ignore_ascii_case(b"EVALSHA");
+        if keys.is_empty() && script {
+            return FtPlan::Reply(err(
+                "ERR a script that writes a key under an FT index's prefix declares it in KEYS \
+                 (ADR-0060 amendment 4)",
+            ));
+        }
         if keys.is_empty() {
             return FtPlan::Reply(err(&format!(
                 "ERR wrong number of arguments for '{}'",
@@ -1762,6 +1782,33 @@ mod tests {
         };
         assert_eq!(w.keys.len(), 1);
         assert!(w.before.is_empty(), "a delete adds no document");
+        // ADR-0060 amendment 4: a script's declared keys, the ones an index
+        // covers, are read back; one declaring none is refused; JSON.MERGE
+        // is planned as JSON.SET is.
+        let FtPlan::Write(w) = s.plan_ft(
+            b"ns",
+            &a(&[
+                "EVAL",
+                "return redis.call('HSET', KEYS[1], 'a', 'b')",
+                "2",
+                "doc:7",
+                "other",
+                "x",
+            ]),
+            0,
+        ) else {
+            panic!("not a write");
+        };
+        assert_eq!(w.keys, vec![(b"doc:7".to_vec(), (true, false))]);
+        assert_eq!(w.before.len(), 1);
+        assert!(matches!(
+            s.plan_ft(b"ns", &a(&["EVALSHA", "0123", "0"]), 0),
+            FtPlan::Reply(Value::Error(e)) if e.contains("declares it in KEYS")
+        ));
+        let FtPlan::Write(w) = s.plan_ft(b"ns", &a(&["JSON.MERGE", "doc:8", "$", "{}"]), 0) else {
+            panic!("not a write");
+        };
+        assert_eq!(w.keys.len(), 1);
         let left = s.ft_reindex(
             b"ns",
             b"doc:1",

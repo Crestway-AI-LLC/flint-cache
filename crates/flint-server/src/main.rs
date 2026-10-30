@@ -5795,6 +5795,16 @@ fn execute(
     } else {
         indexed.of(conn_ns)
     };
+    // ADR-0060 amendment 4: a script the co-processor runs over its channel
+    // may write its declared keys under an index's prefix, which it reads
+    // back and indexes, and no other key under one: that is refused to it at
+    // the row, as to a tenant, so nothing a script writes goes unread.
+    let channel_script = (conn_txn.channel
+        && args.first().is_some_and(|n| {
+            n.eq_ignore_ascii_case(b"EVAL") || n.eq_ignore_ascii_case(b"EVALSHA")
+        }))
+    .then(|| indexed.of(conn_ns))
+    .flatten();
     if let Some(prefixes) = &guarded
         && let Some(w) = flint_commands::written_keys(args)
     {
@@ -6383,7 +6393,8 @@ fn execute(
                 )
                 .holding_every_writer(every_writer)
                 .whole(conn_txn.whole)
-                .indexed(guarded.clone());
+                .indexed(guarded.clone().or_else(|| channel_script.clone()))
+                .indexed_declared_ok(channel_script.is_some());
                 let reply = d.dispatch(args);
                 if !d.wants_every_writer() || every_writer {
                     drop(d);

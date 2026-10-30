@@ -377,6 +377,9 @@ pub struct Dispatcher<'a> {
     /// is not a co-processor's channel (ADR-0060 amendment 2): a script's
     /// write under one is refused at the row.
     indexed: Option<crate::indexed::Prefixes>,
+    /// A script from a co-processor's channel: its declared keys may be
+    /// written under `indexed` (ADR-0060 amendment 4).
+    indexed_declared_ok: bool,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -412,6 +415,7 @@ impl<'a> Dispatcher<'a> {
             whole: false,
             probing: false,
             indexed: None,
+            indexed_declared_ok: false,
         }
     }
 
@@ -419,6 +423,13 @@ impl<'a> Dispatcher<'a> {
     /// `indexed`.
     pub fn indexed(mut self, prefixes: Option<crate::indexed::Prefixes>) -> Self {
         self.indexed = prefixes;
+        self
+    }
+
+    /// Let a script's declared keys be written under `indexed`: see
+    /// `indexed_declared_ok`.
+    pub fn indexed_declared_ok(mut self, yes: bool) -> Self {
+        self.indexed_declared_ok = yes;
         self
     }
 
@@ -2183,7 +2194,8 @@ impl<'a> Dispatcher<'a> {
                     crate::script::KeyGuard::new(&overlay, &self.ns, &declared, self.every_writer)
                         .whole(self.whole)
                         .reserved(self.limits.reserve_coproc_rows)
-                        .indexed(self.indexed.clone());
+                        .indexed(self.indexed.clone())
+                        .declared_exempt(self.indexed_declared_ok);
                 let reply = Dispatcher::with_limits(&guard, self.clock, self.limits, &self.ns)
                     .dispatch(cmd);
                 (reply, guard.strayed())
@@ -8072,6 +8084,48 @@ mod tests {
             ev(&s, &["EVAL", "return redis.call('eval', 'return 1', '0')", "0"]),
             Value::Error(e) if e.starts_with("ERR This command is not allowed from script")
         ));
+    }
+
+    /// ADR-0060 amendment 4: a script the co-processor runs over its channel
+    /// writes its declared keys under an index's prefix, and no other key
+    /// under one, so the co-processor's read-back of its declared keys holds
+    /// all it wrote there. From a tenant it may write neither.
+    #[test]
+    fn a_channel_script_writes_only_its_declared_indexed_keys() {
+        assert_eq!(slot_for_key(b"doc:{t}a"), slot_for_key(b"doc:{t}b"));
+        let s = MemKv::new();
+        let parts = |v: &[&str]| v.iter().map(|p| p.as_bytes().to_vec()).collect::<Vec<_>>();
+        let prefixes: crate::indexed::Prefixes = vec![b"doc:".to_vec()].into();
+        let run = |channel: bool, text: &str| {
+            Dispatcher::new(&s, system_clock)
+                .holding_every_writer(true)
+                .indexed(Some(prefixes.clone()))
+                .indexed_declared_ok(channel)
+                .dispatch(&parts(&["EVAL", text, "1", "doc:{t}a"]))
+        };
+        // redisvl's update_by_filter script, on its one declared key.
+        let own = "if redis.call('EXISTS', KEYS[1]) == 0 then redis.call('HSET', KEYS[1], 'f', 'v') end \
+                   return 1";
+        let built = "redis.call('HSET', KEYS[1], 'f', 'w') redis.call('HSET', 'doc:{t}b', 'f', 'w') \
+                     return 1";
+        let refused = |r: &Value| matches!(r, Value::Error(e) if e.contains("INDEXED 646f633a"));
+        let tenant = run(false, own);
+        assert!(refused(&tenant), "from a tenant: {tenant:?}");
+        assert_eq!(ev(&s, &["EXISTS", "doc:{t}a"]), Value::Integer(0));
+        assert_eq!(run(true, own), Value::Integer(1), "from the channel");
+        assert_eq!(
+            ev(&s, &["HGET", "doc:{t}a", "f"]),
+            Value::Bulk(Some(b"v".to_vec()))
+        );
+        // A key it builds under the prefix is refused, and so is the whole
+        // script: its declared key keeps its value.
+        let r = run(true, built);
+        assert!(refused(&r), "an undeclared key under the prefix: {r:?}");
+        assert_eq!(ev(&s, &["EXISTS", "doc:{t}b"]), Value::Integer(0));
+        assert_eq!(
+            ev(&s, &["HGET", "doc:{t}a", "f"]),
+            Value::Bulk(Some(b"v".to_vec()))
+        );
     }
 
     /// ADR-0052 D2: a key in the declared keys' slot that they do not

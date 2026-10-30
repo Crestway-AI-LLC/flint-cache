@@ -1096,6 +1096,10 @@ pub struct KeyGuard<'a> {
     /// Refuse a write under one of the namespace's FT index prefixes
     /// (ADR-0060 amendment 2), at the row for the same reason.
     indexed: Option<crate::indexed::Prefixes>,
+    /// Let a declared key be written under those prefixes: a script the
+    /// co-processor runs for the tenant, which reads its declared keys back
+    /// and indexes them (ADR-0060 amendment 4).
+    declared_exempt: bool,
     strayed: Mutex<Option<Stray>>,
 }
 
@@ -1165,6 +1169,7 @@ impl<'a> KeyGuard<'a> {
             whole: false,
             reserved: false,
             indexed: None,
+            declared_exempt: false,
             strayed: Mutex::new(None),
         }
     }
@@ -1178,6 +1183,13 @@ impl<'a> KeyGuard<'a> {
     /// Refuse writes under these FT index prefixes (ADR-0060 amendment 2).
     pub fn indexed(mut self, prefixes: Option<crate::indexed::Prefixes>) -> Self {
         self.indexed = prefixes;
+        self
+    }
+
+    /// Let the declared keys be written under the index prefixes, for a
+    /// script the co-processor runs (ADR-0060 amendment 4).
+    pub fn declared_exempt(mut self, yes: bool) -> Self {
+        self.declared_exempt = yes;
         self
     }
 
@@ -1197,6 +1209,7 @@ impl<'a> KeyGuard<'a> {
             .indexed
             .as_deref()
             .and_then(|ps| crate::indexed::under(ps, key))
+            && !(self.declared_exempt && self.declared.contains(key))
         {
             Stray::Indexed(p.to_vec())
         } else {

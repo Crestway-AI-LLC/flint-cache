@@ -13,7 +13,8 @@ what the frameworks' suites need next, was ACCEPTED 2026-10-20 as
 recommended (Jeff: "As recommended"): parts 1, 3, 4, 5 and 6 are built,
 and part 2 is documented only.
 Amendment 4, a script and `JSON.MERGE` on an indexed key, was ACCEPTED
-2026-10-30, option A (Jeff: "go with your recommendations").
+2026-10-30, option A (Jeff: "go with your recommendations"), and is built
+(its As built, below).
 
 Proposed 2026-10-19.
 
@@ -503,6 +504,36 @@ index.
     JSON, with each document's new values found by a search, and an
     undeclared indexed key refused;
   - the suites: the 11 tests pass, and nothing that passed now fails.
+
+### Amendment 4, as built (2026-10-30, rides with v0.1.0-rc.86)
+
+- **The co-processor** serves `EVAL`, `EVALSHA` and `JSON.MERGE` as routed
+  writes (`ftstore::routed_write`).
+  - A script's keys are the ones it declares, read from its `numkeys`. Each
+    one under an index's prefix is read back after the script and indexed,
+    as an `HSET`'s key is.
+  - A script that declares no keys is refused: `ERR a script that writes a
+    key under an FT index's prefix declares it in KEYS (ADR-0060 amendment
+    4)`. It reaches the co-processor only after its node refused it with
+    `-INDEXED`, so it wrote under a prefix.
+  - `JSON.MERGE` is planned and read back as `JSON.SET` is.
+- **The node.** An `EVAL` or `EVALSHA` over a co-processor's channel runs
+  with its namespace's index prefixes guarded, as a tenant's script does,
+  except for its declared keys (`KeyGuard::declared_exempt`). So a key it
+  builds under a prefix is refused at the row. A script that does not
+  `pcall` the refusal ends with nothing written, its declared keys
+  included.
+- **The proxy** is unchanged. It already sends a write a node refused with
+  `-INDEXED`, outside a transaction, to the `FT.` family.
+- **Held by:**
+  - unit tests:
+    - `a_channel_script_writes_only_its_declared_indexed_keys` (node);
+    - the co-processor's plan test, for a script's declared keys, a script
+      that declares none, and `JSON.MERGE`;
+  - `coproc_ft_drill`'s `scripts` section: redisvl's two scripts and
+    `JSON.MERGE` through the proxy on HASH and JSON indexes, each write
+    found by a search, a script on a missing key making no document, and a
+    script that builds an undeclared indexed key refused whole.
 
 ## As built, release N (2026-10-19)
 

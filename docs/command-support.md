@@ -642,12 +642,15 @@ only on a fleet whose operator sets `coproc-ft on`.
 - **`MODULE LIST`** answers one module, `search` at version 20600, while
   `FT.*` is served. Without it, `MODULE` is an unknown command.
 - **Writing documents.** Write them with `HSET`, `HDEL`, `DEL`, `UNLINK`,
-  `EXPIRE` and its variants, `PERSIST`, `JSON.SET` and `JSON.DEL`. Those
-  writes go through the co-processor, which indexes each document as it
-  lands. Any other write to a key under an index's prefix is refused while
-  the index exists, with `-INDEXED <prefix in hex>`:
+  `EXPIRE` and its variants, `PERSIST`, `JSON.SET`, `JSON.MERGE` and
+  `JSON.DEL`, or with an `EVAL` or `EVALSHA` script that declares in `KEYS`
+  each indexed key it writes, as redisvl's `update_by_filter` does (ADR-0060
+  amendment 4). Those writes go through the co-processor, which indexes each
+  document as it lands. Any other write to a key under an index's prefix is
+  refused while the index exists, with `-INDEXED <prefix in hex>`:
   - commands such as `RENAME`, `HINCRBY` and `JSON.NUMINCRBY`;
-  - a script that writes such a key;
+  - a script that writes such a key it does not declare, and with it the
+    whole script;
   - a transaction that includes one, even of keys in one slot. The
     frameworks' own transactions, such as redisvl's `expire_keys` and
     langchain-redis's `clear()`, name keys in different slots, which the
