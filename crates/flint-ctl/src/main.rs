@@ -43,7 +43,8 @@
 //!                                     no CLI flag — FLINT_BG_JOBS,
 //!                                     FLINT_SUBCOMPACTIONS,
 //!                                     FLINT_LEVEL_BASE_MB,
-//!                                     FLINT_WRITE_BUFFER_MB — which
+//!                                     FLINT_WRITE_BUFFER_MB,
+//!                                     FLINT_MANIFEST_MAX_MB — which
 //!                                     flint-storage reads from the
 //!                                     environment and which is otherwise
 //!                                     unreachable on a managed fleet, since
@@ -344,6 +345,7 @@ const SEAT_ENV_NAMES: &[&str] = &[
     "FLINT_BG_JOBS",
     "FLINT_BLOCK_CACHE_MB",
     "FLINT_LEVEL_BASE_MB",
+    "FLINT_MANIFEST_MAX_MB",
     "FLINT_NAGLE_TEST",
     "FLINT_PROBE_APPLY_SEQS",
     "FLINT_PROBE_TARGETS",

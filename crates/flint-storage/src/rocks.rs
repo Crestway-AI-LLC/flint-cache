@@ -641,6 +641,65 @@ fn bound_info_log_with(opts: &mut Options, max_size: usize, keep: usize) {
     opts.set_keep_log_file_num(keep);
 }
 
+/// The size at which RocksDB rolls the MANIFEST over into a new one that
+/// starts from the DB's current state (BUG-0275).
+///
+/// Every rewind snapshot is a checkpoint, and a checkpoint hard-links the
+/// SSTs but COPIES the MANIFEST. The MANIFEST takes a record at every flush
+/// and compaction, and every checkpoint flushes. Unset, RocksDB rolls it at
+/// 1 GiB, which in practice means only at a reopen, so each 30-second
+/// snapshot copied a file that had grown since the last restart: about
+/// 5 MB per snapshot and 14 GB of store for about 1 MB of data on the
+/// playground after nine days. Capped, each copy is at most the DB's state
+/// plus the cap.
+///
+/// The cap cannot simply be small. A roll writes the whole state into the
+/// new MANIFEST, and a state larger than the cap rolls again at the next
+/// edit, so every flush and compaction would rewrite it. RocksDB 10.4 has
+/// no option that scales the cap with the state, and this one is fixed at
+/// open. So it scales with what bounds the state, the volume: one record
+/// per live SST, at most `MANIFEST_STATE_BYTES_PER_SST` bytes each
+/// (`manifest_state_per_sst_stays_under_the_cap_arithmetic` measures it),
+/// for SSTs of RocksDB's 64 MiB target, is at most 1/262,144 of the volume
+/// even when the volume is full of SSTs. The cap is twice that:
+///
+/// | volume | cap |
+/// |---|---|
+/// | 468 GB (i4i.large, the playground) | 3.6 MB |
+/// | 1.7 TB (i4i.2xlarge) | 13 MB |
+/// | 3.75 TB (i4i.4xlarge) | 29 MB |
+///
+/// The snapshot store then holds at most `SNAP_RETAIN_MIN_COUNT` (2,880)
+/// copies of at most half the cap of state plus the cap, about 3.3% of the
+/// volume, and at most two thirds of that on average, where it grew without
+/// limit before. The floor keeps a small test volume from rolling at every edit;
+/// the ceiling is RocksDB's own default, so no volume rolls later than
+/// before. A volume that cannot be read gets 64 MiB, which holds the state
+/// of an 8 TB volume.
+///
+/// `FLINT_MANIFEST_MAX_MB` overrides it, for an operator who sees the
+/// MANIFEST roll at every edit (a live MANIFEST above the cap).
+fn manifest_max_bytes(path: &Path) -> u64 {
+    if let Some(mb) = env_u64("FLINT_MANIFEST_MAX_MB") {
+        return mb.max(1) * 1024 * 1024;
+    }
+    crate::disk::sample_nearest(path).map_or(64 * 1024 * 1024, |u| {
+        manifest_max_bytes_for_volume(u.total_bytes)
+    })
+}
+
+/// The most MANIFEST state one live SST adds, in bytes, for Flint's keys.
+pub const MANIFEST_STATE_BYTES_PER_SST: u64 = 256;
+
+/// See `manifest_max_bytes`: twice the state a volume full of 64 MiB SSTs
+/// would hold, between 1 MiB and RocksDB's default of 1 GiB.
+pub fn manifest_max_bytes_for_volume(total_bytes: u64) -> u64 {
+    const SST_BYTES: u64 = 64 * 1024 * 1024;
+    const FLOOR: u64 = 1024 * 1024;
+    const CEILING: u64 = 1024 * 1024 * 1024;
+    (total_bytes / SST_BYTES * MANIFEST_STATE_BYTES_PER_SST * 2).clamp(FLOOR, CEILING)
+}
+
 impl RocksKv {
     /// Open without the ability — or the side effects — of writing.
     ///
@@ -693,8 +752,22 @@ impl RocksKv {
         wal_ttl_seconds: u64,
         wal_size_limit_mb: u64,
     ) -> Result<Self, rocksdb::Error> {
+        let manifest_max = manifest_max_bytes(path);
+        Self::open_with_manifest_max(path, wal_ttl_seconds, wal_size_limit_mb, manifest_max)
+    }
+
+    /// `open_with_retention`, with the MANIFEST cap stated, so a test can
+    /// roll it over in a few thousand edits rather than a volume's worth.
+    fn open_with_manifest_max(
+        path: &Path,
+        wal_ttl_seconds: u64,
+        wal_size_limit_mb: u64,
+        manifest_max_bytes: u64,
+    ) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        // BUG-0275: a checkpoint copies the MANIFEST, so it must roll over.
+        opts.set_max_manifest_file_size(usize::try_from(manifest_max_bytes).unwrap_or(usize::MAX));
         // Retain WAL long enough for replicas to tail it. The v0 values (1 h
         // / 1 GiB) were chosen before anything measured how far a replica
         // actually falls behind, and a replica died against them twice in
@@ -1633,6 +1706,148 @@ mod audit {
             None,
             "compaction filter should have dropped the expired row"
         );
+    }
+
+    /// Bytes of MANIFEST in a DB directory or checkpoint.
+    fn manifest_bytes(dir: &Path) -> u64 {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("MANIFEST-"))
+            .map(|e| e.metadata().expect("stat").len())
+            .sum()
+    }
+
+    /// BUG-0275 acceptance. A node snapshots every 30 s and keeps a day of
+    /// them, and each snapshot is a checkpoint that flushes and then copies
+    /// the MANIFEST. Without a cap the MANIFEST grows by a record or more per
+    /// snapshot until a reopen, so the newest copy, and the store of kept
+    /// copies, grow with the count. With one, every copy is at most the cap
+    /// plus the DB's state and one edit, however many snapshots ran.
+    ///
+    /// The cap is 64 KiB so 1,200 snapshots cross it many times over; on
+    /// RocksDB's default the newest copy here is several times the bound.
+    #[test]
+    fn bug_0275_snapshots_copy_a_manifest_that_does_not_grow_with_their_count() {
+        const CAP: u64 = 64 * 1024;
+        // The state of a few SSTs and one edit, well under a cap's worth.
+        const SLACK: u64 = 16 * 1024;
+        const SNAPSHOTS: usize = 1_200;
+        const KEPT: usize = 50;
+        let dir = TempDir::new("b0275-db");
+        let snaps = TempDir::new("b0275-snaps");
+        std::fs::create_dir_all(&snaps.0).expect("mkdir snaps");
+        let kv = RocksKv::open_with_manifest_max(
+            &dir.0,
+            DEFAULT_WAL_TTL_SECONDS,
+            DEFAULT_WAL_SIZE_LIMIT_MB,
+            CAP,
+        )
+        .expect("open");
+        let mut kept = std::collections::VecDeque::new();
+        let mut largest = 0;
+        for i in 0..SNAPSHOTS {
+            kv.put(
+                format!("k{:03}", i % 200).as_bytes(),
+                format!("v{i}").as_bytes(),
+            );
+            let snap = snaps.0.join(format!("snap-{i:05}"));
+            kv.checkpoint_to(&snap).expect("checkpoint");
+            largest = largest.max(manifest_bytes(&snap));
+            kept.push_back((i, snap));
+            if kept.len() > KEPT {
+                let (_, old) = kept.pop_front().expect("kept is not empty");
+                std::fs::remove_dir_all(old).expect("prune");
+            }
+        }
+        assert!(
+            largest <= CAP + SLACK,
+            "a snapshot copied {largest} B of MANIFEST against a cap of {CAP} B: \
+             the MANIFEST is not rolling over (BUG-0275)"
+        );
+        let store: u64 = kept.iter().map(|(_, s)| manifest_bytes(s)).sum();
+        assert!(
+            store <= KEPT as u64 * (CAP + SLACK),
+            "the {KEPT} kept snapshots hold {store} B of MANIFEST"
+        );
+        assert!(
+            std::fs::read_dir(&dir.0)
+                .expect("read db dir")
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("MANIFEST-"))
+                .count()
+                <= 2,
+            "rolled-over MANIFESTs must be deleted, not kept beside the live one"
+        );
+        // A rolled MANIFEST still describes the whole DB: the oldest and the
+        // newest kept snapshot each open and read the value of their moment.
+        for (i, snap) in [kept.front(), kept.back()].into_iter().flatten() {
+            let copy = RocksKv::open_read_only(snap).expect("open snapshot");
+            assert_eq!(
+                copy.get(format!("k{:03}", i % 200).as_bytes()),
+                Some(format!("v{i}").into_bytes()),
+                "snapshot {i}"
+            );
+        }
+    }
+
+    /// The arithmetic behind `manifest_max_bytes_for_volume`: a MANIFEST
+    /// holds one record per live SST, and the cap assumes at most
+    /// `MANIFEST_STATE_BYTES_PER_SST` for each. Measured here on SSTs whose
+    /// first and last keys are Flint's envelope around a 40-byte key, which
+    /// is what a record's size moves with; a reopen writes a MANIFEST that
+    /// is the state and nothing else.
+    #[test]
+    fn manifest_state_per_sst_stays_under_the_cap_arithmetic() {
+        const SSTS: u32 = 200;
+        let dir = TempDir::new("b0275-state");
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_disable_auto_compactions(true);
+        {
+            let db = DB::open(&opts, &dir.0).expect("open");
+            for f in 0..SSTS {
+                for k in [0u32, 1] {
+                    let key = format!("user:{f:08}:{k:03}:{}", "s".repeat(23));
+                    let row = crate::encoding::envelope(
+                        crate::encoding::Cf::Metadata,
+                        b"tenant-0042",
+                        (f % 16384) as u16,
+                        key.as_bytes(),
+                    );
+                    db.put(row, b"v").expect("put");
+                }
+                db.flush().expect("flush");
+            }
+        }
+        let db = DB::open(&opts, &dir.0).expect("reopen");
+        let files = db.live_files().expect("live files").len() as u64;
+        assert_eq!(files, u64::from(SSTS));
+        // The live MANIFEST is the one CURRENT names; the one before the
+        // reopen may not be deleted yet.
+        let current = std::fs::read_to_string(dir.0.join("CURRENT")).expect("CURRENT");
+        let live = std::fs::metadata(dir.0.join(current.trim()))
+            .expect("live MANIFEST")
+            .len();
+        let per_sst = live / files;
+        assert!(
+            per_sst <= MANIFEST_STATE_BYTES_PER_SST,
+            "{per_sst} B of MANIFEST state per SST: the cap in \
+             manifest_max_bytes_for_volume assumes at most \
+             {MANIFEST_STATE_BYTES_PER_SST}"
+        );
+    }
+
+    #[test]
+    fn manifest_max_scales_with_the_volume_between_its_bounds() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(manifest_max_bytes_for_volume(0), MB);
+        assert_eq!(manifest_max_bytes_for_volume(20_000_000_000), MB);
+        let playground = manifest_max_bytes_for_volume(468_000_000_000);
+        assert!((3 * MB..4 * MB).contains(&playground), "{playground}");
+        let i4i_2xl = manifest_max_bytes_for_volume(1_700_000_000_000);
+        assert!((12 * MB..13 * MB).contains(&i4i_2xl), "{i4i_2xl}");
+        assert_eq!(manifest_max_bytes_for_volume(u64::MAX), 1024 * MB);
     }
 
     /// S3 snapshots and spare seeding are RocksDB checkpoints.

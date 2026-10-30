@@ -379,6 +379,14 @@ one. What was measured to help is the **pairing** `FLINT_LEVEL_BASE_MB=64` with
 amplification 16.0 → 10.2. `FLINT_BG_JOBS` alone on a shallow LSM is the case
 that measured *worse*.
 
+`FLINT_MANIFEST_MAX_MB` is one more, and a seat should not need it. Every
+30-second rewind snapshot copies RocksDB's MANIFEST, so a seat rolls the
+MANIFEST over at about 1/131,072 of its data volume: 3.6 MB on 468 GB, 13 MB
+on 1.7 TB (BUG-0275). A roll starts the new MANIFEST with the DB's whole
+state, so a seat whose `MANIFEST-*` in its data directory stays above that
+size is rewriting it at every flush and compaction. Set the knob, in MB,
+to about twice that size.
+
 **What "untuned" means in every comparison on this page: an 8 MB level base,
 which is not a stock seat.** `flint-storage` sets `max_bytes_for_level_base`
 only when `FLINT_LEVEL_BASE_MB` is present, so an unset seat runs RocksDB's own
