@@ -12,8 +12,8 @@ was ACCEPTED 2026-10-19, option A (Jeff: "A: node row"). Amendment 3,
 what the frameworks' suites need next, was ACCEPTED 2026-10-20 as
 recommended (Jeff: "As recommended"): parts 1, 3, 4, 5 and 6 are built,
 and part 2 is documented only.
-Amendment 4, a script and `JSON.MERGE` on an indexed key, is PROPOSED
-2026-10-30.
+Amendment 4, a script and `JSON.MERGE` on an indexed key, was ACCEPTED
+2026-10-30, option A (Jeff: "go with your recommendations").
 
 Proposed 2026-10-19.
 
@@ -413,7 +413,7 @@ suites found a fifth item, the flush. Each part below is its own choice.
     - `an_ft_search_is_granted_a_channel_for_its_page`;
   - `coproc_ft_drill`'s `amend3`, `aliassame` and `flush` sections.
 
-## Amendment 4, 2026-10-30 (PROPOSED): a script, and `JSON.MERGE`, on an indexed key
+## Amendment 4, 2026-10-30 (ACCEPTED the same day, option A): a script, and `JSON.MERGE`, on an indexed key
 
 **Why now.** With `FT.AGGREGATE` served (ADR-0064), redisvl's
 `update_by_filter` gets past its cursor to its writes, and stops there.
