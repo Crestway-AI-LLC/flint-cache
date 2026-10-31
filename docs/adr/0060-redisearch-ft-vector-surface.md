@@ -710,9 +710,10 @@ fixture is still refused: none of its 26 cases pass.
 
 ## Amendment 6, 2026-10-31 (PROPOSED): `INDEXMISSING` and `INDEXEMPTY`, and `ismissing()` in a query
 
-**Why now.** It is the last failure in the three suites that is Flint's to
-fix. redisvl's catalogue has 27 left after amendment 5:
-- 19 need `sentence-transformers`, which is a download;
+**Why now.** It is the last failure in the three suites known to be
+Flint's to fix. redisvl's catalogue has 27 left after amendment 5:
+- 19 need `sentence-transformers`, which is a download, so whether they
+  pass is not yet measured;
 - 2 are `EXPIRE`s in one transaction across slots, which the proxy refuses
   by design, as Redis Cluster does (`docs/command-support.md`);
 - 6 are `test_query.py`'s missing-field tests. They stop at their fixture,
