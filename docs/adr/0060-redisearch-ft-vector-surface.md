@@ -17,7 +17,9 @@ Amendment 4, a script and `JSON.MERGE` on an indexed key, was ACCEPTED
 (its As built, below).
 Amendment 5, several VECTOR fields in one index, `FLOAT64` vectors and
 several vector ranges in one query, was ACCEPTED 2026-10-30, option A
-(Jeff: "go with A").
+(Jeff: "go with A"), and is built (its As built, below).
+Amendment 6, `INDEXMISSING`, `INDEXEMPTY` and `ismissing()`, is PROPOSED
+2026-10-31, recommended A.
 
 Proposed 2026-10-19.
 
@@ -705,6 +707,147 @@ fixture is still refused: none of its 26 cases pass.
     - the three mutations, each caught by its unit test: the AND skipped,
       `FLOAT64` bytes not decoded, and a lone `FLOAT64` field written in
       the form an older binary reads as `FLOAT32`.
+
+## Amendment 6, 2026-10-31 (PROPOSED): `INDEXMISSING` and `INDEXEMPTY`, and `ismissing()` in a query
+
+**Why now.** It is the last failure in the three suites that is Flint's to
+fix. redisvl's catalogue has 27 left after amendment 5:
+- 19 need `sentence-transformers`, which is a download;
+- 2 are `EXPIRE`s in one transaction across slots, which the proxy refuses
+  by design, as Redis Cluster does (`docs/command-support.md`);
+- 6 are `test_query.py`'s missing-field tests. They stop at their fixture,
+  because `FT.CREATE` refuses `INDEXMISSING` and `INDEXEMPTY` ("SCHEMA
+  option INDEXMISSING is not supported (ADR-0060)").
+
+langchain-redis's remaining failures are transactions across slots (its
+cache's `clear()` and a pipelined `HGETALL`), and, over RESP3 only, its
+chat history's own reading of `FT.INFO` (above). LlamaIndex has none.
+
+**What redisvl's tests send** (0.28.0, the queries printed from its own
+builders):
+- The fixture: a HASH index declaring `INDEXMISSING` on a TEXT (`title`), a
+  TAG (`category`), a NUMERIC (`price`) and a GEO (`location`) field, and
+  `INDEXEMPTY` on the TEXT and the TAG. Its five documents include one with
+  `title` and `category` set to `""`, one without `category` and
+  `location`, and one with only `description`.
+- The queries:
+
+  ```
+  ismissing(@title)
+  (@price:[(50 +inf] ismissing(@category))
+  (@price:[0 0] | ismissing(@price))
+  ((ismissing(@title) | ismissing(@category)) | ismissing(@price))
+  ismissing(@location)
+  ```
+
+- The assertions: a document whose `title` is `""` is not missing it, and
+  one without `category` is.
+- None of the six queries an empty value: redisvl writes
+  `Tag("category") != ""` as `*`.
+
+**The rules, from RediSearch's documentation** (`FT.CREATE`, and "Index
+missing or empty values" in its indexing guide):
+- `INDEXMISSING`, on a field of any kind, lets `ismissing(@f)` find the
+  documents that do not have `f`;
+- `INDEXEMPTY`, on a TEXT or TAG field, indexes an empty value, so that
+  `@f:{""}` finds it. By default an empty value is not indexed;
+- a field with an empty value is not missing;
+- both are dialect 2.
+
+**What Flint does today:**
+- `FT.CREATE` refuses both options by name (`ft.rs`).
+- A document holds one `Val` for each attribute. `Val::Missing` stands for
+  three things: a field that is absent, one that is empty (a TAG of only
+  separators, a TEXT of no words), and a value that does not parse. A
+  TEXT field's words are in the text index (ADR-0063), not in its `Val`.
+- The query parser refuses `ismissing(@f)`, since the `@f` inside it has
+  no `:` (`ftquery.rs`).
+- It reads `@f:{""}` as the two-byte tag `""`, which no document holds, so
+  that query answers nothing.
+
+### Options
+
+**A. Both options, as RediSearch documents them (recommended).**
+- **`FT.CREATE`** takes `INDEXMISSING` on every kind, VECTOR included, and
+  `INDEXEMPTY` on TEXT and TAG. `INDEXEMPTY` on any other kind is refused
+  by name. `FT.INFO` lists both among the field's flags.
+- **Each document keeps two sets of bits**, one bit for each attribute and
+  VECTOR field (at most 16 + 8, so 8 bytes a document, charged to the
+  index):
+  - *has:* a HASH field that is there, whatever its value; a JSON path that
+    reaches a value other than `null`;
+  - *empty:* a TAG value with no tag in it (`""`, or only separators and
+    spaces), a TEXT value with no words.
+- **`ismissing(@f)`** matches a document without `f`. It is a term like any
+  other: under `|`, `-`, `~` and parentheses, and before a KNN's `=>`, in
+  `FT.SEARCH` and `FT.AGGREGATE` alike. On a field declared without
+  `INDEXMISSING` it is refused by name.
+- **`@f:{""}` on a TAG, and `@f:""` on a TEXT,** match a document whose `f`
+  is empty, when `f` is declared `INDEXEMPTY`. Without it they are refused
+  by name, as an empty phrase is today, never answered as nothing.
+- **A value that is there but does not parse,** such as a NUMERIC that is
+  not a number, is not missing, and matches no range, as today. A GEO
+  value that is not a point still leaves its document out (ADR-0062), so
+  that document matches nothing.
+- **Where it is decided:** on the documents, by the query matcher, as a
+  text term is. A KNN whose filter has one of these terms searches among
+  the matched documents (`Search::has_text`), as a KNN with a text term
+  does today. The vector sets' stored `META` and ADR-0059's
+  `VEC.SEARCH ... FILTER` do not change.
+- **Costs:**
+  - 8 bytes a document;
+  - an `ismissing` term reads every document, as a negated term does
+    today;
+  - the definition row. `INDEXMISSING` and `INDEXEMPTY` are two more
+    flags. A row with `INDEXEMPTY` is written so that a release before this
+    amendment refuses to load it, since that release would answer
+    `@f:{""}` with nothing rather than refuse it. A row with only
+    `INDEXMISSING` loads there: that release refuses `ismissing` by name
+    and answers every other query as this one does.
+
+**B. `INDEXMISSING` and `ismissing()`; `INDEXEMPTY` accepted and listed,
+its empty-value terms refused by name.**
+- The six tests pass, since none queries an empty value.
+- Smaller than A by the *empty* bits, the two empty-value terms and the
+  row guard.
+- A client that queries an empty value gets a refusal by name, not an
+  answer.
+
+**C. Unchanged.** The six tests stay at their fixture.
+
+### Recommendation: A
+
+- **Releases:** the co-processor alone changes; the data node and the
+  proxy do not. If this is built before v0.1.0-rc.86 is cut, it ships with
+  `FT.*`'s first release and needs no rollback rule. Otherwise it is a
+  co-processor upgrade with one rollback rule: **drop every index that
+  declares `INDEXEMPTY` before rolling back** to a release without it. The
+  older co-processor refuses to load such an index, so its prefixes would
+  stay guarded with no index serving them.
+- **Unchanged:** the 16-attribute cap; ADR-0059's filter and the vector
+  sets' `META`; how a value that does not parse is read.
+- **Open: a JSON `null`.** RediSearch's guide says a `null` is not indexed,
+  and A reads one as missing. Neither the documentation nor the suites pin
+  it, and there is no RediSearch here to measure it against, so the
+  release notes will say so.
+- **Verification:**
+  - unit tests:
+    - the two flags round-trip in the definition row, and `FT.INFO` lists
+      them;
+    - `ismissing` on each kind, VECTOR included: alone, under `|`, `-` and
+      `~`, and before a KNN;
+    - empty against missing, on HASH and JSON: a value that is absent,
+      `null`, `""`, or only separators;
+    - the refusals: `ismissing` without `INDEXMISSING`, an empty-value term
+      without `INDEXEMPTY`, and `INDEXEMPTY` on a NUMERIC;
+    - a row with `INDEXEMPTY`, refused by today's decoder;
+  - `coproc_ft_drill`: a `missing` section through the proxy, on HASH and
+    JSON, before and after a co-processor restart;
+  - the suites: `test_query.py`'s six pass, and nothing that passed now
+    fails;
+  - three mutations, each to be caught: an empty value read as missing,
+    `ismissing` answered on a field not declared for it, and the
+    `INDEXEMPTY` row guard dropped.
 
 ## As built, release N (2026-10-19)
 
