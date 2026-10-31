@@ -19,7 +19,8 @@ Amendment 5, several VECTOR fields in one index, `FLOAT64` vectors and
 several vector ranges in one query, was ACCEPTED 2026-10-30, option A
 (Jeff: "go with A"), and is built (its As built, below).
 Amendment 6, `INDEXMISSING`, `INDEXEMPTY` and `ismissing()`, was ACCEPTED
-2026-10-31, option A (Jeff: "go with A").
+2026-10-31, option A (Jeff: "go with A"), and is built (its As built,
+below).
 
 Proposed 2026-10-19.
 
@@ -887,7 +888,18 @@ its empty-value terms refused by name.**
     fixture on HASH and a JSON index with a VECTOR field, through the
     proxy, before and after a co-processor restart;
   - the three mutations, each caught by its unit test, on a verify box
-    (2026-10-31).
+    (2026-10-31);
+  - **gate a606, 2026-10-31,** on d5640fbc: PASS, 180 steps, and `msrv`
+    at Rust 1.89 after it, on the gate box;
+  - **the suites,** on the same box after the gate:
+    - redisvl's `test_query.py` missing-field tests: **6 of 6 pass**, where
+      all 6 stopped at their fixture before;
+    - redisvl's catalogue: 288 passed, 10 failed and 11 errors, from 282,
+      10 and 17, nothing newly failing. Of the 21 left, 19 need
+      `sentence-transformers` and 2 are `EXPIRE` inside a transaction
+      across slots;
+    - `test_aggregation.py` 26 of 26, langchain-redis 157 (RESP2 200) and
+      LlamaIndex 19, as before.
 
 ## As built, release N (2026-10-19)
 
