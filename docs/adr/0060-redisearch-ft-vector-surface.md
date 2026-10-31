@@ -694,6 +694,17 @@ fixture is still refused: none of its 26 cases pass.
   - `coproc_ft_drill`'s `multi` and `multisame` sections: two VECTOR
     fields, one `FLOAT64`, on HASH and JSON, with redisvl's multi-vector
     query and a KNN on the `FLOAT64` field, before and after a restart.
+  - **the suites, 2026-10-31,** on the gate box after gate s1031 (public
+    70104cc5), on Python 3.12:
+    - redisvl's `test_aggregation.py`: **26 of 26 pass**, where all 26
+      stopped at their fixture before;
+    - nothing newly failing elsewhere: redisvl's catalogue 282 passed, 10
+      failed and 17 errors, as before (19 need `sentence-transformers`, 6
+      are `INDEXEMPTY` and `INDEXMISSING`, 2 are `EXPIRE` inside a
+      transaction); langchain-redis 157 (RESP2 200) and LlamaIndex 19;
+    - the three mutations, each caught by its unit test: the AND skipped,
+      `FLOAT64` bytes not decoded, and a lone `FLOAT64` field written in
+      the form an older binary reads as `FLOAT32`.
 
 ## As built, release N (2026-10-19)
 
