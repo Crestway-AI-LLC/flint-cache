@@ -18,8 +18,8 @@ Amendment 4, a script and `JSON.MERGE` on an indexed key, was ACCEPTED
 Amendment 5, several VECTOR fields in one index, `FLOAT64` vectors and
 several vector ranges in one query, was ACCEPTED 2026-10-30, option A
 (Jeff: "go with A"), and is built (its As built, below).
-Amendment 6, `INDEXMISSING`, `INDEXEMPTY` and `ismissing()`, is PROPOSED
-2026-10-31, recommended A.
+Amendment 6, `INDEXMISSING`, `INDEXEMPTY` and `ismissing()`, was ACCEPTED
+2026-10-31, option A (Jeff: "go with A").
 
 Proposed 2026-10-19.
 
@@ -708,7 +708,7 @@ fixture is still refused: none of its 26 cases pass.
       `FLOAT64` bytes not decoded, and a lone `FLOAT64` field written in
       the form an older binary reads as `FLOAT32`.
 
-## Amendment 6, 2026-10-31 (PROPOSED): `INDEXMISSING` and `INDEXEMPTY`, and `ismissing()` in a query
+## Amendment 6, 2026-10-31 (ACCEPTED the same day, option A): `INDEXMISSING` and `INDEXEMPTY`, and `ismissing()` in a query
 
 **Why now.** It is the last failure in the three suites known to be
 Flint's to fix. redisvl's catalogue has 27 left after amendment 5:
