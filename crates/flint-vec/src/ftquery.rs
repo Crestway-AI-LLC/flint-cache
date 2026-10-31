@@ -101,6 +101,39 @@ pub enum Node {
     Not(Box<QNode>),
     /// `~x`: matches with or without `x`, which only adds to the score.
     Optional(Box<QNode>),
+    /// `ismissing(@f)`: a document without the field whose bit this is in
+    /// [`Docs::has`] (ADR-0060 amendment 6).
+    Missing {
+        bit: u32,
+    },
+    /// `@f:{""}` on a TAG, `@f:""` on a TEXT: a document whose field is
+    /// empty, by [`Docs::empty`] (ADR-0060 amendment 6).
+    Empty {
+        bit: u32,
+    },
+}
+
+/// What a query may ask about a field's presence (ADR-0060 amendment 6):
+/// each field by name, its bit in a document's [`Docs::has`] and
+/// [`Docs::empty`], and whether it declared `INDEXMISSING` and
+/// `INDEXEMPTY`. Empty for an index that declares neither.
+#[derive(Clone, Debug, Default)]
+pub struct Presence {
+    pub fields: Vec<PresenceField>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PresenceField {
+    pub name: Box<str>,
+    pub bit: u32,
+    pub missing: bool,
+    pub empty: bool,
+}
+
+impl Presence {
+    fn find(&self, name: &[u8]) -> Option<&PresenceField> {
+        self.fields.iter().find(|f| f.name.as_bytes() == name)
+    }
 }
 
 impl QNode {
@@ -154,11 +187,23 @@ fn leaf_field(e: &Expr) -> Option<usize> {
 /// a stop word, which RediSearch answers with no documents. The error is the
 /// text after `ERR the query `.
 pub fn parse(src: &[u8], fields: &[Field], stop: &StopWords) -> Result<Option<QNode>, String> {
+    parse_with(src, fields, stop, &Presence::default())
+}
+
+/// [`parse`], with what the index lets a query ask about its fields'
+/// presence (ADR-0060 amendment 6).
+pub fn parse_with(
+    src: &[u8],
+    fields: &[Field],
+    stop: &StopWords,
+    presence: &Presence,
+) -> Result<Option<QNode>, String> {
     let mut p = Parser {
         s: src,
         i: 0,
         fields,
         stop,
+        presence,
         depth: 0,
     };
     p.skip();
@@ -199,6 +244,7 @@ struct Parser<'a> {
     i: usize,
     fields: &'a [Field],
     stop: &'a StopWords,
+    presence: &'a Presence,
     depth: usize,
 }
 
@@ -485,7 +531,106 @@ impl Parser<'_> {
                                (ADR-0063)"
                     .into(),
             ),
+            _ if self.at_ismissing() => self.ismissing(),
             _ => self.text_atom(mask),
+        }
+    }
+
+    /// Past whitespace alone.
+    fn spaces(&mut self) {
+        while self.peek().is_some_and(space) {
+            self.i += 1;
+        }
+    }
+
+    /// Whether `ismissing(` starts here, in any case and with spaces before
+    /// its `(`. The word alone, with no `(` after it, is a word.
+    fn at_ismissing(&self) -> bool {
+        const KW: &[u8] = b"ismissing";
+        let rest = &self.s[self.i..];
+        rest.len() > KW.len()
+            && rest[..KW.len()].eq_ignore_ascii_case(KW)
+            && rest[KW.len()..].iter().find(|c| !space(**c)) == Some(&b'(')
+    }
+
+    /// `ismissing(@f)`: a document without `f`, which must be declared
+    /// `INDEXMISSING` (ADR-0060 amendment 6).
+    fn ismissing(&mut self) -> Result<Option<QNode>, String> {
+        self.i += b"ismissing".len();
+        self.spaces();
+        self.i += 1; // the `(` at_ismissing saw
+        self.spaces();
+        if self.peek() != Some(b'@') {
+            return Err("has an ismissing( with no @field after it".into());
+        }
+        self.i += 1;
+        let start = self.i;
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            self.i += 1;
+        }
+        let name = &self.s[start..self.i];
+        self.spaces();
+        if self.peek() != Some(b')') {
+            return Err("has an ismissing(@field with no ')' after it".into());
+        }
+        self.i += 1;
+        let shown = String::from_utf8_lossy(name);
+        match self.presence.find(name) {
+            Some(f) if f.missing => Ok(Some(QNode::new(Node::Missing { bit: f.bit }))),
+            Some(_) => Err(format!(
+                "asks ismissing(@{shown}), but {shown} is not declared INDEXMISSING \
+                 (ADR-0060 amendment 6)"
+            )),
+            None => Err(format!("names {shown}, which is not a field of this index")),
+        }
+    }
+
+    /// After a TAG field's name at `k`: the tags of its `:{...}`, split on
+    /// `|` and trimmed, as written, and where it ends. `None` when it is not
+    /// that shape, for ADR-0059's reader to say why.
+    fn tag_body(&self, k: usize) -> Option<(Vec<&[u8]>, usize)> {
+        let mut k = k;
+        let ws = |k: &mut usize| {
+            while self.at(*k).is_some_and(space) {
+                *k += 1;
+            }
+        };
+        ws(&mut k);
+        (self.at(k) == Some(b':')).then_some(())?;
+        k += 1;
+        ws(&mut k);
+        (self.at(k) == Some(b'{')).then_some(())?;
+        k += 1;
+        let (mut parts, mut start) = (Vec::new(), k);
+        loop {
+            match self.at(k)? {
+                b'\\' => k += 2,
+                c @ (b'|' | b'}') => {
+                    parts.push(self.s[start..k].trim_ascii());
+                    k += 1;
+                    if c == b'}' {
+                        return Some((parts, k));
+                    }
+                    start = k;
+                }
+                _ => k += 1,
+            }
+        }
+    }
+
+    /// The field of `name` for an empty-value term, `@f:{""}` or `@f:""`,
+    /// which must be declared `INDEXEMPTY` (ADR-0060 amendment 6).
+    fn empty_term(&self, name: &[u8]) -> Result<Option<QNode>, String> {
+        let shown = String::from_utf8_lossy(name);
+        match self.presence.find(name) {
+            Some(f) if f.empty => Ok(Some(QNode::new(Node::Empty { bit: f.bit }))),
+            _ => Err(format!(
+                "asks @{shown} for an empty value, but {shown} is not declared \
+                 INDEXEMPTY (ADR-0060 amendment 6)"
+            )),
         }
     }
 
@@ -610,6 +755,23 @@ impl Parser<'_> {
             bits |= 1 << at;
             kinds.push(self.fields[at].kind);
         }
+        if names.len() == 1 && matches!(kinds[0], FieldKind::Tag | FieldKind::FoldedTag) {
+            // `{""}`, the empty tag (ADR-0060 amendment 6), never a tag of
+            // two quotes, which is how ADR-0059's reader would take it.
+            if let Some((parts, end)) = self.tag_body(at + first)
+                && parts.iter().any(|p| *p == b"\"\"")
+            {
+                if parts.len() > 1 {
+                    return Err(format!(
+                        "puts the empty tag beside others in one {{...}}: ask \
+                         @{0}:{{\"\"}} | @{0}:{{...}} (ADR-0060 amendment 6)",
+                        String::from_utf8_lossy(&self.s[at..at + first])
+                    ));
+                }
+                self.i = end;
+                return self.empty_term(&self.s[at..at + first]);
+            }
+        }
         if names.len() == 1 && kinds[0] != FieldKind::Text {
             let (e, end) = filter::parse_field_term(self.s, at, self.fields)?;
             self.i = end;
@@ -629,6 +791,18 @@ impl Parser<'_> {
         self.i += 1;
         self.skip();
         let mask = mask & bits;
+        // `@f:""`, an empty value (ADR-0060 amendment 6), on one field.
+        if let Some(q @ (b'"' | b'\'')) = self.peek()
+            && self.at(self.i + 1) == Some(q)
+        {
+            if names.len() > 1 {
+                return Err("asks several fields for an empty value: ask each, \
+                            @a:\"\" | @b:\"\" (ADR-0060 amendment 6)"
+                    .into());
+            }
+            self.i += 2;
+            return self.empty_term(&self.s[at..at + first]);
+        }
         match self.peek() {
             Some(b'(') => self.atom(mask),
             Some(b'-') | Some(b'~') => self.unary(mask),
@@ -697,6 +871,15 @@ pub trait Docs {
     fn score(&self, id: DocId) -> f32;
     /// How many documents hold `tag` in TAG field `field`.
     fn tag_docs(&self, field: usize, tag: &[u8]) -> usize;
+    /// The fields it has, one bit each ([`Presence`]): every one unless the
+    /// index keeps them (ADR-0060 amendment 6).
+    fn has(&self, _id: DocId) -> u32 {
+        u32::MAX
+    }
+    /// The fields it has empty, one bit each ([`Presence`]).
+    fn empty(&self, _id: DocId) -> u32 {
+        0
+    }
 }
 
 /// `TFIDF`'s IDF: `floor(log2(1 + (N + 1) / n))`, `n` at least 1
@@ -739,6 +922,13 @@ enum Plan<'a> {
     },
     /// A NUMERIC or GEO term: a numeric result.
     Numeric(&'a Expr),
+    /// `ismissing(@f)` (`empty` false) or an empty-value term (true): a
+    /// look at the document's bits, a numeric result as a NUMERIC term's
+    /// (ADR-0060 amendment 6).
+    Presence {
+        bit: u32,
+        empty: bool,
+    },
     Union {
         kids: Vec<Plan<'a>>,
         weight: f64,
@@ -921,6 +1111,14 @@ impl<'a> Planner<'a> {
                 kid: Box::new(self.plan(x)),
                 weight: w,
             },
+            Node::Missing { bit } => Plan::Presence {
+                bit: *bit,
+                empty: false,
+            },
+            Node::Empty { bit } => Plan::Presence {
+                bit: *bit,
+                empty: true,
+            },
         }
     }
 
@@ -936,9 +1134,11 @@ impl<'a> Planner<'a> {
                 .iter()
                 .map(|k| self.estimate(k))
                 .fold(f64::INFINITY, f64::min),
-            Plan::All { .. } | Plan::Numeric(_) | Plan::Not { .. } | Plan::Optional { .. } => {
-                self.docs.count() as f64
-            }
+            Plan::All { .. }
+            | Plan::Numeric(_)
+            | Plan::Presence { .. }
+            | Plan::Not { .. }
+            | Plan::Optional { .. } => self.docs.count() as f64,
         }
     }
 }
@@ -1192,6 +1392,14 @@ fn eval<'a>(p: &Plan<'a>, id: DocId, docs: &dyn Docs) -> Option<Res<'a>> {
             _ => None,
         },
         Plan::Numeric(e) => e.matches(docs.vals(id)).then_some(Res::Numeric),
+        Plan::Presence { bit, empty } => {
+            let hit = if *empty {
+                docs.empty(id) & (1 << *bit) != 0
+            } else {
+                docs.has(id) & (1 << *bit) == 0
+            };
+            hit.then_some(Res::Numeric)
+        }
         Plan::Union {
             kids,
             weight,

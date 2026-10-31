@@ -546,8 +546,28 @@ only on a fleet whose operator sets `coproc-ft on`.
     its distances agree with RediSearch's to about seven significant
     digits rather than sixteen. The document keeps the bytes its client
     wrote, and `FT.INFO` reports `FLOAT64`.
+  - `INDEXMISSING` on a field of any kind, VECTOR included, and
+    `INDEXEMPTY` on a TEXT or TAG field (ADR-0060 amendment 6), each listed
+    among the field's flags in `FT.INFO`. `INDEXEMPTY` on another kind is
+    refused, as is `PHONETIC`. An index that declares `INDEXEMPTY` is one
+    an earlier co-processor will not load: drop it before rolling the
+    co-processor back to a release without it.
 - **Searches:**
   - ADR-0059's filter, or `*`.
+  - `ismissing(@f)`, a document without `f`, on a field declared
+    `INDEXMISSING`; `@f:{""}` on a TAG, and `@f:""` on a TEXT, a document
+    whose `f` is empty, on a field declared `INDEXEMPTY` (ADR-0060
+    amendment 6). Either combines with any other term, and before a KNN's
+    `=>`. A field there with an empty value is not missing:
+    - in a HASH, a field is missing when the document does not have it;
+      in JSON, when its path reaches nothing or `null`. Whether RediSearch
+      reads a JSON `null` as missing is not documented; Flint does;
+    - a TAG is empty when its value holds no tag (`""`, or only separators
+      and spaces, or an empty array), and a TEXT when it holds no word.
+
+    Asked of a field not declared for it, each is refused by name, never
+    answered as nothing, and so is the empty tag beside others in one
+    `{...}`: write `@f:{""} | @f:{a}`.
   - Full text (ADR-0063), in RediSearch's `DIALECT 2` grammar:
     - words, on every TEXT field or on `@f:` or `@f1|f2:`; a word also
       matches its stem's other forms, unless every field it searches is

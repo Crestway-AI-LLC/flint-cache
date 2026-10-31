@@ -850,6 +850,45 @@ its empty-value terms refused by name.**
     `ismissing` answered on a field not declared for it, and the
     `INDEXEMPTY` row guard dropped.
 
+### Amendment 6, as built (2026-10-31, rides with v0.1.0-rc.86)
+
+- **The definition.** `INDEXMISSING` and `INDEXEMPTY` are an attribute's
+  flags, kept once each in the order declared (`Attr::index_missing`,
+  `Attr::index_empty`); a VECTOR field's `INDEXMISSING` is
+  `VectorField::missing`, written as `"missing": true` only when set. An
+  index that declares `INDEXEMPTY` writes `"on"` as
+  `{"type": ..., "requires": ["INDEXEMPTY"]}`, which every earlier
+  decoder, reading `on` as a string, refuses; this one refuses a row that
+  requires anything it does not know (`REQUIRES`). `INDEXEMPTY` on a
+  NUMERIC, GEO or VECTOR field is refused by name, and so is `PHONETIC`.
+- **The document.** `Doc::has` and `Doc::empty`, one bit each for an
+  attribute at its place and a VECTOR field from `VECTOR_BIT0` (16), set
+  as the document is read: a HASH field that is there whatever its value,
+  a JSON path that reaches a value other than `null`; empty, a TAG whose
+  value yields no tag and a TEXT whose value yields no word. `DOC_BYTES`
+  is 208, from 200.
+- **The query.** `ftquery::parse_with` takes the index's `Presence`: each
+  field's bit and what it declared. `ismissing(@f)`, in any case and with
+  spaces inside, is `Node::Missing`; `@f:{""}` on a TAG and `@f:""` on a
+  TEXT are `Node::Empty`; each is refused by name on a field not declared
+  for it, and the empty tag beside others in one `{...}` is refused. The
+  word `ismissing` with no `(` after it is a word. Both nodes have no
+  filter form (`QNode::as_filter`), so a KNN after them searches among the
+  documents they match, as after a text term; the vector sets and
+  ADR-0059's filter are unchanged.
+- **Held by:**
+  - unit tests: `missing_and_empty_fields_answer_redisvl_s_queries`
+    (redisvl's fixture and its queries, verbatim),
+    `missing_and_empty_on_json_and_a_vector_field` (a `null`, `""`, `[]`,
+    a VECTOR field, and three filtered KNNs),
+    `presence_terms_not_declared_are_refused`, and
+    `indexmissing_and_indexempty_are_kept_and_an_indexempty_row_is_guarded`;
+  - `coproc_ft_drill`'s `missing` and `missingsame` sections: redisvl's
+    fixture on HASH and a JSON index with a VECTOR field, through the
+    proxy, before and after a co-processor restart;
+  - the three mutations, each caught by its unit test, on a verify box
+    (2026-10-31).
+
 ## As built, release N (2026-10-19)
 
 Branch `adr0060-ft`, held by `coproc_ft_drill`. Two pairs, a proxy and

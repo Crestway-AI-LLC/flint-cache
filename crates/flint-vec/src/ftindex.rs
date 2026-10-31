@@ -6,7 +6,9 @@
 //! to choose them, and is rebuilt from those keys.
 
 use crate::filter::{self, Field, FieldKind, Val, Vals};
-use crate::ft::{IndexDef, Knn, On, QueryPart, Search, VectorField, distance, vector_from_bytes};
+use crate::ft::{
+    IndexDef, Knn, On, QueryPart, Search, VECTOR_BIT0, VectorField, distance, vector_from_bytes,
+};
 use crate::ftagg::{Load, Plan, Row};
 use crate::ftexpr::Datum;
 use crate::ftquery::{self, Docs};
@@ -43,6 +45,11 @@ struct Doc {
     /// (ADR-0063 amendment 1), in the definition's order; `None` when the
     /// document has none of them.
     sorts: Option<Sorts>,
+    /// The fields it has, and those it has empty, one bit each at
+    /// [`Presence`](crate::ftquery::Presence)'s places: what `ismissing` and
+    /// an empty-value term read (ADR-0060 amendment 6).
+    has: u32,
+    empty: u32,
 }
 
 /// Each attribute's sort value, where it has one.
@@ -81,8 +88,8 @@ fn sort_value(rule: SortRule, raw: &[u8]) -> Result<Option<Box<[u8]>>, &'static 
 
 /// What a document costs the D4 meter beyond its key, twice, and values:
 /// the `Doc`, its key's box and its slot in the map, and its id's entry in
-/// `by_seq`.
-const DOC_BYTES: usize = 200;
+/// `by_seq`. 8 of them are its `has` and `empty` bits (ADR-0060 amendment 6).
+const DOC_BYTES: usize = 208;
 
 /// What a TAG value's document count costs the D4 meter beyond its bytes.
 const TAG_COUNT_BYTES: usize = 64;
@@ -91,6 +98,9 @@ const TAG_COUNT_BYTES: usize = 64;
 /// values by attribute, and its score.
 struct Read {
     vals: Option<Vals>,
+    /// [`Doc::has`] and [`Doc::empty`].
+    has: u32,
+    empty: u32,
     /// One for each VECTOR field, in the definition's order; `None` where
     /// the document has none.
     vectors: Result<Vec<Option<Vec<f32>>>, String>,
@@ -304,6 +314,8 @@ impl FtIndex {
         };
         let Read {
             vals,
+            has,
+            empty,
             vectors,
             texts,
             score,
@@ -362,6 +374,8 @@ impl FtIndex {
                 seq,
                 score,
                 sorts,
+                has,
+                empty,
             },
         );
         Ok(())
@@ -857,6 +871,29 @@ impl FtIndex {
                 .iter()
                 .map(|a| get(&a.path).map(<[u8]>::to_vec)),
         );
+        // Which fields it has, and has empty (ADR-0060 amendment 6). A HASH
+        // field that is there is had, whatever its value.
+        let (mut has, mut empty) = (0u32, 0u32);
+        for (at, a) in self.def.attrs.iter().enumerate() {
+            if let Some(raw) = get(&a.path) {
+                has |= 1 << at;
+                let none = match a.field.kind {
+                    FieldKind::Tag | FieldKind::FoldedTag => {
+                        filter::hash_val(a.field.kind, raw, a.separator) == Val::Missing
+                    }
+                    FieldKind::Text => filter::tokenize(raw).is_empty(),
+                    FieldKind::Numeric | FieldKind::Geo => false,
+                };
+                if none {
+                    empty |= 1 << at;
+                }
+            }
+        }
+        for (j, v) in self.def.vectors.iter().enumerate() {
+            if get(&v.path).is_some() {
+                has |= 1 << (VECTOR_BIT0 + j);
+            }
+        }
         // A score that is not a number is the default, as RediSearch's
         // `SchemaRule_HashScore` takes it.
         let score = self
@@ -871,6 +908,8 @@ impl FtIndex {
         if let Some(e) = bad {
             return Read {
                 vals: any(vals),
+                has,
+                empty,
                 vectors: Err(e),
                 texts,
                 score,
@@ -890,6 +929,8 @@ impl FtIndex {
             .collect();
         Read {
             vals: any(vals),
+            has,
+            empty,
             vectors,
             texts,
             score,
@@ -959,6 +1000,32 @@ impl FtIndex {
                 _ => None,
             }),
         );
+        // Which fields it has, and has empty (ADR-0060 amendment 6). A JSON
+        // path is had when it reaches a value other than `null`.
+        let (mut has, mut empty) = (0u32, 0u32);
+        for (at, a) in self.def.attrs.iter().enumerate() {
+            let Some(x) = json_at(doc, &a.path).filter(|x| !x.is_null()) else {
+                continue;
+            };
+            has |= 1 << at;
+            let none = match (a.field.kind, json_strings(x)) {
+                (FieldKind::Tag | FieldKind::FoldedTag, Some(_)) => {
+                    json_val(a.field.kind, a.separator, Some(x)) == Val::Missing
+                }
+                (FieldKind::Text, Some(ss)) => {
+                    ss.iter().all(|s| filter::tokenize(s.as_bytes()).is_empty())
+                }
+                _ => false,
+            };
+            if none {
+                empty |= 1 << at;
+            }
+        }
+        for (j, v) in self.def.vectors.iter().enumerate() {
+            if json_at(doc, &v.path).is_some_and(|x| !x.is_null()) {
+                has |= 1 << (VECTOR_BIT0 + j);
+            }
+        }
         let score = self
             .def
             .score_field
@@ -969,6 +1036,8 @@ impl FtIndex {
         if let Some(e) = bad {
             return Read {
                 vals: any(vals),
+                has,
+                empty,
                 vectors: Err(e),
                 texts,
                 score,
@@ -983,6 +1052,8 @@ impl FtIndex {
             .collect();
         Read {
             vals: any(vals),
+            has,
+            empty,
             vectors,
             texts,
             score,
@@ -1037,6 +1108,12 @@ impl Docs for View<'_> {
             .and_then(|m| m.get(tag))
             .map_or(0, |n| *n as usize)
     }
+    fn has(&self, id: DocId) -> u32 {
+        self.doc(id).map_or(u32::MAX, |d| d.has)
+    }
+    fn empty(&self, id: DocId) -> u32 {
+        self.doc(id).map_or(0, |d| d.empty)
+    }
 }
 
 /// A GEO field's points, or [`Val::Missing`] with the first error noted in
@@ -1052,6 +1129,15 @@ fn geo_or_note<'a>(
             bad.get_or_insert_with(|| format!("{name} is not indexed: {e}"));
             Val::Missing
         }
+    }
+}
+
+/// A JSON string, or an array of nothing but strings, as its strings.
+fn json_strings(x: &Value) -> Option<Vec<&str>> {
+    match x {
+        Value::String(s) => Some(vec![s.as_str()]),
+        Value::Array(xs) => xs.iter().map(Value::as_str).collect(),
+        _ => None,
     }
 }
 
@@ -2550,5 +2636,268 @@ mod tests {
         );
         // A document is charged for each set it is in.
         assert!(ix.charge(b"doc:1") > ix.charge(b"doc:4"));
+    }
+
+    /// The set of keys a query answers, in key order.
+    fn key_set(ix: &FtIndex, q: &str) -> Vec<String> {
+        let mut k = keys(&search(
+            ix,
+            &["FT.SEARCH", "m", q, "LIMIT", "0", "100"],
+            None,
+        ));
+        k.sort();
+        k
+    }
+
+    /// redisvl 0.28.0's `missing_fields_index` fixture, its five documents.
+    fn missing_index() -> FtIndex {
+        let (_, def) = parse_create(&a(&[
+            "FT.CREATE",
+            "m",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "m:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "INDEXEMPTY",
+            "INDEXMISSING",
+            "category",
+            "TAG",
+            "SEPARATOR",
+            ",",
+            "INDEXEMPTY",
+            "INDEXMISSING",
+            "price",
+            "NUMERIC",
+            "INDEXMISSING",
+            "location",
+            "GEO",
+            "INDEXMISSING",
+            "description",
+            "TEXT",
+            "kind",
+            "TAG",
+        ]))
+        .expect("parses");
+        let mut ix = FtIndex::new(def);
+        let docs: [(&str, &[(&str, &str)]); 5] = [
+            (
+                "m:complete",
+                &[
+                    ("title", "Complete Document"),
+                    ("category", "electronics"),
+                    ("price", "99"),
+                    ("location", "-122.4194,37.7749"),
+                    ("description", "A complete document with all fields"),
+                ],
+            ),
+            (
+                "m:empty_strings",
+                &[
+                    ("title", ""),
+                    ("category", ""),
+                    ("price", "150"),
+                    ("location", "-74.0060,40.7128"),
+                    ("description", "Document with empty string values"),
+                ],
+            ),
+            (
+                "m:partial_missing",
+                &[
+                    ("title", "Partial Document"),
+                    ("price", "75"),
+                    ("description", "Document missing some fields"),
+                ],
+            ),
+            (
+                "m:mostly_missing",
+                &[("description", "Document with most fields missing")],
+            ),
+            (
+                "m:zero_price",
+                &[
+                    ("title", "Zero Price Item"),
+                    ("category", "free"),
+                    ("price", "0"),
+                    ("location", "-118.2437,34.0522"),
+                    ("description", "Document with zero price"),
+                ],
+            ),
+        ];
+        for (k, fields) in docs {
+            let fields: Vec<(&str, &[u8])> =
+                fields.iter().map(|(f, v)| (*f, v.as_bytes())).collect();
+            put(&mut ix, k, &fields);
+        }
+        ix
+    }
+
+    /// ADR-0060 amendment 6: redisvl's own missing-field queries, as its
+    /// `test_query.py` sends them, answer as its assertions expect; an empty
+    /// value is not missing, and `INDEXEMPTY` finds it.
+    #[test]
+    fn missing_and_empty_fields_answer_redisvl_s_queries() {
+        let ix = missing_index();
+        let q = |s: &str| key_set(&ix, s);
+        assert_eq!(q("ismissing(@title)"), ["m:mostly_missing"]);
+        assert_eq!(
+            q("ismissing(@category)"),
+            ["m:mostly_missing", "m:partial_missing"]
+        );
+        assert_eq!(q("ismissing(@price)"), ["m:mostly_missing"]);
+        assert_eq!(
+            q("ismissing(@location)"),
+            ["m:mostly_missing", "m:partial_missing"]
+        );
+        assert_eq!(
+            q("(@price:[(50 +inf] ismissing(@category))"),
+            ["m:partial_missing"]
+        );
+        assert_eq!(
+            q("(@price:[0 0] | ismissing(@price))"),
+            ["m:mostly_missing", "m:zero_price"]
+        );
+        assert_eq!(
+            q("((ismissing(@title) | ismissing(@category)) | ismissing(@price))"),
+            ["m:mostly_missing", "m:partial_missing"]
+        );
+        assert_eq!(
+            q("(ismissing(@title) ismissing(@category) ismissing(@price))"),
+            ["m:mostly_missing"]
+        );
+        assert_eq!(
+            q("-ismissing(@category)"),
+            ["m:complete", "m:empty_strings", "m:zero_price"]
+        );
+        assert_eq!(
+            q("ISMISSING ( @title )"),
+            ["m:mostly_missing"],
+            "any case, any spacing"
+        );
+        // Empty is not missing; INDEXEMPTY finds it, on TAG and on TEXT.
+        assert_eq!(q("@category:{\"\"}"), ["m:empty_strings"]);
+        assert_eq!(q("@category:{ \"\" }"), ["m:empty_strings"]);
+        assert_eq!(q("@title:\"\""), ["m:empty_strings"]);
+        assert_eq!(
+            q("@category:{\"\"} | @category:{free}"),
+            ["m:empty_strings", "m:zero_price"]
+        );
+        assert_eq!(q("-@title:\"\" -ismissing(@title)").len(), 3);
+        // The other terms answer as before: an empty TAG holds no tag.
+        assert_eq!(
+            q("@category:{electronics | free}"),
+            ["m:complete", "m:zero_price"]
+        );
+        assert_eq!(q("@description:(document)").len(), 5);
+        // The word alone, with no `(` after it, is a word.
+        assert_eq!(q("ismissing"), Vec::<String>::new());
+        // Each document is charged its bits.
+        assert!(ix.charge(b"m:mostly_missing") >= DOC_BYTES);
+    }
+
+    /// ADR-0060 amendment 6 on JSON: a `null` is missing, `""` and `[]` are
+    /// empty; a VECTOR field's absence is asked for too, and a KNN whose
+    /// filter asks searches among the documents that answer it.
+    #[test]
+    fn missing_and_empty_on_json_and_a_vector_field() {
+        let (_, def) = parse_create(&a(&[
+            "FT.CREATE",
+            "m",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "j:",
+            "SCHEMA",
+            "$.t",
+            "AS",
+            "t",
+            "TAG",
+            "INDEXEMPTY",
+            "INDEXMISSING",
+            "$.x",
+            "AS",
+            "x",
+            "TEXT",
+            "INDEXEMPTY",
+            "INDEXMISSING",
+            "$.n",
+            "AS",
+            "n",
+            "NUMERIC",
+            "INDEXMISSING",
+            "$.v",
+            "AS",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+            "INDEXMISSING",
+        ]))
+        .expect("parses");
+        let mut ix = FtIndex::new(def);
+        for (k, d) in [
+            ("j:1", r#"{"t":"a","x":"hello","n":1,"v":[0,0]}"#),
+            ("j:2", r#"{"t":"","x":"","n":null}"#),
+            ("j:3", r#"{"t":[],"x":" , ","v":[1,0]}"#),
+            ("j:4", r#"{"t":[""],"x":["", " "],"n":4,"v":[2,0]}"#),
+            ("j:5", r#"{}"#),
+        ] {
+            let d: Value = serde_json::from_str(d).expect("json");
+            ix.put(k.as_bytes(), Source::Json(&d), None)
+                .expect("indexed");
+        }
+        let q = |s: &str| key_set(&ix, s);
+        assert_eq!(q("ismissing(@n)"), ["j:2", "j:3", "j:5"], "null is missing");
+        assert_eq!(q("ismissing(@t)"), ["j:5"]);
+        assert_eq!(q("ismissing(@v)"), ["j:2", "j:5"]);
+        assert_eq!(q("@t:{\"\"}"), ["j:2", "j:3", "j:4"]);
+        assert_eq!(q("@x:\"\""), ["j:2", "j:3", "j:4"]);
+        let knn = |s: &str| {
+            keys(&search(
+                &ix,
+                &["FT.SEARCH", "m", s, "SORTBY", "d"],
+                Some(&[0.0, 0.0]),
+            ))
+        };
+        assert_eq!(knn("(ismissing(@n))=>[KNN 5 @v $v AS d]"), ["j:3"]);
+        assert_eq!(knn("(@t:{\"\"})=>[KNN 5 @v $v AS d]"), ["j:3", "j:4"]);
+        assert_eq!(knn("(-ismissing(@n))=>[KNN 5 @v $v AS d]"), ["j:1", "j:4"]);
+    }
+
+    /// ADR-0060 amendment 6: a presence term on a field not declared for it
+    /// is refused by name, never answered as nothing.
+    #[test]
+    fn presence_terms_not_declared_are_refused() {
+        let ix = missing_index();
+        let err = |q: &str| parse_search(&a(&["FT.SEARCH", "m", q]), ix.def()).expect_err(q);
+        assert!(err("ismissing(@description)").contains("not declared INDEXMISSING"));
+        assert!(err("ismissing(@nope)").contains("nope, which is not a field"));
+        assert!(err("@description:\"\"").contains("not declared INDEXEMPTY"));
+        assert!(err("@kind:{\"\"}").contains("not declared INDEXEMPTY"));
+        assert!(err("@category:{\"\" | free}").contains("beside others"));
+        assert!(err("@title|description:\"\"").contains("several fields"));
+        assert!(err("ismissing(title)").contains("no @field"));
+        assert!(err("ismissing(@title").contains("no ')'"));
+        // Without the options, the same queries are refused: an index made
+        // before this amendment answers none of them as nothing.
+        let mut plain = hash_index();
+        put(&mut plain, "doc:1", &[("content", b"x")]);
+        assert!(
+            parse_search(
+                &a(&["FT.SEARCH", "idx", "ismissing(@content)"]),
+                plain.def()
+            )
+            .is_err()
+        );
     }
 }

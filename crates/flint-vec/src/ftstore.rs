@@ -1106,6 +1106,8 @@ impl Store {
                     };
                     [s(&k), s(x)]
                 }))
+                // Its flag after its options, as an attribute's are.
+                .chain(v.missing.then(|| s("INDEXMISSING")))
                 .collect(),
             )));
         }

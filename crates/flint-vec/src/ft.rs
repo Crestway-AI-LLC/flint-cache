@@ -76,6 +76,9 @@ pub struct VectorField {
     /// `EPSILON`, `INITIAL_CAP`, `BLOCK_SIZE`), as given, so `FT.INFO`
     /// answers the schema a client made.
     pub hints: Vec<(Box<str>, Box<str>)>,
+    /// `INDEXMISSING`: `ismissing(@f)` may ask for a document without one
+    /// (ADR-0060 amendment 6).
+    pub missing: bool,
 }
 
 /// A TAG, NUMERIC or TEXT attribute.
@@ -90,13 +93,38 @@ pub struct Attr {
     pub separator: u8,
     /// `NOINDEX`: returned and sortable, but not filtered on.
     pub noindex: bool,
-    /// The flags declared that change no answer here (`SORTABLE`, `UNF`,
-    /// `NOSTEM`, `WITHSUFFIXTRIE`), in order, and a TEXT field's `WEIGHT`:
-    /// kept so `FT.INFO` answers the schema a client made, which `redisvl`
-    /// reads back to rebuild it.
+    /// The flags declared, in order, and a TEXT field's `WEIGHT`: kept so
+    /// `FT.INFO` answers the schema a client made, which `redisvl` reads
+    /// back to rebuild it. `SORTABLE`, `UNF`, `NOSTEM` and `WITHSUFFIXTRIE`
+    /// change no answer here; `INDEXMISSING` and `INDEXEMPTY` let a query
+    /// ask for a document without the field, or with it empty (ADR-0060
+    /// amendment 6).
     pub flags: Vec<Box<str>>,
     pub weight: Option<Box<str>>,
 }
+
+impl Attr {
+    /// `INDEXMISSING`: `ismissing(@f)` may ask for it.
+    pub fn index_missing(&self) -> bool {
+        self.flags.iter().any(|f| &**f == "INDEXMISSING")
+    }
+
+    /// `INDEXEMPTY`: `@f:{""}` or `@f:""` may ask for it empty.
+    pub fn index_empty(&self) -> bool {
+        self.flags.iter().any(|f| &**f == "INDEXEMPTY")
+    }
+}
+
+/// What a definition row may require of the binary that reads it, beyond
+/// what every binary since `FT.*`'s first release reads (ADR-0060 amendment
+/// 6). An earlier binary refuses any row that requires something.
+const REQUIRES: &[&str] = &["INDEXEMPTY"];
+
+/// Where a field's bit is in a document's `has` and `empty` sets (ADR-0060
+/// amendment 6): an attribute's at its place in [`IndexDef::attrs`], a
+/// VECTOR field's from here, at its place in [`IndexDef::vectors`].
+pub const VECTOR_BIT0: usize = filter::MAX_FIELDS;
+const _: () = assert!(VECTOR_BIT0 + MAX_VECTORS <= 32);
 
 /// What `FT.CREATE` declared.
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +192,9 @@ impl IndexDef {
             if v.ty != VecType::Float32 {
                 o["type"] = json!(v.ty.as_str());
             }
+            if v.missing {
+                o["missing"] = json!(true);
+            }
             o
         };
         // ONE FLOAT32 FIELD IS WRITTEN AS EVERY EARLIER BINARY WROTE IT, so a
@@ -176,8 +207,23 @@ impl IndexDef {
             [v] if v.ty == VecType::Float32 => one(v),
             vs => Value::Array(vs.iter().map(one).collect()),
         };
+        let on = match self.on {
+            On::Hash => "hash",
+            On::Json => "json",
+        };
+        // AN INDEX THAT DECLARES `INDEXEMPTY` NAMES IT IN `on`, which is then
+        // an object. Every earlier binary reads `on` as a string and refuses
+        // the row, leaving the index out out loud: it would read `@f:{""}` as
+        // a tag of two quotes and answer it with nothing (ADR-0060 amendment
+        // 6). `INDEXMISSING` needs no guard: an earlier parser refuses
+        // `ismissing(@f)` by name, and answers every other query as this one.
+        let on = if self.attrs.iter().any(Attr::index_empty) {
+            json!({ "type": on, "requires": ["INDEXEMPTY"] })
+        } else {
+            json!(on)
+        };
         json!({
-            "on": match self.on { On::Hash => "hash", On::Json => "json" },
+            "on": on,
             "prefixes": self.prefixes,
             "attrs": attrs,
             "vector": vector,
@@ -193,7 +239,16 @@ impl IndexDef {
     /// that index out, out loud, rather than serving it with a field missed.
     pub fn decode(s: &str) -> Option<IndexDef> {
         let v: Value = serde_json::from_str(s).ok()?;
-        let on = match v.get("on")?.as_str()? {
+        // A string, or an object naming what the row needs of its reader;
+        // a need this binary does not know leaves the index out.
+        let (on, requires) = match v.get("on")? {
+            Value::Object(o) => (o.get("type")?, strings(o.get("requires"))?),
+            other => (other, Vec::new()),
+        };
+        if requires.iter().any(|r| !REQUIRES.contains(&&**r)) {
+            return None;
+        }
+        let on = match on.as_str()? {
             "hash" => On::Hash,
             "json" => On::Json,
             _ => return None,
@@ -250,6 +305,10 @@ impl IndexDef {
                             Some((kv.first()?.as_str()?.into(), kv.get(1)?.as_str()?.into()))
                         })
                         .collect::<Option<Vec<_>>>()?,
+                },
+                missing: match x.get("missing") {
+                    None | Some(Value::Null) => false,
+                    Some(m) => m.as_bool()?,
                 },
             })
         };
@@ -562,7 +621,22 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                     "an index has at most {MAX_VECTORS} VECTOR fields (ADR-0060 amendment 5)"
                 ));
             }
-            let (v, next) = parse_vector(args, i, &name, &path)?;
+            let (mut v, mut next) = parse_vector(args, i, &name, &path)?;
+            loop {
+                match arg(args, next).map(upper).as_deref() {
+                    Some(b"INDEXMISSING") => {
+                        v.missing = true;
+                        next += 1;
+                    }
+                    Some(b"INDEXEMPTY") => {
+                        return Err(format!(
+                            "SCHEMA field {name}: INDEXEMPTY is for TEXT and TAG fields \
+                             (ADR-0060 amendment 6)"
+                        ));
+                    }
+                    _ => break,
+                }
+            }
             vectors.push(v);
             i = next;
             continue;
@@ -630,11 +704,24 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
                     flags.push("WITHSUFFIXTRIE".into());
                     i += 1;
                 }
-                o @ (b"PHONETIC" | b"INDEXMISSING" | b"INDEXEMPTY") => {
+                // ADR-0060 amendment 6: `ismissing(@f)` on any kind, and an
+                // empty value searchable on TEXT and TAG.
+                b"INDEXMISSING" => {
+                    flag(&mut flags, "INDEXMISSING");
+                    i += 1;
+                }
+                b"INDEXEMPTY" if tag || kind == FieldKind::Text => {
+                    flag(&mut flags, "INDEXEMPTY");
+                    i += 1;
+                }
+                b"INDEXEMPTY" => {
                     return Err(format!(
-                        "SCHEMA option {} is not supported (ADR-0060)",
-                        String::from_utf8_lossy(o)
+                        "SCHEMA field {name}: INDEXEMPTY is for TEXT and TAG fields \
+                         (ADR-0060 amendment 6)"
                     ));
+                }
+                b"PHONETIC" => {
+                    return Err("SCHEMA option PHONETIC is not supported (ADR-0060)".into());
                 }
                 _ => break,
             }
@@ -672,6 +759,13 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             score_field,
         },
     ))
+}
+
+/// Add `f` to a field's flags, once.
+fn flag(flags: &mut Vec<Box<str>>, f: &str) {
+    if !flags.iter().any(|x| &**x == f) {
+        flags.push(f.into());
+    }
 }
 
 /// `VECTOR FLAT|HNSW <n> <attr> <value> ...`, from `i`, the algorithm.
@@ -745,6 +839,7 @@ fn parse_vector(
             metric,
             ef_runtime,
             hints,
+            missing: false,
         },
         i + 2 + n,
     ))
@@ -934,6 +1029,34 @@ pub struct QueryPart {
     pub more: Vec<Knn>,
 }
 
+/// What a query may ask about `def`'s fields' presence (ADR-0060 amendment
+/// 6): each attribute and VECTOR field at its bit, with what it declared.
+fn presence(def: &IndexDef) -> ftquery::Presence {
+    let attrs = def
+        .attrs
+        .iter()
+        .enumerate()
+        .map(|(at, a)| ftquery::PresenceField {
+            name: a.field.name.clone(),
+            bit: at as u32,
+            missing: a.index_missing(),
+            empty: a.index_empty(),
+        });
+    let vectors = def
+        .vectors
+        .iter()
+        .enumerate()
+        .map(|(j, v)| ftquery::PresenceField {
+            name: v.name.clone(),
+            bit: (VECTOR_BIT0 + j) as u32,
+            missing: v.missing,
+            empty: false,
+        });
+    ftquery::Presence {
+        fields: attrs.chain(vectors).collect(),
+    }
+}
+
 /// The query string of an `FT.SEARCH` or `FT.AGGREGATE`, with its `PARAMS`,
 /// against the index `def`.
 pub fn parse_query(
@@ -964,8 +1087,8 @@ pub fn parse_query(
         ));
     }
     let stop = StopWords::of(def.stopwords.as_deref());
-    let mut q =
-        ftquery::parse(f.as_bytes(), &fields, &stop).map_err(|e| format!("the query {e}"))?;
+    let mut q = ftquery::parse_with(f.as_bytes(), &fields, &stop, &presence(def))
+        .map_err(|e| format!("the query {e}"))?;
     // A term on a NOINDEX field matches no document, as RediSearch answers
     // it: the field is returned and sorted on, never searched.
     let noindex: Vec<usize> = def
@@ -2121,5 +2244,120 @@ mod tests {
         assert!(
             refused("*=>[KNN 3 @nope $vector_1]").contains("not one of this index's VECTOR fields")
         );
+    }
+
+    /// ADR-0060 amendment 6: `INDEXMISSING` on every kind, `INDEXEMPTY` on
+    /// TEXT and TAG, kept in the row and refused where RediSearch has none.
+    #[test]
+    fn indexmissing_and_indexempty_are_kept_and_an_indexempty_row_is_guarded() {
+        let create = |schema: &[&str]| {
+            let mut args = a(&[
+                "FT.CREATE",
+                "m",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "m:",
+                "SCHEMA",
+            ]);
+            args.extend(a(schema));
+            parse_create(&args).map(|(_, d)| d)
+        };
+        let def = create(&[
+            "title",
+            "TEXT",
+            "INDEXEMPTY",
+            "INDEXMISSING",
+            "SORTABLE",
+            "category",
+            "TAG",
+            "SEPARATOR",
+            ",",
+            "INDEXEMPTY",
+            "INDEXMISSING",
+            "price",
+            "NUMERIC",
+            "INDEXMISSING",
+            "location",
+            "GEO",
+            "INDEXMISSING",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+            "INDEXMISSING",
+        ])
+        .expect("parses");
+        let flags: Vec<(bool, bool)> = def
+            .attrs
+            .iter()
+            .map(|x| (x.index_missing(), x.index_empty()))
+            .collect();
+        assert_eq!(
+            flags,
+            [(true, true), (true, true), (true, false), (true, false)]
+        );
+        assert_eq!(
+            def.attrs[0].flags.iter().map(|f| &**f).collect::<Vec<_>>(),
+            ["INDEXEMPTY", "INDEXMISSING", "SORTABLE"]
+        );
+        assert!(def.vectors[0].missing);
+        // INDEXEMPTY makes `on` an object, which every earlier binary reads
+        // as a string and so refuses; this one reads the row back whole.
+        let row = def.encode();
+        let v: Value = serde_json::from_str(&row).expect("json");
+        assert!(v["on"].as_str().is_none(), "{row}");
+        assert_eq!(v["on"]["requires"], json!(["INDEXEMPTY"]), "{row}");
+        assert_eq!(IndexDef::decode(&row), Some(def.clone()));
+        // INDEXMISSING alone leaves `on` a string: an earlier binary loads
+        // it and refuses `ismissing(@f)` by name.
+        let only_missing = create(&["price", "NUMERIC", "INDEXMISSING"]).expect("parses");
+        let row = only_missing.encode();
+        let v: Value = serde_json::from_str(&row).expect("json");
+        assert_eq!(v["on"], json!("hash"), "{row}");
+        assert_eq!(IndexDef::decode(&row), Some(only_missing));
+        // A row that needs what this binary does not know is left out.
+        let mut later = serde_json::from_str::<Value>(&def.encode()).expect("json");
+        later["on"]["requires"] = json!(["INDEXEMPTY", "SOMETHING_LATER"]);
+        assert_eq!(IndexDef::decode(&later.to_string()), None);
+        // Declared twice, kept once.
+        let twice = create(&["t", "TAG", "INDEXMISSING", "INDEXMISSING"]).expect("parses");
+        assert_eq!(
+            twice.attrs[0]
+                .flags
+                .iter()
+                .map(|f| &**f)
+                .collect::<Vec<_>>(),
+            ["INDEXMISSING"]
+        );
+        for schema in [
+            &["price", "NUMERIC", "INDEXEMPTY"][..],
+            &["location", "GEO", "INDEXEMPTY"],
+            &[
+                "v",
+                "VECTOR",
+                "FLAT",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "2",
+                "DISTANCE_METRIC",
+                "L2",
+                "INDEXEMPTY",
+            ],
+        ] {
+            let e = create(schema).expect_err("refused");
+            assert!(e.contains("INDEXEMPTY is for TEXT and TAG fields"), "{e}");
+        }
+        let e = create(&["t", "TEXT", "PHONETIC", "dm:en"]).expect_err("refused");
+        assert!(e.contains("PHONETIC is not supported"), "{e}");
     }
 }

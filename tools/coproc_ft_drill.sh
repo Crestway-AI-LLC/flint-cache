@@ -649,6 +649,71 @@ if which in ("multi", "multisame"):
     else:
         print("  two VECTOR fields, one FLOAT64, on HASH and JSON: redisvl's multi-vector query and a KNN on the FLOAT64 field")
 
+if which in ("missing", "missingsame"):
+    # ADR-0060 amendment 6: redisvl's missing-field fixture on HASH, and a
+    # JSON index with a VECTOR field, each asked ismissing() and for an
+    # empty value. An empty value is not missing.
+    hdocs = {"complete": ["title", "Complete Document", "category", "electronics", "price", "99",
+                          "location", "-122.4194,37.7749", "description", "all fields"],
+             "empty": ["title", "", "category", "", "price", "150", "description", "empty strings"],
+             "partial": ["title", "Partial Document", "price", "75", "description", "some missing"],
+             "mostly": ["description", "most fields missing"],
+             "zero": ["title", "Zero Price Item", "category", "free", "price", "0",
+                      "location", "-118.2437,34.0522", "description", "zero price"]}
+    jdocs = {"1": {"t": "a", "n": 1, "v": [0, 0]}, "2": {"t": "", "n": None},
+             "3": {"t": [], "v": [1, 0]}, "4": {}}
+    if which == "missing":
+        want(cmd(px, "FT.CREATE", "mf", "ON", "HASH", "PREFIX", "1", "mf:", "SCHEMA",
+                 "title", "TEXT", "INDEXEMPTY", "INDEXMISSING", "category", "TAG", "SEPARATOR", ",",
+                 "INDEXEMPTY", "INDEXMISSING", "price", "NUMERIC", "INDEXMISSING",
+                 "location", "GEO", "INDEXMISSING", "description", "TEXT"),
+             "OK", "FT.CREATE mf, redisvl's missing-field schema")
+        want(cmd(px, "FT.CREATE", "mfj", "ON", "JSON", "PREFIX", "1", "mfj:", "SCHEMA",
+                 "$.t", "AS", "t", "TAG", "INDEXEMPTY", "INDEXMISSING", "$.n", "AS", "n", "NUMERIC",
+                 "INDEXMISSING", "$.v", "AS", "v", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", "2",
+                 "DISTANCE_METRIC", "L2", "INDEXMISSING"), "OK", "FT.CREATE mfj")
+        for k, h in hdocs.items():
+            want(cmd(px, "HSET", "mf:" + k, *h), len(h) // 2, "HSET mf:" + k)
+        for k, j in jdocs.items():
+            want(cmd(px, "JSON.SET", "mfj:" + k, "$", json.dumps(j)), "OK", "JSON.SET mfj:" + k)
+        info = cmd(px, "FT.INFO", "mf")
+        attrs = info[info.index(b"attributes") + 1]
+        title = [a for a in attrs if a[a.index(b"attribute") + 1] == b"title"][0]
+        if b"INDEXEMPTY" not in title or b"INDEXMISSING" not in title:
+            raise SystemExit("FAIL: FT.INFO mf: title's flags: %r" % title)
+        refused(cmd(px, "FT.SEARCH", "mf", "ismissing(@description)"),
+                "ERR", "ismissing on a field not declared INDEXMISSING")
+
+    def found(ix, q, *extra):
+        r = cmd(px, "FT.SEARCH", ix, q, "NOCONTENT", "LIMIT", "0", "100", *extra, "DIALECT", "2")
+        if isinstance(r, Err):
+            raise SystemExit("FAIL: %s: %s %r: %s" % (which, ix, q, r))
+        return sorted(k.decode() for k in r[1:])
+
+    for q, exp in [
+        ("ismissing(@title)", ["mf:mostly"]),
+        ("ismissing(@category)", ["mf:mostly", "mf:partial"]),
+        ("(@price:[(50 +inf] ismissing(@category))", ["mf:partial"]),
+        ("(@price:[0 0] | ismissing(@price))", ["mf:mostly", "mf:zero"]),
+        ("((ismissing(@title) | ismissing(@category)) | ismissing(@price))", ["mf:mostly", "mf:partial"]),
+        ("ismissing(@location)", ["mf:empty", "mf:mostly", "mf:partial"]),
+        ('@category:{""}', ["mf:empty"]),
+        ('@title:""', ["mf:empty"]),
+    ]:
+        want(found("mf", q), exp, "%s: mf %s" % (which, q))
+    want(found("mfj", "ismissing(@n)"), ["mfj:2", "mfj:3", "mfj:4"], "%s: mfj: null is missing" % which)
+    want(found("mfj", '@t:{""}'), ["mfj:2", "mfj:3"], "%s: mfj: \"\" and [] are empty" % which)
+    want(found("mfj", "ismissing(@v)"), ["mfj:2", "mfj:4"], "%s: mfj: no vector" % which)
+    r = cmd(px, "FT.SEARCH", "mfj", "(ismissing(@n))=>[KNN 3 @v $q AS d]", "NOCONTENT",
+            "PARAMS", "2", "q", vec(0.0, 0.0), "DIALECT", "2")
+    want(r, [1, b"mfj:3"], "%s: mfj: a KNN among the documents without n" % which)
+    if which == "missingsame":
+        want(cmd(px, "FT.DROPINDEX", "mf", "DD"), "OK", "FT.DROPINDEX mf DD")
+        want(cmd(px, "FT.DROPINDEX", "mfj", "DD"), "OK", "FT.DROPINDEX mfj DD")
+        print("  INDEXMISSING and INDEXEMPTY: the same answers, rebuilt")
+    else:
+        print("  INDEXMISSING and INDEXEMPTY, on HASH and JSON: redisvl's ismissing() queries, empty values, and a KNN filtered on a missing field")
+
 if which == "off":
     refused(cmd(px, "FT.CREATE", "z", "PREFIX", "1", "z:", "SCHEMA", "a", "TAG"),
             "ERR FT.* is not enabled", "FT.CREATE without --ft")
@@ -679,6 +744,8 @@ echo "== ADR-0064: FT.AGGREGATE and FT.CURSOR"
 step agg || exit 1
 echo "== ADR-0060 amendment 5: two VECTOR fields, one FLOAT64, and ranges on both"
 step multi || exit 1
+echo "== ADR-0060 amendment 6: INDEXMISSING, INDEXEMPTY and ismissing()"
+step missing || exit 1
 
 echo "== a co-processor restart rebuilds every index and registers its prefixes again"
 kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
@@ -695,6 +762,8 @@ echo "== ADR-0064: the same aggregate, rebuilt; a cursor from before the restart
 step aggsame || exit 1
 echo "== ADR-0060 amendment 5: the same multi-vector answers, rebuilt"
 step multisame || exit 1
+echo "== ADR-0060 amendment 6: the same missing and empty answers, rebuilt"
+step missingsame || exit 1
 grep -q "FT\.\* on" "$D/vec.log" || { echo "FAIL: flint-vec did not say FT.* is on"; exit 1; }
 
 echo "== FT.DROPINDEX takes the prefixes off every pair"
@@ -708,4 +777,4 @@ kill -9 "$COPROC_PID"; wait "$COPROC_PID" 2>/dev/null
 start_vec
 step off || exit 1
 
-echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), FT.AGGREGATE answers redisvl's paging, router and hybrid query and its cursors end with their co-processor (ADR-0064), redisvl's update scripts and JSON.MERGE write indexed documents (ADR-0060 amendment 4), an index with two VECTOR fields, one FLOAT64, answers redisvl's multi-vector query before and after a restart (ADR-0060 amendment 5), and --ft gates it (ADR-0060, amendment 3)"
+echo "PASS: FT.* serves through the proxy over HASH and JSON documents on two pairs, every pair refuses a write around the co-processor, a restart rebuilds the same answers and aliases, a drop or a flush releases its prefixes, MODULE LIST, pages past the default budget and write-order ties answer as RediSearch's, a vector range answers before and after a restart (ADR-0061), GEO fields answer a radius as RediSearch does (ADR-0062), full text scores as BM25STD's formula gives before and after a restart (ADR-0063), FT.AGGREGATE answers redisvl's paging, router and hybrid query and its cursors end with their co-processor (ADR-0064), redisvl's update scripts and JSON.MERGE write indexed documents (ADR-0060 amendment 4), an index with two VECTOR fields, one FLOAT64, answers redisvl's multi-vector query before and after a restart (ADR-0060 amendment 5), ismissing() and empty values answer redisvl's missing-field queries before and after a restart (ADR-0060 amendment 6), and --ft gates it (ADR-0060, amendment 3)"
