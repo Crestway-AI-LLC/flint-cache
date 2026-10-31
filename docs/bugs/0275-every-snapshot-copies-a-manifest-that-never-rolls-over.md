@@ -46,8 +46,9 @@ What it costs:
 - **Under write load, faster.** The MANIFEST takes a record at each flush
   and compaction. The playground's ~200 B per snapshot is about one flush
   per snapshot on a seat that is barely written. A loaded seat flushes and
-  compacts far more often, so its copies grow faster; its rate was not
-  measured.
+  compacts far more often, so its copies grow faster: 30 B/s at 3,000
+  writes a second, about 4.5 times the playground's rate (measured
+  2026-10-31, below).
 
 ## The fix
 
@@ -114,3 +115,37 @@ With the cap taken out, the same test fails: a snapshot copied 187,084 B
 of MANIFEST, and the copies were still growing. With it, it passes, in
 about 80 s. `manifest_state_per_sst_stays_under_the_cap_arithmetic` holds
 the 256 B per SST that the cap's arithmetic assumes, on 200 SSTs.
+
+## Under write load, measured 2026-10-31
+
+Two seats side by side on the gate box (c7i.xlarge, a 200 GB gp3 volume),
+public main abdb31c0, each taking 3,000 `SET`s a second of 1 KB random
+values over a million keys for 90 minutes, and a `FLINTSNAPSHOT` every 30
+seconds. One ran the shipped cap, which this volume makes 1,637,376 B. The
+other ran `FLINT_MANIFEST_MAX_MB=1024`, RocksDB's own default, which is how
+every seat ran before the fix.
+
+| | shipped cap | before the fix |
+|---|---|---|
+| writes (errors) | 16,212,200 (0) | 16,212,200 (0) |
+| live MANIFEST after 5,394 s | 116 B to 164,177 B | 116 B to 164,012 B |
+| growth | 30 B/s | 30 B/s |
+| rolls | 0 | 0 |
+| a snapshot's MANIFEST copy | 650 B to 164,177 B | 650 B to 164,012 B |
+| live SSTs at the end | 26 | 24 |
+
+- **30 B/s on a loaded seat**, about 2.6 MB a day of uptime, against the
+  playground's 0.58 MB. At this rate the playground's 3.6 MB cap is
+  reached about a day and a half after a restart, not six.
+- **The two arms are the same below the cap**, as they should be: the cap
+  changes nothing until the MANIFEST reaches it. On this volume that is
+  about 15 hours at this rate, so no roll happened in the run; the roll
+  itself is held by the acceptance test above.
+- **A roll would not repeat.** The state after one is one record per live
+  SST, 26 here, so at most 26 × 256 B, about 7 KB, a fraction of the cap.
+- **Not the fix's doing:** the seat on the shipped cap released 45
+  snapshots under disk pressure in the run's last seven minutes (BUG-0195's
+  relief, at 25% free). Each seat sized its WAL archive (51,180 MB) for a
+  volume of its own, as a production seat, which has one, does; here two
+  shared it. The MANIFEST figures come from each newest snapshot, read as
+  it was taken.
