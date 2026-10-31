@@ -1,6 +1,8 @@
-# BUG-0270: a `coproc_vec_drill` fleet stopped answering, every process busy, for 30 minutes (OPEN, not reproduced)
+# BUG-0270: a `coproc_vec_drill` fleet stopped answering, every process busy, for 30 minutes (CLOSED, not reproduced)
 
-**Status:** **OPEN, seen once, not reproduced.** Found 2026-10-20 at
+**Status:** **CLOSED 2026-10-31, not reproduced** (Acceptance, below):
+`coproc_vec_drill` ran 50 times on the gate box under the per-drill cap,
+with the stall capture in place, and passed every time. Found 2026-10-20 at
 16:27 PT on the laptop, in a local run of `coproc_vec_drill` whose fleet
 had started at about 15:57 PT. The run was on the ADR-0060 branch
 (`adr0060-ft`) with ADR-0017's D3 amendment, uncommitted then and committed
@@ -50,6 +52,13 @@ It also passed in gate g0269 on public main. One attempt to reproduce it, on
 a small fleet of the same shape with a co-processor restart and retried
 searches, rebuilt and went idle.
 
+And 50 times in a row on the gate box (c7i.xlarge), on public main
+abdb31c0, 2026-10-31 03:08 to 03:29 UTC: each run through `capped_drill`
+under the 900-second cap, so a stall would have taken its evidence before
+the kill. All 50 printed the drill's `PASS:` line and none a `FAIL`; they
+took 1,277 seconds together, the first 135 with the build and the rest
+about 23 each.
+
 ## What would settle it
 
 - **Stacks the next time: in place 2026-10-21.** When the per-drill cap
@@ -76,3 +85,7 @@ searches, rebuilt and went idle.
 - **Acceptance:** the cause is found and held by a test, or `coproc_vec_drill`
   runs 50 times on the box with no stall now that the stack capture is in
   place. Then this closes as not reproduced.
+
+  **Met 2026-10-31:** 50 runs on the box, 50 passed, no stall (above). The
+  capture stays in place, in every drill run under the cap, so a second
+  sighting would arrive with its stacks and reopen this.
