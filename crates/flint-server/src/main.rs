@@ -32,8 +32,9 @@ mod write_queue;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use flint_resp::{Decoded, Value, decode, encode, encode_proto, encode_proto_flushing};
 use flint_storage::{Kv, MemKv};
@@ -159,12 +160,10 @@ const ACCEPTED_FLAGS: &[&str] = &[
 /// startup exits (argument and engine validation) run on the main thread
 /// before any store exists, and should keep `std::process::exit` — it flushes
 /// properly and there is no teardown to race.
-/// Gated with `rocks` because that is where the hazard lives, not to silence a
-/// lint: the teardown being raced is RocksDB's C++ statics, and a `mem` build
-/// has none, no `mod replica`, and no background compaction threads. If a
-/// non-rocks path ever needs to leave from a live thread, widen this — and the
-/// test below will already be failing, because the count will have moved.
-#[cfg(feature = "rocks")]
+/// In every build since ADR-0065: a vital thread's panic leaves through it,
+/// and the lease and GC threads run in a `mem` build too. The hazard is
+/// RocksDB's C++ statics, which a `mem` build does not have, so there it only
+/// skips `atexit` handlers that have nothing to do.
 fn hard_exit(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -175,6 +174,87 @@ fn hard_exit(code: i32) -> ! {
     }
     #[cfg(not(unix))]
     std::process::exit(code)
+}
+
+/// The exit status of a seat whose vital thread panicked (ADR-0065): sysexits'
+/// `EX_SOFTWARE`, an internal error, as `flint-vec` uses for a poisoned lock.
+const EXIT_VITAL_PANIC: i32 = 70;
+
+/// Panics on the reporting threads, which a seat goes on without:
+/// `FLINTINFO`'s `thread_panics_total` (ADR-0065).
+static THREAD_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// Spawn one of the threads a seat must not serve without (ADR-0065):
+/// replication, the WAL fsync, the disk guard, the lease watchdog and
+/// renewal, and GC. A panic on one ended that thread alone, and the seat went
+/// on serving without its WAL sync, its fence or its shedding, which nothing
+/// checks for: BUG-0276's disk guard died that way. The panic now ends the
+/// process, through `hard_exit` because the store is open. The seat
+/// supervisor starts it again, and a master's pair fails over, as for any
+/// stopped seat.
+fn spawn_vital(name: &'static str, f: impl FnOnce() + Send + 'static) {
+    spawn_named(name, move || {
+        if catch_unwind(AssertUnwindSafe(move || {
+            test_panic_thread(name);
+            f()
+        }))
+        .is_err()
+        {
+            elog!(
+                "flint-server: vital thread {name} panicked; exiting with status \
+                 {EXIT_VITAL_PANIC} so the seat is started again (ADR-0065)"
+            );
+            hard_exit(EXIT_VITAL_PANIC);
+        }
+    });
+}
+
+/// Spawn a thread that reports on the seat rather than protects it
+/// (ADR-0065). A panic ends that thread, is logged and counted in
+/// `thread_panics_total`, and the seat serves on. Each of them reads the
+/// engine, so a `mem` build starts none; its test runs in both builds.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+fn spawn_reporting(name: &'static str, f: impl FnOnce() + Send + 'static) {
+    spawn_named(name, move || {
+        if catch_unwind(AssertUnwindSafe(move || {
+            test_panic_thread(name);
+            f()
+        }))
+        .is_err()
+        {
+            let n = THREAD_PANICS.fetch_add(1, Ordering::Relaxed) + 1;
+            elog!(
+                "flint-server: reporting thread {name} panicked; the seat serves on \
+                 without it (thread_panics_total {n}, ADR-0065)"
+            );
+        }
+    });
+}
+
+/// A named thread, so a panic's own line says which one. One that cannot be
+/// started at all is a seat that cannot run, so that exits too.
+fn spawn_named(name: &'static str, f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new().name(name.into()).spawn(f) {
+        elog!("flint-server: could not start thread {name}: {e}");
+        hard_exit(EXIT_VITAL_PANIC);
+    }
+}
+
+/// Test-only (ADR-0065): `FLINT_TEST_PANIC_THREAD=<name>:<ms>` panics the
+/// named thread `<ms>` after it starts, so a drill can show a vital thread's
+/// fail-stop and a reporting thread's count on a real seat. Unset, it costs
+/// one lookup as each thread starts.
+fn test_panic_thread(name: &str) {
+    let Ok(v) = std::env::var("FLINT_TEST_PANIC_THREAD") else {
+        return;
+    };
+    if let Some((want, ms)) = v.split_once(':')
+        && want == name
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        panic!("FLINT_TEST_PANIC_THREAD={v}");
+    }
 }
 
 fn reject_unknown_flags() {
@@ -2888,7 +2968,7 @@ fn main() -> std::io::Result<()> {
             repoint: AtomicBool::new(false),
         });
         let _ = REPLICA_LINK.set(Arc::clone(&link));
-        std::thread::spawn(move || replica::run(&link, &kv, &stop));
+        spawn_vital("replication", move || replica::run(&link, &kv, &stop));
 
         // OPS-ADR-0023 D7.1 pair-agreement. Per-seat config lets the two members
         // of a pair disagree silently, and a pair where one side reclaims
@@ -2901,7 +2981,7 @@ fn main() -> std::io::Result<()> {
         // which is why it lives here rather than in some symmetric place.
         {
             let master = agree_target;
-            std::thread::spawn(move || {
+            spawn_reporting("pair-agreement", move || {
                 loop {
                     let verdict = match peer_info_field(&master, "evictable_ns") {
                         Some(theirs) if theirs == evictable_ns_joined() => 1,
@@ -2970,7 +3050,7 @@ fn main() -> std::io::Result<()> {
             elog!("wal fsync cadence DISABLED (--wal-fsync-ms 0): host-loss window unbounded");
         }
         if let Some(kv) = rocks.clone() {
-            std::thread::spawn(move || {
+            spawn_vital("wal-fsync", move || {
                 loop {
                     let cadence = WAL_FSYNC_MS.load(Ordering::Relaxed);
                     if cadence == 0 {
@@ -3189,7 +3269,7 @@ fn main() -> std::io::Result<()> {
         // scope it is spawned from.
         #[cfg(feature = "rocks")]
         let ev_rocks = rocks.clone();
-        std::thread::spawn(move || {
+        spawn_vital("disk-guard", move || {
             let path = std::path::PathBuf::from(&dir);
             let mut last = diskguard::Verdict::Ok;
             // `every` is the CEILING, not the cadence. The interval shortens
@@ -3388,7 +3468,7 @@ fn main() -> std::io::Result<()> {
     // ENGINE_WRITE_SAMPLES.
     #[cfg(feature = "rocks")]
     if rocks.is_some() {
-        std::thread::spawn(|| {
+        spawn_reporting("engine-sampler", || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 sample_engine_writers();
@@ -3399,7 +3479,7 @@ fn main() -> std::io::Result<()> {
     #[cfg(feature = "rocks")]
     if let Some(rk) = rocks.clone() {
         let hub_re = Arc::clone(&hub);
-        std::thread::spawn(move || {
+        spawn_reporting("wal-headroom", move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 if !HEADROOM_AUTO.load(Ordering::Relaxed) {
@@ -3436,7 +3516,7 @@ fn main() -> std::io::Result<()> {
     {
         let read_only = Arc::clone(&read_only);
         let lease_deadline = Arc::clone(&lease_deadline);
-        std::thread::spawn(move || {
+        spawn_vital("lease-watchdog", move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 let d = lease_deadline.load(Ordering::Relaxed);
@@ -3491,7 +3571,7 @@ fn main() -> std::io::Result<()> {
         let read_only = Arc::clone(&read_only);
         let lease_deadline = Arc::clone(&lease_deadline);
         let me = SELF_ADDR.get().cloned().unwrap_or_default();
-        std::thread::spawn(move || {
+        spawn_vital("lease-renewal", move || {
             let every = std::time::Duration::from_millis((lease_ttl_ms / 3).max(200));
             // After a FAILED attempt, retry fast instead of burning a whole
             // ttl/3 slot. The failure that matters here is a routine CP
@@ -3576,7 +3656,7 @@ fn main() -> std::io::Result<()> {
     {
         let store = Arc::clone(&store);
         let read_only = Arc::clone(&read_only);
-        std::thread::spawn(move || {
+        spawn_vital("gc", move || {
             let mut since_ms: u64 = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -6954,7 +7034,7 @@ fn flintinfo(
     // One read of the pair, so the two describe the same moment.
     let ews_ewb = engine_write_samples();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\nwal_gap_refusals_total:{wgr}\r\nwal_walk_recovered_total:{wwr}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nconns_reserve_admitted:{cra}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\npubsub_links_cut_total:{plc}\r\nengine_write_busy_samples:{ewb}\r\nengine_write_samples:{ews}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\nuptime_ms:{upms}\r\n{lrs}",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\nwal_gap_refusals_total:{wgr}\r\nwal_walk_recovered_total:{wwr}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nconns_reserve_admitted:{cra}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\npubsub_links_cut_total:{plc}\r\nengine_write_busy_samples:{ewb}\r\nengine_write_samples:{ews}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\nuptime_ms:{upms}\r\nthread_panics_total:{tpt}\r\n{lrs}",
         if read_only { "replica" } else { "master" },
         hub.live_replica_count(now),
         soft = hub.lag_soft_ms(),
@@ -7148,6 +7228,9 @@ fn flintinfo(
         // expiring 273 years ago and produced RotateCerts on a healthy fleet.
         // A reason field is prose, so the tempting placeholder is "none" — and
         // "none" is a string a reader can quote as the reason.
+        // ADR-0065: reporting threads that panicked. A vital one ends the
+        // seat instead, so it is never counted here.
+        tpt = THREAD_PANICS.load(Ordering::Relaxed),
         lrs = last_reseed_fields(),
     );
     Value::Bulk(Some(info.into_bytes()))
@@ -7204,9 +7287,10 @@ fn flintinfo(
     // was one dev cluster away, and the failure would have presented as the
     // controller being broken.
     let info = format!(
-        "role:{}\r\nloading:0\r\nlive_replicas:{}\r\n",
+        "role:{}\r\nloading:0\r\nlive_replicas:{}\r\nthread_panics_total:{}\r\n",
         if read_only { "replica" } else { "master" },
         hub.live_replica_count(now),
+        THREAD_PANICS.load(Ordering::Relaxed),
     );
     Value::Bulk(Some(info.into_bytes()))
 }
@@ -11548,6 +11632,59 @@ mod pure_write_predicate {
                 !is_pure_write(&name, &args(&cmd)),
                 "read-modify-write must take the stripe exclusively: {cmd:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod vital_thread_tests {
+    use super::*;
+
+    /// ADR-0065: a vital thread's panic ends the process with
+    /// `EXIT_VITAL_PANIC`, saying which thread. Run in a child process, the
+    /// test binary itself, because the parent must outlive the exit.
+    #[test]
+    fn a_vital_thread_that_panics_ends_the_seat_with_its_status() {
+        if std::env::var_os("VITAL_THREAD_TEST_CHILD").is_some() {
+            spawn_vital("vital-test", || panic!("a vital panic"));
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            panic!("the process outlived its vital thread's panic");
+        }
+        let me = std::env::current_exe().expect("the test binary's path");
+        let out = std::process::Command::new(me)
+            .args([
+                "--exact",
+                "vital_thread_tests::a_vital_thread_that_panics_ends_the_seat_with_its_status",
+                "--nocapture",
+            ])
+            .env("VITAL_THREAD_TEST_CHILD", "1")
+            .output()
+            .expect("run the child");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_VITAL_PANIC),
+            "the child's exit, stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("vital thread vital-test panicked"),
+            "the exit does not say which thread:\n{stderr}"
+        );
+    }
+
+    /// ADR-0065: a reporting thread's panic is counted, and the process
+    /// goes on (this test returning is that half).
+    #[test]
+    fn a_reporting_thread_that_panics_is_counted_and_the_seat_serves_on() {
+        let before = THREAD_PANICS.load(Ordering::Relaxed);
+        spawn_reporting("reporting-test", || panic!("a reporting panic"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while THREAD_PANICS.load(Ordering::Relaxed) == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reporting thread's panic was not counted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }

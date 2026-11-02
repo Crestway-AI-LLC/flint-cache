@@ -362,6 +362,10 @@ const SEAT_ENV_NAMES: &[&str] = &[
     // 500 ms heartbeat, so `rewind_ack_space` exercises the pre-accept path
     // every run. Listed for the same reason as the knob above.
     "FLINT_TEST_DELAY_SYNC_OK_MS",
+    // Test-only (ADR-0065): panics a named background thread, so
+    // `vital_thread` shows a vital one ending the seat and a reporting one
+    // counted. Listed for the same reason as the two above.
+    "FLINT_TEST_PANIC_THREAD",
     "FLINT_WRITE_BUFFER_MB",
 ];
 
