@@ -457,4 +457,13 @@ git grep -nE 'panic!|unreachable!' -- 'crates/*/src'
 
 **Rules and history:** [ADR-0028](adr/0028-a-verdict-must-name-what-it-examined.md), [BUG-0073](bugs/0073-a-panicking-snapshot-thread-wedges-a-pair-forever.md), [BUG-0083](bugs/0083-the-build-read-has-one-attempt-and-every-failure-looks-the-same.md), [BUG-0089](bugs/0089-a-failed-bring-up-is-not-fatal-and-its-reason-is-discarded.md), [BUG-0163](bugs/0163-rewind-snapshots-are-never-pruned.md)
 
+**Swept so far (2026-11-02, against main after the pin).**
+
+- **`eprintln!` and `println!`:** each panics when its write fails, and a seat logs to its own data volume. Every daemon line now goes through `flint-log`, which drops a failed write ([BUG-0276](bugs/0276-a-full-log-volume-killed-the-disk-guard-silently.md)).
+- **Locks in `flint-vec`:** the co-processor planned every command under one store lock and called `lock().expect` on it. A randomized run of its planners found six single commands that panicked there, and the panics poisoned the co-processor for every tenant ([BUG-0277](bugs/0277-one-tenant-s-count-poisoned-the-co-processor-for-every-tenant.md)). Every lock now goes through `held`, and a planning panic answers its own command (ops ADR-0017's D2 amendment). After the fix, 4 million randomized commands found no panic.
+- **Counts from a client in `flint-proxy`:** `BLMPOP`'s and `BZMPOP`'s count wrapped `3 + n` ([BUG-0278](bugs/0278-a-blmpop-count-near-2-64-closed-the-client-s-connection-at-the-proxy.md)). The proxy's other counts already saturate.
+- **The server's `Dispatcher`:** about a million randomized commands, mutated from the 2,477 distinct commands in the conformance harness's and the crates' tests, found no panic. A third of them were answered with something other than an error.
+- **`let _ =` on a storage write:** `RocksKv`'s `Kv::put` and `delete` drop RocksDB's error, because the trait returns none. Acknowledged writes do not take that path: single commands, `EXEC` and the write queue commit through `apply_writes`, whose error is the reply. What calls `put` and `delete` directly is best-effort (GC, lazy expiry). `repl.rs`'s dropped index write says why.
+- **Still open:** the server's long-lived threads (replication, WAL fsync, the disk guard, lease renewal and its watchdog, GC) end silently on a panic. A grep of their bodies found no panic site, which is not a proof that none is reachable. Each Tokio `JoinHandle`, and the `.ok()` and `unwrap_or*` counts, are not yet swept.
+
 Line ranges run from the first function named to the line before the next region, so a range can include a helper or two around the functions it names.
