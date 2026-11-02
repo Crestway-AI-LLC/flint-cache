@@ -5,7 +5,7 @@ holds each durable vector row to the shape `VEC.SET` would have: a set this
 binary loaded, a valid id and the set's `DIM`. A row that fails is left out
 and the rebuild says so, by reason, as it does an unreadable row. **The cap
 half is closed for new rows 2026-10-21,** on public main from 3f7d3581, so it
-ships in the release after v0.1.0-rc.85. Every data seat now refuses a
+shipped in v0.1.0-rc.86, on the playground since 2026-11-02. Every data seat now refuses a
 tenant's own write to a `\x00vec\x00` key by default, so a tenant can no
 longer plant rows. Two kinds of row still load past both caps at a rebuild:
 those a tenant wrote before its fleet ran the guard, and those on a fleet
