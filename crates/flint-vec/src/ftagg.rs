@@ -130,14 +130,16 @@ fn var_args<'a>(args: &'a [Vec<u8>], i: &mut usize, what: &str) -> Result<&'a [V
             }
         },
     };
+    // By slice, not by `start + n`: a count near `usize::MAX` wrapped that
+    // sum past the length check and panicked the slice (BUG-0277).
     let start = *i + 1;
-    if args.len() < start + n {
+    let Some(words) = args.get(start..).and_then(|rest| rest.get(..n)) else {
         return Err(format!(
             "Bad arguments for {what}: Expected an argument, but none provided"
         ));
-    }
+    };
     *i = start + n;
-    Ok(&args[start..start + n])
+    Ok(words)
 }
 
 fn unsigned(a: Option<&[u8]>, what: &str, min: u64) -> Result<u64, String> {

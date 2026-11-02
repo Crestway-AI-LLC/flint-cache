@@ -461,6 +461,14 @@ fn number(a: Option<&[u8]>, what: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("{what} needs a non-negative integer"))
 }
 
+/// The `n` words after the count at `i + 1`, or `None` when fewer follow.
+/// Taken by slice, not by `i + 2 + n`: a count near `usize::MAX` wrapped that
+/// sum past the length check and panicked the slice below it, under the
+/// co-processor's store lock (BUG-0277).
+fn counted(args: &[Vec<u8>], i: usize, n: usize) -> Option<&[Vec<u8>]> {
+    args.get(i + 2..)?.get(..n)
+}
+
 fn arg(args: &[Vec<u8>], i: usize) -> Option<&[u8]> {
     args.get(i).map(|a| a.as_slice())
 }
@@ -502,10 +510,10 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             }
             b"PREFIX" => {
                 let n = number(arg(args, i + 1), "FT.CREATE PREFIX")?;
-                if n == 0 || args.len() < i + 2 + n {
+                let Some(words) = counted(args, i, n).filter(|_| n > 0) else {
                     return Err("FT.CREATE PREFIX <n> needs n prefixes".into());
-                }
-                for p in &args[i + 2..i + 2 + n] {
+                };
+                for p in words {
                     if p.is_empty() {
                         return Err("FT.CREATE PREFIX needs a non-empty prefix: \
                                     an index over every key is not served"
@@ -520,11 +528,11 @@ pub fn parse_create(args: &[Vec<u8>]) -> Result<(Vec<u8>, IndexDef), String> {
             // Left out of TEXT fields and of queries (ADR-0063).
             b"STOPWORDS" => {
                 let n = number(arg(args, i + 1), "FT.CREATE STOPWORDS")?;
-                if args.len() < i + 2 + n {
+                let Some(words) = counted(args, i, n) else {
                     return Err("FT.CREATE STOPWORDS <n> needs n words".into());
-                }
+                };
                 stopwords = Some(
-                    args[i + 2..i + 2 + n]
+                    words
                         .iter()
                         .map(|w| text(w).map(Into::into))
                         .collect::<Result<Vec<_>, _>>()?,
@@ -782,12 +790,12 @@ fn parse_vector(
         _ => return Err("VECTOR needs FLAT or HNSW".into()),
     };
     let n = number(arg(args, i + 1), "VECTOR's attribute count")?;
-    if n % 2 != 0 || args.len() < i + 2 + n {
+    let Some(words) = counted(args, i, n).filter(|_| n % 2 == 0) else {
         return Err("VECTOR <algorithm> <n> needs n words, in name and value pairs".into());
-    }
+    };
     let (mut dim, mut metric, mut ty, mut ef_runtime) = (None, None, None, None);
     let mut hints: Vec<(Box<str>, Box<str>)> = Vec::new();
-    for kv in args[i + 2..i + 2 + n].chunks(2) {
+    for kv in words.chunks(2) {
         let v = kv[1].as_slice();
         match upper(&kv[0]).as_slice() {
             b"TYPE" => ty = Some(upper(v)),
@@ -917,10 +925,10 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
             }
             b"RETURN" => {
                 let n = number(arg(args, i + 1), "FT.SEARCH RETURN")?;
-                let end = i + 2 + n;
-                if args.len() < end {
+                if counted(args, i, n).is_none() {
                     return Err("FT.SEARCH RETURN <n> needs n words".into());
                 }
+                let end = i + 2 + n;
                 let mut out = Vec::new();
                 let mut j = i + 2;
                 while j < end {
@@ -957,12 +965,12 @@ pub fn parse_search(args: &[Vec<u8>], def: &IndexDef) -> Result<Search, String> 
             }
             b"PARAMS" => {
                 let n = number(arg(args, i + 1), "FT.SEARCH PARAMS")?;
-                if n % 2 != 0 || args.len() < i + 2 + n {
+                let Some(words) = counted(args, i, n).filter(|_| n % 2 == 0) else {
                     return Err(
                         "FT.SEARCH PARAMS <n> needs n words, in name and value pairs".into(),
                     );
-                }
-                for kv in args[i + 2..i + 2 + n].chunks(2) {
+                };
+                for kv in words.chunks(2) {
                     params.insert(text(&kv[0])?.to_string(), kv[1].clone());
                 }
                 i += 2 + n;
@@ -1829,6 +1837,73 @@ mod tests {
                 .contains("not one of this index's VECTOR fields")
         );
         assert!(refused("@embedding:[VECTOR_RANGE 0.5 vector]").contains("$parameter"));
+    }
+
+    /// BUG-0277: a count near `usize::MAX` wrapped `i + 2 + n` past the
+    /// length check and panicked the slice under it, under the co-processor's
+    /// store lock. It is refused as any count past the arguments is.
+    #[test]
+    fn a_count_near_usize_max_is_refused_not_a_panic() {
+        let max = usize::MAX.to_string();
+        let even = (usize::MAX - 1).to_string();
+        for (parts, says) in [
+            (
+                vec!["FT.CREATE", "i", "PREFIX", &max, "p", "SCHEMA", "a", "TAG"],
+                "n prefixes",
+            ),
+            (
+                vec![
+                    "FT.CREATE",
+                    "i",
+                    "PREFIX",
+                    "1",
+                    "p",
+                    "STOPWORDS",
+                    &max,
+                    "SCHEMA",
+                    "a",
+                    "TAG",
+                ],
+                "n words",
+            ),
+            (
+                vec![
+                    "FT.CREATE",
+                    "i",
+                    "PREFIX",
+                    "1",
+                    "p",
+                    "SCHEMA",
+                    "v",
+                    "VECTOR",
+                    "FLAT",
+                    &even,
+                    "DIM",
+                ],
+                "n words",
+            ),
+        ] {
+            match parse_create(&a(&parts)) {
+                Ok(d) => panic!("{parts:?} parsed as {d:?}"),
+                Err(e) => assert!(e.contains(says), "{parts:?}: {e}"),
+            }
+        }
+        let def = redisvl_hash();
+        for (parts, says) in [
+            (
+                vec!["FT.SEARCH", "idx", "*", "PARAMS", &even, "a", "b"],
+                "n words",
+            ),
+            (
+                vec!["FT.SEARCH", "idx", "*", "RETURN", &max, "a"],
+                "n words",
+            ),
+        ] {
+            match parse_search(&a(&parts), &def) {
+                Ok(s) => panic!("{parts:?} parsed as {s:?}"),
+                Err(e) => assert!(e.contains(says), "{parts:?}: {e}"),
+            }
+        }
     }
 
     #[test]

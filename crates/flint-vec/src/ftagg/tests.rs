@@ -200,6 +200,30 @@ fn redisvl_s_requests_parse() {
 
 /// RediSearch's words for what it refuses, and ADR-0064's for what Flint
 /// refuses by name.
+/// BUG-0277: a count near `usize::MAX` wrapped `start + n` past the length
+/// check and panicked the slice under it, under the co-processor's store
+/// lock. Every counted list is refused as a count past the arguments is.
+#[test]
+fn a_count_near_usize_max_is_refused_not_a_panic() {
+    let max = usize::MAX.to_string();
+    for (parts, what) in [
+        (vec!["*", "GROUPBY", &max, "@t"], "GROUPBY"),
+        (vec!["*", "LOAD", &max, "@t"], "LOAD"),
+        (vec!["*", "SORTBY", &max, "@t"], "SORTBY"),
+        (vec!["*", "PARAMS", &max, "a", "b"], "PARAMS"),
+        (
+            vec!["*", "GROUPBY", "1", "@t", "REDUCE", "SUM", &max, "@n"],
+            "SUM",
+        ),
+    ] {
+        assert_eq!(
+            req(&parts).expect_err("refused"),
+            format!("Bad arguments for {what}: Expected an argument, but none provided"),
+            "{parts:?}"
+        );
+    }
+}
+
 #[test]
 fn bad_requests_are_refused_in_redisearch_s_words() {
     let refused = |parts: &[&str]| req(parts).expect_err("refused");

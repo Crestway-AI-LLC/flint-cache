@@ -559,7 +559,11 @@ fn flat_search(
     } else {
         0.0
     };
-    let mut heap: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
+    // Sized by what the set can return, not by the tenant's k: a k near
+    // usize::MAX overflowed the capacity and panicked, under the store lock
+    // (BUG-0277).
+    let mut heap: BinaryHeap<std::cmp::Reverse<Scored>> =
+        BinaryHeap::with_capacity(k.min(entries.len()) + 1);
     for (id, e) in entries.iter().filter(|(id, e)| admit(id, e)) {
         let score = flat_score(metric, query, q_norm, e);
         heap.push(std::cmp::Reverse(Scored {
@@ -2117,6 +2121,34 @@ mod tests {
     /// (durable rows, error shapes) and do not care about the clock.
     fn plan0(st: &Store, ns: &[u8], args: &[Vec<u8>]) -> Plan {
         st.plan(ns, args, 0)
+    }
+
+    /// BUG-0277: a flat search's k past what the set holds is the whole set.
+    /// A k near usize::MAX sized the search's heap, overflowed its capacity
+    /// and panicked under the co-processor's store lock.
+    #[test]
+    fn a_k_past_the_set_is_the_whole_set_not_a_panic() {
+        let mut st = Store::new();
+        let ns = b"nsK";
+        assert_eq!(
+            run(
+                &mut st,
+                ns,
+                &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"])
+            ),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.SET", "s", "a", "1,1"])),
+            Value::Simple("OK".into())
+        );
+        for k in [usize::MAX.to_string(), "2907332838385882365".into()] {
+            let Value::Array(Some(rows)) = run(&mut st, ns, &cmd(&["VEC.SEARCH", "s", "1,1", &k]))
+            else {
+                panic!("search reply for k {k}")
+            };
+            assert_eq!(rows.len(), 1, "k {k}: the set's one vector");
+        }
     }
 
     /// ADR-0049 at the command surface: QUANT is HNSW-only, rides the config's
