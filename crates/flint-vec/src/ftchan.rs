@@ -10,7 +10,7 @@
 //! write, and nothing else writes the key (a node refuses it, ADR-0060's
 //! amendment).
 
-use crate::{err, now_ms, read_reply, run_persist, send_cmd};
+use crate::{err, held, now_ms, plan_contained, read_reply, run_persist, send_cmd};
 use flint_resp::Value;
 use flint_vec::Store;
 use flint_vec::ft::IndexDef;
@@ -85,12 +85,14 @@ type Fills = Mutex<HashMap<(Vec<u8>, Vec<u8>), (Fill, bool)>>;
 static LOCKS: LazyLock<KeyLocks> = LazyLock::new(KeyLocks::new);
 static FILLS: LazyLock<Fills> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Whether a panic left the backfill table's lock poisoned (`exit_if_poisoned`).
+pub(crate) fn fills_poisoned() -> bool {
+    FILLS.is_poisoned()
+}
+
 /// Forget `ns`'s backfills (FLINTNSDROP, BUG-0255): its indexes are gone.
 pub(crate) fn forget(ns: &[u8]) {
-    FILLS
-        .lock()
-        .expect("fills lock")
-        .retain(|(n, _), _| n.as_slice() != ns);
+    held(&FILLS, "fills").retain(|(n, _), _| n.as_slice() != ns);
 }
 
 /// Where a namespace's rebuild of its `FT.*` indexes is up to.
@@ -256,10 +258,14 @@ pub(crate) fn handle(
     store: &Arc<Mutex<Store>>,
     g: &mut Grant<'_>,
 ) -> Value {
-    let plan = store
-        .lock()
-        .expect("store lock")
-        .plan_ft(ns, args, now_ms());
+    // ADR-0017's D2 amendment: a panic in planning answers this command only.
+    let plan = match plan_contained(store, |st| {
+        crate::test_panic("plan", args);
+        st.plan_ft(ns, args, now_ms())
+    }) {
+        Ok(plan) => plan,
+        Err(e) => return e,
+    };
     match plan {
         FtPlan::Reply(v) => {
             // A search or FT.INFO on an index still backfilling lends this
@@ -269,9 +275,7 @@ pub(crate) fn handle(
             let lend = matches!(&v, Value::Error(e) if e.starts_with("LOADING"))
                 || args[0].eq_ignore_ascii_case(b"FT.INFO");
             if lend && let Some(name) = args.get(1) {
-                let index = store
-                    .lock()
-                    .expect("store lock")
+                let index = held(store, "store")
                     .ft_resolve(ns, name)
                     .unwrap_or_else(|| name.clone());
                 lend_to_fill(ns, &index, store, g);
@@ -290,10 +294,7 @@ pub(crate) fn handle(
             if let Err(e) = run_persist(&mut ch, &persist) {
                 return e;
             }
-            store
-                .lock()
-                .expect("store lock")
-                .ft_set_alias(ns, alias, index);
+            held(store, "store").ft_set_alias(ns, alias, index);
             Value::Simple("OK".into())
         }
         FtPlan::Create {
@@ -310,7 +311,7 @@ pub(crate) fn handle(
             // so the backfill below misses nothing written meanwhile; a pair
             // that cannot be reached fails the command before anything of
             // the index is kept.
-            let mut prefixes = store.lock().expect("store lock").ft_prefixes(ns);
+            let mut prefixes = held(store, "store").ft_prefixes(ns);
             prefixes.extend(def.prefixes.iter().cloned());
             prefixes.sort();
             prefixes.dedup();
@@ -320,10 +321,7 @@ pub(crate) fn handle(
             if let Err(e) = run_persist(&mut ch, &persist) {
                 return e;
             }
-            store
-                .lock()
-                .expect("store lock")
-                .ft_create(ns, index.clone(), def.clone());
+            held(store, "store").ft_create(ns, index.clone(), def.clone());
             let fill = Fill::start(&index, &def);
             run_fill(&mut ch, ns, fill, store);
             Value::Simple("OK".into())
@@ -340,20 +338,17 @@ pub(crate) fn handle(
             if let Err(e) = run_persist(&mut ch, &persist) {
                 return e;
             }
-            store.lock().expect("store lock").ft_drop(ns, &index);
+            held(store, "store").ft_drop(ns, &index);
             // The prefixes left are the only ones guarded now. A pair that
             // misses this still sends their writes here, which writes them.
-            let left = store.lock().expect("store lock").ft_prefixes(ns);
+            let left = held(store, "store").ft_prefixes(ns);
             if let Err(e) = register(&mut ch, &left) {
                 elog!(
                     "flint-vec: ns {:?} FT.DROPINDEX: {e:?}; the dropped prefixes stay guarded until the next rebuild",
                     String::from_utf8_lossy(ns)
                 );
             }
-            FILLS
-                .lock()
-                .expect("fills lock")
-                .remove(&(ns.to_vec(), index.clone()));
+            held(&FILLS, "fills").remove(&(ns.to_vec(), index.clone()));
             if let Some(docs) = docs.filter(|d| !d.is_empty()) {
                 let keys: Vec<&[u8]> = docs.iter().map(|k| k.as_slice()).collect();
                 let _held = LOCKS.lock(ns, &keys);
@@ -367,7 +362,7 @@ pub(crate) fn handle(
                     }
                     Err(e) => return err(&format!("COPROCUNAVAIL {e}")),
                 }
-                let mut st = store.lock().expect("store lock");
+                let mut st = held(store, "store");
                 for k in &docs {
                     st.ft_reindex(ns, k, &DocRead::default());
                 }
@@ -404,7 +399,7 @@ fn aggregate(plan: AggPlan, store: &Arc<Mutex<Store>>, g: &mut Grant<'_>) -> Val
     };
     let (reply, cursor) = ftstore::aggregate_page(plan, &mut read, now_ms());
     if let Some(c) = cursor {
-        store.lock().expect("store lock").ft_cursor_put(c, now_ms());
+        held(store, "store").ft_cursor_put(c, now_ms());
     }
     reply
 }
@@ -471,7 +466,7 @@ fn write(ns: &[u8], plan: &WritePlan, store: &Arc<Mutex<Store>>, g: &mut Grant<'
         };
         match read {
             Ok(Some(d)) => {
-                let left = store.lock().expect("store lock").ft_reindex(ns, key, &d);
+                let left = held(store, "store").ft_reindex(ns, key, &d);
                 for why in left {
                     elog!(
                         "flint-vec: ns {:?} key {:?} left out of index {why}",
@@ -485,10 +480,7 @@ fn write(ns: &[u8], plan: &WritePlan, store: &Arc<Mutex<Store>>, g: &mut Grant<'
             // what is no longer there, and say so; the tenant's retry of the
             // write puts it back.
             Ok(None) | Err(_) => {
-                store
-                    .lock()
-                    .expect("store lock")
-                    .ft_reindex(ns, key, &DocRead::default());
+                held(store, "store").ft_reindex(ns, key, &DocRead::default());
                 elog!(
                     "flint-vec: ns {:?} key {:?} written but not read back; out of its index until written again",
                     String::from_utf8_lossy(ns),
@@ -558,7 +550,7 @@ fn fill_chunk(
         // A page cut short by the budget is read again from its start next
         // time: indexing a key twice gives the same index.
         for key in &keys {
-            let Some(reads) = store.lock().expect("store lock").ft_reads(ns, key) else {
+            let Some(reads) = held(store, "store").ft_reads(ns, key) else {
                 continue;
             };
             let _held = LOCKS.lock(ns, &[key.as_slice()]);
@@ -574,10 +566,7 @@ fn fill_chunk(
             }
             // Into the index being filled, and not over a write's copy
             // (BUG-0271).
-            store
-                .lock()
-                .expect("store lock")
-                .ft_fill_doc(ns, &fill.index, key, &d);
+            held(store, "store").ft_fill_doc(ns, &fill.index, key, &d);
         }
         if next == b"0" {
             fill.at += 1;
@@ -601,11 +590,11 @@ fn run_fill(ch: &mut flint_tls::Stream, ns: &[u8], fill: Fill, store: &Arc<Mutex
     let key = (ns.to_vec(), index.clone());
     match fill_chunk(ch, ns, fill.clone(), store) {
         Ok(None) => {
-            store.lock().expect("store lock").ft_set_ready(ns, &index);
-            FILLS.lock().expect("fills lock").remove(&key);
+            held(store, "store").ft_set_ready(ns, &index);
+            held(&FILLS, "fills").remove(&key);
         }
         Ok(Some(more)) => {
-            FILLS.lock().expect("fills lock").insert(key, (more, false));
+            held(&FILLS, "fills").insert(key, (more, false));
         }
         Err(e) => {
             elog!(
@@ -613,7 +602,7 @@ fn run_fill(ch: &mut flint_tls::Stream, ns: &[u8], fill: Fill, store: &Arc<Mutex
                 String::from_utf8_lossy(ns),
                 String::from_utf8_lossy(&index)
             );
-            FILLS.lock().expect("fills lock").insert(key, (fill, false));
+            held(&FILLS, "fills").insert(key, (fill, false));
         }
     }
 }
@@ -623,7 +612,7 @@ fn run_fill(ch: &mut flint_tls::Stream, ns: &[u8], fill: Fill, store: &Arc<Mutex
 fn lend_to_fill(ns: &[u8], index: &[u8], store: &Arc<Mutex<Store>>, g: &mut Grant<'_>) {
     let key = (ns.to_vec(), index.to_vec());
     let fill = {
-        let mut f = FILLS.lock().expect("fills lock");
+        let mut f = held(&FILLS, "fills");
         match f.get_mut(&key) {
             Some((fill, running)) if !*running => {
                 *running = true;
@@ -635,7 +624,7 @@ fn lend_to_fill(ns: &[u8], index: &[u8], store: &Arc<Mutex<Store>>, g: &mut Gran
     match g.open() {
         Ok(mut ch) => run_fill(&mut ch, ns, fill, store),
         Err(_) => {
-            if let Some((_, running)) = FILLS.lock().expect("fills lock").get_mut(&key) {
+            if let Some((_, running)) = held(&FILLS, "fills").get_mut(&key) {
                 *running = false;
             }
         }
@@ -652,7 +641,7 @@ pub(crate) fn load_chunk(
     mut at: FtLoad,
     generation: u64,
 ) -> Result<Option<FtLoad>, String> {
-    let current = || store.lock().expect("store lock").generation(ns) == generation;
+    let current = || held(store, "store").generation(ns) == generation;
     loop {
         at = match at {
             FtLoad::Defs => {
@@ -707,7 +696,7 @@ pub(crate) fn load_chunk(
                 if !current() {
                     return Ok(None);
                 }
-                let mut st = store.lock().expect("store lock");
+                let mut st = held(store, "store");
                 for (name, def) in defs {
                     st.ft_create(ns, name, def);
                 }
@@ -768,7 +757,7 @@ pub(crate) fn load_chunk(
             } => {
                 while next < keys.len() {
                     let key = &keys[next];
-                    let Some(reads) = store.lock().expect("store lock").ft_reads(ns, key) else {
+                    let Some(reads) = held(store, "store").ft_reads(ns, key) else {
                         next += 1;
                         continue;
                     };
@@ -777,7 +766,7 @@ pub(crate) fn load_chunk(
                         return Ok(Some(FtLoad::Read { keys, next, fills }));
                     };
                     if current() {
-                        store.lock().expect("store lock").ft_reindex(ns, key, &d);
+                        held(store, "store").ft_reindex(ns, key, &d);
                     }
                     next += 1;
                 }
@@ -796,7 +785,7 @@ pub(crate) fn load_chunk(
                     }
                 }
                 if current() {
-                    let mut st = store.lock().expect("store lock");
+                    let mut st = held(store, "store");
                     for name in st.ft_names(ns) {
                         st.ft_set_ready(ns, &name);
                     }

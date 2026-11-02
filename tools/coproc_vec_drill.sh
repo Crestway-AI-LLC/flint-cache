@@ -36,6 +36,10 @@
 #     out of a QUANT bin set's rebuild, and said to be, where it panicked;
 #     and on a node with --reserve-coproc-rows the tenant cannot plant one,
 #     while the co-processor's channel still writes its rows
+#   - ADR-0017's D2 amendment: a panic while a command is planned answers
+#     that command, and both tenants go on being served; a panic while a
+#     write is committed ends the process with status 70, and the restart a
+#     seat supervisor makes rebuilds the index with that write in it
 #   - the ordinary tenant data path is untouched (control)
 set -u
 cd "$(dirname "$0")/.."
@@ -712,6 +716,45 @@ TW1=$(tw_toward 6677)
 [ $((TW1 - TW0)) -lt 30 ] || { echo "FAIL (BUG-0269): 300 writes left $((TW1 - TW0)) TIME_WAIT sockets toward the proxy edge, one per write's channel"; exit 1; }
 echo "  300 writes left $((TW1 - TW0)) new TIME_WAIT sockets toward the edge, not one per write"
 
+echo "== ADR-0017 D2 amendment: a panic answers its own command; a poisoned lock ends the process"
+# FLINT_TEST_PANIC (test-only) panics where it says, on one set. In planning
+# the store is unchanged: that command is answered with an error and not run,
+# every other command is served, and FLINTINFO counts it.
+[ "$(vexec VEC.CREATE pk DIM 3 METRIC l2)" = "OK " ] || { echo "FAIL: VEC.CREATE pk"; exit 1; }
+[ "$(vexec VEC.SET pk a 1,0,0)" = "OK " ] || { echo "FAIL: VEC.SET pk a"; exit 1; }
+# Tenant 2's own set, made here: the node was started afresh for BUG-0265
+# above, so the sets of earlier sections are gone.
+[ "$(vexec2 VEC.CREATE pk2 DIM 3 METRIC l2)" = "OK " ] || { echo "FAIL: tenant 2 VEC.CREATE pk2"; exit 1; }
+[ "$(vexec2 VEC.SET pk2 t2 1,0,0)" = "OK " ] || { echo "FAIL: tenant 2 VEC.SET pk2 t2"; exit 1; }
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""; sleep 0.3
+FLINT_TEST_PANIC=plan:pk $VEC --port 6678 --vec-dir "$VD" 2>"$D/vec14.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+GOT="$(vexec VEC.SEARCH pk 1,0,0 1)"
+case "$GOT" in *"failed on this command and did not run it"*) : ;; *) echo "FAIL (ADR-0017 D2 amendment): a panic in planning answered: $GOT"; exit 1 ;; esac
+case "$(vexec VEC.SEARCH fl 0,1,0 1)" in *b*) : ;; *) echo "FAIL (ADR-0017 D2 amendment): after a planning panic, tenant 1's other set: $(vexec VEC.SEARCH fl 0,1,0 1)"; exit 1 ;; esac
+case "$(vexec2 VEC.SEARCH pk2 1,0,0 1)" in *t2*) : ;; *) echo "FAIL (ADR-0017 D2 amendment): after tenant 1's planning panic, tenant 2: $(vexec2 VEC.SEARCH pk2 1,0,0 1)"; exit 1 ;; esac
+kill -0 "$COPROC_PID" 2>/dev/null || { echo "FAIL (ADR-0017 D2 amendment): the co-processor exited on a planning panic:"; sed 's/^/    /' "$D/vec14.log"; exit 1; }
+[ "$(info panics_total)" = 1 ] || { echo "FAIL (ADR-0017 D2 amendment): FLINTINFO panics_total [$(info panics_total)], expected 1"; exit 1; }
+grep -q "panicked while it was planned" "$D/vec14.log" || { echo "FAIL (ADR-0017 D2 amendment): the planning panic is not logged:"; sed 's/^/    /' "$D/vec14.log"; exit 1; }
+echo "  a planning panic answered its command; both tenants served; panics_total 1"
+# In commit, the store may be half-changed: the lock is poisoned and the
+# process exits. The write's rows landed first, so the rebuild has them.
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""; sleep 0.3
+FLINT_TEST_PANIC=commit:pk $VEC --port 6678 --vec-dir "$VD" 2>"$D/vec15.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+GOT="$(vexec VEC.SET pk b 0,1,0)"
+[ "$GOT" = "OK " ] && { echo "FAIL (ADR-0017 D2 amendment): a write whose commit panicked answered OK"; exit 1; }
+for _ in $(seq 1 50); do kill -0 "$COPROC_PID" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$COPROC_PID" 2>/dev/null && { echo "FAIL (ADR-0017 D2 amendment): the co-processor is still up with its store lock poisoned (the write answered: $GOT)"; exit 1; }
+wait "$COPROC_PID"; RC=$?; COPROC_PID=""
+[ "$RC" = 70 ] || { echo "FAIL (ADR-0017 D2 amendment): exit status $RC, expected 70:"; sed 's/^/    /' "$D/vec15.log"; exit 1; }
+grep -q "the store lock is poisoned" "$D/vec15.log" || { echo "FAIL (ADR-0017 D2 amendment): the exit does not say why:"; sed 's/^/    /' "$D/vec15.log"; exit 1; }
+# Started again, as the seat supervisor does for a process that has gone.
+restart_vec vec16.log
+case "$(vexec VEC.SEARCH pk 0,1,0 1)" in *b*) : ;; *) echo "FAIL (ADR-0017 D2 amendment): the write whose commit panicked is not in the rebuilt index: $(vexec VEC.SEARCH pk 0,1,0 1)"; exit 1 ;; esac
+case "$(vexec2 VEC.SEARCH pk2 1,0,0 1)" in *t2*) : ;; *) echo "FAIL (ADR-0017 D2 amendment): tenant 2 after the restart: $(vexec2 VEC.SEARCH pk2 1,0,0 1)"; exit 1 ;; esac
+echo "  a commit panic ended the process (status 70, said why); the restart rebuilt the write"
+
 echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw + sq8 and bin on a local file), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
 echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
@@ -726,3 +769,5 @@ echo "      VEC.SEARCH refuses an option it does not know, and filters are serve
 echo "      proxy, unless --no-vec-filters, to only the matches, across a restart (ADR-0059)."
 echo "      A tenant's FLUSHALL empties its vector sets as it does their rows (BUG-0268), and a"
 echo "      write's channel leaves no TIME_WAIT behind on the co-processor's side (BUG-0269)."
+echo "      A panic in planning answers only its own command, and one that leaves a lock"
+echo "      poisoned ends the process, whose restart rebuilds every write (ADR-0017 D2 amendment)."

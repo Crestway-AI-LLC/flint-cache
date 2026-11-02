@@ -777,6 +777,12 @@ impl Store {
     }
 
     /// Puts a cursor back after its page, idle from `now` (ADR-0064).
+    /// Whether a panic left the cursor table's lock poisoned. The binary
+    /// exits if so (ADR-0017's D2 amendment), as for its own locks.
+    pub fn cursors_poisoned(&self) -> bool {
+        self.ft_cursors.is_poisoned()
+    }
+
     pub fn ft_cursor_put(&self, mut c: Cursor, now: u64) {
         c.expires_at = now + c.max_idle_ms;
         let mut cursors = self.ft_cursors.lock().expect("cursors lock");

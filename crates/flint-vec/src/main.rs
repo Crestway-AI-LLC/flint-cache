@@ -50,7 +50,9 @@ use flint_vec::{
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 mod ftchan;
@@ -148,7 +150,8 @@ fn flintinfo(s: &flint_vec::StoreStats, loading: usize) -> String {
         "build:{}\r\nrole:coproc\r\nindex_bytes:{}\r\nindex_cap_ns_bytes:{}\r\n\
          index_cap_total_bytes:{}\r\nnamespaces:{}\r\nnamespaces_loading:{loading}\r\n\
          sets:{}\r\nvectors:{}\r\nvecfull_ns_total:{}\r\nvecfull_server_total:{}\r\n\
-         packed_rows:{}\r\nvec_filters:{}\r\nft:{}\r\nft_indexes:{}\r\nft_docs:{}\r\n",
+         packed_rows:{}\r\nvec_filters:{}\r\nft:{}\r\nft_indexes:{}\r\nft_docs:{}\r\n\
+         panics_total:{}\r\n",
         build_version(),
         s.index_bytes,
         s.index_cap,
@@ -163,11 +166,95 @@ fn flintinfo(s: &flint_vec::StoreStats, loading: usize) -> String {
         u8::from(s.ft),
         s.ft_indexes,
         s.ft_docs,
+        PANICS.load(Relaxed),
     )
 }
 
 fn build_version() -> String {
     flint_build::version(env!("CARGO_PKG_VERSION"))
+}
+
+/// The exit status of a co-processor that found a lock poisoned: sysexits'
+/// `EX_SOFTWARE`, an internal error.
+const EXIT_POISONED: i32 = 70;
+
+/// Commands that panicked and were answered with an error, since start:
+/// `FLINTINFO`'s `panics_total` (ADR-0017's D2 amendment).
+static PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// A lock on the co-processor's shared state (ADR-0017's D2 amendment). A
+/// poisoned one means a thread panicked while it held the lock, so what it
+/// guards may be half-changed: a set's map and its graph disagreeing, say.
+/// The index is a derived replica (D2), so the process exits rather than
+/// serve it. The seat supervisor starts it again, and each namespace
+/// rebuilds from its durable rows on first touch. `lock().expect(..)` panicked
+/// instead, on every later lock, and left a live process serving no one
+/// (BUG-0277).
+fn held<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|_| poisoned(what))
+}
+
+fn poisoned(what: &str) -> ! {
+    elog!(
+        "flint-vec: the {what} lock is poisoned: a thread panicked while it held it, so \
+         what it guards may be half-changed. Exiting, so the seat supervisor starts the \
+         co-processor again and every namespace rebuilds from its durable rows"
+    );
+    std::process::exit(EXIT_POISONED);
+}
+
+/// After a caught panic: exit now if it left a lock poisoned, rather than
+/// when the next thread takes that lock.
+fn exit_if_poisoned(store: &Mutex<Store>, loads: &Loads) {
+    if loads.is_poisoned() {
+        poisoned("loads");
+    }
+    if ftchan::fills_poisoned() {
+        poisoned("fills");
+    }
+    if held(store, "store").cursors_poisoned() {
+        poisoned("FT cursor");
+    }
+}
+
+/// Plan a command, containing a panic (ADR-0017's D2 amendment). `plan` and
+/// `plan_ft` read the store and change nothing, so a panic in one has left
+/// it as it was. Caught while the guard is still held, the guard drops as
+/// usual and the lock is not poisoned: this command is answered with an
+/// error and not run, and every other command is served. A lock the store
+/// holds inside, its cursor table, is checked as [`held`] would.
+fn plan_contained<T>(store: &Mutex<Store>, plan: impl FnOnce(&Store) -> T) -> Result<T, Value> {
+    let st = held(store, "store");
+    let caught = catch_unwind(AssertUnwindSafe(|| plan(&st)));
+    if caught.is_err() && st.cursors_poisoned() {
+        poisoned("FT cursor");
+    }
+    drop(st);
+    caught.map_err(|_| {
+        let n = PANICS.fetch_add(1, Relaxed) + 1;
+        elog!("flint-vec: a command panicked while it was planned; answered, not run (panics_total {n})");
+        err("ERR the co-processor failed on this command and did not run it")
+    })
+}
+
+/// Test-only (ADR-0017's D2 amendment): `FLINT_TEST_PANIC=plan:<set>` panics
+/// while a command on that set or index is planned, and `commit:<set>` while
+/// its write is committed, so `coproc_vec_drill` shows a panic contained and
+/// a poisoned lock ending the process, on real binaries. Unset, it costs one
+/// lookup at first use.
+fn test_panic(at: &str, args: &[Vec<u8>]) {
+    static WANT: LazyLock<Option<String>> =
+        LazyLock::new(|| std::env::var("FLINT_TEST_PANIC").ok());
+    if let Some(want) = WANT.as_deref()
+        && let Some(name) = args.get(1)
+        && want
+            .strip_prefix(at)
+            .and_then(|w| w.strip_prefix(':'))
+            .map(str::as_bytes)
+            == Some(name.as_slice())
+    {
+        panic!("FLINT_TEST_PANIC={want}");
+    }
 }
 
 fn main() {
@@ -289,7 +376,7 @@ fn main() {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(sweep_ms));
-                let swept = store.lock().expect("store lock").sweep_expired(now_ms());
+                let swept = held(&store, "store").sweep_expired(now_ms());
                 if swept > 0 {
                     elog!("flint-vec: swept {swept} expired vector(s)");
                 }
@@ -404,7 +491,21 @@ fn serve(tcp: TcpStream, store: Arc<Mutex<Store>>, loads: Loads, tls: Tls) {
             },
             Err(_) => return, // protocol error: drop the connection
         };
-        let reply = handle_flintfam(&frame, &store, &loads, &tls);
+        // ADR-0017's D2 amendment: a panic outside planning answers its own
+        // command and keeps the connection. One that left a lock poisoned
+        // ends the process (`exit_if_poisoned`): a write's durable rows land
+        // before its commit, so the rebuild that follows has them.
+        let reply = match catch_unwind(AssertUnwindSafe(|| {
+            handle_flintfam(&frame, &store, &loads, &tls)
+        })) {
+            Ok(reply) => reply,
+            Err(_) => {
+                let n = PANICS.fetch_add(1, Relaxed) + 1;
+                exit_if_poisoned(&store, &loads);
+                elog!("flint-vec: a command panicked; answered with an error (panics_total {n})");
+                err("ERR the co-processor failed on this command")
+            }
+        };
         let mut out = Vec::new();
         encode(&reply, &mut out);
         if stream.write_all(&out).is_err() {
@@ -435,10 +536,8 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
     // arrive inside FLINTFAM, and only the mesh reaches this listener (mutual
     // TLS, or loopback since BUG-0203).
     if bulks.len() == 1 && bulks[0].eq_ignore_ascii_case(b"FLINTINFO") {
-        let stats = store.lock().expect("store lock").stats();
-        let loading = loads
-            .lock()
-            .expect("loads lock")
+        let stats = held(store, "store").stats();
+        let loading = held(loads, "loads")
             .values()
             .filter(|l| !matches!(l, LoadState::Loaded))
             .count();
@@ -451,9 +550,9 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
     if bulks.len() == 2 && bulks[0].eq_ignore_ascii_case(b"FLINTNSDROP") {
         let ns = bulks[1];
         // Loads, then the store: the order every path that holds both takes.
-        let mut lk = loads.lock().expect("loads lock");
+        let mut lk = held(loads, "loads");
         lk.remove(ns);
-        let dropped = store.lock().expect("store lock").drop_namespace(ns);
+        let dropped = held(store, "store").drop_namespace(ns);
         ftchan::forget(ns);
         drop(lk);
         elog!(
@@ -478,7 +577,7 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
     // `running` without waiting on the chunk.
     let mut warm: Option<flint_tls::Stream> = None;
     {
-        let mut lk = loads.lock().expect("loads lock");
+        let mut lk = held(loads, "loads");
         let resume = match lk.get(ns) {
             Some(LoadState::Loaded) => None,
             Some(LoadState::Loading { running: true, .. }) => {
@@ -500,16 +599,37 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
             );
             // Read under the loads lock, so a FLINTNSDROP either came before
             // this chunk or makes it install nothing (BUG-0255).
-            let generation = store.lock().expect("store lock").generation(ns);
+            let generation = held(store, "store").generation(ns);
             drop(lk);
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             {
                 let (ns, token, callback) = (ns.to_vec(), token.to_vec(), callback.to_vec());
                 let (store, loads, edge) = (store.clone(), loads.clone(), tls.edge.clone());
                 std::thread::spawn(move || {
-                    rebuild_chunk(
-                        ns, token, callback, store, loads, edge, phase, generation, tx,
-                    )
+                    // ADR-0017's D2 amendment: a chunk that panicked would
+                    // leave its namespace `running` for good, and every
+                    // command on it would answer -LOADING. It is counted, and
+                    // left for the next command to resume, as a failed chunk
+                    // is. One that left a lock poisoned ends the process.
+                    let (st, lk, name) = (store.clone(), loads.clone(), ns.clone());
+                    let chunk = AssertUnwindSafe(|| {
+                        rebuild_chunk(
+                            ns, token, callback, store, loads, edge, phase, generation, tx,
+                        )
+                    });
+                    if catch_unwind(chunk).is_err() {
+                        let n = PANICS.fetch_add(1, Relaxed) + 1;
+                        exit_if_poisoned(&st, &lk);
+                        if let Some(LoadState::Loading { running, .. }) =
+                            held(&lk, "loads").get_mut(&name)
+                        {
+                            *running = false;
+                        }
+                        elog!(
+                            "flint-vec: ns {:?} rebuild chunk panicked; will retry on next touch (panics_total {n})",
+                            String::from_utf8_lossy(&name)
+                        );
+                    }
                 });
             }
             match rx.recv_timeout(WARM_WAIT) {
@@ -530,10 +650,13 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
     let reply = if ftstore::is_ft_command(&cmd_args[0]) {
         ftchan::handle(ns, &cmd_args, store, &mut g)
     } else {
-        let plan = store
-            .lock()
-            .expect("store lock")
-            .plan(ns, &cmd_args, now_ms());
+        let plan = match plan_contained(store, |st| {
+            test_panic("plan", &cmd_args);
+            st.plan(ns, &cmd_args, now_ms())
+        }) {
+            Ok(plan) => plan,
+            Err(e) => return e,
+        };
         match plan {
             Plan::Reply(v) => v,
             Plan::Write { persist, apply, ok } => {
@@ -543,7 +666,10 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
                 };
                 match landed {
                     Ok(()) => {
-                        store.lock().expect("store lock").commit(ns, apply);
+                        let mut st = held(store, "store");
+                        test_panic("commit", &cmd_args);
+                        st.commit(ns, apply);
+                        drop(st);
                         ok
                     }
                     // A shed or failed durable write (e.g. -QUOTA on an over-quota
@@ -619,8 +745,8 @@ fn rebuild_chunk(
         Ok(ch) => rebuild_chunk_inner(ch, &ns, &store, phase, generation),
         Err(e) => Err(e.clone()),
     };
-    let mut lk = loads.lock().expect("loads lock");
-    if store.lock().expect("store lock").generation(&ns) != generation {
+    let mut lk = held(&loads, "loads");
+    if held(&store, "store").generation(&ns) != generation {
         elog!("flint-vec: ns {name:?} was dropped during a rebuild chunk; it installed nothing");
         return;
     }
@@ -883,7 +1009,7 @@ fn install(
     configs: Vec<LoadedConfig>,
     vectors: Vec<LoadedVector>,
 ) -> usize {
-    let mut st = store.lock().expect("store lock");
+    let mut st = held(store, "store");
     // Dropped since the chunk began (BUG-0255): these rows may be the old
     // tenant's. Checked under the same lock as the commits below.
     if st.generation(ns) != generation {
@@ -1098,6 +1224,32 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0017's D2 amendment: a panic while a command is planned answers
+    /// that command, is counted, and leaves the store's lock unpoisoned, so
+    /// the next command on the same store is served.
+    #[test]
+    fn a_panic_in_planning_answers_its_command_and_poisons_nothing() {
+        let store: Arc<Mutex<Store>> = Arc::new(Mutex::new(Store::new()));
+        let before = PANICS.load(Relaxed);
+        let got: Result<(), Value> = plan_contained(&store, |_| panic!("a planning panic"));
+        assert_eq!(
+            got,
+            Err(err(
+                "ERR the co-processor failed on this command and did not run it"
+            ))
+        );
+        assert!(!store.is_poisoned(), "the store's lock was poisoned");
+        assert!(PANICS.load(Relaxed) > before, "the panic was not counted");
+        let create: Vec<Vec<u8>> = ["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]
+            .iter()
+            .map(|a| a.as_bytes().to_vec())
+            .collect();
+        assert!(matches!(
+            plan_contained(&store, |st| st.plan(b"ns", &create, 0)),
+            Ok(Plan::Write { .. })
+        ));
+    }
 
     fn frame(parts: &[&[u8]]) -> Value {
         Value::Array(Some(

@@ -71,9 +71,26 @@ found no panic. It covered well-formed and mutated `FT.SEARCH`,
 `FT.CREATE`, routed writes and the `VEC.` commands, over HASH and JSON
 documents.
 
-**Not in this fix:** the co-processor still turns any panic under its store
-lock into an outage for every tenant. Containing one is a design choice, and
-it is offered separately.
+**With it, the next such panic is contained** (ops ADR-0017's D2 amendment,
+accepted 2026-11-02, option B):
+- **A panic while a command is planned answers that command only.** `plan`
+  and `plan_ft` run under `catch_unwind` while the store's guard is held, so
+  the lock is not poisoned. The command is answered `-ERR the co-processor
+  failed on this command and did not run it`, and `FLINTINFO` counts it in
+  `panics_total`. A panic later in a command, outside the lock, is answered
+  the same way, and keeps its connection.
+- **A panic that leaves a lock poisoned ends the process,** with status 70,
+  saying which lock. The seat supervisor starts it again, and every namespace
+  rebuilds from its durable rows. Every lock in the binary goes through one
+  helper, `held`, in place of `lock().expect(..)`.
+- **A rebuild chunk that panics** is counted and left for the next command to
+  resume, as a failed chunk is, rather than leave its namespace answering
+  `-LOADING` for good.
+
+`coproc_vec_drill` holds both on real binaries, with the test-only
+`FLINT_TEST_PANIC`: a planning panic is answered while both tenants are
+served and the process stays up, and a panic in a write's commit ends the
+process with status 70, after which the restart's rebuild has that write.
 
 ## Acceptance
 
@@ -85,4 +102,6 @@ served at 1 s and 11 s, the thread count stays at 3, and the log has no
 panic. Unit tests, each failing before the fix:
 `ft::tests::a_count_near_usize_max_is_refused_not_a_panic`,
 `ftagg::tests::a_count_near_usize_max_is_refused_not_a_panic` and
-`tests::a_k_past_the_set_is_the_whole_set_not_a_panic`.
+`tests::a_k_past_the_set_is_the_whole_set_not_a_panic`. The containment:
+the binary's `a_panic_in_planning_answers_its_command_and_poisons_nothing`,
+and the drill above.
