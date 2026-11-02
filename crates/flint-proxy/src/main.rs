@@ -5686,6 +5686,50 @@ impl Idle for Sleep {
 const BLOCK_POLL_FIRST: Duration = Duration::from_millis(1);
 const BLOCK_POLL_MAX: Duration = Duration::from_millis(20);
 
+/// The attempts `blocking_pop` makes each round, each with its frame: one
+/// key each, or the whole command as one. BLMPOP's and BZMPOP's keys are
+/// the count at `args[2]` when it parses and names keys that are there, with
+/// the direction after them. That count is the client's, so it is compared
+/// with what is there and never added to: `3 + n` wrapped for a count near
+/// `usize::MAX`, passed the check, and panicked the slice (BUG-0278).
+fn pop_attempts(args: &[Vec<u8>], raw: &[u8]) -> Vec<(Vec<Vec<u8>>, Vec<u8>)> {
+    let name = args[0].to_ascii_uppercase();
+    let moves = matches!(name.as_slice(), b"BLMOVE" | b"BRPOPLPUSH");
+    let mpop = matches!(name.as_slice(), b"BLMPOP" | b"BZMPOP");
+    let mpop_keys = mpop
+        .then(|| {
+            std::str::from_utf8(args.get(2)?)
+                .ok()?
+                .parse::<usize>()
+                .ok()
+        })
+        .flatten()
+        .filter(|&n| n > 1 && n < args.len().saturating_sub(3));
+    if let Some(n) = mpop_keys {
+        args[3..3 + n]
+            .iter()
+            .map(|k| {
+                let mut one = vec![args[0].clone(), args[1].clone(), b"1".to_vec(), k.clone()];
+                one.extend(args[3 + n..].iter().cloned());
+                let frame = encode_cmd(&one.iter().map(Vec::as_slice).collect::<Vec<_>>());
+                (one, frame)
+            })
+            .collect()
+    } else if moves || mpop || args.len() <= 3 {
+        vec![(args.to_vec(), raw.to_vec())]
+    } else {
+        let timeout = &args[args.len() - 1];
+        args[1..args.len() - 1]
+            .iter()
+            .map(|k| {
+                let one = vec![args[0].clone(), k.clone(), timeout.clone()];
+                let frame = encode_cmd(&one.iter().map(Vec::as_slice).collect::<Vec<_>>());
+                (one, frame)
+            })
+            .collect()
+    }
+}
+
 /// `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BLMOVE`, `BRPOPLPUSH`,
 /// `BLMPOP`, `BZMPOP`: the client waits here, at the proxy, and no seat ever
 /// holds a connection or a thread for it (ADR-0052 D4).
@@ -5716,43 +5760,11 @@ async fn blocking_pop(
     raw: &[u8],
     idle: &mut dyn Idle,
 ) -> Value {
-    let name = args[0].to_ascii_uppercase();
-    let moves = matches!(name.as_slice(), b"BLMOVE" | b"BRPOPLPUSH");
-    let mpop = matches!(name.as_slice(), b"BLMPOP" | b"BZMPOP");
-    // BLMPOP's keys: the count at args[2] when it parses and names keys
-    // that are there, with the direction after them.
-    let mpop_keys = mpop
-        .then(|| {
-            std::str::from_utf8(args.get(2)?)
-                .ok()?
-                .parse::<usize>()
-                .ok()
-        })
-        .flatten()
-        .filter(|&n| n > 1 && 3 + n < args.len());
-    let attempts: Vec<(Vec<Vec<u8>>, Vec<u8>)> = if let Some(n) = mpop_keys {
-        args[3..3 + n]
-            .iter()
-            .map(|k| {
-                let mut one = vec![args[0].clone(), args[1].clone(), b"1".to_vec(), k.clone()];
-                one.extend(args[3 + n..].iter().cloned());
-                let frame = encode_cmd(&one.iter().map(Vec::as_slice).collect::<Vec<_>>());
-                (one, frame)
-            })
-            .collect()
-    } else if moves || mpop || args.len() <= 3 {
-        vec![(args.to_vec(), raw.to_vec())]
-    } else {
-        let timeout = &args[args.len() - 1];
-        args[1..args.len() - 1]
-            .iter()
-            .map(|k| {
-                let one = vec![args[0].clone(), k.clone(), timeout.clone()];
-                let frame = encode_cmd(&one.iter().map(Vec::as_slice).collect::<Vec<_>>());
-                (one, frame)
-            })
-            .collect()
-    };
+    let mpop = matches!(
+        args[0].to_ascii_uppercase().as_slice(),
+        b"BLMPOP" | b"BZMPOP"
+    );
+    let attempts = pop_attempts(args, raw);
     let started = Instant::now();
     let mut delay = BLOCK_POLL_FIRST;
     loop {
@@ -7227,6 +7239,28 @@ mod info_tests {
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    /// BUG-0278: BLMPOP's count is the client's. One near usize::MAX wrapped
+    /// `3 + n` past the check and panicked this client's task; it is one
+    /// attempt now, the whole command, which the seat refuses.
+    #[test]
+    fn a_blmpop_count_near_usize_max_is_one_attempt_not_a_panic() {
+        let a = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+        };
+        let two = a(&["BLMPOP", "0", "2", "x", "y", "LEFT"]);
+        let keys: Vec<Vec<u8>> = super::pop_attempts(&two, b"raw")
+            .into_iter()
+            .map(|(one, _)| one[3].clone())
+            .collect();
+        assert_eq!(keys, vec![b"x".to_vec(), b"y".to_vec()], "the control");
+        for n in [usize::MAX - 2, usize::MAX - 1, usize::MAX] {
+            let args = a(&["BLMPOP", "0", &n.to_string(), "x", "y", "LEFT"]);
+            let got = super::pop_attempts(&args, b"raw");
+            assert_eq!(got.len(), 1, "count {n}");
+            assert_eq!(got[0].0, args, "count {n}: the whole command");
+        }
+    }
 
     /// ADR-0060 amendment 3, part 1: an `FT.SEARCH` is granted a channel for
     /// its page, and every other family command the configured budget.
