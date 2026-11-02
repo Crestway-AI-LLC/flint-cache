@@ -1,6 +1,7 @@
 # ADR-0065: A seat whose vital thread panics ends itself, rather than serve on without it
 
-Status: **PROPOSED 2026-11-02**, for Jeff's decision. Nothing is built.
+Status: **ACCEPTED 2026-11-02, option A** (Jeff: "go with your
+recommendation"). **Proposed 2026-11-02.** Being built.
 From the error-handling review's cross-cutting sweep
 (`docs/error-handling-review.md`, area N).
 
@@ -59,7 +60,7 @@ reports (`<thread>_last_ms`), and the agent alerts on one that is stale. The
 seat keeps running without the work until a person acts. That is a page for a
 condition the product could end itself.
 
-## Recommendation: A
+## Decision: A (recommended, accepted 2026-11-02)
 
 - **A stopped seat is a case the fleet already handles,** a running seat
   missing its fsync or its fence is not. The supervisor, failover and the
