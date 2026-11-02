@@ -25,6 +25,9 @@
 //! has grown an extra file has been tampered with or written by something
 //! that does not understand the format, and either way it is not restorable.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
 pub mod store;
 
 use std::fmt;

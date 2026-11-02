@@ -289,7 +289,7 @@ impl RocksKv {
             // the ops agent reads (FLINTINFO), and one line per recovered
             // walk with what the WAL held.
             self.note_wal_walk_recovered();
-            eprintln!(
+            elog!(
                 "WAL walk from seq {last_applied} saw a gap that a re-walk did not ({why}; {}): \
                  serving it (BUG-0252)",
                 seen.unwrap_or_default()
@@ -1078,14 +1078,14 @@ mod tests {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         let gaps = gaps.into_inner().expect("gaps");
-        eprintln!(
+        elog!(
             "polls={} rolls={} gaps={}",
             polls.load(std::sync::atomic::Ordering::Relaxed),
             rolls.load(std::sync::atomic::Ordering::Relaxed),
             gaps.len()
         );
         for g in gaps.iter().take(8) {
-            eprintln!("  {g}");
+            elog!("  {g}");
         }
         assert!(gaps.is_empty(), "{} false WAL gaps", gaps.len());
     }
@@ -1308,9 +1308,16 @@ mod tests {
             (live, arch)
         };
 
-        eprintln!(
+        elog!(
             "{:>10} {:>8} {:>7} {:>12} {:>12} {:>12} {:>12} {:>12}",
-            "seqs", "wal", "arch", "cons(0)ms", "first(0)ms", "cons(hi)ms", "first(hi)ms", "WALKms"
+            "seqs",
+            "wal",
+            "arch",
+            "cons(0)ms",
+            "first(0)ms",
+            "cons(hi)ms",
+            "first(hi)ms",
+            "WALKms"
         );
         // VALUE SIZE MATTERS and defaulted wrong the first time: at 1 byte a
         // 3 M-sequence WAL is 60 small files, while the fleet writes 1 KiB and
@@ -1325,7 +1332,7 @@ mod tests {
             .ok()
             .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
             .unwrap_or_else(|| vec![100_000, 500_000, 1_000_000, 2_000_000, 3_000_000]);
-        eprintln!("  value_bytes={vsize}");
+        elog!("  value_bytes={vsize}");
         let mut written = 0u64;
         for target in targets {
             while written < target {
@@ -1372,7 +1379,7 @@ mod tests {
             let walk = t.elapsed().as_secs_f64() * 1000.0;
 
             let (live, arch) = count_wal();
-            eprintln!(
+            elog!(
                 "{:>10} {:>8} {:>7} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>12.1}",
                 latest,
                 live,
@@ -1399,7 +1406,7 @@ mod tests {
             let t = Instant::now();
             let r = kv.own_seq_for_upstream(latest.saturating_sub(1));
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
+            elog!(
                 "own_seq_for_upstream(latest-1) over {latest} seqs: {ms:.1}ms  (result: {})",
                 match &r {
                     Ok(v) => format!("Ok({v})"),
@@ -1454,12 +1461,12 @@ mod tests {
             }
             stop.store(true, Ordering::Relaxed);
             let ended = writer.join().expect("writer");
-            eprintln!(
+            elog!(
                 "UNDER LOAD (writer active, {} writes issued): worst from(0)={worst0:.1}ms  worst from(hi)={worsth:.1}ms",
                 ended - 10_000_000
             );
             let (l2, a2) = count_wal();
-            eprintln!("  wal files after load arm: live={l2} archive={a2}");
+            elog!("  wal files after load arm: live={l2} archive={a2}");
         }
 
         // FOURTH ARM -- the fix, measured the same way the bug was. A
@@ -1530,7 +1537,7 @@ mod tests {
                 format!("{without:?}"),
                 "the index CHANGED the answer at {upstream} sequences"
             );
-            eprintln!(
+            elog!(
                 "own_seq_for_upstream near tip of {upstream} upstream seqs \
                  ({planted} index entries): indexed={ms_with:.1}ms  \
                  unindexed={ms_without:.1}ms  speedup={:.1}x",
@@ -1601,7 +1608,7 @@ mod tests {
             Ok(b) => format!("SERVED {} batch(es)", b.len()),
             Err(e) => format!("REFUSED: {e:?}"),
         };
-        eprintln!(
+        elog!(
             "BUG-0050 probe A (no checkpoint): archived={archived} early={early} latest={latest} -> {outcome}"
         );
 
@@ -1627,7 +1634,7 @@ mod tests {
             Ok(b) => format!("SERVED {} batch(es)", b.len()),
             Err(e) => format!("REFUSED: {e:?}"),
         };
-        eprintln!(
+        elog!(
             "BUG-0050 probe B (after checkpoint at {mid}, latest {after}): \
              pre-checkpoint cursor {early} -> {out_b} | just-before-checkpoint cursor -> {out_c}"
         );
@@ -1655,7 +1662,7 @@ mod tests {
             Ok(b) => format!("SERVED {} batch(es)", b.len()),
             Err(e) => format!("REFUSED: {e:?}"),
         };
-        eprintln!(
+        elog!(
             "BUG-0050 probe C (cursor at latest-1 = {tail_cursor}, then roll): \
              immediately -> {out_d} | after one more write -> {out_e}"
         );
@@ -1699,13 +1706,13 @@ mod tests {
             Ok(b) => format!("SERVED {} batch(es)", b.len()),
             Err(e) => format!("REFUSED: {e:?}"),
         };
-        eprintln!(
+        elog!(
             "BUG-0050 probe D: an 8-key write consumed {consumed} sequence(s) \
              ({before_multi} -> {after_multi}) and produced batches [{}]",
             spans.join(", ")
         );
-        eprintln!("                  cursor at batch START-1 ({before_multi}) -> {out_g}");
-        eprintln!("                  cursor at INTERIOR      ({interior}) -> {out_f}");
+        elog!("                  cursor at batch START-1 ({before_multi}) -> {out_g}");
+        elog!("                  cursor at INTERIOR      ({interior}) -> {out_f}");
 
         // ARMED. If nothing was archived, or the cursor never left the live
         // WAL, the probe answered an easier question than the one asked and
@@ -2322,7 +2329,7 @@ mod bug_0050_iterator_shape {
             Err(e) => panic!("the WAL scan failed for a reason that is not recycling: {e}"),
         };
         if reachable.is_some_and(|f| f <= stale) {
-            eprintln!(
+            elog!(
                 "  SKIP: the WAL still reaches back to {stale} (oldest {reachable:?}); \
                  this environment does not recycle, so the protection is untested here"
             );
@@ -2368,7 +2375,7 @@ mod bug_0050_iterator_shape {
                 .last()
                 .map(|b| b.last_seq)
                 .unwrap_or(0);
-            eprintln!(
+            elog!(
                 "  {label}: db {before} -> {after} (advance {}), collector last_seq {reported}{}",
                 after - before,
                 if reported == after {
@@ -2405,13 +2412,13 @@ mod bug_0050_iterator_shape {
                 .filter_map(|i| i.ok())
                 .map(|(first, b)| format!("first={first} count={}", b.len()))
                 .collect();
-            eprintln!(
+            elog!(
                 "  cursor {cursor}: iterator yielded {} item(s) [{}]",
                 spans.len(),
                 spans.join("; ")
             );
         }
-        eprintln!("  (batch occupies {}..={})", before + 1, after);
+        elog!("  (batch occupies {}..={})", before + 1, after);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -21,6 +21,12 @@
 //! `ring` is the crypto provider (pure-Rust build), pinned explicitly so a
 //! stray `install_default` elsewhere can never change what these configs use.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -735,10 +741,10 @@ fn watch_config<T: Send + Sync + 'static>(
                         if let Ok(mut g) = handle.write() {
                             *g = fresh;
                         }
-                        eprintln!("tls: hot-reloaded leaf certificate");
+                        elog!("tls: hot-reloaded leaf certificate");
                         last = now;
                     }
-                    Err(e) => eprintln!("tls: reload skipped (keeping current): {e}"),
+                    Err(e) => elog!("tls: reload skipped (keeping current): {e}"),
                 }
             }
         }

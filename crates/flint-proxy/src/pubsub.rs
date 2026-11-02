@@ -474,7 +474,7 @@ impl Hub {
                 return;
             }
             LINK_REDIALS_TOTAL.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
+            elog!(
                 "[{}] pubsub link to {addr}: {err}; dialing again in {} ms",
                 crate::log_ms(),
                 backoff.as_millis()
@@ -889,7 +889,7 @@ impl Subscriber {
         let name = name.map_or_else(String::new, |n| {
             format!(" ({})", String::from_utf8_lossy(n))
         });
-        eprintln!(
+        elog!(
             "[{}] pubsub: client {id}{name} of namespace {} cut off, {} MiB behind (ADR-0052): \
              it was disconnected, and the messages queued for it were dropped",
             crate::log_ms(),

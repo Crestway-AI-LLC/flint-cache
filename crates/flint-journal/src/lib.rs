@@ -17,6 +17,12 @@
 //! affect the transition being reported — the transition already happened;
 //! the report is history, not a precondition.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -403,7 +409,7 @@ fn tail_across(path: &str, n: usize, keep: &dyn Fn(&str) -> bool) -> Vec<String>
                 // no error channel and losing the readable segments too would
                 // be worse. But it must not be quiet about it.
                 if f.as_path() != live {
-                    eprintln!(
+                    elog!(
                         "journal: segment {} unreadable ({e}) — this read is SHORT by \
                          whatever it held; a horizon computed from it is not trustworthy",
                         f.display()

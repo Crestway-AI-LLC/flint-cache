@@ -15,6 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+flint-log = { path = "../flint-log" }
 # sha256_stream_hex. No object-store SDK here, deliberately: this crate is
 # the FORMAT, and the format must be testable — and restorable — without
 # credentials or a network. The SDK lives behind ObjectStore in the seat.

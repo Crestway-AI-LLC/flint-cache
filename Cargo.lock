@@ -515,6 +515,7 @@ name = "flint-backup"
 version = "0.0.1"
 dependencies = [
  "flint-build",
+ "flint-log",
  "flint-resp",
  "flint-sched",
  "flint-slot",
@@ -574,6 +575,7 @@ dependencies = [
  "flint-balance",
  "flint-build",
  "flint-journal",
+ "flint-log",
  "flint-resp",
  "flint-tls",
 ]
@@ -584,6 +586,7 @@ version = "0.0.1"
 dependencies = [
  "flint-build",
  "flint-journal",
+ "flint-log",
  "flint-resp",
  "flint-slot",
  "flint-tls",
@@ -609,6 +612,7 @@ dependencies = [
 name = "flint-exporter"
 version = "0.0.1"
 dependencies = [
+ "flint-log",
  "flint-resp",
  "flint-tls",
 ]
@@ -617,10 +621,18 @@ dependencies = [
 name = "flint-journal"
 version = "0.0.1"
 dependencies = [
+ "flint-log",
  "flint-resp",
  "flint-tls",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "flint-log"
+version = "0.0.1"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -629,6 +641,7 @@ version = "0.0.1"
 dependencies = [
  "flint-build",
  "flint-commands",
+ "flint-log",
  "flint-resp",
  "flint-slot",
  "flint-tls",
@@ -654,6 +667,7 @@ dependencies = [
  "flint-build",
  "flint-commands",
  "flint-journal",
+ "flint-log",
  "flint-resp",
  "flint-slot",
  "flint-storage",
@@ -671,6 +685,7 @@ version = "0.0.1"
 name = "flint-storage"
 version = "0.0.1"
 dependencies = [
+ "flint-log",
  "flint-slot",
  "libc",
  "rocksdb",
@@ -680,6 +695,7 @@ dependencies = [
 name = "flint-tls"
 version = "0.0.1"
 dependencies = [
+ "flint-log",
  "rcgen",
  "ring",
  "rustls",
@@ -694,6 +710,7 @@ name = "flint-vec"
 version = "0.0.1"
 dependencies = [
  "flint-build",
+ "flint-log",
  "flint-resp",
  "flint-tls",
  "libc",

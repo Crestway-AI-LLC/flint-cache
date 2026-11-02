@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+flint-log = { path = "../flint-log" }
 # statvfs for the data-dir headroom probe (disk.rs). Already in the tree
 # via rocksdb, so this adds no new third-party code.
 libc = "0.2"

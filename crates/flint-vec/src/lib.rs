@@ -22,6 +22,13 @@
 //! unchanged. ADR-0059 adds fields read from a vector's `META`, which
 //! `VEC.SEARCH ... FILTER` matches before it ranks, in a fifth config field.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+// Its lines outside tests are in the binary; its tests log too.
+#[cfg_attr(test, macro_use)]
+extern crate flint_log;
+
 mod casefold;
 pub mod filter;
 pub mod ft;

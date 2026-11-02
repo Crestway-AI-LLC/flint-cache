@@ -61,6 +61,12 @@
 //! Usage: flint-proxy --port 7379 --pairs "m0,r0;m1,r1;..."
 //!                    [--tenants "tokenA=nsA,tokenB=nsB"]
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 mod apool;
 mod cache;
 mod errors;
@@ -1073,7 +1079,7 @@ impl Topology {
                 // re-probes that CHANGE the master are exactly as rare as
                 // promotions (#187).
                 if was != found {
-                    eprintln!(
+                    elog!(
                         "[{}] pair {i} master {} -> {} (re-probe triggered by {addr})",
                         log_ms(),
                         was.as_deref().unwrap_or("none"),
@@ -1129,7 +1135,7 @@ impl Topology {
         // zero lines mentioning a promotion across a 25-minute run containing
         // several, which left "the hint never arrived" and "the hint arrived
         // and did nothing" indistinguishable — two very different bugs (#187).
-        eprintln!(
+        elog!(
             "[{}] promotion hint {hint}: re-probing the pair holding {addr}",
             log_ms()
         );
@@ -2286,7 +2292,7 @@ fn auth_step(
             let due =
                 g.0.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
             if due {
-                eprintln!(
+                elog!(
                     "flint-proxy: operator command REFUSED — no admin token \
                      ({} refusal(s) since the last such line; {} total since \
                      start)",
@@ -6294,7 +6300,7 @@ fn watch_control_plane(
                     // it. See `ready`.
                     topo.ready.store(true, Ordering::Release);
                     *last_version = *version as u64;
-                    eprintln!("control-plane snapshot v{version} applied");
+                    elog!("control-plane snapshot v{version} applied");
                     out.clear();
                     encode(
                         &Value::Array(Some(vec![
@@ -6403,7 +6409,7 @@ fn main() -> std::io::Result<()> {
     // `flintctl upgrade` rolled the edge with no way to check what landed —
     // a half-completed edge roll was indistinguishable from a finished one.
     if std::env::args().any(|a| a == "--build-version") {
-        println!("{}", build_version());
+        olog!("{}", build_version());
         return Ok(());
     }
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7379);
@@ -6504,7 +6510,7 @@ fn main() -> std::io::Result<()> {
         .iter()
         .map(|nodes| discover_master(nodes, &backend_tls))
         .collect();
-    eprintln!(
+    elog!(
         "flint-proxy: {} static pair(s), {} static tenant(s), control-plane {:?}, open={open_mode}",
         pairs.len(),
         tenants.len(),
@@ -6658,7 +6664,7 @@ fn main() -> std::io::Result<()> {
             loop {
                 let cp = &seats[i % seats.len()];
                 if let Err(e) = watch_control_plane(cp, &advertise, &topo, &mut last_version) {
-                    eprintln!("control-plane watch ({cp}): {e}; trying next seat");
+                    elog!("control-plane watch ({cp}): {e}; trying next seat");
                     i += 1;
                 }
                 std::thread::sleep(Duration::from_millis(1000));
@@ -6711,7 +6717,7 @@ fn main() -> std::io::Result<()> {
     // subscribes.
     pubsub::HUB.start(Arc::clone(&topo))?;
 
-    eprintln!(
+    elog!(
         "flint-proxy listening on {bind}:{port} ({}, max-conns {max_conns}, {workers} workers)",
         if tls.is_some() { "TLS" } else { "plaintext" }
     );
@@ -6731,7 +6737,7 @@ fn main() -> std::io::Result<()> {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        eprintln!("worker {w}: runtime: {e}");
+                        elog!("worker {w}: runtime: {e}");
                         return;
                     }
                 };
@@ -6762,7 +6768,7 @@ fn main() -> std::io::Result<()> {
                                 Ok(s) => {
                                     let _ = serve_client(s, topo).await;
                                 }
-                                Err(e) => eprintln!("tls: connection setup failed: {e}"),
+                                Err(e) => elog!("tls: connection setup failed: {e}"),
                             }
                         });
                     }

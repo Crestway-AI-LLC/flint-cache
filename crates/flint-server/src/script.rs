@@ -1371,12 +1371,12 @@ mod cost_probe {
             )
             .expect("probe");
         }
-        eprintln!("new_with:          {:?}/call", t.elapsed() / n);
+        elog!("new_with:          {:?}/call", t.elapsed() / n);
         let t = Instant::now();
         for _ in 0..n {
             let _ = sandbox(DEFAULT_MEMORY_LIMIT).expect("probe");
         }
-        eprintln!("sandbox:           {:?}/call", t.elapsed() / n);
+        elog!("sandbox:           {:?}/call", t.elapsed() / n);
         let lua = sandbox(DEFAULT_MEMORY_LIMIT).expect("probe");
         let t = Instant::now();
         for _ in 0..n {
@@ -1386,12 +1386,12 @@ mod cost_probe {
                 .into_function()
                 .expect("probe");
         }
-        eprintln!("compile prelude:   {:?}/call", t.elapsed() / n);
+        elog!("compile prelude:   {:?}/call", t.elapsed() / n);
         let t = Instant::now();
         for _ in 0..n {
             let _ = compile(&lua, b"return redis.call('incr', KEYS[1])").expect("probe");
         }
-        eprintln!("compile script:    {:?}/call", t.elapsed() / n);
+        elog!("compile script:    {:?}/call", t.elapsed() / n);
         let call = |_: &[Vec<u8>]| Ok(Value::Integer(1));
         let text = b"return redis.call('incr', KEYS[1])";
         let sha = flint_tls::sha1_hex(text);
@@ -1407,7 +1407,7 @@ mod cost_probe {
                 &call,
             );
         }
-        eprintln!("whole run:         {:?}/call", t.elapsed() / n);
+        elog!("whole run:         {:?}/call", t.elapsed() / n);
     }
 }
 

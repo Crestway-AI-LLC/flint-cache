@@ -34,6 +34,12 @@
 //! are tiny next to the vectors, and a set that overflows even that surfaces a
 //! raise-the-budget error rather than a silent partial.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_vec::filter::Field;
 use flint_vec::ftstore;
@@ -173,7 +179,7 @@ fn main() {
     // process that bound a port and never returned. `flintctl upgrade`'s
     // post-roll check and the drill warm-up both hang on exactly that.
     if args.iter().any(|a| a == "--build-version") {
-        println!("{}", build_version());
+        olog!("{}", build_version());
         return;
     }
     let port: u16 = arg(&args, "--port")
@@ -267,7 +273,7 @@ fn main() {
     };
     let filters_note = if filters { "filters on" } else { "filters off" };
     let ft_note = if ft { "FT.* on" } else { "FT.* off" };
-    eprintln!(
+    elog!(
         "flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note}, {vec_note}, {rows_note}, {filters_note}, {ft_note})"
     );
 
@@ -285,7 +291,7 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(sweep_ms));
                 let swept = store.lock().expect("store lock").sweep_expired(now_ms());
                 if swept > 0 {
-                    eprintln!("flint-vec: swept {swept} expired vector(s)");
+                    elog!("flint-vec: swept {swept} expired vector(s)");
                 }
             }
         });
@@ -317,7 +323,7 @@ fn claim_vec_dir(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
         }
     }
     if swept > 0 {
-        eprintln!(
+        elog!(
             "flint-vec: removed {swept} vector file(s) from {} (derived; the rebuild writes them again)",
             dir.display()
         );
@@ -450,7 +456,7 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
         let dropped = store.lock().expect("store lock").drop_namespace(ns);
         ftchan::forget(ns);
         drop(lk);
-        eprintln!(
+        elog!(
             "flint-vec: dropped ns {:?} ({dropped} set(s)); its next touch rebuilds from durable rows",
             String::from_utf8_lossy(ns)
         );
@@ -615,14 +621,12 @@ fn rebuild_chunk(
     };
     let mut lk = loads.lock().expect("loads lock");
     if store.lock().expect("store lock").generation(&ns) != generation {
-        eprintln!(
-            "flint-vec: ns {name:?} was dropped during a rebuild chunk; it installed nothing"
-        );
+        elog!("flint-vec: ns {name:?} was dropped during a rebuild chunk; it installed nothing");
         return;
     }
     match result {
         Ok(Chunk::Done(total)) => {
-            eprintln!("flint-vec: rebuilt ns {name:?} ({total} vectors) from durable rows");
+            elog!("flint-vec: rebuilt ns {name:?} ({total} vectors) from durable rows");
             lk.insert(ns, LoadState::Loaded);
             drop(lk);
             // ADR-0017's D3 amendment: the command that lent this channel may
@@ -647,7 +651,7 @@ fn rebuild_chunk(
                 Phase::Fetch { keys, next } => format!("{next}/{} keys fetched", keys.len()),
                 Phase::Ft(_) => "vectors in, loading FT.* indexes".to_string(),
             };
-            eprintln!(
+            elog!(
                 "flint-vec: ns {name:?} rebuild chunk loaded {installed}; {where_}; resuming on the next channel"
             );
             lk.insert(
@@ -659,7 +663,7 @@ fn rebuild_chunk(
             );
         }
         Err(e) => {
-            eprintln!(
+            elog!(
                 "flint-vec: ns {name:?} rebuild chunk failed: {e} (will retry on next touch; index not served partial)"
             );
             if let Some(LoadState::Loading { running, .. }) = lk.get_mut(&ns) {
@@ -813,7 +817,7 @@ fn rebuild_chunk_inner(
     }
     install(store, ns, generation, configs, vectors);
     if unreadable > 0 {
-        eprintln!(
+        elog!(
             "flint-vec: rebuild of ns {:?} left out {unreadable} vector row(s) it cannot read; first: {first_unreadable}",
             String::from_utf8_lossy(ns)
         );
@@ -858,7 +862,7 @@ fn ft_chunk(
             installed,
         },
         Err(e) => {
-            eprintln!(
+            elog!(
                 "flint-vec: ns {:?} FT.* rebuild chunk failed: {e}; resuming from the index list",
                 String::from_utf8_lossy(ns)
             );
@@ -934,7 +938,7 @@ fn install(
         }
     }
     for (why, count, first) in left {
-        eprintln!(
+        elog!(
             "flint-vec: rebuild of ns {:?} left out {count} vector row(s) {}; first: {first}",
             String::from_utf8_lossy(ns),
             why.reason()

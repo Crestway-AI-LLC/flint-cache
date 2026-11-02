@@ -56,6 +56,12 @@
 //!
 //! Usage: flint-controlplane --port 7500 --state /path/state
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 mod ha;
 mod raft;
 mod registry;
@@ -1574,7 +1580,7 @@ fn watch(
                 families.clone(),
             ))
         {
-            eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
+            elog!("watch {proxy}: suppressed push at version {v} (view unchanged)");
             acked = v;
             continue;
         }
@@ -1754,7 +1760,7 @@ fn main() -> std::io::Result<()> {
     // Before --raft dispatch: asking a binary what it is must not depend on
     // which mode it would have started in.
     if std::env::args().any(|a| a == "--build-version") {
-        println!("{}", build_version());
+        olog!("{}", build_version());
         return Ok(());
     }
     // WHAT THIS BINARY CAN READ, ASKED DIRECTLY (BUG-0167).
@@ -1775,7 +1781,7 @@ fn main() -> std::io::Result<()> {
     if std::env::args().any(|a| a == "--state-formats") {
         // Space-separated, one line, oldest first. `line` is the hand-written
         // format every release before rc.73 wrote; `json` is ADR-0032 step 2.
-        println!("line json");
+        olog!("line json");
         return Ok(());
     }
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7500);
@@ -1806,7 +1812,7 @@ fn main() -> std::io::Result<()> {
         });
         let _ = state.commit();
     }
-    eprintln!(
+    elog!(
         "flint-controlplane: state {path} (version {}, {} proxies, {} pairs, {} tenants)",
         state.version,
         state.proxies.len(),
@@ -1831,7 +1837,7 @@ fn main() -> std::io::Result<()> {
     // controller or an agent living anywhere else.
     let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
     let listener = TcpListener::bind((bind.as_str(), port))?;
-    eprintln!(
+    elog!(
         "flint-controlplane listening on {bind}:{port} ({})",
         if internal_tls.is_some() {
             "internal mTLS"
@@ -1848,7 +1854,7 @@ fn main() -> std::io::Result<()> {
             let conn = match flint_tls::accept(stream, &internal_tls) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("internal tls accept: {e}");
+                    elog!("internal tls accept: {e}");
                     return;
                 }
             };

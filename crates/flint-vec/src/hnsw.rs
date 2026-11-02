@@ -1592,7 +1592,7 @@ mod tests {
         for metric in [Metric::L2, Metric::Cosine, Metric::Ip] {
             let full = recall_at(metric, Quant::None, 256, 10);
             let got = recall_at(metric, Quant::Bin, 256, 100);
-            eprintln!("{metric:?} bin: {got:.3} against full {full:.3}");
+            elog!("{metric:?} bin: {got:.3} against full {full:.3}");
             assert!(
                 got >= full - 0.03,
                 "{metric:?}: bin+rerank recall {got} fell more than 0.03 below full {full}"
@@ -1792,7 +1792,7 @@ mod tests {
             for every in [2, 10, 100] {
                 for follow in [false, true] {
                     let (r, plain) = filtered_recall(quant, every, follow, false);
-                    eprintln!(
+                    elog!(
                         "walk {quant:?} 1 in {every} follow {follow}: recall@10 {r:.3}, unfiltered {plain:.3}"
                     );
                     assert!(
@@ -1812,7 +1812,7 @@ mod tests {
         for quant in [Quant::Sq8, Quant::Bin] {
             for every in [10, 100] {
                 let (r, plain) = filtered_recall(quant, every, false, true);
-                eprintln!("scan {quant:?} 1 in {every}: recall@10 {r:.3}, unfiltered {plain:.3}");
+                elog!("scan {quant:?} 1 in {every}: recall@10 {r:.3}, unfiltered {plain:.3}");
                 assert!(r >= 0.95, "{quant:?}, 1 in {every}: {r}");
             }
         }

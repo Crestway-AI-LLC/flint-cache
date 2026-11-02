@@ -10,6 +10,12 @@
 //! starts a replica that tails the master, applies batches atomically, and
 //! rejects mutating commands with -READONLY.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 mod commands;
 mod diskguard;
 mod glob;
@@ -174,8 +180,8 @@ fn hard_exit(code: i32) -> ! {
 fn reject_unknown_flags() {
     for a in std::env::args().skip(1) {
         if a.starts_with("--") && !ACCEPTED_FLAGS.contains(&a.as_str()) {
-            eprintln!("flint-server: unrecognised argument `{a}`");
-            eprintln!("             run `flint-server --help` for the accepted set");
+            elog!("flint-server: unrecognised argument `{a}`");
+            elog!("             run `flint-server --help` for the accepted set");
             std::process::exit(2);
         }
     }
@@ -213,7 +219,7 @@ const NEEDS_RESEED: &str = "NEEDS_RESEED";
 fn mark_needs_reseed(dir: &std::path::Path, why: &str) {
     let marker = dir.join(NEEDS_RESEED);
     if let Err(e) = std::fs::write(&marker, format!("{why}\n")) {
-        eprintln!("could not write {}: {e}", marker.display());
+        elog!("could not write {}: {e}", marker.display());
     }
 }
 
@@ -243,7 +249,7 @@ const WARM_REJOIN_FAILED: &str = "WARM_REJOIN_FAILED";
 fn mark_warm_rejoin_failed(dir: &std::path::Path, cursor: u64) {
     let f = dir.join(WARM_REJOIN_FAILED);
     if let Err(e) = std::fs::write(&f, format!("{cursor}\n")) {
-        eprintln!("could not write {}: {e}", f.display());
+        elog!("could not write {}: {e}", f.display());
     }
 }
 
@@ -357,9 +363,9 @@ fn clear_needs_reseed(dir: &std::path::Path) -> bool {
     if marker.exists() {
         remember_reseed_reason(dir);
         if let Err(e) = std::fs::remove_file(&marker) {
-            eprintln!("could not remove {}: {e}", marker.display());
+            elog!("could not remove {}: {e}", marker.display());
         } else {
-            eprintln!("cleared {NEEDS_RESEED}: this node is the lineage now");
+            elog!("cleared {NEEDS_RESEED}: this node is the lineage now");
         }
         return true;
     }
@@ -470,7 +476,7 @@ const UNRESUMABLE_PREFIX: &str = "unresumable-";
 #[cfg(feature = "rocks")]
 fn quarantine_unresumable(snaps_dir: &str, cursor: u64) -> usize {
     let Ok(entries) = std::fs::read_dir(std::path::Path::new(snaps_dir)) else {
-        eprintln!("quarantine: no snapshot dir at {snaps_dir}; nothing to disqualify");
+        elog!("quarantine: no snapshot dir at {snaps_dir}; nothing to disqualify");
         return 0;
     };
     let mut n = 0;
@@ -498,7 +504,7 @@ fn quarantine_unresumable(snaps_dir: &str, cursor: u64) -> usize {
         match std::fs::rename(e.path(), &to) {
             Ok(()) => {
                 n += 1;
-                eprintln!(
+                elog!(
                     "quarantine: {name} (seq {seq} <= unresumable cursor {cursor}) is no \
                      longer a rewind candidate; kept as \
                      {UNRESUMABLE_PREFIX}c{cursor}-{name}"
@@ -506,7 +512,7 @@ fn quarantine_unresumable(snaps_dir: &str, cursor: u64) -> usize {
             }
             // Best effort by design: failing to rename must not stop the
             // re-seed, which is the actual recovery. It costs another boot.
-            Err(err) => eprintln!("quarantine: renaming {name}: {err}"),
+            Err(err) => elog!("quarantine: renaming {name}: {err}"),
         }
     }
     n
@@ -592,7 +598,7 @@ fn release_snapshots_under_pressure(
         }
         match std::fs::remove_dir_all(&path) {
             Ok(()) => released += 1,
-            Err(err) => eprintln!("snapshot relief: removing {}: {err}", path.display()),
+            Err(err) => elog!("snapshot relief: removing {}: {err}", path.display()),
         }
     }
     released
@@ -704,7 +710,7 @@ fn prune_snapshots(
             Ok(()) => removed += 1,
             // Best effort: a snapshot that will not delete is disk, not
             // correctness, and stopping here would leave the rest forever.
-            Err(err) => eprintln!("prune: removing {}: {err}", path.display()),
+            Err(err) => elog!("prune: removing {}: {err}", path.display()),
         }
     }
     (removed, "nothing older than the cutoff")
@@ -787,7 +793,7 @@ fn probe_resume(
             ProbeVerdict::Transport(e) => {
                 last = e;
                 if attempt < ATTEMPTS {
-                    eprintln!(
+                    elog!(
                         "rewind: probe attempt {attempt}/{ATTEMPTS} to {target} did not \
                          complete ({last}) — the master has not answered, so this says \
                          nothing about the copy; retrying"
@@ -833,7 +839,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
     let mut t_restore_done: Option<std::time::Instant> = None;
     let snaps = std::path::Path::new(snaps_dir);
     let Ok(entries) = std::fs::read_dir(snaps) else {
-        eprintln!("rewind: no snapshot dir at {snaps_dir}; full re-seed");
+        elog!("rewind: no snapshot dir at {snaps_dir}; full re-seed");
         return false;
     };
     // The third element is the cursor a quarantined snapshot was disqualified
@@ -858,7 +864,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
     // reading it, and a pre-initialised value would be dead.
     let t_enum = std::time::Instant::now();
     if candidates.is_empty() {
-        eprintln!("rewind: no epoch-labeled snapshots in {snaps_dir}; full re-seed");
+        elog!("rewind: no epoch-labeled snapshots in {snaps_dir}; full re-seed");
         return false;
     }
     // One fence query per distinct epoch; the master's answer is the highest
@@ -876,11 +882,11 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
             ) {
                 Ok(Value::Integer(b)) if b >= 0 => Some(b as u64),
                 Ok(_) => {
-                    eprintln!("rewind: {target} cannot vouch for epoch {epoch}");
+                    elog!("rewind: {target} cannot vouch for epoch {epoch}");
                     None
                 }
                 Err(e) => {
-                    eprintln!("rewind: FLINTFENCE {epoch} against {target} failed: {e}");
+                    elog!("rewind: FLINTFENCE {epoch} against {target} failed: {e}");
                     None
                 }
             }
@@ -907,7 +913,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
             continue;
         }
         if seq > bound {
-            eprintln!(
+            elog!(
                 "rewind: snapshot {} is past the fence ({seq} > {bound}); trying older",
                 path.display()
             );
@@ -919,7 +925,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         // evidence the 2026-08-28 94.2 s re-seed turned out to need and not
         // have — the absence of a "past the fence" line was all that
         // distinguished "accepted" from "never asked".
-        eprintln!(
+        elog!(
             "rewind: candidate {} clears the fence for epoch {epoch} ({seq} <= {bound})",
             path.display()
         );
@@ -933,7 +939,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         let tmp = data_dir.with_extension("rewind-tmp");
         let _ = std::fs::remove_dir_all(&tmp);
         if let Err(e) = std::fs::create_dir_all(&tmp) {
-            eprintln!("rewind: create {}: {e}; full re-seed", tmp.display());
+            elog!("rewind: create {}: {e}; full re-seed", tmp.display());
             return false;
         }
         let restored = std::fs::read_dir(&path).map(|dir| {
@@ -958,7 +964,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         match restored {
             Ok(Ok(())) => {}
             Ok(Err(e)) | Err(e) => {
-                eprintln!("rewind: restoring {}: {e}; full re-seed", path.display());
+                elog!("rewind: restoring {}: {e}; full re-seed", path.display());
                 let _ = std::fs::remove_dir_all(&tmp);
                 return false;
             }
@@ -966,7 +972,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         if let Err(e) =
             std::fs::remove_dir_all(data_dir).and_then(|_| std::fs::rename(&tmp, data_dir))
         {
-            eprintln!("rewind: swapping in the restored copy: {e}; full re-seed");
+            elog!("rewind: swapping in the restored copy: {e}; full re-seed");
             let _ = std::fs::remove_dir_all(&tmp);
             return false;
         }
@@ -993,7 +999,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
                 use flint_storage::manifest::{self, Role, RoleClaim};
                 let cursor = kv.latest_seq();
                 if let Err(e) = kv.set_last_applied(cursor) {
-                    eprintln!("rewind: cursor init on restored copy ({e:?}); full re-seed");
+                    elog!("rewind: cursor init on restored copy ({e:?}); full re-seed");
                     drop(kv);
                     let _ = std::fs::remove_dir_all(data_dir);
                     return false;
@@ -1009,7 +1015,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
                 cursor
             }
             Err(e) => {
-                eprintln!("rewind: restored copy does not open ({e}); full re-seed");
+                elog!("rewind: restored copy does not open ({e}); full re-seed");
                 let _ = std::fs::remove_dir_all(data_dir);
                 return false;
             }
@@ -1031,7 +1037,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
                 // every failure, including a socket that never reached the
                 // master — and that wording sent the 95s investigation at the
                 // fence logic rather than at the transport.
-                eprintln!(
+                elog!(
                     "rewind: cannot resume from the restored copy against {target} ({e}); \
                      full re-seed"
                 );
@@ -1039,7 +1045,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
                 return false;
             }
         }
-        eprintln!(
+        elog!(
             "rewound to {} (seq {seq} <= fence {bound}, epoch {epoch}): tailing incrementally \
              instead of a full re-seed",
             path.display()
@@ -1069,7 +1075,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         );
         return true;
     }
-    eprintln!("rewind: no snapshot at or before the fence; full re-seed");
+    elog!("rewind: no snapshot at or before the fence; full re-seed");
     journal_event(
         flint_journal::EventKind::RejoinDecided,
         None,
@@ -2111,7 +2117,7 @@ static JOURNAL_DROP_WARNED: std::sync::atomic::AtomicBool =
 fn journal_event(kind: flint_journal::EventKind, epoch: Option<String>, cause: &str) {
     let Some(Some(target)) = JOURNAL_TARGET.get().cloned() else {
         if !JOURNAL_DROP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
+            elog!(
                 "journal: no --journal target yet; dropping {kind:?} and any \
                  further events until one is set. Timeline gaps downstream are \
                  THIS, not an absence of the events."
@@ -2150,7 +2156,7 @@ fn main() -> std::io::Result<()> {
     // Adding the aliases was the narrow fix; refusing every unrecognised
     // argument is the general one and now lands too — see ACCEPTED_FLAGS.
     if std::env::args().any(|a| a == "--build-version" || a == "--version" || a == "-V") {
-        println!("{}", build_version());
+        olog!("{}", build_version());
         return Ok(());
     }
     // --help must not START A NODE. Until now `--build-version` was the only
@@ -2169,7 +2175,7 @@ fn main() -> std::io::Result<()> {
     // enumerated at BOTH ends first; doing it blind is what broke the suite
     // the first time.
     if std::env::args().any(|a| a == "--help" || a == "-h") {
-        println!("{}", usage());
+        olog!("{}", usage());
         return Ok(());
     }
     // The general fix, now that the caller side is enumerated (BUG-0034).
@@ -2228,7 +2234,7 @@ fn main() -> std::io::Result<()> {
     // Role is dynamic: FLINTPROMOTE flips a replica to master at runtime.
     if let Some(raw) = arg("--evictable-ns") {
         let parsed = parse_evictable_ns(&raw);
-        eprintln!("evictable namespaces: {}", parsed.join(","));
+        elog!("evictable namespaces: {}", parsed.join(","));
         if let Ok(mut g) = EVICTABLE_NS.write() {
             *g = parsed;
         }
@@ -2250,7 +2256,7 @@ fn main() -> std::io::Result<()> {
         Some(raw) => match flint_storage::admission::Mode::parse(raw) {
             Some(m) => m,
             None => {
-                eprintln!("--collection-read-mode: expected `enforce` or `observe`, got `{raw}`");
+                elog!("--collection-read-mode: expected `enforce` or `observe`, got `{raw}`");
                 std::process::exit(2);
             }
         },
@@ -2261,7 +2267,7 @@ fn main() -> std::io::Result<()> {
     // than served. Same rule as `collection_read_unmeasured`: never let "I
     // did not look" render as "nothing was wrong".
     if read_mode == flint_storage::admission::Mode::Observe && read_budget_pct == 0 {
-        eprintln!(
+        elog!(
             "--collection-read-mode observe needs --collection-read-budget-pct > 0: there is \
              no budget to observe against, and collection_read_would_refuse would sit at 0 \
              whatever the workload did"
@@ -2278,14 +2284,14 @@ fn main() -> std::io::Result<()> {
     ));
     if read_budget_pct > 0 {
         let tenths = flint_storage::admission::READ_PEAK_MULTIPLIER_TENTHS;
-        eprintln!(
+        elog!(
             "collection-read-budget-pct: {read_budget_pct} ({}, a read is estimated at {}.{}x its ComplexMeta.bytes)",
             read_mode.as_str(),
             tenths / 10,
             tenths % 10,
         );
         if read_mode == flint_storage::admission::Mode::Observe {
-            eprintln!(
+            elog!(
                 "collection-read-mode: OBSERVE -- nothing will be refused. \
                  collection_read_would_refuse counts what enforcement would have refused, \
                  and OVER-counts it: a refusal sheds the read, so enforcing leaves less \
@@ -2293,7 +2299,7 @@ fn main() -> std::io::Result<()> {
             );
         }
         if flint_storage::mem::sample().is_none() {
-            eprintln!(
+            elog!(
                 "collection-read-budget-pct: node memory is UNREADABLE here, so reads will be \
                  admitted without a budget and counted in collection_read_unmeasured"
             );
@@ -2331,7 +2337,7 @@ fn main() -> std::io::Result<()> {
     // loading one exits once LOADING clears (see `accept_while_loading`).
     let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
     let listener = Arc::new(TcpListener::bind((bind.as_str(), port))?);
-    eprintln!(
+    elog!(
         "flint-server listening on {bind}:{port} ({}) — LOADING",
         if internal_reload.is_some() {
             "internal mTLS"
@@ -2363,7 +2369,7 @@ fn main() -> std::io::Result<()> {
     let store: Arc<dyn Kv> = match engine.as_str() {
         "mem" => {
             if replica_of.is_some() {
-                eprintln!("--replica-of requires --engine rocks");
+                elog!("--replica-of requires --engine rocks");
                 std::process::exit(2);
             }
             Arc::new(MemKv::new())
@@ -2453,7 +2459,7 @@ fn main() -> std::io::Result<()> {
                             // The comment at the FATAL site says why: matching
                             // on the message is what let BUG-0062 recur.
                             if warm_rejoin_failed_at(&dir_path) == Some(cursor) {
-                                eprintln!(
+                                elog!(
                                     "warm rejoin already failed at seq {cursor} on this copy; \
                                      not asking {target} to vouch for it again — taking the \
                                      rewind or re-seed the last tail's FATAL called for"
@@ -2462,7 +2468,7 @@ fn main() -> std::io::Result<()> {
                                 match probe_resume(target, cursor, claim.epoch) {
                                     Ok(()) => {
                                         clear_needs_reseed(&dir_path);
-                                        eprintln!(
+                                        elog!(
                                             "marked copy verified against the lineage held by \
                                          {target}: warm rejoin at seq {cursor} (epoch {})",
                                             claim.epoch
@@ -2475,7 +2481,7 @@ fn main() -> std::io::Result<()> {
                                         warm = true;
                                         remember_reseed_path("warm");
                                     }
-                                    Err(e) => eprintln!(
+                                    Err(e) => elog!(
                                         "marked copy refused by {target} ({e}); trying a rewind"
                                     ),
                                 }
@@ -2503,7 +2509,7 @@ fn main() -> std::io::Result<()> {
                     }
                     if !rewound {
                         remember_reseed_path("full_sync");
-                        eprintln!(
+                        elog!(
                             "{NEEDS_RESEED} present: this copy cannot be continued ({why}) — \
                              discarding it and re-seeding from a checkpoint"
                         );
@@ -2570,7 +2576,7 @@ fn main() -> std::io::Result<()> {
                                     )) =>
                         {
                             attempt += 1;
-                            eprintln!("full sync not ready ({e}); retry {attempt} in 1s");
+                            elog!("full sync not ready ({e}); retry {attempt} in 1s");
                             std::thread::sleep(std::time::Duration::from_secs(1));
                         }
                         Err(e) => return Err(e),
@@ -2602,7 +2608,7 @@ fn main() -> std::io::Result<()> {
                         std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
                     }
                 }
-                eprintln!("restored data dir from snapshot {id}");
+                elog!("restored data dir from snapshot {id}");
                 restored_from_id = Some(id);
             }
             // BUG-0033: the retention seam existed with no caller, so nothing
@@ -2638,7 +2644,7 @@ fn main() -> std::io::Result<()> {
             // quietly. `sample_nearest` stays below as the fallback for when
             // the create itself fails.
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                eprintln!("WAL budget: could not create {dir} before sizing the archive: {e}");
+                elog!("WAL budget: could not create {dir} before sizing the archive: {e}");
             }
             let mut measured = true;
             let derived_mb = match flint_storage::disk::sample_nearest(std::path::Path::new(&dir)) {
@@ -2649,7 +2655,7 @@ fn main() -> std::io::Result<()> {
                     // failed syscall is not evidence about disk space, and a
                     // budget is the one place where believing it costs a
                     // replica its archive.
-                    eprintln!(
+                    elog!(
                         "WAL budget: no filesystem under {dir} could be measured; \
                          using {} MB rather than assuming a small volume",
                         flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB
@@ -2680,7 +2686,7 @@ fn main() -> std::io::Result<()> {
             // would report itself overridden on every boot. A warning that
             // fires when nothing is wrong is a warning nobody reads.
             if wal_ttl != flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS || wal_mb != derived_mb {
-                eprintln!(
+                elog!(
                     "WAL retention OVERRIDDEN: ttl={wal_ttl}s size={wal_mb}MB \
                      (this node would have chosen {}s / {derived_mb}MB) — a \
                      replica that falls outside this window needs a full re-seed",
@@ -2695,11 +2701,11 @@ fn main() -> std::io::Result<()> {
             let stale = std::path::Path::new(&dir).join(FULLSYNC_CKPT_DIR);
             if stale.exists() {
                 match std::fs::remove_dir_all(&stale) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => elog!(
                         "removed {}: a full sync checkpoint left by an earlier run",
                         stale.display()
                     ),
-                    Err(e) => eprintln!("could not remove {}: {e}", stale.display()),
+                    Err(e) => elog!("could not remove {}: {e}", stale.display()),
                 }
             }
             // The flag is parsed before the engine exists, so the engine
@@ -2726,12 +2732,12 @@ fn main() -> std::io::Result<()> {
                 let cursor = kv.latest_seq();
                 kv.set_last_applied(cursor)
                     .map_err(|e| std::io::Error::other(format!("cursor init: {e:?}")))?;
-                eprintln!("full sync complete; tailing from seq {cursor}");
+                elog!("full sync complete; tailing from seq {cursor}");
             } else if rewound {
                 // Covers both marked-rejoin continuations: a verified warm
                 // copy and a fence-checked rewind ("rewound to" names the
                 // second in try_rewind's own log line).
-                eprintln!(
+                elog!(
                     "marked rejoin continues; tailing from seq {}",
                     kv.last_applied()
                 );
@@ -2805,7 +2811,7 @@ fn main() -> std::io::Result<()> {
                 let cursor = kv.latest_seq();
                 kv.set_last_applied(cursor)
                     .map_err(|e| std::io::Error::other(format!("cursor init: {e:?}")))?;
-                eprintln!(
+                elog!(
                     "spare restored from {id}: MASTER at epoch {bumped} (generation bump fences the old lineage)"
                 );
                 journal_event(
@@ -2838,14 +2844,14 @@ fn main() -> std::io::Result<()> {
             match manifest::read_role(&kv).map(|c| c.role) {
                 Some(Role::Master) => {
                     if replica_of.is_some() {
-                        eprintln!("manifest role is master (durable); ignoring --replica-of");
+                        elog!("manifest role is master (durable); ignoring --replica-of");
                         tailer_stop.store(true, Ordering::Relaxed);
                     }
                     // ZOMBIE HAZARD (until the trio's leases land): if this
                     // node was replaced while down, it will serve writes
                     // alongside its successor until FLINTDEMOTE fences it.
                     // The trio will demote returning masters automatically.
-                    eprintln!(
+                    elog!(
                         "booting as MASTER from durable role; if a successor was promoted while this node was down, fence it with FLINTDEMOTE"
                     );
                     read_only.store(false, Ordering::Relaxed);
@@ -2855,11 +2861,11 @@ fn main() -> std::io::Result<()> {
             }
             let kv = Arc::new(kv);
             rocks = Some(Arc::clone(&kv));
-            eprintln!("engine=rocks data-dir={dir}");
+            elog!("engine=rocks data-dir={dir}");
             kv
         }
         other => {
-            eprintln!(
+            elog!(
                 "unknown --engine '{other}' (built-in: mem{})",
                 if cfg!(feature = "rocks") {
                     ", rocks"
@@ -2873,7 +2879,7 @@ fn main() -> std::io::Result<()> {
 
     #[cfg(feature = "rocks")]
     if let (Some(target), Some(kv)) = (replica_of.clone(), rocks.clone()) {
-        eprintln!("replica-of={target} (writes rejected with -READONLY)");
+        elog!("replica-of={target} (writes rejected with -READONLY)");
         let stop = Arc::clone(&tailer_stop);
         // Cloned BEFORE the move: `target` goes into the replication closure.
         let agree_target = target.clone();
@@ -2900,7 +2906,7 @@ fn main() -> std::io::Result<()> {
                     let verdict = match peer_info_field(&master, "evictable_ns") {
                         Some(theirs) if theirs == evictable_ns_joined() => 1,
                         Some(theirs) => {
-                            eprintln!(
+                            elog!(
                                 "EVICTABLE-NS MISMATCH with master {master}: this seat [{}], master [{theirs}] \
                                  — one side may reclaim while the other fills to -QUOTA",
                                 evictable_ns_joined()
@@ -2944,7 +2950,7 @@ fn main() -> std::io::Result<()> {
             .unwrap_or(DEFAULT_FULLSYNC_RATE_BYTES);
         FULLSYNC_RATE_BYTES.store(fullsync_rate_bytes, Ordering::Relaxed);
         if fullsync_rate_bytes == 0 {
-            eprintln!(
+            elog!(
                 "full-sync serve rate UNCAPPED (--fullsync-rate-bytes 0): a re-seed can \
                  starve this node's write path (#184)"
             );
@@ -2955,13 +2961,13 @@ fn main() -> std::io::Result<()> {
             .unwrap_or(DEFAULT_WRITE_DEADLINE_MS);
         WRITE_DEADLINE_MS.store(write_deadline_ms, Ordering::Relaxed);
         if write_deadline_ms == 0 {
-            eprintln!(
+            elog!(
                 "write deadline DISABLED (--write-deadline-ms 0): writes queue without bound \
                  and may complete long after the client gave up (#186)"
             );
         }
         if wal_fsync_ms == 0 {
-            eprintln!("wal fsync cadence DISABLED (--wal-fsync-ms 0): host-loss window unbounded");
+            elog!("wal fsync cadence DISABLED (--wal-fsync-ms 0): host-loss window unbounded");
         }
         if let Some(kv) = rocks.clone() {
             std::thread::spawn(move || {
@@ -2977,7 +2983,7 @@ fn main() -> std::io::Result<()> {
                         continue;
                     }
                     if let Err(e) = kv.flush_wal_sync() {
-                        eprintln!("wal fsync tick failed: {e}");
+                        elog!("wal fsync tick failed: {e}");
                     }
                 }
             });
@@ -3012,7 +3018,7 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(repl_hub::DEFAULT_LAG_HARD_MS);
     if lag_soft != repl_hub::DEFAULT_LAG_SOFT_MS || lag_hard != repl_hub::DEFAULT_LAG_HARD_MS {
-        eprintln!("lag caps: soft={lag_soft}ms hard={lag_hard}ms");
+        elog!("lag caps: soft={lag_soft}ms hard={lag_hard}ms");
     }
     // Safety gate: shed writes while live replicas < this (Redis
     // min-replicas-to-write). Operator-settable, honoured at whatever value is
@@ -3045,14 +3051,14 @@ fn main() -> std::io::Result<()> {
     match arg("--wal-headroom-seq").and_then(|v| v.parse::<u64>().ok()) {
         Some(v) => {
             hub.set_wal_headroom_shed_seq(v);
-            eprintln!("wal headroom shed threshold: {v} sequences (operator override)");
+            elog!("wal headroom shed threshold: {v} sequences (operator override)");
         }
         None => {
             let budget_mb = WAL_BUDGET_MB.load(Ordering::Relaxed);
             let v = repl_hub::headroom_shed_seq_for_budget(budget_mb);
             hub.set_wal_headroom_shed_seq(v);
             HEADROOM_AUTO.store(true, Ordering::Relaxed);
-            eprintln!(
+            elog!(
                 "wal headroom shed threshold: {v} sequences (half of a {budget_mb} MB \
                  archive; starts from an assumed 16 KiB/sequence and re-derives \
                  from OBSERVED bytes/sequence once writes arrive — override \
@@ -3120,27 +3126,27 @@ fn main() -> std::io::Result<()> {
         reserve_coproc_rows: std::env::args().any(|a| a == "--reserve-coproc-rows"),
     };
     if limits.reserve_coproc_rows {
-        eprintln!(
+        elog!(
             "reserve-coproc-rows: on (only a co-processor's channel may write its reserved rows)"
         );
     }
     if limits.stream_groups {
-        eprintln!(
+        elog!(
             "stream-groups: on (XGROUP CREATE may create a consumer group; this fleet cannot roll back below this release while it holds one)"
         );
     }
     if limits.chunked_strings {
-        eprintln!(
+        elog!(
             "chunked-strings: on (strings over 64 KiB are stored in chunks; this fleet cannot roll back below this release while it holds one)"
         );
     }
     if limits.streams {
-        eprintln!(
+        elog!(
             "streams: on (XADD may create a stream; this fleet cannot roll back below this release while it holds one)"
         );
     }
     if limits.max_value_bytes != flint_storage::DEFAULT_MAX_VALUE_BYTES {
-        eprintln!(
+        elog!(
             "max-value-bytes: {}",
             if limits.max_value_bytes == 0 {
                 "unlimited".into()
@@ -3169,9 +3175,12 @@ fn main() -> std::io::Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2_000),
         );
-        eprintln!(
+        elog!(
             "disk guard: min-free {}% or {} bytes, sampling {} every {:?} OR SOONER",
-            thresholds.min_free_pct, thresholds.min_free_bytes, dir, every
+            thresholds.min_free_pct,
+            thresholds.min_free_bytes,
+            dir,
+            every
         );
         let _ = DISK_THRESHOLDS.set(thresholds);
         // The guard thread reclaims as well as sheds, so it needs the engine:
@@ -3204,7 +3213,7 @@ fn main() -> std::io::Result<()> {
                         usage.map(|u| u.free_bytes).unwrap_or(0),
                         usage.map(|u| u.total_bytes).unwrap_or(0)
                     );
-                    eprintln!("disk guard: {last:?} -> {v:?} ({detail})");
+                    elog!("disk guard: {last:?} -> {v:?} ({detail})");
                     journal_event(
                         if v == diskguard::Verdict::Shed {
                             flint_journal::EventKind::DiskShed
@@ -3229,7 +3238,7 @@ fn main() -> std::io::Result<()> {
                         diskguard::ReclaimAction::ReclaimToFreeBytes(b) => b,
                         diskguard::ReclaimAction::Idle => 0,
                     };
-                    eprintln!(
+                    elog!(
                         "capacity reclaim: {} (free {} of {} bytes, target {target})",
                         if now_reclaiming {
                             "ENGAGED"
@@ -3299,7 +3308,7 @@ fn main() -> std::io::Result<()> {
     }
 
     if limits.max_key_bytes != flint_storage::DEFAULT_MAX_KEY_BYTES {
-        eprintln!(
+        elog!(
             "max-key-bytes: {} (structural ceiling {})",
             limits.max_key_bytes,
             flint_storage::MAX_KEY_BYTES
@@ -3330,7 +3339,7 @@ fn main() -> std::io::Result<()> {
                         .unwrap_or(write_queue::DEFAULT_QUEUE_CAP);
                     let scope = match &spec {
                         Some(s) => {
-                            eprintln!("async-writes ENABLED (opt-in write queue): {s} (cap {cap})");
+                            elog!("async-writes ENABLED (opt-in write queue): {s} (cap {cap})");
                             write_queue::AsyncScope::parse(s)
                         }
                         // No static scope: the queue serves only
@@ -3348,7 +3357,7 @@ fn main() -> std::io::Result<()> {
                     ))
                 }
                 (Some(_), None) => {
-                    eprintln!("--async-writes requires --engine rocks");
+                    elog!("--async-writes requires --engine rocks");
                     std::process::exit(2);
                 }
                 (None, None) => None,
@@ -3357,7 +3366,7 @@ fn main() -> std::io::Result<()> {
         #[cfg(not(feature = "rocks"))]
         {
             if arg("--async-writes").is_some() {
-                eprintln!("--async-writes requires a rocks build");
+                elog!("--async-writes requires a rocks build");
                 std::process::exit(2);
             }
             None
@@ -3436,9 +3445,7 @@ fn main() -> std::io::Result<()> {
                     && !read_only.load(Ordering::Relaxed)
                 {
                     read_only.store(true, Ordering::Relaxed);
-                    eprintln!(
-                        "lease expired: self-fenced to read-only (partitioned from controllers)"
-                    );
+                    elog!("lease expired: self-fenced to read-only (partitioned from controllers)");
                     journal_event(
                         flint_journal::EventKind::SelfFenced,
                         None,
@@ -3528,7 +3535,7 @@ fn main() -> std::io::Result<()> {
                     }
                     LeaseRenewal::Superseded(successor) => {
                         read_only.store(true, Ordering::Relaxed);
-                        eprintln!(
+                        elog!(
                             "lease superseded by {successor}: a promotion is on record — self-fenced to read-only"
                         );
                         // NAME THE SUCCESSOR IN THE JOURNAL, not only on stderr
@@ -3587,9 +3594,10 @@ fn main() -> std::io::Result<()> {
                 GC_EXPIRED_TOTAL.fetch_add(report.expired_meta, Ordering::Relaxed);
                 GC_ORPHANS_TOTAL.fetch_add(report.orphan_rows, Ordering::Relaxed);
                 if report.expired_meta + report.orphan_rows > 0 {
-                    eprintln!(
+                    elog!(
                         "gc sweep: reclaimed {} expired meta row(s), {} orphaned subkey row(s)",
-                        report.expired_meta, report.orphan_rows
+                        report.expired_meta,
+                        report.orphan_rows
                     );
                 }
             }
@@ -3616,13 +3624,13 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
-        eprintln!("flint-server holding LOADING for {ms} ms (FLINT_TEST_HOLD_LOADING_MS)");
+        elog!("flint-server holding LOADING for {ms} ms (FLINT_TEST_HOLD_LOADING_MS)");
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
     LOADING.store(false, Ordering::SeqCst);
     let _ = loading_acceptor.join();
     listener.set_nonblocking(false)?;
-    eprintln!("flint-server serving on {bind}:{port}");
+    elog!("flint-server serving on {bind}:{port}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         // Nagle OFF, or a pipelining client pays a delayed ACK per round trip.
@@ -3707,7 +3715,7 @@ fn main() -> std::io::Result<()> {
             let mut conn = match flint_tls::accept(stream, &internal_tls) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("internal tls accept: {e}");
+                    elog!("internal tls accept: {e}");
                     return;
                 }
             };
@@ -6573,7 +6581,7 @@ fn flintpromote(
             if clear_needs_reseed(kv.path()) {
                 remember_reseed_path("lineage");
             }
-            eprintln!("promoted to master at role epoch {epoch}");
+            elog!("promoted to master at role epoch {epoch}");
             journal_event(
                 flint_journal::EventKind::Promoted,
                 Some(epoch.to_string()),
@@ -6707,7 +6715,7 @@ fn flintfollow(
         return Value::Simple(format!("OK already following {addr}"));
     }
     link.repoint.store(true, Ordering::Relaxed);
-    eprintln!("FLINTFOLLOW: re-pointing replication at {addr} (epoch {theirs})");
+    elog!("FLINTFOLLOW: re-pointing replication at {addr} (epoch {theirs})");
     Value::Simple(format!("OK following {addr}"))
 }
 
@@ -6866,16 +6874,16 @@ fn flintdemote(
             // AFTER the marker, so a failure here leaves this copy marked for
             // the re-seed that recovers it rather than trusting a stale number.
             match kv.set_last_applied(own_at_demote) {
-                Ok(()) => eprintln!(
+                Ok(()) => elog!(
                     "demote: replication cursor reset to this copy's own seq \
                      {own_at_demote} (it named a position from a previous replica life)"
                 ),
-                Err(e) => eprintln!(
+                Err(e) => elog!(
                     "demote: could not reset the replication cursor ({e:?}); the \
                      re-seed marker above is what recovers this copy"
                 ),
             }
-            eprintln!(
+            elog!(
                 "demoted to replica at role epoch {epoch} (fenced; wipe + --replica-of to resync)"
             );
             journal_event(
@@ -7285,7 +7293,7 @@ fn drain_acks(
             // sides deadlocked with both send buffers full (soak run 32).
             Ok(Decoded::NeedMore) => match stream.drain_read(&mut chunk) {
                 Ok(0) => {
-                    eprintln!("replication stream ended: replica closed");
+                    elog!("replication stream ended: replica closed");
                     return Ok(false);
                 }
                 Ok(n) => ack_buf.extend_from_slice(&chunk[..n]),
@@ -7296,12 +7304,12 @@ fn drain_acks(
                     return Ok(true); // no more ACK data this tick
                 }
                 Err(e) => {
-                    eprintln!("replication stream ended: ack read error {e}");
+                    elog!("replication stream ended: ack read error {e}");
                     return Err(e);
                 }
             },
             Err(e) => {
-                eprintln!("replication stream ended: ack protocol garbage {e:?}");
+                elog!("replication stream ended: ack protocol garbage {e:?}");
                 return Ok(false);
             }
         }
@@ -7380,7 +7388,7 @@ fn flintsync(
             // The client adopts the translated cursor from the OK line.
             match kv.own_seq_for_upstream(cursor) {
                 Ok(own) => {
-                    eprintln!(
+                    elog!(
                         "rewind attach: upstream cursor {cursor} (epoch {theirs}) maps to \
                          local seq {own}"
                     );
@@ -7457,7 +7465,7 @@ fn flintsync(
         };
         // Counted and logged as the stream's refusals are (BUG-0252).
         WAL_GAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
-        eprintln!(
+        elog!(
             "rejoin refused at seq {cursor}: WALGAP {why} ({held}; {})",
             kv.wal_files_note()
         );
@@ -7503,7 +7511,7 @@ fn flintsync(
     stream.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
     let mut idle = false;
     let mut last_keepalive = std::time::Instant::now();
-    eprintln!("replica connected, streaming from seq {cursor}");
+    elog!("replica connected, streaming from seq {cursor}");
     // The floor drain_acks holds acks to. `cursor` itself advances as batches
     // are served, so the value it had here is kept apart (BUG-0175).
     let served_from = cursor;
@@ -7584,7 +7592,7 @@ fn flintsync(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("replication stream ended: batch write error {e}");
+                                elog!("replication stream ended: batch write error {e}");
                                 return Err(e);
                             }
                         }
@@ -7631,7 +7639,7 @@ fn flintsync(
                     // refusal as its FATAL, and this side used to say nothing
                     // (BUG-0252).
                     WAL_GAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
+                    elog!(
                         "replica refused at seq {cursor}: WALGAP {e} ({held}; {})",
                         kv.wal_files_note()
                     );
@@ -7646,7 +7654,7 @@ fn flintsync(
                 // SequenceGap is apply-side; a master seeing it is a bug —
                 // fail the stream loudly rather than continue.
                 Err(e @ (ReplError::Storage(_) | ReplError::SequenceGap { .. })) => {
-                    eprintln!("replication stream error: {e:?}");
+                    elog!("replication stream error: {e:?}");
                     return Ok(());
                 }
             }
@@ -7735,7 +7743,7 @@ fn flintsnapshot(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
             ));
         }
     }
-    eprintln!("snapshot {id} written to {} ({prune_note})", root.display());
+    elog!("snapshot {id} written to {} ({prune_note})", root.display());
     Value::Simple(format!("OK {id}"))
 }
 
@@ -7784,7 +7792,7 @@ fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> s
         return stream.write_all(&out);
     }
     let _slot = FullSyncGuard;
-    eprintln!(
+    elog!(
         "full sync starting ({}/{} slots in use)",
         FULLSYNC_ACTIVE.load(Ordering::Relaxed),
         MAX_FULLSYNC.load(Ordering::Relaxed)
@@ -7816,7 +7824,7 @@ fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> s
         // as if the master were merely busy, and one this node does not log
         // leaves nothing to read afterwards.
         let _ = std::fs::remove_dir_all(&ckpt);
-        eprintln!(
+        elog!(
             "full sync FAILED: could not checkpoint into {}: {e}",
             ckpt.display()
         );
@@ -7876,7 +7884,7 @@ fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> s
         stream.write_all(&out)
     })();
     let _ = std::fs::remove_dir_all(&ckpt);
-    eprintln!("full sync served");
+    elog!("full sync served");
     result
 }
 
@@ -7953,7 +7961,7 @@ mod replica {
     pub fn run(link: &Arc<super::ReplicaLink>, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) {
         loop {
             if stop.load(Ordering::Relaxed) {
-                eprintln!("tailer stopped (promoted)");
+                elog!("tailer stopped (promoted)");
                 return;
             }
             // The address, every time round: FLINTFOLLOW may have moved it
@@ -7968,9 +7976,9 @@ mod replica {
             // without the error backoff or the WalPurged remedy below, which
             // are about a link that broke, not one that moved.
             if link.repoint.swap(false, Ordering::Relaxed) {
-                eprintln!("tailer now following {target}");
+                elog!("tailer now following {target}");
                 if let Err(e) = tail_once(target, kv, stop, link) {
-                    eprintln!("tail from {target} ended: {e}");
+                    elog!("tail from {target} ended: {e}");
                 }
                 continue;
             }
@@ -7984,7 +7992,7 @@ mod replica {
                 // unprotected, and only a manual wipe recovered it. So take
                 // the remedy WalGap already prescribes: re-seed.
                 if let TailError::WalPurged(why) = &e {
-                    eprintln!(
+                    elog!(
                         "FATAL: {why} — this link can never resume. Marking for re-seed and \
                          exiting; the next start will full-sync from a checkpoint."
                     );
@@ -8021,7 +8029,7 @@ mod replica {
                     if let Some(snaps) = arg("--rewind-snaps") {
                         let cursor = kv.last_applied();
                         let n = quarantine_unresumable(&snaps, cursor);
-                        eprintln!(
+                        elog!(
                             "quarantine: {n} snapshot(s) at or below seq {cursor} disqualified; \
                              the next start has no rewind candidate to lose this race with"
                         );
@@ -8034,7 +8042,7 @@ mod replica {
                     // deliberate exit 3 into a segfault under load.
                     super::hard_exit(3);
                 }
-                eprintln!("replication link lost ({e}); reconnecting in 1s");
+                elog!("replication link lost ({e}); reconnecting in 1s");
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
@@ -8062,7 +8070,7 @@ mod replica {
                     buf.drain(..used);
                     match frame {
                         Value::Simple(s) if s == "FULLSYNC-END" => {
-                            eprintln!("full sync: received {} files", seen.len());
+                            elog!("full sync: received {} files", seen.len());
                             return Ok(());
                         }
                         Value::Error(e) => {
@@ -8166,7 +8174,7 @@ mod replica {
             &mut out,
         );
         stream.write_all(&out)?;
-        eprintln!("replicating from {target} starting at seq {cursor} (epoch {claim_epoch})");
+        elog!("replicating from {target} starting at seq {cursor} (epoch {claim_epoch})");
 
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 64 * 1024];
@@ -8292,13 +8300,13 @@ mod replica {
                                     })?;
                                 }
                                 if let Some(c) = to_cursor {
-                                    eprintln!(
+                                    elog!(
                                         "adopted the master's translated cursor {c}: tailing \
                                          its sequence space now (asked from {asked})"
                                     );
                                 }
                                 if let Some(e) = to_epoch {
-                                    eprintln!(
+                                    elog!(
                                         "adopted the master's role epoch {e}: this copy is \
                                          on its timeline now"
                                     );
@@ -9793,7 +9801,7 @@ mod serve_tests {
         }
         let el = start.elapsed().as_secs_f64();
         let total = conns * per;
-        println!(
+        olog!(
             "PIPELINED_SET conns={conns} total={total} in {el:.3}s = {:.0} sets/s",
             total as f64 / el
         );

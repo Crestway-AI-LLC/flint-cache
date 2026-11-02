@@ -1592,7 +1592,7 @@ mod tests {
                 in_knn as f64 / truths as f64,
                 page_hits as f64 / page_truths as f64,
             );
-            eprintln!("{metric}: range recall {range:.3}, its first page {page:.3}, KNN {knn:.3}");
+            elog!("{metric}: range recall {range:.3}, its first page {page:.3}, KNN {knn:.3}");
             assert!(
                 range >= floor && page >= floor,
                 "{metric}: range {range}, page {page}"

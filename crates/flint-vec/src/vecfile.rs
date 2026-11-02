@@ -245,7 +245,7 @@ mod tests {
                     }
                     spent += t.elapsed();
                 }
-                eprintln!(
+                elog!(
                     "{} cold={cold} hinted={hinted}: {:.0} us per 40 reads",
                     dir.display(),
                     spent.as_secs_f64() * 1e6 / queries.len() as f64

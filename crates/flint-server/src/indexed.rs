@@ -70,7 +70,7 @@ impl Indexed {
         store.for_each_prefix(ROW_PREFIX, &mut |k, v| {
             let ns = k[ROW_PREFIX.len()..].to_vec();
             let prefixes = decode(v).unwrap_or_else(|| {
-                eprintln!(
+                elog!(
                     "flint-server: indexed-prefix row of ns {:?} is unreadable; guarding every write of it",
                     String::from_utf8_lossy(&ns)
                 );

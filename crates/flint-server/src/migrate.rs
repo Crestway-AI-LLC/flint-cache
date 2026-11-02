@@ -248,7 +248,7 @@ pub(crate) fn flintmigrateout(
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("migrateout stream error: {e:?}");
+                elog!("migrateout stream error: {e:?}");
                 return Ok(());
             }
         }
@@ -334,7 +334,7 @@ fn migrate_in(
         // It is durable and it lands FIRST, so dying anywhere below leaves the
         // fact recoverable rather than leaving a lie.
         if let Err(e) = set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Aborted, src) {
-            eprintln!("cutover rollback: slot {slot} could not record Aborted: {e:?}");
+            elog!("cutover rollback: slot {slot} could not record Aborted: {e:?}");
         }
 
         // Then unfreeze the source. We are the right actor: we KNOW we
@@ -356,7 +356,7 @@ fn migrate_in(
             // KEEP the Aborted marker. It is now the only durable evidence
             // that the source is frozen on our account, and it is what stops a
             // reconcile from mistaking that freeze for a half-done flip.
-            eprintln!(
+            elog!(
                 "cutover rollback: slot {slot} could not be unfrozen on {src} ({r:?}) \
                  — Aborted marker retained so recovery unfreezes it rather than \
                  completing a flip onto us"

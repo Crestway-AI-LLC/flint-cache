@@ -504,7 +504,7 @@ fn block_cache_bytes() -> usize {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(mb) if mb > 0 => mb * 1024 * 1024,
             _ => {
-                eprintln!(
+                elog!(
                     "FLINT_BLOCK_CACHE_MB={v:?} is not a positive integer; \
                      using the {} MiB default",
                     BLOCK_CACHE_BYTES / (1024 * 1024)
@@ -818,7 +818,7 @@ impl RocksKv {
         // dump into the info LOG; enabling this alone records but never prints.
         if env_u64("FLINT_ROCKS_STATS").is_some_and(|v| v != 0) {
             opts.enable_statistics();
-            eprintln!(
+            elog!(
                 "rocksdb statistics ENABLED (FLINT_ROCKS_STATS) — profiling only, \
                  this instrument perturbs the path it measures"
             );
@@ -2407,7 +2407,7 @@ mod alloc_count {
             "with_value should allocate ~never — it borrows the block-cache \
              entry — but allocated {borrowing} times over {N} reads"
         );
-        eprintln!(
+        elog!(
             "  [alloc] {N} reads: get={copying} with_value={borrowing} \
              ({:.2} vs {:.2} per read)",
             copying as f64 / N as f64,

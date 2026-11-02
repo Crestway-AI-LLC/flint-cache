@@ -53,6 +53,12 @@
 // `flint-balance` library so the managed plane reuses the same
 // metric-agnostic planner (fed a different load metric). Aliased to
 // `planner` to keep call sites unchanged.
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 use flint_balance as planner;
 
 use std::io::{Read, Write};
@@ -827,7 +833,7 @@ impl Pair {
             .last_page
             .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
         {
-            eprintln!("{msg}");
+            elog!("{msg}");
             self.last_page = Some(Instant::now());
         }
     }
@@ -855,12 +861,13 @@ impl Pair {
                 .as_deref()
                 .filter(|d| std::path::Path::new(d).join("LATEST").exists());
             if let Some(root) = restore {
-                eprintln!(
+                elog!(
                     "[{}][{}] WHOLE PAIR DARK — restoring spare from snapshot root {root}",
-                    cfg.id, self.label
+                    cfg.id,
+                    self.label
                 );
             } else {
-                eprintln!("[{}][{}] bootstrapping managed pair", cfg.id, self.label);
+                elog!("[{}][{}] bootstrapping managed pair", cfg.id, self.label);
             }
             let c0 = spawn_slot(&cfg.bin, &self.slots[0], None, cfg.min_replicas, restore);
             self.reap(0, c0);
@@ -965,7 +972,7 @@ impl Pair {
                             &format!("scheduled snapshot into {dir}: {reply}"),
                         ),
                         other => {
-                            eprintln!("[{id}][{label}] snapshot on {addr} failed: {other:?}")
+                            elog!("[{id}][{label}] snapshot on {addr} failed: {other:?}")
                         }
                     }
                 });
@@ -1043,9 +1050,11 @@ impl Pair {
                     }
                     self.slot_miss[i] += 1;
                     if self.slot_miss[i] >= cfg.confirm {
-                        eprintln!(
+                        elog!(
                             "[{}][{}] slot :{} dead — respawning as fresh replica of {legit_addr}",
-                            cfg.id, self.label, self.slots[i].port
+                            cfg.id,
+                            self.label,
+                            self.slots[i].port
                         );
                         let c = spawn_slot(
                             &cfg.bin,
@@ -1132,9 +1141,10 @@ impl Pair {
                 Some(ms) if ms > 0 => {
                     if !self.hold_announced {
                         self.hold_announced = true;
-                        eprintln!(
+                        elog!(
                             "[{}][{}] holding: a planned handover is in progress on this pair (CP hold, {ms} ms left) -- not promoting into its gap",
-                            cfg.id, self.label
+                            cfg.id,
+                            self.label
                         );
                     }
                     self.hold_recheck_at =
@@ -1143,9 +1153,10 @@ impl Pair {
                 }
                 _ => {
                     if self.hold_announced {
-                        eprintln!(
+                        elog!(
                             "[{}][{}] the handover's hold ended with no master on the pair -- resuming failover",
-                            cfg.id, self.label
+                            cfg.id,
+                            self.label
                         );
                     }
                     self.hold_announced = false;
@@ -1178,9 +1189,11 @@ impl Pair {
         if !self.converged_ever || self.last_converged.elapsed() > cfg.max_stale {
             match insync_lineage_holder(&states) {
                 Some(h) => {
-                    eprintln!(
+                    elog!(
                         "[{}][{}] no master-claimer, but {} holds the top epoch with a caught-up replica — self-fenced, recovering it (#168)",
-                        cfg.id, self.label, h.addr
+                        cfg.id,
+                        self.label,
+                        h.addr
                     );
                     journal_event(
                         &cfg.id,
@@ -1197,9 +1210,11 @@ impl Pair {
                 // there whole into a permanent write outage.
                 None => match remembered_lineage_holder(&states, &self.last_insync) {
                     Some(h) => {
-                        eprintln!(
+                        elog!(
                             "[{}][{}] no master-claimer and no PROVABLE in-sync node, but {} is the member last observed holding the lineage and still holds the top epoch — recovering it (#171)",
-                            cfg.id, self.label, h.addr
+                            cfg.id,
+                            self.label,
+                            h.addr
                         );
                         journal_event(
                             &cfg.id,
@@ -1288,9 +1303,13 @@ impl Pair {
         // acquired a master-CLAIMER since the decision was taken.
         let recheck: Vec<Node> = self.nodes.iter().map(|a| observe(a)).collect();
         if let Some(m) = master_holds_top_epoch(&recheck, max_epoch) {
-            eprintln!(
+            elog!(
                 "[{}][{}] abandoning the promotion of {}: {} claims master at epoch {} on a re-read, so the decision was taken against a pair that has since acquired one",
-                cfg.id, self.label, survivor.addr, m.addr, m.epoch
+                cfg.id,
+                self.label,
+                survivor.addr,
+                m.addr,
+                m.epoch
             );
             journal_event(
                 &cfg.id,
@@ -1351,7 +1370,7 @@ impl Pair {
         // Three strings on a path that only runs when a promotion is already
         // happening. The RTO-critical work is the FLINTPROMOTE call under it.
         if !self.no_master_ticks.is_empty() {
-            eprintln!(
+            elog!(
                 "[{}][{}] no master for {}/{} ticks ({}) — promoting {}",
                 cfg.id,
                 self.label,
@@ -1366,9 +1385,11 @@ impl Pair {
             &[b"FLINTPROMOTE", b"0", next.to_string().as_bytes()],
         ) {
             Ok(Value::Simple(s)) => {
-                eprintln!(
+                elog!(
                     "[{}][{}] PROMOTED {} at (0,{next}): {s}",
-                    cfg.id, self.label, survivor.addr
+                    cfg.id,
+                    self.label,
+                    survivor.addr
                 );
                 journal_event(
                     &cfg.id,
@@ -1414,18 +1435,26 @@ impl Pair {
                 // never allowed to fail the promotion that already succeeded.
                 for other in states.iter().filter(|n| n.addr != survivor.addr) {
                     match call(&other.addr, &[b"FLINTFOLLOW", survivor.addr.as_bytes()]) {
-                        Ok(Value::Simple(_)) => eprintln!(
+                        Ok(Value::Simple(_)) => elog!(
                             "[{}][{}] re-pointed {} at {}",
-                            cfg.id, self.label, other.addr, survivor.addr
+                            cfg.id,
+                            self.label,
+                            other.addr,
+                            survivor.addr
                         ),
-                        Ok(v) => eprintln!(
+                        Ok(v) => elog!(
                             "[{}][{}] {} declined to follow {}: {v:?}",
-                            cfg.id, self.label, other.addr, survivor.addr
+                            cfg.id,
+                            self.label,
+                            other.addr,
+                            survivor.addr
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => elog!(
                             "[{}][{}] {} unreachable to re-point ({e}); it re-points when \
                              flintctl restarts it",
-                            cfg.id, self.label, other.addr
+                            cfg.id,
+                            self.label,
+                            other.addr
                         ),
                     }
                 }
@@ -1433,15 +1462,18 @@ impl Pair {
             // -FENCED here means another controller already promoted at this
             // or a higher epoch: the desired outcome exists, so it's fine.
             Ok(Value::Error(e)) if e.starts_with("FENCED") => {
-                eprintln!(
+                elog!(
                     "[{}][{}] promotion fenced (another controller won): {e}",
-                    cfg.id, self.label
+                    cfg.id,
+                    self.label
                 );
                 self.no_master_streak = 0;
             }
-            other => eprintln!(
+            other => elog!(
                 "[{}][{}] promotion of {} failed: {other:?}",
-                cfg.id, self.label, survivor.addr
+                cfg.id,
+                self.label,
+                survivor.addr
             ),
         }
     }
@@ -1503,7 +1535,7 @@ fn main() {
     // is the only way to interrogate the file directly, and the running
     // process reports itself by REGISTERING with the CP instead (below).
     if std::env::args().any(|a| a == "--build-version") {
-        println!("{}", build_version());
+        olog!("{}", build_version());
         return;
     }
     // Internal-mesh mutual TLS toward the nodes (the controller is a client
@@ -1530,7 +1562,7 @@ fn main() {
     // error, not a silent fallback to the wrong metric.
     let policy_name = arg("--balance-policy").unwrap_or_else(|| "size".into());
     let balance_policy = planner::policy_by_name(&policy_name).unwrap_or_else(|| {
-        eprintln!("unknown --balance-policy '{policy_name}' (open stack ships: size)");
+        elog!("unknown --balance-policy '{policy_name}' (open stack ships: size)");
         std::process::exit(2);
     });
 
@@ -1594,7 +1626,7 @@ fn main() {
         "need --nodes/--pairs, --manage-slots/--manage-pairs, or --recover-nodes"
     );
 
-    eprintln!(
+    elog!(
         "[{}] flint-controller: {} pair(s) recover-nodes={} poll={:?} confirm={} balance-policy={}",
         cfg.id,
         pairs.len(),
@@ -1686,15 +1718,19 @@ fn main() {
                     loads.iter().map(|l| (l.label.clone(), l.fill)).collect();
                 let plan = planner::plan_moves(&loads, cfg.rebalance_deadband);
                 match plan.first() {
-                    None => eprintln!(
+                    None => elog!(
                         "[{}] rebalance: balanced within deadband {:.2} — fills={fills:?}",
-                        cfg.id, cfg.rebalance_deadband
+                        cfg.id,
+                        cfg.rebalance_deadband
                     ),
                     Some(_) if !cfg.rebalance_execute => {
                         for m in &plan {
-                            eprintln!(
+                            elog!(
                                 "[{}] rebalance PLAN (dry-run): move ~{} load from {} to {} — fills={fills:?}",
-                                cfg.id, m.approx, m.from, m.to
+                                cfg.id,
+                                m.approx,
+                                m.from,
+                                m.to
                             );
                         }
                     }
@@ -1709,10 +1745,12 @@ fn main() {
                                 }
                             }
                         }
-                        None => eprintln!(
+                        None => elog!(
                             "[{}] rebalance: move {}->{} deferred — the control plane could \
                              not say which tenants are placed on one pair (ADR-0053)",
-                            cfg.id, m.from, m.to
+                            cfg.id,
+                            m.from,
+                            m.to
                         ),
                     },
                 }
@@ -1853,9 +1891,11 @@ fn execute_move(
         return true;
     };
     if has_inflight_migration(src) || has_inflight_migration(dst) {
-        eprintln!(
+        elog!(
             "[{}] rebalance: move {}->{} deferred — a migration is already in flight",
-            cfg.id, m.from, m.to
+            cfg.id,
+            m.from,
+            m.to
         );
         return true;
     }
@@ -1864,9 +1904,12 @@ fn execute_move(
     if units.is_empty() {
         return false;
     }
-    eprintln!(
+    elog!(
         "[{}] rebalance EXECUTE: ~{} load {}({src}) -> {}({dst}), units {units:?} — fills={fills:?}",
-        cfg.id, m.approx, m.from, m.to
+        cfg.id,
+        m.approx,
+        m.from,
+        m.to
     );
     for (ns, slot) in units {
         match call_slow(
@@ -1881,9 +1924,11 @@ fn execute_move(
             Duration::from_secs(120),
         ) {
             Ok(Value::Simple(s)) => {
-                eprintln!(
+                elog!(
                     "[{}] rebalance: {ns}/{slot} {}->{}: {s}",
-                    cfg.id, m.from, m.to
+                    cfg.id,
+                    m.from,
+                    m.to
                 );
                 // Option B: the cutover is durable on the nodes; now commit
                 // the ownership truth to the CP so every proxy (including
@@ -1906,7 +1951,7 @@ fn execute_move(
                             dst.as_bytes(),
                         ],
                     );
-                    eprintln!(
+                    elog!(
                         "[{}] rebalance: CPSETSLOT {ns}/{slot} -> {dst}: {r:?}",
                         cfg.id
                     );
@@ -1915,7 +1960,7 @@ fn execute_move(
             other => {
                 // Stop the cycle; recovery reconciles any half-done state and
                 // the next cycle re-plans from observed reality.
-                eprintln!(
+                elog!(
                     "[{}] rebalance: {ns}/{slot} move failed ({other:?}) — yielding to recovery",
                     cfg.id
                 );
@@ -1984,9 +2029,10 @@ fn recover_migrations(cfg: &Config) {
     for rec in &importing {
         let (dest, src) = (&rec.node, &rec.peer);
         if reachable(src) {
-            eprintln!(
+            elog!(
                 "[{}] recovery: resuming import of slot {} into {dest} from {src}",
-                cfg.id, rec.slot
+                cfg.id,
+                rec.slot
             );
             let r = call_slow(
                 dest,
@@ -1999,14 +2045,16 @@ fn recover_migrations(cfg: &Config) {
                 ],
                 Duration::from_secs(120),
             );
-            eprintln!(
+            elog!(
                 "[{}] recovery: resume of slot {} -> {r:?}",
-                cfg.id, rec.slot
+                cfg.id,
+                rec.slot
             );
         } else {
-            eprintln!(
+            elog!(
                 "[{}] recovery: source {src} unreachable — aborting import of slot {} at {dest}",
-                cfg.id, rec.slot
+                cfg.id,
+                rec.slot
             );
             let _ = call(
                 dest,
@@ -2039,10 +2087,11 @@ fn recover_migrations(cfg: &Config) {
             .iter()
             .any(|a| &a.node == dest && a.slot == rec.slot)
         {
-            eprintln!(
+            elog!(
                 "[{}] recovery: dest {dest} ABORTED slot {} — unfreezing {src} \
                  instead of completing the flip",
-                cfg.id, rec.slot
+                cfg.id,
+                rec.slot
             );
             let _ = call(
                 src,
@@ -2065,9 +2114,10 @@ fn recover_migrations(cfg: &Config) {
             continue;
         }
         if reachable(dest) {
-            eprintln!(
+            elog!(
                 "[{}] recovery: completing flip of slot {} — {src} -> Moved to {dest}",
-                cfg.id, rec.slot
+                cfg.id,
+                rec.slot
             );
             let _ = call(
                 src,
@@ -2079,9 +2129,10 @@ fn recover_migrations(cfg: &Config) {
                 ],
             );
         } else {
-            eprintln!(
+            elog!(
                 "[{}] recovery: dest {dest} gone — unfreezing slot {} on {src}",
-                cfg.id, rec.slot
+                cfg.id,
+                rec.slot
             );
             let _ = call(
                 src,
@@ -2104,10 +2155,11 @@ fn recover_migrations(cfg: &Config) {
         {
             continue; // handled above, or will be next cycle
         }
-        eprintln!(
+        elog!(
             "[{}] recovery: clearing stale abort marker for slot {} on {dest} \
              (source {src} is not frozen for it)",
-            cfg.id, rec.slot
+            cfg.id,
+            rec.slot
         );
         let _ = call(
             dest,
@@ -2125,11 +2177,11 @@ fn fence(id: &str, zombie: &str, epoch: u32) {
         zombie,
         &[b"FLINTDEMOTE", b"0", epoch.to_string().as_bytes()],
     ) {
-        Ok(Value::Simple(s)) => eprintln!("[{id}] FENCED {zombie} at (0,{epoch}): {s}"),
+        Ok(Value::Simple(s)) => elog!("[{id}] FENCED {zombie} at (0,{epoch}): {s}"),
         Ok(Value::Error(e)) if e.starts_with("FENCED") => {
-            eprintln!("[{id}] fence of {zombie} already done by a peer: {e}")
+            elog!("[{id}] fence of {zombie} already done by a peer: {e}")
         }
-        other => eprintln!("[{id}] fence of {zombie} failed: {other:?}"),
+        other => elog!("[{id}] fence of {zombie} failed: {other:?}"),
     }
 }
 

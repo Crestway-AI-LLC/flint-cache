@@ -19,6 +19,12 @@
 //!
 //! Omit --ca/--cert/--key for a plaintext (dev) fleet.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -216,7 +222,7 @@ fn main() {
     let coprocs = multi("--coproc");
     let admin = one("--admin-token");
     if nodes.is_empty() && proxies.is_empty() && coprocs.is_empty() {
-        eprintln!(
+        elog!(
             "usage: flint-exporter --port N --node H:P... --proxy H:P... [--coproc H:P...] [--ca --cert --key] [--admin-token T]"
         );
         std::process::exit(2);
@@ -229,7 +235,7 @@ fn main() {
         _ => None,
     };
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind metrics port");
-    eprintln!(
+    elog!(
         "flint-exporter on :{port} ({} node(s), {} proxy(ies), {} co-processor(s), tls={})",
         nodes.len(),
         proxies.len(),

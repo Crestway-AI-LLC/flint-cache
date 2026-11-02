@@ -17,6 +17,13 @@
 //! arrives with the storage spike; `TypeStore` arrives with the encoding
 //! layer.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+// Its lines are in `repl` and `rocks`, which the `rocksdb` feature builds.
+#[cfg_attr(feature = "rocksdb", macro_use)]
+extern crate flint_log;
+
 pub mod admission;
 pub mod batch;
 pub mod bloom;

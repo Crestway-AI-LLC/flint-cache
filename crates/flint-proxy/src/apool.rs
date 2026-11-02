@@ -206,7 +206,7 @@ impl AsyncConn {
             }
             // The trigger, not just the storm. The shared pool logged neither,
             // so a fleet collapse could be observed but never explained.
-            eprintln!("apool: backend {addr} died: {why} (failed={n} in flight)");
+            elog!("apool: backend {addr} died: {why} (failed={n} in flight)");
         });
         *conn.reader.borrow_mut() = Some(handle);
         LIVE_CONNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

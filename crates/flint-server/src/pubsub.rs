@@ -85,7 +85,7 @@ impl Outbox {
                     .as_ref()
                     .and_then(|s| s.peer_addr().ok())
                     .map_or_else(|| "an unknown address".into(), |a| a.to_string());
-                eprintln!(
+                elog!(
                     "pubsub: cut off the subscriber link from {peer}, {} MiB behind (ADR-0052): \
                      its proxy's clients lose this seat's messages until it dials again",
                     OUTBOX_LIMIT_BYTES >> 20

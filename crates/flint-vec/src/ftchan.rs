@@ -345,7 +345,7 @@ pub(crate) fn handle(
             // misses this still sends their writes here, which writes them.
             let left = store.lock().expect("store lock").ft_prefixes(ns);
             if let Err(e) = register(&mut ch, &left) {
-                eprintln!(
+                elog!(
                     "flint-vec: ns {:?} FT.DROPINDEX: {e:?}; the dropped prefixes stay guarded until the next rebuild",
                     String::from_utf8_lossy(ns)
                 );
@@ -473,7 +473,7 @@ fn write(ns: &[u8], plan: &WritePlan, store: &Arc<Mutex<Store>>, g: &mut Grant<'
             Ok(Some(d)) => {
                 let left = store.lock().expect("store lock").ft_reindex(ns, key, &d);
                 for why in left {
-                    eprintln!(
+                    elog!(
                         "flint-vec: ns {:?} key {:?} left out of index {why}",
                         String::from_utf8_lossy(ns),
                         String::from_utf8_lossy(key)
@@ -489,7 +489,7 @@ fn write(ns: &[u8], plan: &WritePlan, store: &Arc<Mutex<Store>>, g: &mut Grant<'
                     .lock()
                     .expect("store lock")
                     .ft_reindex(ns, key, &DocRead::default());
-                eprintln!(
+                elog!(
                     "flint-vec: ns {:?} key {:?} written but not read back; out of its index until written again",
                     String::from_utf8_lossy(ns),
                     String::from_utf8_lossy(key)
@@ -608,7 +608,7 @@ fn run_fill(ch: &mut flint_tls::Stream, ns: &[u8], fill: Fill, store: &Arc<Mutex
             FILLS.lock().expect("fills lock").insert(key, (more, false));
         }
         Err(e) => {
-            eprintln!(
+            elog!(
                 "flint-vec: ns {:?} index {:?} backfill: {e}; resuming on the next search",
                 String::from_utf8_lossy(ns),
                 String::from_utf8_lossy(&index)
@@ -677,7 +677,7 @@ pub(crate) fn load_chunk(
                     };
                     let Some(def) = std::str::from_utf8(&row).ok().and_then(IndexDef::decode)
                     else {
-                        eprintln!(
+                        elog!(
                             "flint-vec: ns {:?} index {:?} left out: its definition row is one this binary cannot read",
                             String::from_utf8_lossy(ns),
                             String::from_utf8_lossy(&name)

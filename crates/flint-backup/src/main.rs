@@ -23,6 +23,12 @@
 //! `verify` takes only a store location: it must work when the cluster it
 //! came from no longer exists, which is the case it is for.
 
+// BUG-0276: a log line that cannot be written is dropped, not a panic.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
+#[macro_use]
+extern crate flint_log;
+
 mod s3;
 
 use flint_backup::store::{LocalDir, ObjectStore};
@@ -34,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn die(msg: &str) -> ! {
-    eprintln!("flint-backup: {msg}");
+    elog!("flint-backup: {msg}");
     std::process::exit(1)
 }
 
@@ -191,9 +197,9 @@ fn main() {
         Some("restore-ns") => restore_ns(),
         Some("schedule") => schedule(),
         Some("inspect") => inspect(),
-        Some("--build-version") => println!("{}", flint_build::version(env!("CARGO_PKG_VERSION"))),
+        Some("--build-version") => olog!("{}", flint_build::version(env!("CARGO_PKG_VERSION"))),
         _ => {
-            eprintln!(
+            elog!(
                 "usage:\n  \
                  flint-backup run        --pairs <a,b;c,d> --cp-state <path> --to <dir|s3://bucket/prefix> \
                  [--tls <certs-dir>] [--snap-root <dir>]\n  \
@@ -215,9 +221,13 @@ fn verify() {
     let store = open_store(&from);
     match flint_backup::load_verified(store.as_ref()) {
         Ok((m, r)) => {
-            println!(
+            olog!(
                 "OK {} — {} objects, {} bytes, taken {} by {}",
-                r.id, r.objects, r.bytes, m.finished_ms, m.release
+                r.id,
+                r.objects,
+                r.bytes,
+                m.finished_ms,
+                m.release
             );
         }
         // The exit status is the answer, so a scheduler can branch on it
@@ -262,9 +272,11 @@ fn restore() {
         Ok(v) => v,
         Err(e) => die(&e.to_string()),
     };
-    println!(
+    olog!(
         "set {} verified: {} objects, {} bytes",
-        report.id, report.objects, report.bytes
+        report.id,
+        report.objects,
+        report.bytes
     );
 
     for pair in &manifest.pairs {
@@ -378,7 +390,7 @@ fn restore() {
                 survivors.join(", ")
             ));
         }
-        println!(
+        olog!(
             "pair {} restored from {} (epoch {} at seq {}): scrubbed {} role, {} claim(s), {} migration(s), {} repl cursor(s); kept {} promotion fence(s) — verified across a reopen",
             pair.index,
             pair.master,
@@ -402,7 +414,7 @@ fn restore() {
         .unwrap_or_else(|e| die(&format!("create cp-state: {e}")));
     std::io::copy(&mut r, &mut f).unwrap_or_else(|e| die(&format!("copy cp-state: {e}")));
 
-    println!(
+    olog!(
         "OK restored {} into {into} — {} pair(s) + cp-state, system rows scrubbed; \
          nothing was started, and the restored cluster must mint its own CA",
         manifest.id,
@@ -476,9 +488,11 @@ fn restore_ns() {
         Ok(v) => v,
         Err(e) => die(&e.to_string()),
     };
-    println!(
+    olog!(
         "set {} verified: {} objects, {} bytes",
-        report.id, report.objects, report.bytes
+        report.id,
+        report.objects,
+        report.bytes
     );
 
     // Current ownership, from the CP: pair addresses + default ranges, and
@@ -634,7 +648,7 @@ fn restore_ns() {
         .filter(|(_, n)| **n > 0)
         .map(|(i, n)| format!("pair {i}: {n} rows"))
         .collect();
-    println!(
+    olog!(
         "OK restored {total} rows of {src_ns:?} into namespace {dest_ns:?} by current \
          ownership ({}); the live namespace was not touched",
         placed.join(", ")
@@ -704,11 +718,11 @@ fn inspect() {
         true
     });
     if rows.is_empty() {
-        println!("none — no system rows");
+        olog!("none — no system rows");
         return;
     }
     for (k, len) in &rows {
-        println!(
+        olog!(
             "{} ({len} bytes)",
             String::from_utf8_lossy(k).escape_debug()
         );
@@ -980,7 +994,7 @@ fn schedule() {
         );
     }
 
-    eprintln!(
+    elog!(
         "schedule: backup every {every:?}, verify {verify_every:?}, rehearse {rehearse_every:?}, keep {keep}, to {to}"
     );
     // The status file is rewritten after every pass — atomically, since an
@@ -1166,9 +1180,10 @@ fn run() {
     // are still in page cache, and it is the only thing standing between
     // "the job succeeded" and "the job produced something restorable".
     match flint_backup::load_verified(store.as_ref()) {
-        Ok((_, r)) => println!(
+        Ok((_, r)) => olog!(
             "OK {id} — {} objects, {} bytes, verified",
-            r.objects, r.bytes
+            r.objects,
+            r.bytes
         ),
         Err(e) => die(&format!("set written but does not verify: {e}")),
     }

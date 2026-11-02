@@ -481,7 +481,7 @@ pub async fn run_client(
     tls_server: Option<Arc<flint_tls::ReloadableServerConfig>>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind_host.as_str(), port)).await?;
-    eprintln!(
+    elog!(
         "flint-controlplane[raft node {}] client on :{port} ({})",
         ha.node_id,
         if tls_server.is_some() {
@@ -1621,7 +1621,7 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     families.clone(),
                 ))
             {
-                eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
+                elog!("watch {proxy}: suppressed push at version {v} (view unchanged)");
                 acked = v;
                 continue;
             }
