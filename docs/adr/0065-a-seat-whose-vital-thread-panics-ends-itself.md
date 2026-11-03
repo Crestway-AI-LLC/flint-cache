@@ -1,7 +1,8 @@
 # ADR-0065: A seat whose vital thread panics ends itself, rather than serve on without it
 
 Status: **ACCEPTED 2026-11-02, option A** (Jeff: "go with your
-recommendation"). **Proposed 2026-11-02.** Being built.
+recommendation"); **BUILT 2026-11-02** (As built, below). **Proposed
+2026-11-02.**
 From the error-handling review's cross-cutting sweep
 (`docs/error-handling-review.md`, area N).
 
@@ -86,3 +87,32 @@ condition the product could end itself.
   over, and no acknowledged write is lost.
 - `spawn_reporting`'s panic counts in `thread_panics_total`, and the seat goes
   on serving.
+
+## As built (public `653744b3`, gate a65v PASS 181, 2026-11-02; ships in v0.1.0-rc.87)
+
+- `spawn_vital(name, f)` starts replication (`replication`), the WAL fsync
+  (`wal-fsync`), the disk guard (`disk-guard`), the lease watchdog
+  (`lease-watchdog`) and renewal (`lease-renewal`), and GC (`gc`). Each runs
+  under `catch_unwind` in a thread of that name. On a panic it logs `vital
+  thread <name> panicked; exiting with status 70` and calls `hard_exit(70)`.
+- `spawn_reporting(name, f)` starts the pair-agreement check
+  (`pair-agreement`), the engine-write sampler (`engine-sampler`) and
+  automatic WAL headroom (`wal-headroom`). A panic is logged and counted in
+  `FLINTINFO`'s `thread_panics_total`, in both builds.
+- `hard_exit` is in every build now: the lease and GC threads run in a `mem`
+  build too.
+- **Not journaled.** A new journal event kind would not decode on a control
+  plane still on the previous release during a roll. The log line and the
+  seat's exit, which every check that watches seats already sees, are the
+  record.
+- The test-only `FLINT_TEST_PANIC_THREAD=<name>:<ms>` panics a named thread
+  that long after it starts. flintctl lists it among the names a seat reads.
+- **Held by** `vital_thread_tests` (the fail-stop, in a child process, with
+  its status and line; a reporting panic counted) in both builds, and the
+  `vital_thread` drill: a master's `wal-fsync` panic exits 70 and its restart
+  has all 50 acknowledged writes; a replica's `replication` panic exits 70
+  and its restart catches up; an `engine-sampler` panic is counted while the
+  seat serves, and the control seat counts none.
+- **Not drilled here:** a master's pair failing over after its exit. A
+  stopped master's failover is what `failover` and the chaos drills hold.
+
