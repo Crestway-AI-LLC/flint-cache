@@ -101,6 +101,12 @@ The master's stream to its replicas, the replica's apply loop, full sync, and th
 
 **Rules and history:** [ADR-0019](adr/0019-rewind-rejoin-promotion-fences.md), [ADR-0022](adr/0022-wal-retention-bounded-by-replica-progress.md), [BUG-0070](bugs/0070-the-rejoin-probe-scans-the-wal-so-rto-grows-with-uptime.md), [BUG-0143](bugs/0143-the-wal-gap-quarantine-does-not-always-fire-when-the-span-is-gone.md), [BUG-0162](bugs/0162-a-wal-file-that-vanishes-under-a-walk-is-reported-as-an-unrecoverable-gap.md), [BUG-0196](bugs/0196-a-replica-and-master-that-disagree-about-the-stream-lose-writes-silently.md), [failover.md](failover.md)
 
+**Swept so far (2026-11-05, against main after the pin).**
+
+- **A full sync cut off part way** cannot serve a partial copy: RocksDB refuses it at open. But once `CURRENT` had arrived, which the master's `read_dir` order allows, the replica exited at open on every start and needed its directory deleted by hand ([BUG-0279](bugs/0279-a-replica-whose-first-full-sync-is-cut-off-can-never-start-again.md)). A marker now discards such a copy and seeds again.
+- **`apply_batch` is all-or-nothing:** the batch and the cursor are one `WriteBatch`, and a stale or gapped batch is refused before it.
+- **Still open:** the ways a stream can end and whether each is counted, `mark_needs_reseed` failing, and acks under `min-replicas-to-write`.
+
 ## C. Failover, roles and fencing
 
 **P1** · ≈ 5,400 lines · reviewer: distributed systems, consensus
@@ -166,6 +172,14 @@ Rewind snapshots on the node, the controller's scheduled snapshots, and flint-ba
 - Does a failed scheduled backup reach an operator, or only a log line?
 
 **Rules and history:** [ADR-0011](adr/0011-backup-and-restore.md), [BUG-0058](bugs/0058-a-tier-that-is-already-down-fails-the-job-at-filesystem-init.md), [BUG-0073](bugs/0073-a-panicking-snapshot-thread-wedges-a-pair-forever.md), [BUG-0163](bugs/0163-rewind-snapshots-are-never-pruned.md), [BUG-0195](bugs/0195-snapshot-retention-filled-the-disk-and-every-write-was-refused.md), [BUG-0260](bugs/0260-a-failed-tenant-wipe-could-not-be-finished.md), [BUG-0275](bugs/0275-every-snapshot-copies-a-manifest-that-never-rolls-over.md), [space-reclaim.md](space-reclaim.md)
+
+**Swept so far (2026-11-05, against main after the pin).**
+
+- **A failed checkpoint is never named by `LATEST`:** `FLINTSNAPSHOT` repoints it, by write-then-rename, only after `checkpoint_to` succeeds.
+- **Pruning deletes by age only,** past the point where the archive could tail a snapshot forward, and keeps `LATEST`'s snapshot, a count floor, and anything whose age or the archive's reach it cannot read.
+- **A namespace restore** reads a verified set into a new namespace beside the live one. A batch that fails stops the run with its error, and a re-run into the same namespace completes it; only the `OK restored` line says it finished.
+- **`--restore-from`** copies a snapshot into the data directory file by file, as the full sync did before BUG-0279, so a crash part way through leaves the same kind of copy. It runs once, by hand, on a spare.
+- **Still open:** restore from S3 under a 5xx or a truncated body, and whether a failed scheduled backup reaches an operator.
 
 ## E. Client connections and the wire protocol
 
