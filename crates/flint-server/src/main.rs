@@ -292,6 +292,45 @@ fn arg(name: &str) -> Option<String> {
 #[cfg(feature = "rocks")]
 const NEEDS_RESEED: &str = "NEEDS_RESEED";
 
+/// Written into a data directory before a full sync's first file, and
+/// removed only once every file it received is synced to disk (BUG-0279).
+/// The download writes into the directory itself, in the master's
+/// `read_dir` order, so a copy cut off part way can hold `CURRENT` beside a
+/// MANIFEST or SST it never received. RocksDB refuses that at open, on
+/// every start, and the seat could never come back by itself. A start that
+/// finds this marker discards the copy, which never served, and seeds again.
+#[cfg(feature = "rocks")]
+const FULLSYNC_INCOMPLETE: &str = "FULLSYNC_INCOMPLETE";
+
+/// A start that finds [`FULLSYNC_INCOMPLETE`] in `dir` (BUG-0279). As a
+/// replica, the cut-off copy is discarded and the caller seeds afresh.
+/// Without `--replica-of` there is nothing to seed it from, so the start is
+/// refused rather than coming up empty as a master. Returns whether it
+/// discarded.
+#[cfg(feature = "rocks")]
+fn discard_cut_off_full_sync(dir: &std::path::Path, replica: bool) -> std::io::Result<bool> {
+    if !dir.join(FULLSYNC_INCOMPLETE).exists() {
+        return Ok(false);
+    }
+    if !replica {
+        return Err(std::io::Error::other(format!(
+            "{FULLSYNC_INCOMPLETE} in {}: a full sync into it was cut off, so it is not a \
+             copy this node can serve; start it with --replica-of to seed it again",
+            dir.display()
+        )));
+    }
+    elog!(
+        "{FULLSYNC_INCOMPLETE} present: a full sync into {} was cut off; discarding it and \
+         seeding again (BUG-0279)",
+        dir.display()
+    );
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
 /// Record that `dir`'s contents must be thrown away before this node can
 /// tail a master again. Best-effort and loud on failure: losing the marker
 /// costs a manual wipe later, which is exactly where we were before.
@@ -2466,6 +2505,8 @@ fn main() -> std::io::Result<()> {
             // narrow — silently turning ordinary restarts into full syncs
             // would be a far worse bug than the one this fixes.
             let dir_path = std::path::Path::new(&dir).to_path_buf();
+            // BUG-0279: before anything reads the directory as a copy.
+            discard_cut_off_full_sync(&dir_path, replica_of.is_some())?;
             // The start of the rejoin, and the only marker that separates BOOT
             // from the catch-up that follows it. Without it the window between
             // a promotion and writes resuming is one number; with it, restart
@@ -8132,9 +8173,27 @@ mod replica {
         }
     }
 
+    /// Sync a directory's entries, so a file created or removed in it
+    /// survives a crash.
+    fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+        std::fs::File::open(dir)?.sync_all()
+    }
+
     /// Download a checkpoint into `dir` before the DB is first opened.
     pub fn full_sync_download(target: &str, dir: &std::path::Path) -> std::io::Result<()> {
+        // BUG-0279: an earlier attempt in this process, cut off, may have
+        // left files this checkpoint does not have. Start from nothing, and
+        // mark the directory until every file of this one is on disk.
+        if dir.join(super::FULLSYNC_INCOMPLETE).exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
         std::fs::create_dir_all(dir)?;
+        std::fs::write(
+            dir.join(super::FULLSYNC_INCOMPLETE),
+            "a full sync into this directory has not finished; a start that finds this \
+             discards the copy and seeds again (BUG-0279)\n",
+        )?;
+        sync_dir(dir)?;
         let mut stream = internal_connect(target)?;
         let mut out = Vec::new();
         encode(
@@ -8154,6 +8213,15 @@ mod replica {
                     buf.drain(..used);
                     match frame {
                         Value::Simple(s) if s == "FULLSYNC-END" => {
+                            // Every file on disk before the marker goes, so a
+                            // crash after this cannot leave a copy that looks
+                            // whole and is not (BUG-0279).
+                            for name in &seen {
+                                std::fs::File::open(dir.join(name))?.sync_all()?;
+                            }
+                            sync_dir(dir)?;
+                            std::fs::remove_file(dir.join(super::FULLSYNC_INCOMPLETE))?;
+                            sync_dir(dir)?;
                             elog!("full sync: received {} files", seen.len());
                             return Ok(());
                         }
@@ -11686,5 +11754,53 @@ mod vital_thread_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+}
+
+#[cfg(all(test, feature = "rocks"))]
+mod cut_off_full_sync_tests {
+    use super::*;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "flint-bug0279-{tag}-{}-{}",
+            std::process::id(),
+            flint_storage::strings::system_clock()
+        ));
+        std::fs::create_dir_all(&d).expect("make the test dir");
+        std::fs::write(d.join("CURRENT"), "MANIFEST-000015\n").expect("write CURRENT");
+        d
+    }
+
+    /// BUG-0279: a directory a full sync finished into, or one that never
+    /// had a sync, is left alone.
+    #[test]
+    fn a_copy_with_no_marker_is_kept() {
+        let d = dir("kept");
+        assert!(!discard_cut_off_full_sync(&d, true).expect("no marker"));
+        assert!(d.join("CURRENT").exists(), "the copy was touched");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BUG-0279: a replica's cut-off copy, `CURRENT` and all, is discarded so
+    /// the start seeds again. RocksDB refused it at open on every start.
+    #[test]
+    fn a_replicas_cut_off_copy_is_discarded() {
+        let d = dir("replica");
+        std::fs::write(d.join(FULLSYNC_INCOMPLETE), "x").expect("write the marker");
+        assert!(discard_cut_off_full_sync(&d, true).expect("discarded"));
+        assert!(!d.exists(), "the cut-off copy is still there");
+    }
+
+    /// BUG-0279: without `--replica-of` there is nothing to seed from, so
+    /// the start is refused and the copy kept, rather than an empty master.
+    #[test]
+    fn without_a_master_the_start_is_refused_and_the_copy_kept() {
+        let d = dir("master");
+        std::fs::write(d.join(FULLSYNC_INCOMPLETE), "x").expect("write the marker");
+        let e = discard_cut_off_full_sync(&d, false).expect_err("refused");
+        assert!(e.to_string().contains("--replica-of"), "{e}");
+        assert!(d.join("CURRENT").exists(), "the copy was discarded");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
