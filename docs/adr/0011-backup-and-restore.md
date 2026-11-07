@@ -7,7 +7,9 @@ scheduler library with the three policy jobs, and `backup-to` in the
 flintctl inventory. Verification items 1–5, 8 and 9 are standing checks;
 6 (a format break refusing END TO END — the refusal itself is unit-tested)
 and 7 (the mTLS isolation of a restored cluster asserted live) remain open
-and are tracked with the follow-ons rather than silently assumed.
+and are tracked with the follow-ons rather than silently assumed. An
+amendment to D8, how a backup that is not working reaches someone, is
+PROPOSED (2026-11-06).
 
 > Numbering: 0005–0009 are private-plane records and 0010 is reserved for the
 > co-processor extension model. See [README](README.md) for why the sequence
@@ -276,6 +278,98 @@ Encryption of the backup at rest is delegated to the object store (SSE-KMS or
 equivalent) and documented rather than implemented. That is where the data
 actually leaves the host, and a bucket policy is stronger and easier to audit
 than a key we manage.
+
+#### Amendment to D8, 2026-11-06 (PROPOSED): a backup that is not working reaches someone
+
+**Why.** D8 names the alertable metric, the age of the newest set that has
+been restored, and verification item 9 asserts it goes stale. Nothing carries
+it to anyone. The schedule writes it, with each job's runs, failures and last
+error, to `logs/backup-status` (`flintctl` passes `--status-file`). Nothing
+reads that file except `backup_seat_drill` and `backup_schedule_drill`. No
+metric, journal event or alert has it. A backup that fails every night,
+because a credential expired or a bucket policy changed, is visible only to
+someone who logs in to the backup host and reads the file. Production has
+not turned backups on yet (the `FLINT_BACKUP_*` lines in ops'
+`inventory.params.env` are commented out), so this must land first. Found by
+the error-handling review, area D.
+
+**What it has to carry.**
+- **A page, when the newest set proven restorable is older than the schedule
+  promises.** The action is concrete: read the failing job's last error, fix
+  its cause (credentials, bucket policy, endpoint, the backup host's disk),
+  and run a verify or rehearsal by hand to clear it. L2 has no verb for any
+  of those. The product already retries a failed job with backoff
+  (`flint-sched`), which is what clears a transient failure without a page.
+- **A warning, when a job starts failing,** with the error, for the daily
+  review. Its first failure is not yet a page: the retries may clear it.
+- **"Could not look" is not "all clear."** A backup seat that cannot be read
+  must not leave the age looking fresh.
+
+**The options.**
+- **A. The journal only.** `flintctl` gives the seat `--journal`, as it does
+  the controller. The seat journals a failure streak's start and end, and
+  each set proven restorable, and the agent computes the age from the last
+  success. But the journal is a local file on each control-plane member, and
+  it may lose events across a control-plane failover (`flint-journal`'s
+  module note). After one, "no recent success" reads the same as "the seat
+  is dead", and a weekly rehearsal would page falsely for up to a week.
+- **B. The seat answers `FLINTINFO`.** A read-only listener on the backup
+  seat, mesh mTLS on a TLS fleet, answers `PING` and `FLINTINFO` and refuses
+  everything else. It reports, per job, `runs`, `failures`,
+  `consecutive_failures`, `last_ok_age_s` and `last_error`, plus
+  `restorable_age_s`, `restorable_bound_s` and `restorable_by`.
+  - **`restorable_by`** is `rehearse`, `verify` or `backup`: the strongest
+    check the schedule runs. Without a rehearsal, "restorable" degrades to
+    "verified", and says so.
+  - **`restorable_bound_s` is 1.25 × (every + R),** where R is that check's
+    interval. A set is at most `every` old when a check proves it, and the
+    next proof comes within R; each job jitters by up to an eighth of its
+    interval, and the rest covers run time. The seat computes it from its
+    own flags, so a reader compares two numbers and holds no copy of the
+    schedule.
+  - **Readers:** the ops agent reads it as it reads a co-processor
+    (`--coproc`), and `flint-exporter` re-emits it as gauges for a
+    self-hosted Prometheus. The status file stays, for a person on the host.
+- **C. B, and the failure edges in the journal.** The seat also gets
+  `--journal`, and records two new kinds: `BackupJobFailed`, once at the
+  start of a failure streak, carrying the job and its error, and
+  `BackupJobRecovered`, at the first success after one. The gauge says it is
+  failing now; the journal says why and since when, where the daily review
+  reads. Both fire only on the condition they name, so a healthy fleet's
+  journal stays as ops' `fleet_journal_drill` requires it.
+
+**Recommendation: C.** B alone pages correctly but leaves the warnings
+outside the journal, where the daily review does not look. A cannot carry
+the page. C costs one listener and two event kinds more than today.
+
+**What changes, for C.**
+- **`flint-backup schedule`:** `--listen <addr>` for the read-only
+  `FLINTINFO`, and `--journal <cp>`. Without them it behaves as today.
+- **`flintctl backup on`:** passes both, on a port the allocator assigns,
+  checked by `port_allocator_drill`.
+- **`flint-exporter`:** `--backup <addr>`.
+- **Ops, `flint-agent`:** reads it, exports `flint_backup_up`,
+  `flint_backup_restorable_age_seconds` and
+  `flint_backup_restorable_bound_seconds`, and raises
+  `flint_insight{kind="backup_overdue"}` when the age passes the bound, or
+  when the seat has been unreadable for 30 minutes. That insight pages
+  through `AgentPaged`, with a runbook row in agent-ops; `BackupJobFailed`
+  is warning-only.
+- **The listener holds no credential and changes nothing.** D8 keeps backup
+  out of `flintctl` so a bucket key cannot reach cluster control. A read-only
+  status port does not open that path: it serves numbers about jobs, never
+  a key, a set or a command.
+
+**Verification.**
+- **`backup_schedule_drill` reads `FLINTINFO`, not the file:**
+  `restorable_age_s` stays under its bound while rehearsals pass, and passes
+  it when the newest set is corrupted (item 9, moved to what a reader sees).
+- **A job failing three times journals `BackupJobFailed` once,** with its
+  error, and `BackupJobRecovered` once on the first success. A healthy
+  schedule journals nothing.
+- **The listener refuses every command but `PING` and `FLINTINFO`.**
+- **Ops, an agent drill on the public binaries:** `backup_overdue` is 0
+  while fresh, 1 past the bound, and 1 again when the seat is stopped.
 
 ## Alternatives considered
 
