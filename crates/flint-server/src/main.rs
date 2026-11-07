@@ -2559,6 +2559,10 @@ fn main() -> std::io::Result<()> {
                     // probe by construction — their durable role is Master,
                     // and a master-role dir must go through the fence-
                     // checked rewind below (#107's contract, unchanged).
+                    // A DEMOTED ex-master's role is Replica, at an epoch
+                    // above its new master's when the controller fenced it;
+                    // the master refuses that epoch, so it too goes to the
+                    // rewind or the re-seed (BUG-0280).
                     let mut warm = false;
                     if let Ok(kv) = flint_storage::rocks::RocksKv::open(&dir_path) {
                         use flint_storage::manifest::{self, Role};
@@ -7487,6 +7491,35 @@ fn flintsync(
             generation: g,
             counter: c,
         };
+        // A COPY CLAIMING A NEWER EPOCH THAN THIS MASTER (BUG-0280). The epoch
+        // names the space the cursor is in (BUG-0194), and no copy reaches an
+        // epoch above its master's by following it: syncs copy the master's,
+        // and adoption only ever moves up to it. The one way there is a
+        // demotion at an epoch above this node's, which is how the controller
+        // fences a zombie (`max_epoch + 1`). Its epoch is then a fence token
+        // that names no timeline, and its cursor is in its OWN old space.
+        // Read here as this node's, it was admitted whenever this node had
+        // written past it: measured, the zombie kept the 200 writes this node
+        // never had and skipped this node's first 196, at seq_lag 0.
+        //
+        // Refused, and NOT as a WALGAP, for BUG-0196's reason: this node
+        // cannot tell a fenced zombie from a newer copy pointed at a master
+        // that is itself stale, and a WALGAP would wipe the second. A marked
+        // zombie, which is what every rejoin path starts, takes this refusal
+        // to its rewind or re-seed; FLINTDEMOTE's contract was always that.
+        if theirs > my_epoch {
+            let mut out = Vec::new();
+            encode(
+                &Value::Error(format!(
+                    "ERR FLINTSYNC this copy's role epoch {theirs} is newer than this \
+                     master's {my_epoch}, so its cursor {cursor} is not a position on this \
+                     node's timeline and it is not streamed; a copy demoted above its \
+                     master is re-seeded, not resumed (BUG-0280)"
+                )),
+                &mut out,
+            );
+            return stream.write_all(&out);
+        }
         if theirs < my_epoch {
             let refusal = match promo_fence_bound(kv.as_ref(), theirs) {
                 FenceBound::Bound(fence) if cursor > fence => Some(format!(
@@ -9670,6 +9703,45 @@ mod serve_tests {
         match ask(latest) {
             Value::Simple(ok) => assert!(ok.starts_with("FLINTSYNC-OK"), "{ok}"),
             other => panic!("a cursor AT the tip must still be admitted: {other:?}"),
+        }
+    }
+
+    /// BUG-0280. A copy presenting a role epoch above this master's was read
+    /// as being in this node's sequence space. The controller fences a
+    /// zombie at `max_epoch + 1`, so its cursor, in its own old space, was
+    /// resumed as this node's whenever this node had written past it.
+    /// Refused, and not as a WALGAP, which would wipe a copy this node cannot
+    /// judge. The same cursor at this node's own epoch is the control.
+    #[cfg(feature = "rocks")]
+    #[test]
+    fn a_copy_with_an_epoch_above_the_master_is_refused_but_not_as_a_walgap() {
+        let (addr, _dir, _serial) = spawn_rocks_server();
+        let mut c = TcpStream::connect(addr).expect("connect");
+        for i in 0..5 {
+            let k = format!("k{i}");
+            roundtrip(&mut c, &["SET", &k, "v"]);
+        }
+        // This harness opens RocksDB with no role row, so the master's epoch
+        // is (0,0), as the cursor-ahead test above relies on too.
+        let ask = |counter: &str| -> Value {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            roundtrip(&mut s, &["FLINTSYNC", "2", "0", counter])
+        };
+        match ask("1") {
+            Value::Error(e) => {
+                assert!(e.contains("BUG-0280"), "refused, but why: {e}");
+                assert!(
+                    !e.starts_with("WALGAP"),
+                    "a WALGAP would re-seed the copy: {e}"
+                );
+            }
+            other => panic!("a copy at an epoch above the master's was admitted: {other:?}"),
+        }
+        match ask("0") {
+            Value::Simple(ok) => assert!(ok.starts_with("FLINTSYNC-OK"), "{ok}"),
+            other => {
+                panic!("the same cursor at the master's own epoch must be admitted: {other:?}")
+            }
         }
     }
 

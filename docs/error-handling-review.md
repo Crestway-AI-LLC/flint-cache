@@ -105,7 +105,10 @@ The master's stream to its replicas, the replica's apply loop, full sync, and th
 
 - **A full sync cut off part way** cannot serve a partial copy: RocksDB refuses it at open. But once `CURRENT` had arrived, which the master's `read_dir` order allows, the replica exited at open on every start and needed its directory deleted by hand ([BUG-0279](bugs/0279-a-replica-whose-first-full-sync-is-cut-off-can-never-start-again.md)). A marker now discards such a copy and seeds again.
 - **`apply_batch` is all-or-nothing:** the batch and the cursor are one `WriteBatch`, and a stale or gapped batch is refused before it.
-- **Still open:** the ways a stream can end and whether each is counted, `mark_needs_reseed` failing, and acks under `min-replicas-to-write`.
+- **`mark_needs_reseed` failing** led to a worse finding (2026-11-06): the marker does not matter. A master the controller fenced, at `max_epoch + 1`, rejoined its new master at a cursor from its own timeline, marked or not, and kept the writes the master never had while lacking as many of the master's, at `seq_lag` 0 ([BUG-0280](bugs/0280-a-zombie-the-controller-fenced-rejoined-at-a-cursor-from-its-own-timeline.md)). The master now refuses a copy whose epoch is newer than its own. A lost marker then leaves the copy refused and kept, not diverged; the marker is still written without a sync.
+- **Acks under `min-replicas-to-write`:** by design, a write is acknowledged before any replica has it. Replication is asynchronous ([failover.md](failover.md), "The lag cap"), and the gate counts replicas that acked anything in the last 2 s (`LIVENESS_WINDOW_MS`), so a replica whose acks stop counts as live for up to 2 s. What bounds the loss is the lag cap.
+- **The ways a stream can end:** each is logged on the replica (`replication link lost (...)`), and a purged span exits for a re-seed. A reconnect is not counted on the replica; the master's `live_replicas` and lag show the link. A counter would be a new metric, and is not proposed here.
+- **Still open:** nothing in this area's questions.
 
 ## C. Failover, roles and fencing
 
@@ -141,6 +144,11 @@ Who is master and how the others are kept from acting as one: role epochs on dis
 - Each Raft storage callback changes the in-memory vote, log or registry and then `flush`es. If the flush fails after the change, what does the running node serve next, what does openraft do with the error, and what does a restart recover?
 
 **Rules and history:** [ADR-0004](adr/0004-no-per-group-raft.md), [ADR-0018](adr/0018-cp-held-leases.md), [ADR-0019](adr/0019-rewind-rejoin-promotion-fences.md), [ADR-0032](adr/0032-one-implementation-of-every-control-plane-mutation.md), [BUG-0074](bugs/0074-min-replicas-that-cannot-survive-a-failover.md), [BUG-0076](bugs/0076-a-surviving-replica-is-never-repointed-after-a-promotion.md), [BUG-0119](bugs/0119-flintctl-panicked-on-a-master-that-was-merely-mid-promotion.md), [BUG-0151](bugs/0151-a-pair-whose-membership-changed-can-hold-two-lease-rows-and-two-masters.md), [BUG-0174](bugs/0174-reconcile-cold-start-gives-up-while-the-master-is-still-loading.md), [BUG-0201](bugs/0201-the-controller-fails-over-a-master-at-its-connection-cap-though-it-is-serving.md), [BUG-0207](bugs/0207-during-a-roll-the-controller-fails-the-pair-over-mid-handover.md), [failover.md](failover.md)
+
+**Swept so far (2026-11-06).**
+
+- **A zombie the controller fences** is demoted at `max_epoch + 1`, above the master it promoted, so its epoch names no timeline while its cursor is in its own. The master read that cursor as its own and the zombie rejoined diverged ([BUG-0280](bugs/0280-a-zombie-the-controller-fenced-rejoined-at-a-cursor-from-its-own-timeline.md), found from area B). The master now refuses a copy whose epoch is above its own, as `FLINTFOLLOW` already refused a master below the replica's.
+- **Still open:** every question above.
 
 ## D. Snapshots, backup and restore
 
