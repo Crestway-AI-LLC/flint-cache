@@ -567,8 +567,22 @@ impl BodyReader {
     }
 }
 
+/// A connection that closes before the body it declared is a failed
+/// download, never the end of the object. Reading it as a clean end wrote a
+/// short file with no error, and a restore whose cut file was the MANIFEST
+/// opened as an older version of the database and said OK (BUG-0281).
+fn body_cut(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("body cut: the connection closed with {what}"),
+    )
+}
+
 impl Read for BodyReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         if self.chunked {
             if self.chunk_done {
                 return Ok(0);
@@ -586,6 +600,12 @@ impl Read for BodyReader {
             }
             let want = (self.chunk_left.min(out.len() as u64)) as usize;
             let n = self.raw_read(&mut out[..want])?;
+            if n == 0 {
+                return Err(body_cut(&format!(
+                    "{} bytes of a chunk unread",
+                    self.chunk_left
+                )));
+            }
             self.chunk_left -= n as u64;
             if self.chunk_left == 0 {
                 let mut crlf = [0u8; 2];
@@ -598,6 +618,11 @@ impl Read for BodyReader {
             Some(rem) => {
                 let want = (rem.min(out.len() as u64)) as usize;
                 let n = self.raw_read(&mut out[..want])?;
+                if n == 0 {
+                    return Err(body_cut(&format!(
+                        "{rem} of its Content-Length bytes unread"
+                    )));
+                }
                 self.remaining = Some(rem - n as u64);
                 Ok(n)
             }
@@ -696,5 +721,54 @@ mod tests {
                    <IsTruncated>false</IsTruncated></ListBucketResult>";
         assert_eq!(xml_values(xml, "Key"), ["a/b&c", "a/d"]);
         assert_eq!(xml_values(xml, "IsTruncated"), ["false"]);
+    }
+
+    /// One response, written by a peer that then closes the connection,
+    /// read to its end through the same path a GET's body takes.
+    fn read_after_close(head: &str, body: &[u8]) -> io::Result<Vec<u8>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (head, body) = (head.to_string(), body.to_vec());
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            s.write_all(head.as_bytes()).expect("head");
+            s.write_all(&body).expect("body");
+            // Dropped here: the connection closes after `body`.
+        });
+        let s = flint_tls::Stream::Plain(std::net::TcpStream::connect(addr)?);
+        let resp = read_response(s)?;
+        peer.join().expect("peer");
+        let mut got = Vec::new();
+        resp.into_body().read_to_end(&mut got)?;
+        Ok(got)
+    }
+
+    /// BUG-0281. A GET whose connection closed part way through its body
+    /// read as the whole object, so restore wrote a short file and said OK.
+    #[test]
+    fn a_body_cut_before_its_content_length_is_an_error_not_the_end() {
+        let cut = read_after_close("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n", b"abcd")
+            .expect_err("a body six bytes short of its Content-Length read as whole");
+        assert_eq!(cut.kind(), io::ErrorKind::UnexpectedEof, "{cut}");
+        assert!(
+            cut.to_string()
+                .contains("6 of its Content-Length bytes unread"),
+            "{cut}"
+        );
+        let whole = read_after_close("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", b"abcd")
+            .expect("a whole body");
+        assert_eq!(whole, b"abcd");
+    }
+
+    /// BUG-0281, the chunked encoding: a close inside a chunk is not the
+    /// zero-length chunk that ends a body.
+    #[test]
+    fn a_chunked_body_cut_inside_a_chunk_is_an_error_not_the_end() {
+        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let cut = read_after_close(head, b"a\r\nabcd")
+            .expect_err("a chunk six bytes short read as the end of the body");
+        assert_eq!(cut.kind(), io::ErrorKind::UnexpectedEof, "{cut}");
+        let whole = read_after_close(head, b"4\r\nabcd\r\n0\r\n\r\n").expect("a whole body");
+        assert_eq!(whole, b"abcd");
     }
 }

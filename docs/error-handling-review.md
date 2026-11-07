@@ -187,7 +187,9 @@ Rewind snapshots on the node, the controller's scheduled snapshots, and flint-ba
 - **Pruning deletes by age only,** past the point where the archive could tail a snapshot forward, and keeps `LATEST`'s snapshot, a count floor, and anything whose age or the archive's reach it cannot read.
 - **A namespace restore** reads a verified set into a new namespace beside the live one. A batch that fails stops the run with its error, and a re-run into the same namespace completes it; only the `OK restored` line says it finished.
 - **`--restore-from`** copies a snapshot into the data directory file by file, as the full sync did before BUG-0279, so a crash part way through leaves the same kind of copy. It runs once, by hand, on a spare.
-- **Still open:** restore from S3 under a 5xx or a truncated body, and whether a failed scheduled backup reaches an operator.
+- **Restore from S3** under a 5xx dies with the status. Under a body cut short it said OK (2026-11-06): restore verifies each object, then reads it again to copy it, the copy was not checked, and the S3 body reader took a closed connection for the end of the object. A MANIFEST cut part way restored as an older version of the database ([BUG-0281](bugs/0281-a-restore-whose-copy-of-an-object-was-cut-short-said-ok.md)). Restore now checks every object it writes against the verified set.
+- **A failed scheduled backup reaches no operator.** The schedule writes each job's runs, failures and last error to `logs/backup-status` (`flintctl` passes `--status-file`), and nothing in either repository reads that file but `backup_seat_drill`. No metric, journal event or alert carries it. Making it reach someone is a new metric and alert, so it goes to a decision, not into a fix.
+- **Still open:** that decision.
 
 ## E. Client connections and the wire protocol
 

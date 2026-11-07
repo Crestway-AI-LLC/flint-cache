@@ -295,7 +295,15 @@ fn restore() {
                 .unwrap_or_else(|e| die(&format!("open {}: {e}", obj.key)));
             let mut f = std::fs::File::create(pair_dir.join(name))
                 .unwrap_or_else(|e| die(&format!("create {name}: {e}")));
-            std::io::copy(&mut r, &mut f).unwrap_or_else(|e| die(&format!("copy {name}: {e}")));
+            // Checked as it is written, against the manifest the verify
+            // above checked the store against (BUG-0281): this is a second
+            // read, and a download cut part way through it is not the object.
+            flint_backup::copy_verified(&mut r, &mut f, obj).unwrap_or_else(|e| {
+                die(&format!(
+                    "copy {name}: {e}; {into} holds a partial restore, so remove it before \
+                     running restore again"
+                ))
+            });
         }
 
         // The D4 scrub, counted so the report is evidence rather than a

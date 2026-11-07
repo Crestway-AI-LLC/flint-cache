@@ -69,6 +69,15 @@ pub enum Error {
     Unlisted {
         key: String,
     },
+    /// What a restore wrote for an object is not what the verify read
+    /// (BUG-0281): the copy's own read of the store came back different.
+    Copy {
+        key: String,
+        wrote: u64,
+        found: String,
+        bytes: u64,
+        expected: String,
+    },
     Io(String),
 }
 
@@ -97,6 +106,18 @@ impl fmt::Display for Error {
                 f,
                 "object {key} is present but not listed in the manifest — the set has been \
                  written to by something that does not understand the format"
+            ),
+            Error::Copy {
+                key,
+                wrote,
+                found,
+                bytes,
+                expected,
+            } => write!(
+                f,
+                "object {key} was copied as {wrote} bytes with sha256 {found}, but the verified \
+                 set records {bytes} bytes with sha256 {expected}: the copy did not read what \
+                 the verify read, so what was restored is not the set"
             ),
             Error::Io(e) => write!(f, "{e}"),
         }
@@ -315,6 +336,47 @@ pub fn verify(store: &dyn ObjectStore, manifest: &Manifest) -> Result<Report, Er
     })
 }
 
+/// Copy one object from `r` into `w`, and refuse unless what was written is
+/// exactly what the manifest records: its length and its sha256 (BUG-0281).
+///
+/// [`load_verified`] hashes every object before a restore writes a byte, and
+/// the restore then reads each object AGAIN to copy it. That second read was
+/// trusted. A download cut part way through it wrote a short file and the
+/// restore said OK: a cut MANIFEST opened as an older version of the
+/// database, its newer SSTs deleted as obsolete. Hashing the bytes as they
+/// are written gives the copy the same proof the verify has.
+pub fn copy_verified(
+    r: &mut dyn std::io::Read,
+    w: &mut dyn std::io::Write,
+    obj: &ObjectRecord,
+) -> Result<(), Error> {
+    struct Tee<'a> {
+        r: &'a mut dyn std::io::Read,
+        w: &'a mut dyn std::io::Write,
+        wrote: u64,
+    }
+    impl std::io::Read for Tee<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.r.read(buf)?;
+            self.w.write_all(&buf[..n])?;
+            self.wrote += n as u64;
+            Ok(n)
+        }
+    }
+    let mut tee = Tee { r, w, wrote: 0 };
+    let found = flint_tls::sha256_stream_hex(&mut tee)?;
+    if tee.wrote != obj.bytes || found != obj.sha256 {
+        return Err(Error::Copy {
+            key: obj.key.clone(),
+            wrote: tee.wrote,
+            found,
+            bytes: obj.bytes,
+            expected: obj.sha256.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Read and verify a set in one step — the only entry point a restore should
 /// use, so that "load the manifest" and "check the manifest" cannot be
 /// separated by a caller in a hurry.
@@ -505,5 +567,46 @@ mod tests {
         sst[10] ^= 0xff;
         std::fs::write(t.0.join("pairs/0/000009.sst"), &sst).expect("write");
         assert!(matches!(load_verified(&store), Err(Error::Checksum { .. })));
+    }
+
+    /// BUG-0281. Restore's copy read each object a second time and trusted
+    /// it: a copy cut short, or one that read other bytes, was written as the
+    /// object. Measured: a MANIFEST cut part way restored OK as an older
+    /// version of the database.
+    #[test]
+    fn a_copy_that_is_not_the_verified_object_is_refused() {
+        let data = b"MANIFEST bytes, 32 of them here.";
+        let obj = ObjectRecord {
+            key: "pairs/0/MANIFEST-000005".into(),
+            bytes: data.len() as u64,
+            sha256: flint_tls::sha256_hex(data),
+        };
+        // The control: the whole object is copied and accepted, byte for byte.
+        let mut out = Vec::new();
+        copy_verified(&mut &data[..], &mut out, &obj).expect("a whole copy was refused");
+        assert_eq!(out, data);
+        // Cut short, as a connection closed part way through.
+        let mut out = Vec::new();
+        let e = copy_verified(&mut &data[..20], &mut out, &obj)
+            .expect_err("a copy 12 bytes short was accepted");
+        assert!(
+            matches!(
+                e,
+                Error::Copy {
+                    wrote: 20,
+                    bytes: 32,
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        assert!(e.to_string().contains("pairs/0/MANIFEST-000005"), "{e}");
+        // The right length and other bytes.
+        let mut other = *data;
+        other[3] ^= 0xff;
+        let mut out = Vec::new();
+        let e = copy_verified(&mut &other[..], &mut out, &obj)
+            .expect_err("a copy of other bytes was accepted");
+        assert!(matches!(e, Error::Copy { wrote: 32, .. }), "{e}");
     }
 }
