@@ -14,6 +14,7 @@
 //!     --node 127.0.0.1:7001 --node 127.0.0.1:7002 \
 //!     --proxy 127.0.0.1:7379 \
 //!     [--coproc 127.0.0.1:7411] \
+//!     [--backup 127.0.0.1:7430] \
 //!     [--ca certs/ca.crt --cert certs/int.crt --key certs/int.key] \
 //!     `[--admin-token <tok>]`      # if the proxy admin surface is gated
 //!
@@ -181,6 +182,7 @@ fn render(
     nodes: &[String],
     proxies: &[String],
     coprocs: &[String],
+    backups: &[String],
     tls: &Option<Arc<ClientConfig>>,
     admin: &Option<String>,
 ) -> String {
@@ -212,6 +214,17 @@ fn render(
             &mut out,
         );
     }
+    // The backup schedule's read-only status port (ADR-0011's D8 amendment):
+    // `flint_backup_restorable_age_s` against `flint_backup_restorable_bound_s`,
+    // and `flint_backup_restorable_overdue`, which is what to alert on.
+    for b in backups {
+        emit(
+            "flint_backup_",
+            b,
+            scrape(b, tls, b"FLINTINFO", &None, false).as_deref(),
+            &mut out,
+        );
+    }
     out
 }
 
@@ -220,10 +233,11 @@ fn main() {
     let nodes = multi("--node");
     let proxies = multi("--proxy");
     let coprocs = multi("--coproc");
+    let backups = multi("--backup");
     let admin = one("--admin-token");
-    if nodes.is_empty() && proxies.is_empty() && coprocs.is_empty() {
+    if nodes.is_empty() && proxies.is_empty() && coprocs.is_empty() && backups.is_empty() {
         elog!(
-            "usage: flint-exporter --port N --node H:P... --proxy H:P... [--coproc H:P...] [--ca --cert --key] [--admin-token T]"
+            "usage: flint-exporter --port N --node H:P... --proxy H:P... [--coproc H:P...] [--backup H:P...] [--ca --cert --key] [--admin-token T]"
         );
         std::process::exit(2);
     }
@@ -236,17 +250,18 @@ fn main() {
     };
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind metrics port");
     elog!(
-        "flint-exporter on :{port} ({} node(s), {} proxy(ies), {} co-processor(s), tls={})",
+        "flint-exporter on :{port} ({} node(s), {} proxy(ies), {} co-processor(s), {} backup seat(s), tls={})",
         nodes.len(),
         proxies.len(),
         coprocs.len(),
+        backups.len(),
         tls.is_some()
     );
     for stream in listener.incoming() {
         let Ok(mut s) = stream else { continue };
         let mut buf = [0u8; 1024];
         let _ = s.read(&mut buf); // consume the request line (any path -> metrics)
-        let body = render(&nodes, &proxies, &coprocs, &tls, &admin);
+        let body = render(&nodes, &proxies, &coprocs, &backups, &tls, &admin);
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),

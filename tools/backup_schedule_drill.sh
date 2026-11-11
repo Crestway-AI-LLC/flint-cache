@@ -134,7 +134,14 @@ AT_AFTER=$(field "rehearsed_at_ms" 2)
 [ "$AT_AFTER" = "$AT_BEFORE" ] || {
   echo "FAIL: rehearsed_at advanced ($AT_BEFORE -> $AT_AFTER) past a corrupt artifact"; exit 1; }
 AGE=$(field "rehearsed_age_s" 2)
-echo "  rehearse failing (failures=$RF), rehearsed_at pinned, age=${AGE}s and climbing"
+# ADR-0011's D8 amendment: what the status port and an alert read is the
+# set the strongest check last proved. It must stay the corrupted set's
+# predecessor in proof, never move on to a set nothing restored.
+[ "$(field "restorable_by" 2)" = rehearse ] \
+  || { echo "FAIL: restorable_by is $(field "restorable_by" 2), not rehearse, with rehearsals configured"; status; exit 1; }
+[ "$(field "restorable_set" 2)" = "$RS" ] \
+  || { echo "FAIL: restorable_set moved to $(field "restorable_set" 2) past a set that does not restore"; status; exit 1; }
+echo "  rehearse failing (failures=$RF), rehearsed_at pinned, age=${AGE}s and climbing; restorable_set pinned at $RS"
 status | grep '^job rehearse' | sed 's/^/  | /'
 
 echo

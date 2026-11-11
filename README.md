@@ -260,7 +260,8 @@ Everything needed to run AND operate Flint yourself:
   its own scrub; namespace-scoped restore into a live cluster placed by
   current slot ownership; and a `schedule` mode running backup / verify /
   restore-rehearsal as a policy, whose alertable metric is the age of the
-  newest set that actually restored — never the run count. `backup-to` in
+  newest set that actually restored — never the run count, served on a
+  read-only status port (`backup-listen`) for an alert to read. `backup-to` in
   the flintctl inventory runs it as a supervised seat.
 - **`flint-sched`** — recurring jobs as a library: serial execution (a job
   cannot overlap itself), completion-based cadence (no catch-up bursts),

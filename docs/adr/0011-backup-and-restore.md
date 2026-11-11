@@ -8,8 +8,8 @@ flintctl inventory. Verification items 1–5, 8 and 9 are standing checks;
 6 (a format break refusing END TO END — the refusal itself is unit-tested)
 and 7 (the mTLS isolation of a restored cluster asserted live) remain open
 and are tracked with the follow-ons rather than silently assumed. An
-amendment to D8, how a backup that is not working reaches someone, is
-PROPOSED (2026-11-06).
+amendment to D8, how a backup that is not working reaches someone, was
+ACCEPTED 2026-11-11 (option C) and is built.
 
 > Numbering: 0005–0009 are private-plane records and 0010 is reserved for the
 > co-processor extension model. See [README](README.md) for why the sequence
@@ -279,7 +279,7 @@ equivalent) and documented rather than implemented. That is where the data
 actually leaves the host, and a bucket policy is stronger and easier to audit
 than a key we manage.
 
-#### Amendment to D8, 2026-11-06 (PROPOSED): a backup that is not working reaches someone
+#### Amendment to D8, 2026-11-06 (ACCEPTED 2026-11-11, option C): a backup that is not working reaches someone
 
 **Why.** D8 names the alertable metric, the age of the newest set that has
 been restored, and verification item 9 asserts it goes stale. Nothing carries
@@ -338,15 +338,16 @@ the error-handling review, area D.
   reads. Both fire only on the condition they name, so a healthy fleet's
   journal stays as ops' `fleet_journal_drill` requires it.
 
-**Recommendation: C.** B alone pages correctly but leaves the warnings
-outside the journal, where the daily review does not look. A cannot carry
-the page. C costs one listener and two event kinds more than today.
+**Decision: C,** accepted 2026-11-11 (Jeff: "accept C"). B alone pages
+correctly but leaves the warnings outside the journal, where the daily
+review does not look. A cannot carry the page. C costs one listener and two
+event kinds more than today.
 
 **What changes, for C.**
 - **`flint-backup schedule`:** `--listen <addr>` for the read-only
   `FLINTINFO`, and `--journal <cp>`. Without them it behaves as today.
-- **`flintctl backup on`:** passes both, on a port the allocator assigns,
-  checked by `port_allocator_drill`.
+- **`flintctl backup on`:** passes both; the port is the inventory's
+  `backup-listen <host:port>`, as the agent's is `agent <host:port>`.
 - **`flint-exporter`:** `--backup <addr>`.
 - **Ops, `flint-agent`:** reads it, exports `flint_backup_up`,
   `flint_backup_restorable_age_seconds` and
@@ -370,6 +371,52 @@ the page. C costs one listener and two event kinds more than today.
 - **The listener refuses every command but `PING` and `FLINTINFO`.**
 - **Ops, an agent drill on the public binaries:** `backup_overdue` is 0
   while fresh, 1 past the bound, and 1 again when the seat is stopped.
+
+**As built (public, 2026-11-11; the ops half follows).**
+- `flint-backup schedule` takes `--listen <addr>` and `--journal <cp>`. The
+  listener answers `PING`, `FLINTINFO` and `QUIT`, and refuses everything
+  else with `-ERR this is the backup schedule's read-only status port`.
+- **`FLINTINFO`**, computed when asked, since a job runs on the scheduler's
+  own thread and a rehearsal can take an hour:
+  - `role:backup`, `build`, `uptime_s`;
+  - per job, `job_<job>_runs`, `_failures`, `_consecutive_failures`,
+    `_last_ok_age_s` and `_last_error`;
+  - `restorable_by`, `restorable_set`, `restorable_age_s`,
+    `restorable_bound_s` and `restorable_overdue`.
+  - A value not known yet is left out, never `0`, except
+    `restorable_overdue`, which is always `0` or `1` so an alert always has
+    a series.
+- **The age is the proven set's own age** (from its id), not the time since
+  the check ran, which is what the status file's `rehearsed_age_s` counted.
+- **Nothing proven** is overdue once the seat has been up longer than the
+  bound: "it has never managed one" is the failure this exists to report.
+- **The proofs survive a restart:** they are written to the status file as
+  `proof <check> <set> <set_ms>` and read back at the next start. So are the
+  failure streaks, so a restart mid-streak journals no second start and does
+  not lose the recovery.
+- **The journal kinds** are `BackupJobFailed` (subject the job, cause its
+  error) and `BackupJobRecovered`, emitted from the scheduler loop's view of
+  each job's streak, never per run.
+- `flintctl` passes `--journal` to the backup seat whenever the inventory
+  has a control plane, and `--listen` when it names `backup-listen`. It
+  passes the agent `--backup <addr>` when a backup seat runs, and refuses a
+  wildcard `backup-listen`, BUG-0140's rule: the agent dials it.
+  `flint-exporter --backup <addr>` emits the fields as `flint_backup_*`.
+- **Two departures from the text above.** The agent's series take the
+  exporter's names (`flint_backup_up`, `flint_backup_restorable_age_s`,
+  `_restorable_bound_s`, `_restorable_overdue`,
+  `flint_backup_job_<job>_consecutive_failures`), not `_seconds` names, so an
+  alert written against either source reads the other, as the co-processor's
+  do. And `backup_overdue` does not page `AgentPaged` directly: it becomes a
+  `PageHuman` recommendation keyed `backup-overdue:<seat>`, as `PairDark`
+  does, which the agent journals and spools as a case like every page of
+  its kind. The dark allowance is the agent's `--backup-dark-ms`, 30
+  minutes.
+- Held by `status::tests` (seven), `backup_args_tests` (three),
+  `backup_status_drill` (in CORE) and `backup_schedule_drill`. Item 9 there
+  now also checks that `restorable_set` stays pinned at the last set that
+  restored; with a 10-minute cadence its bound is 12 minutes, so the overdue
+  verdict itself is asserted in `backup_status_drill`, at a 2-second cadence.
 
 ## Alternatives considered
 

@@ -329,9 +329,15 @@ struct Inventory {
     backup_verify_every: Option<String>,
     backup_rehearse_every: Option<String>,
     backup_keep: Option<u32>,
-    /// Which host runs the backup seat. Like the controller it dials
-    /// rather than serves, so placement must be declared; absent = local.
+    /// Which host runs the backup seat. It dials the pairs; the one thing
+    /// it serves is the optional status port below, so placement is still
+    /// declared here; absent = local.
     backup_host: Option<String>,
+    /// `backup-listen <host:port>`: the seat's read-only status port, `PING`
+    /// and `FLINTINFO` only (ADR-0011's D8 amendment). What an alert reads:
+    /// the age of the newest set proven restorable against its bound.
+    /// Absent = no port, and nothing can page about a backup that stopped.
+    backup_listen: Option<String>,
 }
 
 /// Every `FLINT_*` name a seat process actually reads, harvested from
@@ -553,6 +559,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "backup-rehearse-every" => inv.backup_rehearse_every = Some(val.to_string()),
             "backup-keep" => inv.backup_keep = val.parse().ok(),
             "backup-host" => inv.backup_host = Some(val.to_string()),
+            "backup-listen" => inv.backup_listen = Some(val.to_string()),
             // Declares this fleet THROWAWAY: a non-release flintctl may
             // mutate it. Absent means a real cluster, which is the safe
             // default and the one every existing inventory already has.
@@ -619,6 +626,19 @@ fn parse_inventory(path: &str) -> Inventory {
             "`coproc {fam} {addr}` names no machine: this address is handed to \
              every proxy as a DIAL target, so a wildcard sends each of them to \
              its own loopback. Give the co-processor's real address"
+        );
+    }
+    // BUG-0140's rule for the backup seat's status port (ADR-0011's D8
+    // amendment): the agent DIALS `backup-listen`, so a wildcard sends it to
+    // its own loopback, where nothing answers, and every sweep reads the
+    // backup seat as dark.
+    if let Some(addr) = &inv.backup_listen {
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+        assert!(
+            !is_wildcard_host(host),
+            "`backup-listen {addr}` names no machine: the agent dials it to read \
+             the backup schedule's status, so a wildcard sends it to its own \
+             loopback. Give the backup host's real address"
         );
     }
     inv
@@ -4902,6 +4922,16 @@ fn agent_args(inv: &Inventory) -> Option<Vec<String>> {
     for (_, addr) in &inv.coprocs {
         args.extend(["--coproc".into(), addr.clone()]);
     }
+    // ADR-0011's D8 amendment: the backup schedule's status port, so the
+    // agent pages when the newest set proven restorable is older than its
+    // bound. Only when a backup seat runs: a port nothing serves would read
+    // as a dark seat and page. Ignored by an agent older than the flag, as
+    // `--coproc` is.
+    if inv.backup_to.is_some()
+        && let Some(addr) = &inv.backup_listen
+    {
+        args.extend(["--backup".into(), addr.clone()]);
+    }
     args.extend(internal_args(inv));
     Some(args)
 }
@@ -5016,6 +5046,15 @@ fn backup_args(inv: &Inventory) -> Option<Vec<String>> {
     }
     if inv.tls {
         args.extend(["--tls".into(), format!("{d}/certs")]);
+    }
+    // ADR-0011's D8 amendment: a failure streak's start and end go to the
+    // journal, where the daily review reads, and the age an alert reads is
+    // served on the status port when the inventory names one.
+    if !inv.cp.is_empty() {
+        args.extend(["--journal".into(), cp_dial(inv, 0)]);
+    }
+    if let Some(addr) = &inv.backup_listen {
+        args.extend(["--listen".into(), addr.clone()]);
     }
     Some(args)
 }
@@ -13490,5 +13529,64 @@ mod tenant_namespace_tests {
         assert_eq!(holder_of(&tenants, "acme", Some("acme")), None);
         assert_eq!(holder_of(&tenants, "shared", Some("beta")), Some("gamma"));
         assert_eq!(holder_of(&tenants, "gone", None), None);
+    }
+}
+
+#[cfg(test)]
+mod backup_args_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn inv_from(body: &str, name: &str) -> Inventory {
+        let p = std::env::temp_dir().join(format!("flint-backupargs-{name}.flint"));
+        let mut f = std::fs::File::create(&p).expect("write inventory");
+        f.write_all(body.as_bytes()).expect("write inventory");
+        parse_inventory(p.to_str().expect("utf8 path"))
+    }
+
+    const BASE: &str = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+                        cp 10.0.0.9:7500\npair 10.0.0.1:7001,10.0.0.1:7002\n\
+                        backup-to s3://bucket/fleet\n";
+
+    fn after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let i = args.iter().position(|a| a == flag)?;
+        args.get(i + 1).map(String::as_str)
+    }
+
+    /// ADR-0011's D8 amendment: the seat journals its failure streaks to the
+    /// control plane, and serves its status where the inventory says.
+    #[test]
+    fn backup_listen_gives_the_seat_its_status_port_and_the_journal_always_rides() {
+        let inv = inv_from(&format!("{BASE}backup-listen 10.0.0.20:7430\n"), "listen");
+        let a = backup_args(&inv).expect("backup-to is set");
+        assert_eq!(after(&a, "--listen"), Some("10.0.0.20:7430"), "{a:?}");
+        assert_eq!(after(&a, "--journal"), Some("10.0.0.9:7500"), "{a:?}");
+    }
+
+    /// The agent reads the port only when a backup seat serves it.
+    #[test]
+    fn the_agent_is_pointed_at_the_status_port_only_when_a_seat_serves_it() {
+        let agent = "agent 10.0.0.30:9090\n";
+        let with = inv_from(
+            &format!("{BASE}{agent}backup-listen 10.0.0.20:7430\n"),
+            "agent-with",
+        );
+        let a = agent_args(&with).expect("agent is set");
+        assert_eq!(after(&a, "--backup"), Some("10.0.0.20:7430"), "{a:?}");
+        let body = format!(
+            "{}{agent}backup-listen 10.0.0.20:7430\n",
+            BASE.replace("backup-to s3://bucket/fleet\n", "")
+        );
+        let a = agent_args(&inv_from(&body, "agent-noseat")).expect("agent is set");
+        assert!(!a.iter().any(|x| x == "--backup"), "{a:?}");
+    }
+
+    /// Without the key there is no port: nothing listens that the operator
+    /// did not place. The journal still gets the streaks.
+    #[test]
+    fn no_backup_listen_no_status_port() {
+        let a = backup_args(&inv_from(BASE, "nolisten")).expect("backup-to is set");
+        assert!(!a.iter().any(|x| x == "--listen"), "{a:?}");
+        assert_eq!(after(&a, "--journal"), Some("10.0.0.9:7500"), "{a:?}");
     }
 }

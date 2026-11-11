@@ -812,6 +812,7 @@ flint-exporter --port 9100 \
   --ca state/certs/ca.crt --cert state/certs/int.crt --key state/certs/int.key
 # omit --ca/--cert/--key for a fully plaintext dev fleet;
 # add --admin-token <tok> if your proxy admin surface is gated.
+# add --backup <host:port> for the backup schedule's status port (below).
 ```
 
 It emits `flint_up{instance,role}` / `flint_proxy_up{instance}` plus every
@@ -841,6 +842,19 @@ rejoin; each sends a replica to its rewind or to a full re-seed.
 a moment later did not, and that were served rather than refused. Each is also
 logged with the newest live and archived WAL files: "replica refused at seq",
 "rejoin refused at seq", and "saw a gap that a re-walk did not".
+
+**Backups** (ADR-0011's D8 amendment). Name the backup schedule's status
+port in the inventory, `backup-listen <host:port>`, and point the exporter at
+it with `--backup <host:port>`. Alert on **`flint_backup_restorable_overdue ==
+1`**: the newest set the schedule's strongest check proved (a rehearsal, else
+a verify, else the backup completing) is older than
+`flint_backup_restorable_bound_s`, which the seat computes from its own
+cadence, or it has proven none since a start longer ago than that. Alert on
+`flint_backup_up == 0` beside it: a seat that cannot be read cannot say it is
+overdue. `flint_backup_restorable_age_s` is absent until a set is proven,
+never `0`. Each job's failures are `flint_backup_job_<job>_consecutive_failures`;
+a failure streak's start goes to the fleet journal as `BackupJobFailed`, with
+the error, and its end as `BackupJobRecovered`.
 
 **Numeric is the whole filter, so a field that cannot be known still renders a
 number** (BUG-0095): `acked_seq`, `seq_lag` and `lag_ms` read **`-1`** when no

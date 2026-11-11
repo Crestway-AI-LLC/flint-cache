@@ -165,6 +165,16 @@ pub enum EventKind {
     /// its auth count stayed flat across the tenant's subset for a full
     /// drain window. detail carries the drained digest (non-secret).
     TokenRetired,
+    /// A scheduled backup job (`backup`, `verify` or `rehearse`) failed after
+    /// its last run succeeded: the START of a failure streak, never each
+    /// failed run (ADR-0011 D8 amendment). subject is the job, cause its
+    /// error. The streak's later failures are retries, already counted in the
+    /// seat's `FLINTINFO`; one row per streak is what the daily review reads.
+    BackupJobFailed,
+    /// The first success of a scheduled backup job after a failure streak.
+    /// Emitted only when the seat saw that streak, so a healthy schedule
+    /// journals nothing.
+    BackupJobRecovered,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

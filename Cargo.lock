@@ -515,6 +515,7 @@ name = "flint-backup"
 version = "0.0.1"
 dependencies = [
  "flint-build",
+ "flint-journal",
  "flint-log",
  "flint-resp",
  "flint-sched",

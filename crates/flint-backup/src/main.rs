@@ -30,6 +30,7 @@
 extern crate flint_log;
 
 mod s3;
+mod status;
 
 use flint_backup::store::{LocalDir, ObjectStore};
 use flint_backup::{Manifest, ObjectRecord, PairRecord};
@@ -209,7 +210,8 @@ fn main() {
                  --cp <addr> --proxy-name <registered-proxy> [--tls <certs-dir>]\n  \
                  flint-backup schedule   --pairs <a,b;c,d> --cp-state <path> --to <dir|s3://...> \
                  --every <dur> [--verify-every <dur>] [--rehearse-every <dur>] [--keep <n>] \
-                 [--status-file <path>] [--jitter <dur>] [--tls <certs-dir>] [--snap-root <dir>]"
+                 [--status-file <path>] [--jitter <dur>] [--tls <certs-dir>] [--snap-root <dir>] \
+                 [--listen <addr>] [--journal <cp-addr>]"
             );
             std::process::exit(2)
         }
@@ -844,9 +846,51 @@ fn schedule() {
     // status writer; the backup job never touches it, which is the point.
     let rehearsed: Arc<Mutex<Option<(String, u64)>>> = Arc::new(Mutex::new(None));
 
+    // ADR-0011 D8 amendment: the newest set each check has passed, the
+    // alertable age computed from it, and who hears about it. Seeded from
+    // this seat's own status file, so a restart does not reset a known age
+    // to unknown, nor journal a second start for a streak already reported.
+    let started_ms = now_ms();
+    let cadence = status::Cadence {
+        every_s: every.as_secs(),
+        verify_s: verify_every.map(|d| d.as_secs()),
+        rehearse_s: rehearse_every.map(|d| d.as_secs()),
+    };
+    let previous = status_file
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let proofs = Arc::new(Mutex::new(status::Proofs::parse(&previous)));
+    let mut streaks = status::streaks(&previous);
+    let shown: Arc<Mutex<Vec<(String, flint_sched::JobStats)>>> = Arc::new(Mutex::new(Vec::new()));
+    let journal = arg("--journal");
+    let mesh = arg("--tls").map(|d| {
+        flint_tls::client_config(
+            &format!("{d}/ca.crt"),
+            &format!("{d}/int.crt"),
+            &format!("{d}/int.key"),
+        )
+        .unwrap_or_else(|e| die(&format!("load mesh certs from {d}: {e}")))
+    });
+    if let Some(addr) = arg("--listen") {
+        status_listener(
+            &addr,
+            arg("--tls"),
+            shown.clone(),
+            proofs.clone(),
+            cadence,
+            started_ms,
+        );
+    }
+    let actor = format!(
+        "backup:{}",
+        arg("--listen").unwrap_or_else(|| "schedule".to_string())
+    );
+
     let mut sched = flint_sched::Scheduler::new();
     {
         let invoke = invoke.clone();
+        let proofs = proofs.clone();
         // Computed BEFORE the job closure takes `to`: the first-run delay
         // reads the store once at startup.
         let initial_delay = {
@@ -920,6 +964,18 @@ fn schedule() {
                         false
                     })
                     .collect();
+                // The set this run landed is the newest completed one: it
+                // passed the weakest check, completing. Recorded before the
+                // prune, whose early return must not lose it.
+                if let Some(newest) = completed.last()
+                    && let Some(ms) = set_id_ms(newest)
+                {
+                    proofs.lock().unwrap_or_else(|p| p.into_inner()).record(
+                        status::Check::Backup,
+                        newest,
+                        ms,
+                    );
+                }
                 let mut pruned = 0usize;
                 if completed.len() > keep {
                     for id in &completed[..completed.len() - keep] {
@@ -969,10 +1025,19 @@ fn schedule() {
     if let Some(vd) = verify_every {
         let invoke = invoke.clone();
         let to = to.clone();
+        let proofs = proofs.clone();
         sched.add(
             flint_sched::Job::new("verify", vd, vd / 8, move || {
                 let newest = newest_completed(&to)?;
-                invoke(&["verify", "--from", &join_spec(&to, &newest)])
+                let summary = invoke(&["verify", "--from", &join_spec(&to, &newest)])?;
+                if let Some(ms) = set_id_ms(&newest) {
+                    proofs.lock().unwrap_or_else(|p| p.into_inner()).record(
+                        status::Check::Verify,
+                        &newest,
+                        ms,
+                    );
+                }
+                Ok(summary)
             }),
             flint_sched::Scheduler::startup_jitter(jitter),
         );
@@ -980,6 +1045,7 @@ fn schedule() {
     if let Some(rd) = rehearse_every {
         let to = to.clone();
         let rehearsed = rehearsed.clone();
+        let proofs = proofs.clone();
         sched.add(
             flint_sched::Job::new("rehearse", rd, rd / 8, move || {
                 let newest = newest_completed(&to)?;
@@ -996,6 +1062,13 @@ fn schedule() {
                 let _ = std::fs::remove_dir_all(&dest);
                 let summary = r?;
                 *rehearsed.lock().expect("rehearsed lock") = Some((newest.clone(), now_ms()));
+                if let Some(ms) = set_id_ms(&newest) {
+                    proofs.lock().unwrap_or_else(|p| p.into_inner()).record(
+                        status::Check::Rehearse,
+                        &newest,
+                        ms,
+                    );
+                }
                 Ok(summary)
             }),
             flint_sched::Scheduler::startup_jitter(jitter),
@@ -1010,6 +1083,38 @@ fn schedule() {
     let stop = std::sync::atomic::AtomicBool::new(false);
     loop {
         let next = sched.tick(std::time::Instant::now());
+        // A job runs on this thread, so the listener reads what the last
+        // finished run left here, and computes the age itself, at the moment
+        // it is asked: a rehearsal that takes an hour must not freeze it.
+        let stats = sched.stats();
+        *shown.lock().unwrap_or_else(|p| p.into_inner()) = stats.clone();
+        for edge in status::edges(&mut streaks, &stats) {
+            let (kind, subject, cause) = match edge {
+                status::Edge::Failed { job, error } => {
+                    elog!("schedule: job {job} started failing: {error}");
+                    (flint_journal::EventKind::BackupJobFailed, job, Some(error))
+                }
+                status::Edge::Recovered { job } => {
+                    elog!("schedule: job {job} recovered");
+                    (flint_journal::EventKind::BackupJobRecovered, job, None)
+                }
+            };
+            if let Some(target) = &journal {
+                flint_journal::emit_detached(
+                    target.clone(),
+                    mesh.clone(),
+                    flint_journal::Event {
+                        at_ms: flint_journal::now_ms(),
+                        actor: actor.clone(),
+                        kind,
+                        subject,
+                        epoch: None,
+                        cause,
+                        detail: None,
+                    },
+                );
+            }
+        }
         if let Some(path) = &status_file {
             let mut s = String::new();
             for (name, st) in sched.stats() {
@@ -1047,6 +1152,19 @@ fn schedule() {
 ",
                 );
             }
+            // The proofs, for the next start to read back, and the verdict
+            // the listener gives, for a person reading the file.
+            let held = proofs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            s.push_str(&held.lines());
+            let r = status::restorable(&held, &cadence, now_ms(), started_ms);
+            s.push_str(&format!(
+                "restorable_by {}\nrestorable_set {}\nrestorable_age_s {}\nrestorable_bound_s {}\nrestorable_overdue {}\n",
+                r.by.name(),
+                r.set.as_deref().unwrap_or("none"),
+                r.age_s.map_or("unknown".to_string(), |a| a.to_string()),
+                r.bound_s,
+                u8::from(r.overdue)
+            ));
             let tmp = format!("{path}.tmp");
             if std::fs::write(&tmp, &s).is_ok() {
                 let _ = std::fs::rename(&tmp, path);
@@ -1061,6 +1179,106 @@ fn schedule() {
         }
         std::thread::sleep(sleep);
     }
+}
+
+/// The schedule's read-only status port (ADR-0011's D8 amendment): `PING`
+/// and `FLINTINFO`, nothing else. It changes nothing and holds no credential,
+/// so D8's reason for keeping backup out of `flintctl`, that a bucket key
+/// must not reach cluster control, is not reopened by it. Mesh mTLS when
+/// `--tls` names the certs, as on every other seat's port.
+fn status_listener(
+    addr: &str,
+    tls_dir: Option<String>,
+    shown: Arc<std::sync::Mutex<Vec<(String, flint_sched::JobStats)>>>,
+    proofs: Arc<std::sync::Mutex<status::Proofs>>,
+    cadence: status::Cadence,
+    started_ms: u64,
+) {
+    let listener =
+        std::net::TcpListener::bind(addr).unwrap_or_else(|e| die(&format!("--listen {addr}: {e}")));
+    let tls = tls_dir.map(|d| {
+        flint_tls::ReloadableServerConfig::watch(
+            &format!("{d}/ca.crt"),
+            &format!("{d}/int.crt"),
+            &format!("{d}/int.key"),
+        )
+        .unwrap_or_else(|e| die(&format!("load mesh certs from {d}: {e}")))
+    });
+    elog!(
+        "schedule: status port on {addr} (PING and FLINTINFO only, tls={})",
+        tls.is_some()
+    );
+    let build = flint_build::version(env!("CARGO_PKG_VERSION"));
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(tcp) = conn else { continue };
+            let cfg = tls.as_ref().and_then(|r| r.current());
+            let (shown, proofs, build) = (shown.clone(), proofs.clone(), build.clone());
+            std::thread::spawn(move || {
+                let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
+                let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
+                let Ok(mut s) = flint_tls::accept(tcp, &cfg) else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match decode(&buf) {
+                        Ok(Decoded::Complete(v, used)) => {
+                            buf.drain(..used);
+                            let name = match &v {
+                                Value::Array(Some(a)) => match a.first() {
+                                    Some(Value::Bulk(Some(b))) => {
+                                        String::from_utf8_lossy(b).to_ascii_uppercase()
+                                    }
+                                    _ => String::new(),
+                                },
+                                _ => String::new(),
+                            };
+                            let reply = match name.as_str() {
+                                "PING" => Value::Simple("PONG".into()),
+                                "FLINTINFO" => {
+                                    let now = now_ms();
+                                    let held =
+                                        proofs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                                    let r = status::restorable(&held, &cadence, now, started_ms);
+                                    let stats =
+                                        shown.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                                    Value::Bulk(Some(
+                                        status::info(&stats, &r, now, started_ms, &build)
+                                            .into_bytes(),
+                                    ))
+                                }
+                                "QUIT" => Value::Simple("OK".into()),
+                                _ => Value::Error(
+                                    "ERR this is the backup schedule's read-only status port: it \
+                                     answers PING and FLINTINFO only"
+                                        .into(),
+                                ),
+                            };
+                            let mut out = Vec::new();
+                            encode(&reply, &mut out);
+                            if s.write_all(&out).is_err() || name == "QUIT" {
+                                return;
+                            }
+                        }
+                        Ok(Decoded::NeedMore) => {
+                            // A status request is a few bytes; a peer that
+                            // sends more than this without a frame is not one.
+                            if buf.len() > 64 * 1024 {
+                                return;
+                            }
+                            match s.read(&mut chunk) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
+    });
 }
 
 fn run() {
