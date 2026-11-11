@@ -209,6 +209,39 @@ pub trait Kv: Send + Sync {
     fn clear(&self);
 }
 
+thread_local! {
+    static WRITE_FAULT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Record that the engine refused a write made on this thread, keeping the
+/// first refusal until `take_write_fault` reads it (BUG-0283).
+///
+/// `Kv::put` and `Kv::delete` return nothing, so a store whose engine can
+/// refuse a write (RocksDB on a full disk or a failing volume) has no other
+/// way to say so to the command that made it. A command runs on one thread
+/// from start to reply, with no await between its rows, so what this thread
+/// recorded between two `take_write_fault` calls is that command's.
+pub fn note_write_fault(error: &dyn std::fmt::Display) {
+    WRITE_FAULT.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.is_none() {
+            *f = Some(error.to_string());
+        }
+    });
+}
+
+/// The first write the engine refused on this thread since the last call,
+/// and clear it (BUG-0283).
+///
+/// The server takes it before a write command runs, so nothing left by
+/// earlier work on the thread (a read's lazy-expiry delete) is charged to
+/// the command, and again after it, where `Some` means a row the command
+/// wrote did not land: its reply must be an error, not the success it
+/// computed.
+pub fn take_write_fault() -> Option<String> {
+    WRITE_FAULT.with(|f| f.borrow_mut().take())
+}
+
 /// A write-suppressing view of another `Kv`, used on replicas.
 ///
 /// A replica rejects mutating commands at dispatch, so the ONLY writes that

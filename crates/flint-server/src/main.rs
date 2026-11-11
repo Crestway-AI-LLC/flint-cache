@@ -5903,7 +5903,16 @@ fn execute(
         if args[1..].iter().any(|p| p.is_empty()) {
             return Value::Error("ERR FLINTINDEXED takes non-empty prefixes".into());
         }
+        let _ = flint_storage::take_write_fault();
         indexed.set(store, conn_ns, args[1..].to_vec());
+        // BUG-0283: the row is written with `Kv::put`, which cannot return
+        // RocksDB's refusal. The prefixes guard this node from here either
+        // way; a row that did not land is forgotten at the next start.
+        if let Some(e) = flint_storage::take_write_fault() {
+            return Value::Error(format!(
+                "ERR FLINTINDEXED: the prefix row was not stored, so a restart forgets it: {e}"
+            ));
+        }
         return Value::Simple("OK".into());
     }
     // FLINTINDEXEDROW <ns>: that namespace's row as stored, or nil, for a
@@ -6560,14 +6569,30 @@ fn execute(
         // still computes its exact reply against everything the run has
         // written so far.
         let engine: &dyn Kv = batch_kv.unwrap_or(store);
-        Dispatcher::with_limits(
+        // BUG-0283: a write here reaches the engine row by row through
+        // `Kv::put` and `Kv::delete`, which return nothing; only a staged
+        // write (`batch_kv`) commits through `apply_writes`, whose error is
+        // the reply. A row RocksDB refuses is recorded on this thread, so the
+        // record is cleared before the command and read after it: `Some`
+        // means a row of this command did not land, and the reply it
+        // computed (`:1` for an HSET, the new length for an APPEND) is not
+        // true.
+        let direct = is_write && batch_kv.is_none();
+        if direct {
+            let _ = flint_storage::take_write_fault();
+        }
+        let reply = Dispatcher::with_limits(
             engine,
             flint_storage::strings::system_clock,
             limits,
             conn_ns,
         )
         .whole(conn_txn.whole)
-        .dispatch(args)
+        .dispatch(args);
+        if direct && let Some(e) = flint_storage::take_write_fault() {
+            return Value::Error(format!("ERR write failed: {e}"));
+        }
+        reply
     }
 }
 

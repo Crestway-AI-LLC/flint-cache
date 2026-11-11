@@ -284,6 +284,11 @@ fn migrate_in(
 ) -> Value {
     use flint_storage::manifest::{self, MigrationPhase};
 
+    // BUG-0283: every row below lands through `Kv::put`, which cannot return
+    // RocksDB's refusal, so a refused row is recorded on this thread instead.
+    // Cleared here so that only this import's rows are counted; read at each
+    // caught-up point, before anything is claimed on the strength of them.
+    let _ = flint_storage::take_write_fault();
     // Step 1 (cutover): mark Importing before pulling.
     if let Some(_me) = self_addr {
         if let Err(e) = set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Importing, src) {
@@ -449,6 +454,18 @@ fn migrate_in(
                             Value::Integer(cursor),
                             Value::Integer(head),
                         ] if t == b"CAUGHTUP" && past_bulk && cursor >= head => {
+                            // A row the engine refused is a row this node
+                            // does not have. Freezing the source, flipping
+                            // ownership or saying OK would each act as if it
+                            // did, and after the flip the source purges its
+                            // copy (BUG-0283).
+                            if let Some(e) = flint_storage::take_write_fault() {
+                                rollback();
+                                return Value::Error(format!(
+                                    "ERR migrate: this node's engine refused a row it imported \
+                                     ({e}); the slot was not taken"
+                                ));
+                            }
                             match self_addr {
                                 // Data-ship only: caught up, done.
                                 None => return Value::Simple(format!("MIGRATEIN-OK {applied}")),

@@ -1104,10 +1104,16 @@ impl Kv for RocksKv {
         }
     }
 
+    /// A refused write is recorded for the command that made it
+    /// (`crate::take_write_fault`), since this signature cannot return it.
+    /// It was discarded, and a client was told OK for an `HSET` or `APPEND`
+    /// that RocksDB had refused (BUG-0283).
     fn put(&self, key: &[u8], value: &[u8]) {
         self.observe_record((key.len() + value.len()) as u64);
         let _w = Counted::enter(&ENGINE_WRITERS);
-        let _ = self.db.put(key, value);
+        if let Err(e) = self.db.put(key, value) {
+            crate::note_write_fault(&e);
+        }
     }
 
     fn delete(&self, key: &[u8]) -> bool {
@@ -1116,7 +1122,9 @@ impl Kv for RocksKv {
         let existed = self.db.get_pinned(key).ok().flatten().is_some();
         self.observe_record(key.len() as u64);
         let _w = Counted::enter(&ENGINE_WRITERS);
-        let _ = self.db.delete(key);
+        if let Err(e) = self.db.delete(key) {
+            crate::note_write_fault(&e);
+        }
         existed
     }
 
@@ -1212,14 +1220,18 @@ impl Kv for RocksKv {
             pending += 1;
             if pending == CHUNK {
                 let _w = Counted::enter(&ENGINE_WRITERS);
-                let _ = self.db.write(std::mem::take(&mut batch));
+                if let Err(e) = self.db.write(std::mem::take(&mut batch)) {
+                    crate::note_write_fault(&e);
+                }
                 pending = 0;
             }
             true
         });
         if pending > 0 {
             let _w = Counted::enter(&ENGINE_WRITERS);
-            let _ = self.db.write(batch);
+            if let Err(e) = self.db.write(batch) {
+                crate::note_write_fault(&e);
+            }
         }
     }
 }
@@ -1470,6 +1482,50 @@ mod audit {
         assert!(!kv.delete(b"k"));
         kv.clear();
         assert_eq!(kv.scan_prefix(b"").len(), 0);
+    }
+
+    /// BUG-0283: a write RocksDB refuses is recorded for the command that
+    /// made it, once, and only on the thread that made it. A read-only handle
+    /// refuses every write, which stands in here for a full or failing disk.
+    #[test]
+    fn a_refused_write_is_recorded_for_the_thread_that_made_it() {
+        let dir = TempDir::new("write-fault");
+        RocksKv::open(&dir.0).expect("open").put(b"k", b"v");
+        let _ = crate::take_write_fault();
+        let kv = RocksKv::open(&dir.0).expect("reopen");
+        kv.put(b"ok", b"1");
+        assert_eq!(
+            crate::take_write_fault(),
+            None,
+            "a write that landed records nothing"
+        );
+        drop(kv);
+
+        let ro = RocksKv::open_read_only(&dir.0).expect("open read-only");
+        ro.put(b"k", b"w");
+        let refusal = crate::take_write_fault().expect("a refused put is recorded");
+        assert!(!refusal.is_empty(), "the record carries RocksDB's message");
+        assert_eq!(crate::take_write_fault(), None, "taking it clears it");
+        assert!(
+            ro.delete(b"k"),
+            "the row existed, and the refused delete says so"
+        );
+        assert!(
+            crate::take_write_fault().is_some(),
+            "a refused delete is recorded"
+        );
+        assert_eq!(ro.get(b"k"), Some(b"v".to_vec()), "nothing was written");
+        ro.clear();
+        assert!(
+            crate::take_write_fault().is_some(),
+            "a refused clear is recorded"
+        );
+
+        ro.put(b"k", b"z");
+        std::thread::scope(|s| {
+            s.spawn(|| assert_eq!(crate::take_write_fault(), None, "another thread's"));
+        });
+        assert!(crate::take_write_fault().is_some(), "still this thread's");
     }
 
     /// FLUSHALL must drain datasets larger than one delete chunk without
