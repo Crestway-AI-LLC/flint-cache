@@ -76,9 +76,15 @@ pub fn sweep(kv: &dyn Kv, now_ms: u64, lock_key: KeyLock) -> SweepReport {
                     });
                 live_version != Some(version)
             };
-            if judge() {
+            // A meta row the engine could not read is not an absent one: the
+            // rows under it are not orphans. Deleting them, which the WAL
+            // takes to every replica, turned one unreadable block into lost
+            // fields, readable ones included (BUG-0284). Pass 1 needs no
+            // watch: a re-read that fails reads as not expired.
+            let engine = crate::watch_engine();
+            if judge() && engine.fault().is_none() {
                 let _guard = lock_key(ns, user_key);
-                if judge() && kv.delete(k) {
+                if judge() && engine.fault().is_none() && kv.delete(k) {
                     report.orphan_rows += 1;
                 }
             }

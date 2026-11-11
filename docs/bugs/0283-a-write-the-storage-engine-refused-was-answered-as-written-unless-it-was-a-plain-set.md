@@ -63,21 +63,21 @@ Writer has previous error.` once a second; nothing reached a client.
 
 **A row the engine refuses is recorded on the thread that wrote it.**
 `RocksKv`'s `put`, `delete` and `clear` keep RocksDB's error with
-`flint_storage::note_write_fault`, the first one until it is read, since
-their signature cannot return it. A command runs on one thread from start to
-reply, with no await between its rows, so what the thread recorded between
-two reads is that command's. `flint_storage::take_write_fault` reads and
-clears it.
+`flint_storage::note_write_fault`, since their signature cannot return it.
+A command runs on one thread from start to reply, with no await between its
+rows, so the work that watches the engine (`flint_storage::watch_engine`,
+which BUG-0284 extends to reads) learns of the first failure from
+`EngineWatch::fault`.
 
-- **An inline write command** clears the record before it runs and reads it
-  after. A refusal replaces the reply with `ERR write failed: <RocksDB's
-  message>`. A read's lazy-expiry delete that fails is not charged to it,
-  and is not charged to the next write either.
-- **A slot import** clears it at the start and reads it at each caught-up
-  point. A refusal rolls the import back, unfreezing the source if it was
-  frozen, and answers `ERR migrate: this node's engine refused a row it
-  imported (…); the slot was not taken`. The source keeps the slot and its
-  rows.
+- **A write command** is watched from dispatch to reply. A refusal replaces
+  the reply with `ERR write failed: <RocksDB's message>`. A read whose
+  lazy-expiry delete was refused keeps its reply, which that delete does
+  not change.
+- **A slot import** is watched from its start and reads the watch at each
+  caught-up point. A refusal rolls the import back, unfreezing the source if
+  it was frozen, and answers `ERR migrate: this node's storage engine write
+  failed: … during the import; the slot was not taken`. The source keeps the
+  slot and its rows.
 - **`FLINTINDEXED`** answers an error when its prefix row was not stored.
   The prefixes guard the node from then on either way. Only a restart
   forgets a row that did not land.

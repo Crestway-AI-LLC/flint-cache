@@ -147,6 +147,11 @@ pub(crate) fn flintmigrateout(
     // holds a whole slot in memory.
     let mut bulk_rows: u64 = 0;
     let mut pacer = Pacer::new(&crate::MIGRATE_RATE_BYTES);
+    // A scan stops at a block the engine cannot read. Unwatched, it stopped
+    // as if the slot ended there, and the destination took the slot with
+    // the rows before the block, after which this node purged every row of
+    // it, the readable ones after the block included (BUG-0284).
+    let engine = flint_storage::watch_engine();
     for prefix in &prefixes {
         out.clear();
         let mut io_err: Option<std::io::Error> = None;
@@ -174,12 +179,23 @@ pub(crate) fn flintmigrateout(
         if let Some(e) = io_err {
             return Err(e);
         }
+        if let Some(f) = engine.fault() {
+            out.clear();
+            encode(
+                &Value::Error(format!(
+                    "ERR the source's storage engine {f} while reading the slot; nothing is handed over"
+                )),
+                &mut out,
+            );
+            return stream.write_all(&out);
+        }
         if !out.is_empty() {
             let n = out.len();
             stream.write_all(&out)?;
             pacer.pace(n);
         }
     }
+    drop(engine);
     out.clear();
     encode(
         &Value::Array(Some(vec![
@@ -285,10 +301,11 @@ fn migrate_in(
     use flint_storage::manifest::{self, MigrationPhase};
 
     // BUG-0283: every row below lands through `Kv::put`, which cannot return
-    // RocksDB's refusal, so a refused row is recorded on this thread instead.
-    // Cleared here so that only this import's rows are counted; read at each
-    // caught-up point, before anything is claimed on the strength of them.
-    let _ = flint_storage::take_write_fault();
+    // RocksDB's refusal, so the engine is watched for the whole import and
+    // the watch is read at each caught-up point, before anything is claimed
+    // on the strength of the rows. Once it has seen a failure, no further
+    // row is written (BUG-0284); `rollback` writes its records regardless.
+    let engine = flint_storage::watch_engine();
     // Step 1 (cutover): mark Importing before pulling.
     if let Some(_me) = self_addr {
         if let Err(e) = set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Importing, src) {
@@ -314,59 +331,61 @@ fn migrate_in(
     // un-disown a handoff that actually completed — the safety is in the
     // source's own check, not in our timing.
     let rollback = || {
-        if self_addr.is_none() {
-            // Data-ship only: we never claimed the slot, so there is nothing
-            // of ours to roll back and no source state we created.
-            return;
-        }
-        if !frozen.get() {
-            // The source was never frozen, so no other node is holding state
-            // on our behalf. Clearing our own record is the whole rollback.
-            manifest::clear_migration(kv.as_ref(), ns, slot);
-            return;
-        }
+        flint_storage::unwithheld(|| {
+            if self_addr.is_none() {
+                // Data-ship only: we never claimed the slot, so there is nothing
+                // of ours to roll back and no source state we created.
+                return;
+            }
+            if !frozen.get() {
+                // The source was never frozen, so no other node is holding state
+                // on our behalf. Clearing our own record is the whole rollback.
+                manifest::clear_migration(kv.as_ref(), ns, slot);
+                return;
+            }
 
-        // We froze the source. RECORD WHY WE STOPPED before doing anything
-        // else (docs/bugs/0025).
-        //
-        // Deleting our Importing record here is what made an abort and a
-        // completed flip the same bytes: the cutover clears the SAME record
-        // one step before the flip, when we genuinely own the slot. A
-        // controller seeing a frozen source and no record on us read that
-        // absence as "the flip half-completed", told the source to disown, and
-        // the source purged every row. Aborted says which of the two happened.
-        //
-        // It is durable and it lands FIRST, so dying anywhere below leaves the
-        // fact recoverable rather than leaving a lie.
-        if let Err(e) = set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Aborted, src) {
-            elog!("cutover rollback: slot {slot} could not record Aborted: {e:?}");
-        }
+            // We froze the source. RECORD WHY WE STOPPED before doing anything
+            // else (docs/bugs/0025).
+            //
+            // Deleting our Importing record here is what made an abort and a
+            // completed flip the same bytes: the cutover clears the SAME record
+            // one step before the flip, when we genuinely own the slot. A
+            // controller seeing a frozen source and no record on us read that
+            // absence as "the flip half-completed", told the source to disown, and
+            // the source purged every row. Aborted says which of the two happened.
+            //
+            // It is durable and it lands FIRST, so dying anywhere below leaves the
+            // fact recoverable rather than leaving a lie.
+            if let Err(e) = set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Aborted, src) {
+                elog!("cutover rollback: slot {slot} could not record Aborted: {e:?}");
+            }
 
-        // Then unfreeze the source. We are the right actor: we KNOW we
-        // aborted, where the controller could only infer it. FLINTSLOTABORT
-        // refuses a slot that is already Moved, so this cannot un-disown a
-        // handoff that actually completed.
-        let r = call_retrying(
-            src,
-            &[b"FLINTSLOTABORT", slot.to_string().as_bytes(), ns],
-            3,
-            std::time::Duration::from_secs(5),
-        );
-        if matches!(r, Ok(Value::Simple(_))) {
-            // Source is released and we own nothing: the marker has served its
-            // purpose and would otherwise redirect our clients to the source
-            // forever.
-            manifest::clear_migration(kv.as_ref(), ns, slot);
-        } else {
-            // KEEP the Aborted marker. It is now the only durable evidence
-            // that the source is frozen on our account, and it is what stops a
-            // reconcile from mistaking that freeze for a half-done flip.
-            elog!(
-                "cutover rollback: slot {slot} could not be unfrozen on {src} ({r:?}) \
+            // Then unfreeze the source. We are the right actor: we KNOW we
+            // aborted, where the controller could only infer it. FLINTSLOTABORT
+            // refuses a slot that is already Moved, so this cannot un-disown a
+            // handoff that actually completed.
+            let r = call_retrying(
+                src,
+                &[b"FLINTSLOTABORT", slot.to_string().as_bytes(), ns],
+                3,
+                std::time::Duration::from_secs(5),
+            );
+            if matches!(r, Ok(Value::Simple(_))) {
+                // Source is released and we own nothing: the marker has served its
+                // purpose and would otherwise redirect our clients to the source
+                // forever.
+                manifest::clear_migration(kv.as_ref(), ns, slot);
+            } else {
+                // KEEP the Aborted marker. It is now the only durable evidence
+                // that the source is frozen on our account, and it is what stops a
+                // reconcile from mistaking that freeze for a half-done flip.
+                elog!(
+                    "cutover rollback: slot {slot} could not be unfrozen on {src} ({r:?}) \
                  — Aborted marker retained so recovery unfreezes it rather than \
                  completing a flip onto us"
-            );
-        }
+                );
+            }
+        })
     };
 
     // ADR-0060 amendment 2: the namespace's FT index prefixes come before
@@ -459,11 +478,11 @@ fn migrate_in(
                             // ownership or saying OK would each act as if it
                             // did, and after the flip the source purges its
                             // copy (BUG-0283).
-                            if let Some(e) = flint_storage::take_write_fault() {
+                            if let Some(f) = engine.fault() {
                                 rollback();
                                 return Value::Error(format!(
-                                    "ERR migrate: this node's engine refused a row it imported \
-                                     ({e}); the slot was not taken"
+                                    "ERR migrate: this node's storage engine {f} during the \
+                                     import; the slot was not taken"
                                 ));
                             }
                             match self_addr {

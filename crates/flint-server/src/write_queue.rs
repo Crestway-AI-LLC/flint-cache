@@ -309,6 +309,10 @@ fn consumer(
         // Run every command against ONE BatchingKv: each computes its exact
         // reply over the accumulating state (an INCR burst on one key sees
         // its own prior increments).
+        // One watch for the batch: its commands share one buffer, so a read
+        // the engine could not do fails all of them, as a failed commit does
+        // (BUG-0284).
+        let engine = flint_storage::watch_engine();
         let batching = BatchingKv::new(store.as_ref());
         let mut pending: Vec<(Value, SyncSender<Value>)> = Vec::with_capacity(jobs.len());
         for job in jobs {
@@ -333,6 +337,14 @@ fn consumer(
         // symmetric: a spurious bump can only abort a transaction that might
         // have committed, which WATCH permits -- it is optimistic. A MISSED
         // bump commits one that must abort, which nothing permits.
+        if let Some(f) = engine.fault() {
+            let msg = Value::Error(format!("ERR batch aborted, nothing applied: {f}"));
+            for (_, tx) in pending {
+                let _ = tx.send(msg.clone());
+            }
+            continue;
+        }
+        drop(engine);
         let ops = batching.into_ops();
         for (k, _) in &ops {
             watch.bump(k);

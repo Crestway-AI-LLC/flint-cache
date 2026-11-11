@@ -5401,6 +5401,9 @@ fn exec_transaction(
     // A queued PUBLISH is heard once the transaction's writes commit, and
     // not at all if they fail (ADR-0052 D5).
     let held = pubsub::Deferral::begin();
+    // A transaction that read a key the engine could not read computed its
+    // writes from a key it took for absent: none of them commit (BUG-0284).
+    let engine = flint_storage::watch_engine();
     let batching = flint_storage::batch::BatchingKv::new(store);
     let mut replies = Vec::with_capacity(txn.queued.len());
     {
@@ -5431,6 +5434,9 @@ fn exec_transaction(
                 .dispatch(cmd),
             );
         }
+    }
+    if let Some(f) = engine.fault() {
+        return Value::Error(format!("ERR transaction aborted, nothing applied: {f}"));
     }
     let ops = batching.into_ops();
     if !ops.is_empty()
@@ -5903,14 +5909,14 @@ fn execute(
         if args[1..].iter().any(|p| p.is_empty()) {
             return Value::Error("ERR FLINTINDEXED takes non-empty prefixes".into());
         }
-        let _ = flint_storage::take_write_fault();
+        let engine = flint_storage::watch_engine();
         indexed.set(store, conn_ns, args[1..].to_vec());
         // BUG-0283: the row is written with `Kv::put`, which cannot return
         // RocksDB's refusal. The prefixes guard this node from here either
         // way; a row that did not land is forgotten at the next start.
-        if let Some(e) = flint_storage::take_write_fault() {
+        if let Some(f) = engine.fault() {
             return Value::Error(format!(
-                "ERR FLINTINDEXED: the prefix row was not stored, so a restart forgets it: {e}"
+                "ERR FLINTINDEXED: the prefix row was not stored, so a restart forgets it: {f}"
             ));
         }
         return Value::Simple("OK".into());
@@ -6504,15 +6510,24 @@ fn execute(
     // the compaction filter reclaim expired rows. Reads still return None
     // for expired keys — correctness is unchanged, only the local write is
     // suppressed.
+    //
+    // BUG-0283, BUG-0284: the engine is watched for this command, from here
+    // to its reply. `Kv::get` answers `None` for a read RocksDB could not
+    // do, and `Kv::put` and `Kv::delete` return nothing, so the watch is
+    // where a command learns that the engine failed it. Once it has, the
+    // store writes nothing more for the command (a key read as absent must
+    // not be written over), and the reply is the failure (`engine_checked`).
+    let engine = flint_storage::watch_engine();
     if ro {
         let ro_store = flint_storage::ReadOnlyKv(store);
-        Dispatcher::with_limits(
+        let reply = Dispatcher::with_limits(
             &ro_store,
             flint_storage::strings::system_clock,
             limits,
             conn_ns,
         )
-        .dispatch(args)
+        .dispatch(args);
+        engine_checked(&engine, is_write, reply)
     } else {
         // A script's writes commit as ONE batch (ADR-0051), as a
         // transaction's do: `cmd_eval` hands its writes to this buffer only
@@ -6556,6 +6571,13 @@ fn execute(
                 write_guard = Some(write_lock::lock_all());
                 every_writer = true;
             };
+            // A script that read a key the engine could not read computed
+            // its writes from a key it took for absent (BUG-0284).
+            if let Some(f) = engine.fault() {
+                return Value::Error(format!(
+                    "ERR script aborted, none of its writes applied: {f}"
+                ));
+            }
             let ops = batching.into_ops();
             if !ops.is_empty()
                 && let Err(e) = commit_watched(store, rocks, watch, &ops)
@@ -6568,31 +6590,35 @@ fn execute(
         // otherwise. BatchingKv overlays reads and scans, so this command
         // still computes its exact reply against everything the run has
         // written so far.
-        let engine: &dyn Kv = batch_kv.unwrap_or(store);
-        // BUG-0283: a write here reaches the engine row by row through
-        // `Kv::put` and `Kv::delete`, which return nothing; only a staged
-        // write (`batch_kv`) commits through `apply_writes`, whose error is
-        // the reply. A row RocksDB refuses is recorded on this thread, so the
-        // record is cleared before the command and read after it: `Some`
-        // means a row of this command did not land, and the reply it
-        // computed (`:1` for an HSET, the new length for an APPEND) is not
-        // true.
-        let direct = is_write && batch_kv.is_none();
-        if direct {
-            let _ = flint_storage::take_write_fault();
-        }
-        let reply = Dispatcher::with_limits(
-            engine,
-            flint_storage::strings::system_clock,
-            limits,
-            conn_ns,
-        )
-        .whole(conn_txn.whole)
-        .dispatch(args);
-        if direct && let Some(e) = flint_storage::take_write_fault() {
-            return Value::Error(format!("ERR write failed: {e}"));
-        }
-        reply
+        //
+        // A write here reaches the engine row by row through `Kv::put` and
+        // `Kv::delete`; only a staged write (`batch_kv`) commits through
+        // `apply_writes`, whose error is the reply. So the reply this
+        // command computes (`:1` for an HSET, the new length for an APPEND)
+        // stands only if the watch saw no failure (BUG-0283).
+        let kv: &dyn Kv = batch_kv.unwrap_or(store);
+        let reply =
+            Dispatcher::with_limits(kv, flint_storage::strings::system_clock, limits, conn_ns)
+                .whole(conn_txn.whole)
+                .dispatch(args);
+        engine_checked(&engine, is_write, reply)
+    }
+}
+
+/// A command's reply once the storage engine has failed it (BUG-0283,
+/// BUG-0284).
+///
+/// A read the engine could not do fails any command, a read included: what
+/// it took for an absent key may be there, so `nil`, `0` or a short list
+/// would be a wrong answer, not a miss. A refused write fails a write
+/// command. A read whose lazy-expiry delete was refused keeps its reply,
+/// which that delete does not change.
+fn engine_checked(engine: &flint_storage::EngineWatch, is_write: bool, reply: Value) -> Value {
+    use flint_storage::EngineFault;
+    match engine.fault() {
+        Some(f @ EngineFault::Read(_)) => Value::Error(format!("ERR {f}")),
+        Some(f @ EngineFault::Write(_)) if is_write => Value::Error(format!("ERR {f}")),
+        _ => reply,
     }
 }
 

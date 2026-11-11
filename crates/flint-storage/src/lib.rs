@@ -209,37 +209,151 @@ pub trait Kv: Send + Sync {
     fn clear(&self);
 }
 
-thread_local! {
-    static WRITE_FAULT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+/// What the storage engine failed to do for this thread (BUG-0283,
+/// BUG-0284): RocksDB's message, and whether it was a read or a write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineFault {
+    Read(String),
+    Write(String),
 }
 
-/// Record that the engine refused a write made on this thread, keeping the
-/// first refusal until `take_write_fault` reads it (BUG-0283).
-///
-/// `Kv::put` and `Kv::delete` return nothing, so a store whose engine can
-/// refuse a write (RocksDB on a full disk or a failing volume) has no other
-/// way to say so to the command that made it. A command runs on one thread
-/// from start to reply, with no await between its rows, so what this thread
-/// recorded between two `take_write_fault` calls is that command's.
-pub fn note_write_fault(error: &dyn std::fmt::Display) {
-    WRITE_FAULT.with(|f| {
+impl std::fmt::Display for EngineFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineFault::Read(m) => write!(f, "read failed: {m}"),
+            EngineFault::Write(m) => write!(f, "write failed: {m}"),
+        }
+    }
+}
+
+thread_local! {
+    static ENGINE_FAULT: std::cell::RefCell<Option<EngineFault>> =
+        const { std::cell::RefCell::new(None) };
+    static WATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UNWITHHELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Engine failures since the last log line, and when that line was written.
+static FAULTS_UNLOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FAULT_LOGGED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note(fault: EngineFault) {
+    use std::sync::atomic::Ordering;
+    // One line every 10 s at most: a key in a corrupt block is read on every
+    // request for it, and the client is told each time.
+    let n = FAULTS_UNLOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let last = FAULT_LOGGED_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 10_000
+        && FAULT_LOGGED_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        FAULTS_UNLOGGED.fetch_sub(n, Ordering::Relaxed);
+        flint_log::elog!(
+            "storage engine {fault} ({n} engine failure(s) since the last such line; \
+             each one answered as an error, BUG-0283/BUG-0284)"
+        );
+    }
+    ENGINE_FAULT.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_none() {
-            *f = Some(error.to_string());
+            *f = Some(fault);
         }
     });
 }
 
-/// The first write the engine refused on this thread since the last call,
-/// and clear it (BUG-0283).
+/// The engine refused a write made on this thread (BUG-0283).
 ///
-/// The server takes it before a write command runs, so nothing left by
-/// earlier work on the thread (a read's lazy-expiry delete) is charged to
-/// the command, and again after it, where `Some` means a row the command
-/// wrote did not land: its reply must be an error, not the success it
-/// computed.
-pub fn take_write_fault() -> Option<String> {
-    WRITE_FAULT.with(|f| f.borrow_mut().take())
+/// `Kv::put` and `Kv::delete` return nothing, so a store whose engine can
+/// refuse a write (RocksDB on a full disk or a failing volume) has no other
+/// way to say so to the command that made it. The first failure is kept
+/// until the thread's outermost `EngineWatch` ends.
+pub fn note_write_fault(error: &dyn std::fmt::Display) {
+    note(EngineFault::Write(error.to_string()));
+}
+
+/// The engine could not do a read made on this thread (BUG-0284): a block
+/// whose checksum does not match, an I/O error. `Kv::get` answers `None`,
+/// which the caller cannot tell from a key that is not there, so this is
+/// how the caller learns the difference.
+pub fn note_read_fault(error: &dyn std::fmt::Display) {
+    note(EngineFault::Read(error.to_string()));
+}
+
+/// Whether a store write on this thread is to be withheld: inside an
+/// `EngineWatch` that has seen the engine fail (BUG-0284).
+///
+/// A command that read `None` for a key the engine could not read would
+/// otherwise write on as if the key were absent: `INCR` storing 1 over the
+/// value, `SET NX` storing over it, the GC deleting a live key's fields as
+/// orphans. Those writes ride the WAL to every replica, which turns one
+/// node's unreadable block into lost data everywhere.
+pub fn writes_withheld() -> bool {
+    WATCHED.with(|w| w.get())
+        && UNWITHHELD.with(|u| u.get()) == 0
+        && ENGINE_FAULT.with(|f| f.borrow().is_some())
+}
+
+/// Watch the storage engine for the work this thread does until the watch
+/// is dropped: a command from start to reply, a slot import, one GC
+/// judgment. A command runs on one thread with no await between its rows,
+/// so what the thread records while it is watched is that work's.
+///
+/// While the watch has seen a failure, `RocksKv` writes nothing more
+/// (`writes_withheld`), and `fault` says what failed, for the caller to
+/// answer an error and commit nothing. A watch opened inside another shares
+/// it: the outermost one clears the record when it begins and when it ends.
+pub fn watch_engine() -> EngineWatch {
+    let outer = WATCHED.with(|w| w.replace(true));
+    if !outer {
+        ENGINE_FAULT.with(|f| f.borrow_mut().take());
+    }
+    EngineWatch {
+        outer,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+/// See `watch_engine`. Not `Send`: the record it reads is this thread's.
+pub struct EngineWatch {
+    outer: bool,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl EngineWatch {
+    /// The first failure the engine reported since the outermost watch
+    /// began, if any.
+    pub fn fault(&self) -> Option<EngineFault> {
+        ENGINE_FAULT.with(|f| f.borrow().clone())
+    }
+}
+
+impl Drop for EngineWatch {
+    fn drop(&mut self) {
+        WATCHED.with(|w| w.set(self.outer));
+        if !self.outer {
+            ENGINE_FAULT.with(|f| f.borrow_mut().take());
+        }
+    }
+}
+
+/// Run `f` with writes not withheld, whatever the watch around it has seen:
+/// for the writes that undo or record a failed attempt, a slot import's
+/// rollback, which must land however the attempt failed. The watch and its
+/// record are left as they were.
+pub fn unwithheld<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNWITHHELD.with(|u| u.set(u.get() - 1));
+        }
+    }
+    UNWITHHELD.with(|u| u.set(u.get() + 1));
+    let _restore = Restore;
+    f()
 }
 
 /// A write-suppressing view of another `Kv`, used on replicas.

@@ -1086,9 +1086,37 @@ impl RocksKv {
     }
 }
 
+/// The rows of a RocksDB iterator up to its first error, which is recorded
+/// (`crate::note_read_fault`) and ends the scan. The scans used to skip it
+/// with `filter_map(Result::ok)`, and as RocksDB's iterator ends at an
+/// error, a scan that met an unreadable block stopped there as if the range
+/// ended: `DBSIZE` answered 73 for 500 keys, and a slot move would have
+/// shipped only the rows before the block (BUG-0284).
+fn rows_until_fault(
+    iter: impl Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>>,
+) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> {
+    iter.map_while(|row| match row {
+        Ok(row) => Some(row),
+        Err(e) => {
+            crate::note_read_fault(&e);
+            None
+        }
+    })
+}
+
 impl Kv for RocksKv {
+    /// A read RocksDB could not do is `None`, as the trait requires, and is
+    /// recorded for the caller (`crate::note_read_fault`). It was only
+    /// `None`: a key in a block whose checksum failed read as absent, and
+    /// `INCR` stored 1 over it (BUG-0284).
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.db.get(key).ok().flatten()
+        match self.db.get(key) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::note_read_fault(&e);
+                None
+            }
+        }
     }
 
     /// `get_pinned` hands back a slice that borrows the block-cache entry,
@@ -1100,15 +1128,23 @@ impl Kv for RocksKv {
                 f(&p);
                 true
             }
-            _ => false,
+            Ok(None) => false,
+            Err(e) => {
+                crate::note_read_fault(&e);
+                false
+            }
         }
     }
 
     /// A refused write is recorded for the command that made it
-    /// (`crate::take_write_fault`), since this signature cannot return it.
+    /// (`crate::note_write_fault`), since this signature cannot return it.
     /// It was discarded, and a client was told OK for an `HSET` or `APPEND`
-    /// that RocksDB had refused (BUG-0283).
+    /// that RocksDB had refused (BUG-0283). Inside a watch that has seen the
+    /// engine fail, nothing is written (`crate::writes_withheld`, BUG-0284).
     fn put(&self, key: &[u8], value: &[u8]) {
+        if crate::writes_withheld() {
+            return;
+        }
         self.observe_record((key.len() + value.len()) as u64);
         let _w = Counted::enter(&ENGINE_WRITERS);
         if let Err(e) = self.db.put(key, value) {
@@ -1119,7 +1155,18 @@ impl Kv for RocksKv {
     fn delete(&self, key: &[u8]) -> bool {
         // Existence only — `get` here allocated and copied the whole value
         // just to throw it away.
-        let existed = self.db.get_pinned(key).ok().flatten().is_some();
+        let existed = match self.db.get_pinned(key) {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                crate::note_read_fault(&e);
+                false
+            }
+        };
+        // Withheld: nothing was deleted, which is what a caller counting
+        // deletes (the GC) must hear.
+        if crate::writes_withheld() {
+            return false;
+        }
         self.observe_record(key.len() as u64);
         let _w = Counted::enter(&ENGINE_WRITERS);
         if let Err(e) = self.db.delete(key) {
@@ -1136,7 +1183,7 @@ impl Kv for RocksKv {
             prefix,
             rocksdb::Direction::Forward,
         ));
-        for (k, v) in iter.filter_map(Result::ok) {
+        for (k, v) in rows_until_fault(iter) {
             if !k.starts_with(prefix) || !visit(&k, &v) {
                 return;
             }
@@ -1161,7 +1208,7 @@ impl Kv for RocksKv {
             seek,
             rocksdb::Direction::Forward,
         ));
-        for (k, v) in iter.filter_map(Result::ok) {
+        for (k, v) in rows_until_fault(iter) {
             if !k.starts_with(prefix) {
                 return;
             }
@@ -1191,7 +1238,7 @@ impl Kv for RocksKv {
         } else {
             rocksdb::IteratorMode::End
         };
-        for (k, v) in self.db.iterator(mode).filter_map(Result::ok) {
+        for (k, v) in rows_until_fault(self.db.iterator(mode)) {
             if !start_before.is_empty() && k.as_ref() >= start_before {
                 continue;
             }
@@ -1219,6 +1266,9 @@ impl Kv for RocksKv {
             batch.delete(k);
             pending += 1;
             if pending == CHUNK {
+                if crate::writes_withheld() {
+                    return false;
+                }
                 let _w = Counted::enter(&ENGINE_WRITERS);
                 if let Err(e) = self.db.write(std::mem::take(&mut batch)) {
                     crate::note_write_fault(&e);
@@ -1227,7 +1277,7 @@ impl Kv for RocksKv {
             }
             true
         });
-        if pending > 0 {
+        if pending > 0 && !crate::writes_withheld() {
             let _w = Counted::enter(&ENGINE_WRITERS);
             if let Err(e) = self.db.write(batch) {
                 crate::note_write_fault(&e);
@@ -1484,48 +1534,155 @@ mod audit {
         assert_eq!(kv.scan_prefix(b"").len(), 0);
     }
 
-    /// BUG-0283: a write RocksDB refuses is recorded for the command that
-    /// made it, once, and only on the thread that made it. A read-only handle
-    /// refuses every write, which stands in here for a full or failing disk.
+    /// BUG-0283: a write RocksDB refuses is recorded for the work that made
+    /// it, the first one only, and only on the thread that made it. A
+    /// read-only handle refuses every write, which stands in here for a full
+    /// or failing disk.
     #[test]
     fn a_refused_write_is_recorded_for_the_thread_that_made_it() {
+        use crate::EngineFault;
         let dir = TempDir::new("write-fault");
         RocksKv::open(&dir.0).expect("open").put(b"k", b"v");
-        let _ = crate::take_write_fault();
         let kv = RocksKv::open(&dir.0).expect("reopen");
-        kv.put(b"ok", b"1");
-        assert_eq!(
-            crate::take_write_fault(),
-            None,
-            "a write that landed records nothing"
-        );
+        {
+            let w = crate::watch_engine();
+            kv.put(b"ok", b"1");
+            assert_eq!(w.fault(), None, "a write that landed records nothing");
+        }
         drop(kv);
 
         let ro = RocksKv::open_read_only(&dir.0).expect("open read-only");
-        ro.put(b"k", b"w");
-        let refusal = crate::take_write_fault().expect("a refused put is recorded");
-        assert!(!refusal.is_empty(), "the record carries RocksDB's message");
-        assert_eq!(crate::take_write_fault(), None, "taking it clears it");
-        assert!(
-            ro.delete(b"k"),
-            "the row existed, and the refused delete says so"
-        );
-        assert!(
-            crate::take_write_fault().is_some(),
-            "a refused delete is recorded"
-        );
+        {
+            let w = crate::watch_engine();
+            ro.put(b"k", b"w");
+            match w.fault() {
+                Some(EngineFault::Write(m)) => assert!(!m.is_empty(), "RocksDB's message"),
+                other => panic!("a refused put is recorded as a write: {other:?}"),
+            }
+        }
+        {
+            let w = crate::watch_engine();
+            assert_eq!(w.fault(), None, "a new watch starts clear");
+            assert!(
+                ro.delete(b"k"),
+                "the row existed, and the refused delete says so"
+            );
+            assert!(
+                matches!(w.fault(), Some(EngineFault::Write(_))),
+                "a refused delete is recorded"
+            );
+        }
         assert_eq!(ro.get(b"k"), Some(b"v".to_vec()), "nothing was written");
-        ro.clear();
-        assert!(
-            crate::take_write_fault().is_some(),
-            "a refused clear is recorded"
-        );
-
+        {
+            let w = crate::watch_engine();
+            ro.clear();
+            assert!(w.fault().is_some(), "a refused clear is recorded");
+        }
+        let w = crate::watch_engine();
         ro.put(b"k", b"z");
         std::thread::scope(|s| {
-            s.spawn(|| assert_eq!(crate::take_write_fault(), None, "another thread's"));
+            s.spawn(|| assert_eq!(crate::watch_engine().fault(), None, "another thread's"));
         });
-        assert!(crate::take_write_fault().is_some(), "still this thread's");
+        assert!(w.fault().is_some(), "still this thread's");
+    }
+
+    /// The SST under `dir`, with eight bytes overwritten `at` bytes in: a
+    /// data block whose checksum no longer matches.
+    fn corrupt_sst(dir: &Path, at: u64) {
+        use std::io::{Seek, SeekFrom, Write};
+        let sst = std::fs::read_dir(dir)
+            .expect("read db dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "sst"))
+            .expect("an SST");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sst)
+            .expect("open sst");
+        f.seek(SeekFrom::Start(at)).expect("seek");
+        f.write_all(&[0xff; 8]).expect("corrupt");
+    }
+
+    /// BUG-0284: a key RocksDB cannot read is `None`, as the trait requires,
+    /// and the failure is recorded. Inside a watch it withholds every write
+    /// after it, so a command that read the key as absent cannot write over
+    /// it; outside one, writes go on, so nothing outside a watch is stopped
+    /// by a fault nobody will read. A scan stops at the block and records it.
+    #[test]
+    fn an_unreadable_key_is_recorded_and_withholds_the_writes_after_it() {
+        use crate::EngineFault;
+        let dir = TempDir::new("read-fault");
+        {
+            let kv = RocksKv::open(&dir.0).expect("open");
+            for i in 0..2_000u32 {
+                kv.put(
+                    format!("n{i:06}").as_bytes(),
+                    format!("{}", 1_000 + i).as_bytes(),
+                );
+            }
+            kv.flush_checked().expect("flush");
+        }
+        corrupt_sst(&dir.0, 100);
+        let kv = RocksKv::open(&dir.0).expect("reopen");
+
+        let w = crate::watch_engine();
+        assert_eq!(kv.get(b"n000000"), None, "an unreadable key reads as None");
+        assert!(
+            matches!(w.fault(), Some(EngineFault::Read(_))),
+            "and the failure is recorded: {:?}",
+            w.fault()
+        );
+        assert!(
+            crate::writes_withheld(),
+            "a watch that saw it withholds writes"
+        );
+        kv.put(b"n000000", b"1");
+        kv.put(b"other", b"x");
+        assert!(
+            !kv.delete(b"n001999"),
+            "a withheld delete reports nothing deleted"
+        );
+        crate::unwithheld(|| kv.put(b"rollback", b"r"));
+        drop(w);
+        assert_eq!(kv.get(b"other"), None, "withheld: not written");
+        assert_eq!(
+            kv.get(b"n001999"),
+            Some(b"2999".to_vec()),
+            "withheld: not deleted"
+        );
+        assert_eq!(
+            kv.get(b"rollback"),
+            Some(b"r".to_vec()),
+            "unwithheld: written"
+        );
+
+        // Unwatched: the read is still None, and writes are not stopped.
+        assert_eq!(kv.get(b"n000000"), None);
+        kv.put(b"after", b"y");
+        assert_eq!(kv.get(b"after"), Some(b"y".to_vec()));
+
+        // Nested watches share the outer one's record.
+        let outer = crate::watch_engine();
+        {
+            let inner = crate::watch_engine();
+            let _ = kv.get(b"n000000");
+            assert!(inner.fault().is_some());
+        }
+        assert!(outer.fault().is_some(), "an inner watch leaves the record");
+        drop(outer);
+
+        let w = crate::watch_engine();
+        let mut seen = 0;
+        kv.for_each_prefix(b"n", &mut |_, _| {
+            seen += 1;
+            true
+        });
+        assert!(seen < 2_000, "the scan stops at the block ({seen} rows)");
+        assert!(
+            matches!(w.fault(), Some(EngineFault::Read(_))),
+            "and says so"
+        );
     }
 
     /// FLUSHALL must drain datasets larger than one delete chunk without
