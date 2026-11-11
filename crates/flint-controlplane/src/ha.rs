@@ -335,6 +335,44 @@ pub async fn start(
         .await
         .expect("raft new");
 
+    // A RAFT CORE THAT STOPS ENDS THE PROCESS (BUG-0282). openraft stops its
+    // core on a storage error -- a flush that fails, on a full or read-only
+    // volume -- and the process used to go on serving. Its metrics froze at
+    // the moment the core stopped, so a node that was leader went on saying
+    // so: `CPINFO` answered `leader:` itself, and `CPLEASE`, whose whole
+    // point is to be answered by the leader only, kept answering OK to a
+    // master the real leader had since fenced. A master renewing against
+    // that seat first was never told, and wrote on beside its successor.
+    //
+    // Exit 70, as a seat whose vital thread dies does (ADR-0065): the
+    // supervisor starts it again, `Store::open` reads what is durable, and
+    // it rejoins as a follower, or refuses to start if the store cannot be
+    // read. Nothing is lost by leaving: the core that stopped acknowledges
+    // nothing more.
+    {
+        let mut metrics = raft.metrics();
+        tokio::spawn(async move {
+            loop {
+                let stopped = metrics.borrow().running_state.clone().err();
+                if let Some(fatal) = stopped {
+                    elog!(
+                        "flint-controlplane: the Raft core stopped ({fatal}); exiting so the \
+                         supervisor restarts this seat from its durable store, rather than \
+                         answer as a leader it no longer is (BUG-0282)"
+                    );
+                    std::process::exit(70);
+                }
+                if metrics.changed().await.is_err() {
+                    elog!(
+                        "flint-controlplane: the Raft core is gone; exiting so the supervisor \
+                         restarts this seat (BUG-0282)"
+                    );
+                    std::process::exit(70);
+                }
+            }
+        });
+    }
+
     // BIND THE ADDRESS THIS NODE IS DIALED AT, not loopback. Both Raft
     // listeners hardcoded 127.0.0.1, so an HA control plane was reachable
     // only from its own host — peers could never connect and no proxy or
