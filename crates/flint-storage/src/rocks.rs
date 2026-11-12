@@ -1609,6 +1609,76 @@ mod audit {
         );
     }
 
+    /// BUG-0286: a role row the engine cannot read is an error, never "no
+    /// role", and the fence refuses a transition it cannot measure; a row that
+    /// does not decode is `Corrupt`. Both used to read as no role, and
+    /// `set_role` measured a stale epoch against `Epoch::ZERO` and stored it.
+    #[test]
+    fn an_unreadable_role_row_refuses_the_fence_rather_than_reading_as_none() {
+        use crate::manifest::{self, Epoch, ManifestError, Role, RoleClaim};
+        let claim = |counter| RoleClaim {
+            role: Role::Master,
+            epoch: Epoch {
+                generation: 0,
+                counter,
+            },
+        };
+        let dir = TempDir::new("role-fault");
+        {
+            let kv = RocksKv::open(&dir.0).expect("open");
+            manifest::set_role(&kv, claim(7)).expect("claim (0,7)");
+            for i in 0..2_000u32 {
+                kv.put(format!("n{i:06}").as_bytes(), b"v");
+            }
+            kv.flush_checked().expect("flush");
+        }
+        // The role key sorts first, so it is in the first data block.
+        corrupt_sst(&dir.0, 100);
+        let kv = RocksKv::open(&dir.0).expect("reopen");
+        assert_eq!(
+            manifest::read_role(&kv),
+            None,
+            "the unchecked read cannot tell"
+        );
+        assert!(
+            matches!(
+                manifest::read_role_checked(&kv),
+                Err(ManifestError::Unreadable(ref m)) if m.starts_with("read failed")
+            ),
+            "the checked one can: {:?}",
+            manifest::read_role_checked(&kv)
+        );
+        assert!(
+            matches!(
+                manifest::set_role(&kv, claim(2)),
+                Err(ManifestError::Unreadable(_))
+            ),
+            "a stale epoch is refused, not measured against zero"
+        );
+        drop(kv);
+
+        let dir = TempDir::new("role-undecodable");
+        let kv = RocksKv::open(&dir.0).expect("open");
+        assert_eq!(
+            manifest::read_role_checked(&kv),
+            Ok(None),
+            "no row is no role"
+        );
+        kv.put(manifest::ROLE_KEY, b"\x09not-a-role");
+        assert_eq!(
+            manifest::read_role_checked(&kv),
+            Err(ManifestError::Corrupt)
+        );
+        assert_eq!(
+            manifest::set_role(&kv, claim(2)),
+            Err(ManifestError::Corrupt),
+            "a row that does not decode is no fence either"
+        );
+        kv.delete(manifest::ROLE_KEY);
+        manifest::set_role(&kv, claim(1)).expect("a fresh node claims its first epoch");
+        assert_eq!(manifest::read_role_checked(&kv), Ok(Some(claim(1))));
+    }
+
     /// The SST under `dir`, with eight bytes overwritten `at` bytes in: a
     /// data block whose checksum no longer matches.
     fn corrupt_sst(dir: &Path, at: u64) {

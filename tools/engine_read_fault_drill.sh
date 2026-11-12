@@ -21,6 +21,12 @@
 #     deleted on purpose (the positive control) and nothing else
 #   - with the SST put back as it was, every key holds exactly what the
 #     answered writes made it, and every hash all its fields
+#
+# BUG-0286: a seat whose role row was in the bad block took it for no role,
+# started again at epoch (0,1) with the role its flags named, and then let a
+# stale FLINTPROMOTE through its fence. Asserts, on a second seat at epoch
+# (0,7) whose first data block (the role key sorts first) is overwritten:
+#   - started with a stale --replica-of, it refuses to start, naming BUG-0286
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
@@ -199,5 +205,35 @@ fin=$(rp final "$D/incr" "$D/setnx"); echo "  strings: $(tail -1 <<<"$fin")"
 fl=$(rp fields "$DEL_I"); echo "  hashes: $fl"
 [ "$fl" = "short 0 errors 0" ] || { echo "FAIL (BUG-0284): the GC deleted fields of hashes that were there"; exit 1; }
 
+echo "== a seat at epoch (0,7) whose role row it cannot read (BUG-0286)"
+fleet_kill server; sleep 0.3
+R="$D/role"
+role_start() {
+  $B --port $P --engine rocks --data-dir "$R" "$@" 2>>"$D/r.log" &
+  SEAT=$!
+}
+role_start; fleet_wait_listen $P; fleet_wait_ping $P
+for i in $(seq 0 $((N - 1))); do echo "SET n:$i $((1000 + i))"; done | valkey-cli -p $P >/dev/null
+[ "$(rp cmd FLINTDEMOTE 0 5)" = "+OK demoted at (0,5)" ] && [ "$(rp cmd FLINTPROMOTE 0 7)" = "+OK promoted at (0,7)" ] \
+  || { echo "FAIL: could not take the seat to epoch (0,7)"; tail -3 "$D/r.log"; exit 1; }
+fleet_kill server; sleep 0.3
+role_start; fleet_wait_listen $P; fleet_wait_ping $P
+fleet_kill server; sleep 0.3
+RSST=$(ls "$R"/*.sst 2>/dev/null)
+[ "$(echo "$RSST" | wc -w | tr -d ' ')" = 1 ] || { echo "FAIL: expected one SST, found: $RSST"; exit 1; }
+printf '\377\377\377\377\377\377\377\377' | dd of="$RSST" bs=1 seek=100 conv=notrunc 2>/dev/null
+role_start --replica-of 127.0.0.1:1
+for _ in $(seq 1 100); do kill -0 "$SEAT" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$SEAT" 2>/dev/null; then
+  fleet_wait_listen $P
+  echo "FAIL (BUG-0286): the seat started without its role: $(valkey-cli -p $P FLINTINFO | tr -d '\r' | grep -E '^role(_epoch)?:' | tr '\n' ' ')"
+  echo "  and a stale FLINTPROMOTE 0 2 answers: $(rp cmd FLINTPROMOTE 0 2)"
+  exit 1
+fi
+wait "$SEAT"; rc=$?
+grep -q 'BUG-0286' "$D/r.log" || { echo "FAIL: the seat exited $rc without saying why"; tail -3 "$D/r.log"; exit 1; }
+echo "  refused to start, status $rc: $(grep 'BUG-0286' "$D/r.log" | head -1 | cut -c1-110)"
+
 echo "PASS: a key the engine cannot read answers an error, never nil; no write lands over it, the GC"
-echo "      deletes only real orphans, and with the block repaired every key is intact (BUG-0284)."
+echo "      deletes only real orphans, and with the block repaired every key is intact (BUG-0284);"
+echo "      a seat that cannot read its role row does not start (BUG-0286)."

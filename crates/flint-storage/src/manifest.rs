@@ -208,10 +208,32 @@ pub enum ManifestError {
         current: Epoch,
     },
     Corrupt,
+    /// The storage engine could not read the row (BUG-0286): `EngineFault`'s
+    /// text, `read failed: <RocksDB's message>`.
+    Unreadable(String),
 }
 
+impl std::fmt::Display for ManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ManifestError::Fenced { current } => {
+                write!(f, "fenced: the stored epoch is {current}")
+            }
+            ManifestError::Corrupt => write!(f, "the stored row does not decode"),
+            ManifestError::Unreadable(m) => write!(f, "the storage engine {m}"),
+        }
+    }
+}
+
+/// The stored role, `None` when there is none or when it cannot be had.
+///
+/// For a decision that needs the difference, [`read_role_checked`]: this one
+/// is for reporting, and for the readers the review map lists as open.
 pub fn read_role(kv: &dyn Kv) -> Option<RoleClaim> {
-    let raw = kv.get(ROLE_KEY)?;
+    decode_role(&kv.get(ROLE_KEY)?)
+}
+
+fn decode_role(raw: &[u8]) -> Option<RoleClaim> {
     if raw.len() != 9 {
         return None;
     }
@@ -226,10 +248,31 @@ pub fn read_role(kv: &dyn Kv) -> Option<RoleClaim> {
     })
 }
 
+/// The stored role, or why it cannot be had (BUG-0286). `Ok(None)` only when
+/// no row is stored. A row the engine could not read, or one that does not
+/// decode, is an error and never "no role": a seat that took an unreadable
+/// row for none started again at epoch (0,1), with the role its command line
+/// named, and its fence then let a stale promotion through.
+pub fn read_role_checked(kv: &dyn Kv) -> Result<Option<RoleClaim>, ManifestError> {
+    let engine = crate::watch_engine();
+    let raw = kv.get(ROLE_KEY);
+    if let Some(fault) = engine.fault() {
+        return Err(ManifestError::Unreadable(fault.to_string()));
+    }
+    match raw {
+        None => Ok(None),
+        Some(raw) => decode_role(&raw).map(Some).ok_or(ManifestError::Corrupt),
+    }
+}
+
 /// Fenced role transition: `new.epoch` must strictly exceed the stored
-/// epoch. The first claim on a fresh node must still exceed Epoch::ZERO.
+/// epoch. The first claim on a fresh node must still exceed Epoch::ZERO. A
+/// stored role that cannot be read is no fence to measure against, so the
+/// transition is refused (BUG-0286).
 pub fn set_role(kv: &dyn Kv, new: RoleClaim) -> Result<(), ManifestError> {
-    let current = read_role(kv).map(|c| c.epoch).unwrap_or(Epoch::ZERO);
+    let current = read_role_checked(kv)?
+        .map(|c| c.epoch)
+        .unwrap_or(Epoch::ZERO);
     if new.epoch <= current {
         return Err(ManifestError::Fenced { current });
     }

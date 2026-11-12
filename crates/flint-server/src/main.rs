@@ -2914,7 +2914,19 @@ fn main() -> std::io::Result<()> {
                 )
                 .map_err(|e| std::io::Error::other(format!("manifest claim: {e:?}")))?;
             }
-            if manifest::read_role(&kv).is_none() {
+            // A role row the engine cannot read, or that does not decode, is
+            // not a fresh node. Taking it for one started this seat again at
+            // epoch (0,1) with the role its flags named, and its fence then
+            // let a stale promotion through (BUG-0286). It does not know what
+            // it is, so it does not start.
+            let stored_role = manifest::read_role_checked(&kv).map_err(|e| {
+                std::io::Error::other(format!(
+                    "the durable role row: {e}. This seat cannot know its role or its \
+                     epoch, so it does not start; replace its store from a healthy copy \
+                     (BUG-0286)"
+                ))
+            })?;
+            if stored_role.is_none() {
                 let role = if replica_of.is_some() {
                     Role::Replica
                 } else {
@@ -6773,9 +6785,11 @@ fn flintpromote(
     // stands BEFORE the flip -- the stream last_applied counts in. Without
     // it a later promotion that never saw this one answers in the wrong
     // node's space (BUG-0075).
-    let superseded = manifest::read_role(kv.as_ref())
-        .map(|c| c.epoch)
-        .unwrap_or(Epoch::ZERO);
+    let superseded = match manifest::read_role_checked(kv.as_ref()) {
+        Ok(claim) => claim.map(|c| c.epoch).unwrap_or(Epoch::ZERO),
+        // No fence to measure against and no lineage to record (BUG-0286).
+        Err(e) => return Value::Error(format!("ERR FLINTPROMOTE refused: the role row: {e}")),
+    };
     manifest::record_promo_fence(kv.as_ref(), epoch, superseded, kv.last_applied());
     match commit_role(
         kv.as_ref(),
@@ -6820,7 +6834,7 @@ fn flintpromote(
         Err(ManifestError::Fenced { current }) => Value::Error(format!(
             "FENCED current role epoch is {current}, promotion epoch must exceed it"
         )),
-        Err(e) => Value::Error(format!("ERR manifest: {e:?}")),
+        Err(e) => Value::Error(format!("ERR manifest: {e}")),
     }
 }
 
@@ -7124,7 +7138,7 @@ fn flintdemote(
         Err(ManifestError::Fenced { current }) => Value::Error(format!(
             "FENCED current role epoch is {current}, demotion epoch must exceed it"
         )),
-        Err(e) => Value::Error(format!("ERR manifest: {e:?}")),
+        Err(e) => Value::Error(format!("ERR manifest: {e}")),
     }
 }
 

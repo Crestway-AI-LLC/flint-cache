@@ -122,9 +122,9 @@ never reconfigure anything (promotion in seconds, bounded loss).
 
 ## The error vocabulary
 
-Flint tells you to back off or stop in exactly three ways. Everything
-else a well-behaved client never sees (`-MOVED` and `-TRYAGAIN` are
-absorbed by the proxy).
+Flint tells you to back off or stop in three ways, and that a node's disk
+failed in two more. Everything else a well-behaved client never sees
+(`-MOVED` and `-TRYAGAIN` are absorbed by the proxy).
 
 | error | meaning | what to do |
 |---|---|---|
@@ -132,6 +132,8 @@ absorbed by the proxy).
 | `-QUOTA ...` | your storage cap is exceeded; **writes** are rejected | reads still work, and **deletes always work** — free space (`DEL`, `UNLINK`, `FLUSHALL`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`) and the verdict clears itself within a sweep |
 | `-QUOTA server is low on disk space ...` | the **server**, not your cap, is short of room | same contract: reads served, deletes work, and it clears itself once space returns. Your usage may be well under quota — this one is ours to fix, and it pages us |
 | `-WRONGPASS` / `-NOAUTH` | bad or missing token | check the token; re-AUTH |
+| `-ERR write failed: ...`; `-ERR batch commit failed`, `transaction commit failed`, `script commit failed` or `batch write failed: ...`; `-ERR ... aborted, nothing applied: ...` or `-ERR script aborted, none of its writes applied: ...` | the node's storage engine refused a write, its volume failed or filled (BUG-0283), or, in a transaction, script or batch, could not read a key | the `commit failed`, `batch write failed`, `nothing applied` and `none of its writes applied` forms wrote nothing: retry with backoff. `write failed` on a command that writes more than one row (a new hash field, `RENAME`) may have kept the rows before the refused one, so treat it as a lost reply ([retry-safety.md](retry-safety.md)). A node whose engine refused a write restarts within seconds (BUG-0285); this one is ours to fix |
+| `-ERR read failed: ...` | the node could not read that key from its disk, a damaged block (BUG-0284) | nothing was written. The same node answers the same error until its copy is replaced from a healthy one; this one is ours to fix |
 
 Two invariants worth knowing. **Both are about the storage cap**, which is
 the one that can leave you stuck; the ops/s limit is a separate thing and is
