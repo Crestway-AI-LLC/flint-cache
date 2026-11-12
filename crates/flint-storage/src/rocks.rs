@@ -334,7 +334,11 @@ impl RocksKv {
             }
         }
         let _w = Counted::enter(&ENGINE_WRITERS);
-        self.db.write(wb)
+        let written = self.db.write(wb);
+        if written.is_err() {
+            crate::count_refused_write();
+        }
+        written
     }
 
     /// Engine write-stall signals (W2 back-pressure visibility): RocksDB's
@@ -1584,6 +1588,25 @@ mod audit {
             s.spawn(|| assert_eq!(crate::watch_engine().fault(), None, "another thread's"));
         });
         assert!(w.fault().is_some(), "still this thread's");
+        drop(w);
+
+        // Every refused write is counted for the server's WAL sync thread,
+        // which ends a seat whose engine has stopped (BUG-0285), and the batch
+        // path's too. Other tests may count theirs meanwhile, so only the
+        // increase is checked.
+        let before = crate::refused_writes_total();
+        ro.put(b"k", b"y");
+        let after_put = crate::refused_writes_total();
+        assert!(after_put > before, "a refused put is counted");
+        assert!(
+            ro.apply_writes(&[(b"k".to_vec(), Some(b"b".to_vec()))])
+                .is_err(),
+            "a read-only handle refuses a batch"
+        );
+        assert!(
+            crate::refused_writes_total() > after_put,
+            "a refused batch is counted"
+        );
     }
 
     /// The SST under `dir`, with eight bytes overwritten `at` bytes in: a

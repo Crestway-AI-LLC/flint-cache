@@ -265,6 +265,25 @@ fn note(fault: EngineFault) {
     });
 }
 
+/// Writes the engine has refused since the process started: the rows
+/// `Kv::put`, `delete` and `clear` could not write, and the batches
+/// `apply_writes` could not commit.
+static WRITES_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count a write the engine refused, on any path (BUG-0285).
+pub fn count_refused_write() {
+    WRITES_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Writes the engine has refused since the process started (BUG-0285).
+///
+/// After a WAL append or sync fails, RocksDB refuses every later write until
+/// the database is opened again. The server's WAL sync thread reads this to
+/// learn, between its own ticks, that the engine may have stopped.
+pub fn refused_writes_total() -> u64 {
+    WRITES_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The engine refused a write made on this thread (BUG-0283).
 ///
 /// `Kv::put` and `Kv::delete` return nothing, so a store whose engine can
@@ -272,6 +291,7 @@ fn note(fault: EngineFault) {
 /// way to say so to the command that made it. The first failure is kept
 /// until the thread's outermost `EngineWatch` ends.
 pub fn note_write_fault(error: &dyn std::fmt::Display) {
+    count_refused_write();
     note(EngineFault::Write(error.to_string()));
 }
 

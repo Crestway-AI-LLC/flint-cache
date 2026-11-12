@@ -180,6 +180,35 @@ fn hard_exit(code: i32) -> ! {
 /// `EX_SOFTWARE`, an internal error, as `flint-vec` uses for a poisoned lock.
 const EXIT_VITAL_PANIC: i32 = 70;
 
+/// WAL syncs refused in a row that mean the engine has stopped taking writes
+/// (BUG-0285). One would do: RocksDB keeps a WAL writer's first error and
+/// answers every later append and sync with it. Three, half a second apart
+/// at most, rule out a sync that failed once and would not again.
+#[cfg(feature = "rocks")]
+const ENGINE_STOPPED_SYNCS: u32 = 3;
+
+/// End a seat whose storage engine has stopped taking writes (BUG-0285).
+///
+/// After a WAL append or sync fails (a full volume, an I/O error, a file-size
+/// limit), RocksDB refuses every later write, `Writer has previous error`,
+/// until the database is opened again, and nothing this crate can call
+/// resumes it. The seat went on as master, answering reads and refusing
+/// every write, with `disk_verdict:ok` once space was back, until someone
+/// restarted it by hand. Leaving is ADR-0065's answer for a seat that cannot
+/// do its vital work: the supervisor starts it again, opening the database
+/// recovers every acknowledged write from the WAL, and a master's pair fails
+/// over meanwhile. The writes it refused were answered as errors
+/// (BUG-0283), so nothing acknowledged is left behind.
+#[cfg(feature = "rocks")]
+fn engine_stopped(e: &dyn std::fmt::Display) -> ! {
+    elog!(
+        "flint-server: the storage engine refused {ENGINE_STOPPED_SYNCS} WAL syncs in a row \
+         ({e}); RocksDB takes no write after its WAL fails until it is opened again, so \
+         exiting with status {EXIT_VITAL_PANIC} for the seat to be started again (BUG-0285)"
+    );
+    hard_exit(EXIT_VITAL_PANIC)
+}
+
 /// Panics on the reporting threads, which a seat goes on without:
 /// `FLINTINFO`'s `thread_panics_total` (ADR-0065).
 static THREAD_PANICS: AtomicU64 = AtomicU64::new(0);
@@ -3096,19 +3125,42 @@ fn main() -> std::io::Result<()> {
         }
         if let Some(kv) = rocks.clone() {
             spawn_vital("wal-fsync", move || {
+                // Besides its cadence, the thread syncs once a write has been
+                // refused, and again on every slice until a sync succeeds:
+                // that is how a seat whose engine stopped taking writes learns
+                // it, whatever the cadence, 0 included (BUG-0285).
+                const SLICE_MS: u64 = 500;
+                let mut since_sync_ms: u64 = 0;
+                let mut refused_seen = flint_storage::refused_writes_total();
+                let mut failed_syncs: u32 = 0;
                 loop {
                     let cadence = WAL_FSYNC_MS.load(Ordering::Relaxed);
-                    if cadence == 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    let step = if cadence == 0 {
+                        SLICE_MS
+                    } else {
+                        SLICE_MS.min(cadence.saturating_sub(since_sync_ms).max(1))
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(step));
+                    since_sync_ms = since_sync_ms.saturating_add(step);
+                    // Re-read: a retune to 0 during the sleep means no tick is due.
+                    let cadence = WAL_FSYNC_MS.load(Ordering::Relaxed);
+                    let due = cadence != 0 && since_sync_ms >= cadence;
+                    let refused = flint_storage::refused_writes_total();
+                    let probe = failed_syncs > 0 || refused != refused_seen;
+                    refused_seen = refused;
+                    if !due && !probe {
                         continue;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(cadence));
-                    // Re-check: a retune to 0 during the sleep means skip.
-                    if WAL_FSYNC_MS.load(Ordering::Relaxed) == 0 {
-                        continue;
-                    }
-                    if let Err(e) = kv.flush_wal_sync() {
-                        elog!("wal fsync tick failed: {e}");
+                    since_sync_ms = 0;
+                    match kv.flush_wal_sync() {
+                        Ok(()) => failed_syncs = 0,
+                        Err(e) => {
+                            failed_syncs += 1;
+                            elog!("wal fsync tick failed: {e}");
+                            if failed_syncs >= ENGINE_STOPPED_SYNCS {
+                                engine_stopped(&e);
+                            }
+                        }
                     }
                 }
             });

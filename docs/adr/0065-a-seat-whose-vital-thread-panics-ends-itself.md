@@ -116,3 +116,12 @@ condition the product could end itself.
 - **Not drilled here:** a master's pair failing over after its exit. A
   stopped master's failover is what `failover` and the chaos drills hold.
 
+
+## Later: a WAL fsync thread whose syncs the engine refuses (BUG-0285, 2026-11-11)
+
+The same rule covers a vital thread that is alive but cannot do its work.
+After one WAL append or sync fails, RocksDB refuses every write until the
+database is opened again, and the seat went on as master refusing them all.
+The `wal-fsync` thread now also syncs after any refused write, and three
+refused syncs in a row end the seat with status 70 and a line naming
+BUG-0285, as a panic would. Held by the `engine_write_fault` drill.
