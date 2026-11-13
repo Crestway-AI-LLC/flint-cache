@@ -27,6 +27,12 @@
 # stale FLINTPROMOTE through its fence. Asserts, on a second seat at epoch
 # (0,7) whose first data block (the role key sorts first) is overwritten:
 #   - started with a stale --replica-of, it refuses to start, naming BUG-0286
+#
+# BUG-0287: a seat whose migration records were in the bad block read them
+# as none, turned its slot gate off, and served every slot it had handed off,
+# taking writes the slots' owners never saw. Asserts, on a third seat that
+# handed off 1,500 slots and whose first data block is overwritten:
+#   - it refuses to start, naming BUG-0287
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
@@ -234,6 +240,44 @@ wait "$SEAT"; rc=$?
 grep -q 'BUG-0286' "$D/r.log" || { echo "FAIL: the seat exited $rc without saying why"; tail -3 "$D/r.log"; exit 1; }
 echo "  refused to start, status $rc: $(grep 'BUG-0286' "$D/r.log" | head -1 | cut -c1-110)"
 
+echo "== a seat that handed off 1,500 slots, whose slot records it cannot read (BUG-0287)"
+R="$D/slot"
+K3=$(python3 -c '
+def crc(d):
+    c = 0
+    for b in d:
+        c ^= b << 8
+        for _ in range(8):
+            c = ((c << 1) ^ 0x1021) if c & 0x8000 else c << 1
+            c &= 0xffff
+    return c
+i = 0
+while crc(b"k:%d" % i) % 16384 != 3:
+    i += 1
+print("k:%d" % i)')
+role_start; fleet_wait_listen $P; fleet_wait_ping $P
+for s in $(seq 0 1499); do echo "FLINTSLOTMOVED $s 127.0.0.1:1"; done | valkey-cli -p $P | grep -vc '^OK slot' | grep -qx 0 \
+  || { echo "FAIL: FLINTSLOTMOVED refused"; exit 1; }
+moved=$(rp cmd SET "$K3" v)
+case "$moved" in "-MOVED 3 "*) ;; *) echo "FAIL: slot 3 should redirect once handed off, answered: $moved"; exit 1 ;; esac
+fleet_kill server; sleep 0.3
+role_start; fleet_wait_listen $P; fleet_wait_ping $P
+fleet_kill server; sleep 0.3
+RSST=$(ls "$R"/*.sst 2>/dev/null)
+[ "$(echo "$RSST" | wc -w | tr -d ' ')" = 1 ] || { echo "FAIL: expected one SST, found: $RSST"; exit 1; }
+printf '\377\377\377\377\377\377\377\377' | dd of="$RSST" bs=1 seek=100 conv=notrunc 2>/dev/null
+role_start
+for _ in $(seq 1 100); do kill -0 "$SEAT" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$SEAT" 2>/dev/null; then
+  fleet_wait_listen $P
+  echo "FAIL (BUG-0287): the seat started without its slot records, and a write to slot 3, which it"
+  echo "  handed off, answers: $(rp cmd SET "$K3" after) (GET: $(rp cmd GET "$K3"))"
+  exit 1
+fi
+wait "$SEAT"; rc=$?
+grep -q 'BUG-0287' "$D/r.log" || { echo "FAIL: the seat exited $rc without saying why"; tail -3 "$D/r.log"; exit 1; }
+echo "  refused to start, status $rc: $(grep 'BUG-0287' "$D/r.log" | head -1 | cut -c1-110)"
+
 echo "PASS: a key the engine cannot read answers an error, never nil; no write lands over it, the GC"
 echo "      deletes only real orphans, and with the block repaired every key is intact (BUG-0284);"
-echo "      a seat that cannot read its role row does not start (BUG-0286)."
+echo "      a seat that cannot read its role row (BUG-0286) or its slot records (BUG-0287) does not start."

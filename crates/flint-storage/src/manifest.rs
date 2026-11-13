@@ -305,7 +305,32 @@ fn claim_key(ns: &[u8]) -> Vec<u8> {
 }
 
 pub fn read_claim(kv: &dyn Kv, ns: &[u8]) -> Option<SlotClaim> {
-    let raw = kv.get(&claim_key(ns))?;
+    decode_claim(ns, &kv.get(&claim_key(ns))?)
+}
+
+/// The stored slot claim, or why it cannot be had (BUG-0287): `Ok(None)` only
+/// when none is stored. See [`read_role_checked`].
+pub fn read_claim_checked(kv: &dyn Kv, ns: &[u8]) -> Result<Option<SlotClaim>, ManifestError> {
+    match checked_get(kv, &claim_key(ns))? {
+        None => Ok(None),
+        Some(raw) => decode_claim(ns, &raw)
+            .map(Some)
+            .ok_or(ManifestError::Corrupt),
+    }
+}
+
+/// One manifest row through an engine watch: `Unreadable` when the engine
+/// could not read it, which `Kv::get` answers as `None` (BUG-0284).
+fn checked_get(kv: &dyn Kv, key: &[u8]) -> Result<Option<Vec<u8>>, ManifestError> {
+    let engine = crate::watch_engine();
+    let raw = kv.get(key);
+    match engine.fault() {
+        Some(fault) => Err(ManifestError::Unreadable(fault.to_string())),
+        None => Ok(raw),
+    }
+}
+
+fn decode_claim(ns: &[u8], raw: &[u8]) -> Option<SlotClaim> {
     if raw.len() != 12 {
         return None;
     }
@@ -319,7 +344,7 @@ pub fn read_claim(kv: &dyn Kv, ns: &[u8]) -> Option<SlotClaim> {
 
 /// Fenced ownership write, same strict-monotonicity rule as roles.
 pub fn set_claim(kv: &dyn Kv, claim: &SlotClaim) -> Result<(), ManifestError> {
-    let current = read_claim(kv, &claim.ns)
+    let current = read_claim_checked(kv, &claim.ns)?
         .map(|c| c.epoch)
         .unwrap_or(Epoch::ZERO);
     if claim.epoch <= current {
@@ -376,12 +401,29 @@ pub fn read_migration(kv: &dyn Kv, ns: &[u8], slot: u16) -> Option<MigrationReco
     decode_migration(ns, slot, &raw)
 }
 
+/// The slot's migration record, or why it cannot be had (BUG-0287):
+/// `Ok(None)` only when none is stored. A record the engine could not read
+/// used to be no record, so a node that had handed a slot off served it
+/// again, and took writes its new owner never saw.
+pub fn read_migration_checked(
+    kv: &dyn Kv,
+    ns: &[u8],
+    slot: u16,
+) -> Result<Option<MigrationRecord>, ManifestError> {
+    match checked_get(kv, &migration_key(ns, slot))? {
+        None => Ok(None),
+        Some(raw) => decode_migration(ns, slot, &raw)
+            .map(Some)
+            .ok_or(ManifestError::Corrupt),
+    }
+}
+
 /// Fenced migration write: a record must carry a STRICTLY greater epoch than
 /// any stored record for this (ns, slot). Two controllers racing to start or
 /// advance the same slot's move cannot both win — the loser is fenced, same
 /// rule as roles and claims.
 pub fn set_migration(kv: &dyn Kv, rec: &MigrationRecord) -> Result<(), ManifestError> {
-    let current = read_migration(kv, &rec.ns, rec.slot)
+    let current = read_migration_checked(kv, &rec.ns, rec.slot)?
         .map(|r| r.epoch)
         .unwrap_or(Epoch::ZERO);
     if rec.epoch <= current {
@@ -422,13 +464,30 @@ pub fn scan_migrations(kv: &dyn Kv, ns: &[u8]) -> Vec<MigrationRecord> {
 pub fn scan_all_migrations(kv: &dyn Kv) -> Vec<MigrationRecord> {
     kv.scan_prefix(MIGRATION_KEY_PREFIX)
         .into_iter()
-        .filter_map(|(k, v)| {
-            let rest = k.get(MIGRATION_KEY_PREFIX.len()..)?;
-            let ns_len = *rest.first()? as usize;
-            let ns = rest.get(1..1 + ns_len)?;
-            let slot = u16::from_be_bytes(rest.get(1 + ns_len..1 + ns_len + 2)?.try_into().ok()?);
-            decode_migration(ns, slot, &v)
-        })
+        .filter_map(|(k, v)| decode_migration_row(&k, &v))
+        .collect()
+}
+
+fn decode_migration_row(k: &[u8], v: &[u8]) -> Option<MigrationRecord> {
+    let rest = k.get(MIGRATION_KEY_PREFIX.len()..)?;
+    let ns_len = *rest.first()? as usize;
+    let ns = rest.get(1..1 + ns_len)?;
+    let slot = u16::from_be_bytes(rest.get(1 + ns_len..1 + ns_len + 2)?.try_into().ok()?);
+    decode_migration(ns, slot, v)
+}
+
+/// Every migration record, or why they cannot all be had (BUG-0287). The
+/// scan stops at a block the engine cannot read, so the unchecked one
+/// answered a short list, and an empty one turned the node's slot gate off:
+/// a node that had handed slots off served them all again.
+pub fn scan_all_migrations_checked(kv: &dyn Kv) -> Result<Vec<MigrationRecord>, ManifestError> {
+    let engine = crate::watch_engine();
+    let rows = kv.scan_prefix(MIGRATION_KEY_PREFIX);
+    if let Some(fault) = engine.fault() {
+        return Err(ManifestError::Unreadable(fault.to_string()));
+    }
+    rows.iter()
+        .map(|(k, v)| decode_migration_row(k, v).ok_or(ManifestError::Corrupt))
         .collect()
 }
 

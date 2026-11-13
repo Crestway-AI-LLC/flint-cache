@@ -120,14 +120,28 @@ pub(crate) fn flintmigrateout(
     // would hand out data whose ownership already changed hands.
     {
         use flint_storage::manifest::{self, MigrationPhase};
-        if let Some(rec) = manifest::read_migration(kv.as_ref(), ns, slot)
-            && matches!(rec.phase, MigrationPhase::Moved | MigrationPhase::Importing)
-        {
-            encode(
-                &Value::Error(format!("ERR slot {slot} not owned (phase {:?})", rec.phase)),
-                &mut out,
-            );
-            return stream.write_all(&out);
+        match manifest::read_migration_checked(kv.as_ref(), ns, slot) {
+            Ok(Some(rec))
+                if matches!(rec.phase, MigrationPhase::Moved | MigrationPhase::Importing) =>
+            {
+                encode(
+                    &Value::Error(format!("ERR slot {slot} not owned (phase {:?})", rec.phase)),
+                    &mut out,
+                );
+                return stream.write_all(&out);
+            }
+            Ok(_) => {}
+            // Whether this node still owns the slot is unknown (BUG-0287).
+            Err(e) => {
+                encode(
+                    &Value::Error(format!(
+                        "ERR slot {slot}'s migration record: {e}; whether this node owns \
+                         the slot is unknown, so nothing is shipped"
+                    )),
+                    &mut out,
+                );
+                return stream.write_all(&out);
+            }
         }
     }
     let prefixes: Vec<Vec<u8>> = [Cf::Metadata, Cf::Subkey, Cf::ZScore]
@@ -1081,7 +1095,11 @@ pub(crate) fn flintslotabort(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> V
         return Value::Error("ERR FLINTSLOTABORT <slot> [ns]".into());
     };
     let ns: &[u8] = args.get(2).map(|v| v.as_slice()).unwrap_or(b"0");
-    match manifest::read_migration(kv.as_ref(), ns, slot) {
+    let record = match manifest::read_migration_checked(kv.as_ref(), ns, slot) {
+        Ok(record) => record,
+        Err(e) => return Value::Error(format!("ERR slot {slot}'s migration record: {e}")),
+    };
+    match record {
         Some(r) if r.phase == MigrationPhase::Moved => {
             Value::Error("ERR slot is Moved (settled ownership), not in-flight".into())
         }
@@ -1128,15 +1146,25 @@ pub(crate) fn check_slot_gate(
     let key = commands::command_key(args)?;
     let slot = flint_slot::slot_for_key(key);
     // Migration records are per (ns, slot): tenant A's moved slot must not
-    // redirect tenant B, whose rows did not move.
-    match manifest::read_migration(kv.as_ref(), ns, slot)?.phase {
+    // redirect tenant B, whose rows did not move. A record the engine cannot
+    // read is not "no record": this node may have handed the slot off, and
+    // serving it would take writes its owner never sees (BUG-0287).
+    let rec = match manifest::read_migration_checked(kv.as_ref(), ns, slot) {
+        Ok(rec) => rec?,
+        Err(e) => {
+            return Some(Value::Error(format!(
+                "ERR slot {slot}'s migration record: {e}; whether this node owns the slot \
+                 is unknown, so the command is refused"
+            )));
+        }
+    };
+    match rec.phase {
         // Aborted belongs with Importing, not with "no record": this node
         // started an import and gave up, so it holds a PARTIAL copy and the
         // peer (the source) still owns the slot. Serving from here would hand
         // clients a truncated slot that looks whole (docs/bugs/0025).
         MigrationPhase::Moved | MigrationPhase::Importing | MigrationPhase::Aborted => {
-            let peer = manifest::read_migration(kv.as_ref(), ns, slot)?.peer;
-            Some(Value::Error(format!("MOVED {slot} {peer}")))
+            Some(Value::Error(format!("MOVED {slot} {}", rec.peer)))
         }
         MigrationPhase::Migrating if is_write => {
             Some(Value::Error("TRYAGAIN slot migrating, retry".into()))

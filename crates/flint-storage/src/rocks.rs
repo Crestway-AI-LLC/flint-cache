@@ -1679,6 +1679,95 @@ mod audit {
         assert_eq!(manifest::read_role_checked(&kv), Ok(Some(claim(1))));
     }
 
+    /// BUG-0287: slot claims and migration records the engine cannot read are
+    /// errors, never "none". The scan used to answer a short list, empty when
+    /// the bad block held them all, and a node that had handed slots off
+    /// served them again.
+    #[test]
+    fn unreadable_slot_records_are_errors_rather_than_no_records() {
+        use crate::manifest::{
+            self, Epoch, ManifestError, MigrationPhase, MigrationRecord, SlotClaim,
+        };
+        let epoch = |counter| Epoch {
+            generation: 0,
+            counter,
+        };
+        let moved = |slot, counter| MigrationRecord {
+            ns: b"0".to_vec(),
+            slot,
+            phase: MigrationPhase::Moved,
+            epoch: epoch(counter),
+            peer: "127.0.0.1:1".into(),
+        };
+        let dir = TempDir::new("slot-fault");
+        {
+            let kv = RocksKv::open(&dir.0).expect("open");
+            let claim = SlotClaim {
+                ns: b"0".to_vec(),
+                start: 0,
+                end: 16383,
+                epoch: epoch(1),
+            };
+            manifest::set_claim(&kv, &claim).expect("claim");
+            for slot in 0..1_500u16 {
+                manifest::set_migration(&kv, &moved(slot, 2)).expect("moved");
+            }
+            assert_eq!(
+                manifest::scan_all_migrations_checked(&kv).map(|r| r.len()),
+                Ok(1_500)
+            );
+            kv.flush_checked().expect("flush");
+        }
+        // The claim and the migration records sort first, so the first data
+        // block holds the claim and the lowest slots' records.
+        corrupt_sst(&dir.0, 100);
+        let kv = RocksKv::open(&dir.0).expect("reopen");
+        let unreadable =
+            |r: Result<(), ManifestError>| matches!(r, Err(ManifestError::Unreadable(_)));
+        assert!(
+            unreadable(manifest::read_claim_checked(&kv, b"0").map(|_| ())),
+            "the claim"
+        );
+        assert!(
+            unreadable(manifest::read_migration_checked(&kv, b"0", 0).map(|_| ())),
+            "slot 0's record"
+        );
+        assert!(
+            unreadable(manifest::scan_all_migrations_checked(&kv).map(|_| ())),
+            "the scan: the unchecked one answered {} records",
+            manifest::scan_all_migrations(&kv).len()
+        );
+        assert!(
+            unreadable(manifest::set_migration(&kv, &moved(0, 1))),
+            "a stale record is refused, not measured against zero"
+        );
+        drop(kv);
+
+        let dir = TempDir::new("slot-undecodable");
+        let kv = RocksKv::open(&dir.0).expect("open");
+        assert_eq!(manifest::read_migration_checked(&kv, b"0", 7), Ok(None));
+        manifest::set_migration(&kv, &moved(7, 1)).expect("first record");
+        assert_eq!(manifest::scan_all_migrations(&kv).len(), 1);
+        kv.put(
+            &[
+                manifest::MIGRATION_KEY_PREFIX,
+                &[1],
+                b"0",
+                &7u16.to_be_bytes(),
+            ]
+            .concat(),
+            b"\x09",
+        );
+        assert_eq!(
+            manifest::read_migration_checked(&kv, b"0", 7),
+            Err(ManifestError::Corrupt)
+        );
+        assert_eq!(
+            manifest::scan_all_migrations_checked(&kv).map(|r| r.len()),
+            Err(ManifestError::Corrupt)
+        );
+    }
+
     /// The SST under `dir`, with eight bytes overwritten `at` bytes in: a
     /// data block whose checksum no longer matches.
     fn corrupt_sst(dir: &Path, at: u64) {

@@ -2899,7 +2899,37 @@ fn main() -> std::io::Result<()> {
             // Initialize the manifest on first boot: default slot claim
             // and a role claim at epoch (0,1).
             use flint_storage::manifest::{self, Epoch, Role, RoleClaim, SlotClaim};
-            if manifest::read_claim(&kv, b"0").is_none() {
+            // A role row the engine cannot read, or that does not decode, is
+            // not a fresh node. Taking it for one started this seat again at
+            // epoch (0,1) with the role its flags named, and its fence then
+            // let a stale promotion through (BUG-0286). It does not know what
+            // it is, so it does not start.
+            let stored_role = manifest::read_role_checked(&kv).map_err(|e| {
+                std::io::Error::other(format!(
+                    "the durable role row: {e}. This seat cannot know its role or its \
+                     epoch, so it does not start; replace its store from a healthy copy \
+                     (BUG-0286)"
+                ))
+            })?;
+            // The slot claim and the migration records say which slots this
+            // node serves. Read as absent, a node re-claimed every slot at
+            // epoch (0,1) and served the slots it had handed off (BUG-0287).
+            // As with the role row, a node that cannot read them does not
+            // start.
+            let stored_claim = manifest::read_claim_checked(&kv, b"0").map_err(|e| {
+                std::io::Error::other(format!(
+                    "the durable slot claim: {e}. This seat cannot know which slots it owns, \
+                     so it does not start; replace its store from a healthy copy (BUG-0287)"
+                ))
+            })?;
+            manifest::scan_all_migrations_checked(&kv).map_err(|e| {
+                std::io::Error::other(format!(
+                    "the durable slot migration records: {e}. This seat cannot know which \
+                     slots it handed off, so it does not start; replace its store from a \
+                     healthy copy (BUG-0287)"
+                ))
+            })?;
+            if stored_claim.is_none() {
                 manifest::set_claim(
                     &kv,
                     &SlotClaim {
@@ -2914,18 +2944,6 @@ fn main() -> std::io::Result<()> {
                 )
                 .map_err(|e| std::io::Error::other(format!("manifest claim: {e:?}")))?;
             }
-            // A role row the engine cannot read, or that does not decode, is
-            // not a fresh node. Taking it for one started this seat again at
-            // epoch (0,1) with the role its flags named, and its fence then
-            // let a stale promotion through (BUG-0286). It does not know what
-            // it is, so it does not start.
-            let stored_role = manifest::read_role_checked(&kv).map_err(|e| {
-                std::io::Error::other(format!(
-                    "the durable role row: {e}. This seat cannot know its role or its \
-                     epoch, so it does not start; replace its store from a healthy copy \
-                     (BUG-0286)"
-                ))
-            })?;
             if stored_role.is_none() {
                 let role = if replica_of.is_some() {
                     Role::Replica
@@ -3610,10 +3628,17 @@ fn main() -> std::io::Result<()> {
     // extra manifest read) when at least one migration override exists.
     // Set at boot from durable records and by FLINTSLOTMOVED; false is the
     // common case, so normal traffic pays nothing.
+    // Records it cannot read turn the gate ON, never off: an empty list read
+    // short of a bad block let a node serve every slot it had handed off
+    // (BUG-0287). Startup has already refused such a store; this holds if a
+    // block goes bad between the two reads.
     let migration_active = Arc::new(AtomicBool::new(false));
     #[cfg(feature = "rocks")]
     if let Some(kv) = &rocks
-        && !flint_storage::manifest::scan_all_migrations(kv.as_ref()).is_empty()
+        && !matches!(
+            flint_storage::manifest::scan_all_migrations_checked(kv.as_ref()),
+            Ok(records) if records.is_empty()
+        )
     {
         migration_active.store(true, Ordering::Relaxed);
     }
